@@ -4,6 +4,7 @@ import { useWebSocket } from "../hooks/useWebSocket";
 import { useChatStore } from "../store/chatStore";
 import type { ChatMessage, ServerMessage } from "../types/ws";
 import { Dispatcher } from "./Dispatcher";
+import { ToastContainer } from "./Toast";
 
 export function ChatView() {
   const messages = useChatStore((s) => s.messages);
@@ -14,6 +15,7 @@ export function ChatView() {
   const setStatus = useChatStore((s) => s.setStatus);
   const setWaiting = useChatStore((s) => s.setWaiting);
   const setSessionId = useChatStore((s) => s.setSessionId);
+  const pushToast = useChatStore((s) => s.pushToast);
 
   const handleMessage = useCallback(
     (msg: ServerMessage) => {
@@ -28,12 +30,12 @@ export function ChatView() {
           addAssistantMessage(msg.speech, msg.ui);
           break;
         case "error":
-          addAssistantMessage(`[error] ${msg.message}`);
+          pushToast(msg.message, msg.code);
           setWaiting(false);
           break;
       }
     },
-    [addAssistantMessage, setSessionId, setWaiting],
+    [addAssistantMessage, setSessionId, setWaiting, pushToast],
   );
 
   const { status, send } = useWebSocket({ url: WS_URL, onMessage: handleMessage });
@@ -73,7 +75,8 @@ export function ChatView() {
   };
 
   return (
-    <div className="flex h-full flex-col bg-neutral-950 text-neutral-100">
+    <div className="relative flex h-full flex-col bg-neutral-950 text-neutral-100">
+      <ToastContainer />
       <header className="flex items-center justify-between border-b border-neutral-800 px-4 py-3">
         <h1 className="text-lg font-semibold tracking-tight">Bob</h1>
         {connectionStatus !== "open" && (

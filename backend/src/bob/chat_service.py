@@ -71,8 +71,9 @@ class ChatService:
         raw = await self._llm_client.chat(
             messages,
             schema=self._ui_registry.get_response_schema(),
+            session_id=session_id,
         )
-        parsed = await response_parser.parse(raw, self._llm_client, messages)
+        parsed = await response_parser.parse(raw, self._llm_client, messages, session_id=session_id)
         self._conversation.append(session_id, "assistant", parsed.speech)
         return parsed
 

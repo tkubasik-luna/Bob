@@ -68,6 +68,37 @@ async def test_chat_with_schema_passes_response_format() -> None:
 
 
 @pytest.mark.asyncio
+async def test_chat_logs_llm_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = LMStudioClient(_make_settings())
+    create = AsyncMock(
+        return_value=SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))],
+            usage=SimpleNamespace(prompt_tokens=11, completion_tokens=22),
+        )
+    )
+    fake_chat = MagicMock()
+    fake_chat.completions.create = create
+    client._client = SimpleNamespace(chat=fake_chat)  # type: ignore[assignment]
+
+    captured: dict[str, Any] = {}
+
+    def _spy(**kwargs: Any) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr("bob.llm_client.log_llm_call", _spy)
+
+    messages: list[dict[str, Any]] = [{"role": "user", "content": "hi"}]
+    await client.chat(messages=messages, session_id="sess-42")
+
+    assert captured["session_id"] == "sess-42"
+    assert captured["messages"] == messages
+    assert captured["raw_response"] == "ok"
+    assert captured["tokens_in"] == 11
+    assert captured["tokens_out"] == 22
+    assert isinstance(captured["latency_ms"], float)
+
+
+@pytest.mark.asyncio
 async def test_chat_returns_empty_string_when_content_is_none() -> None:
     client = LMStudioClient(_make_settings())
     create = AsyncMock(

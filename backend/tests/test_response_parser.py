@@ -22,8 +22,9 @@ class FakeLLMClient(LLMClient):
         self,
         messages: list[dict[str, Any]],
         schema: dict[str, Any] | None = None,
+        session_id: str | None = None,
     ) -> str:
-        self.calls.append({"messages": messages, "schema": schema})
+        self.calls.append({"messages": messages, "schema": schema, "session_id": session_id})
         if not self._responses:
             raise AssertionError("FakeLLMClient ran out of canned responses")
         return self._responses.pop(0)

@@ -42,6 +42,8 @@ async def parse(
     raw_llm_output: str,
     llm_client: LLMClient,
     messages_so_far: list[dict[str, Any]],
+    *,
+    session_id: str | None = None,
 ) -> ParsedResponse:
     """Parse ``raw_llm_output``; retry once via ``llm_client`` on failure.
 
@@ -69,7 +71,11 @@ async def parse(
         {"role": "user", "content": correction},
     ]
 
-    retry_raw = await llm_client.chat(retry_messages, schema=ui_registry.get_response_schema())
+    retry_raw = await llm_client.chat(
+        retry_messages,
+        schema=ui_registry.get_response_schema(),
+        session_id=session_id,
+    )
     retry_parsed, retry_error = _try_parse(retry_raw)
     if retry_parsed is not None:
         return retry_parsed

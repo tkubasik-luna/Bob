@@ -11,12 +11,16 @@ import uuid
 from collections.abc import Callable
 from typing import Any
 
+import httpx
+import openai
+import structlog
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from bob import conversation as conversation_module
 from bob.chat_service import ChatService, get_default_chat_service
 
 router = APIRouter()
+_logger = structlog.get_logger(__name__)
 
 # In-memory per-session state. Keyed by session_id (uuid hex).
 # Kept module-level so it can be inspected from tests if needed.
@@ -54,6 +58,8 @@ async def chat_ws(websocket: WebSocket) -> None:
           ``{"type": "thinking", "state": "start"}``
           ``{"type": "assistant_msg", "speech": str, "ui": [...]}``
           ``{"type": "thinking", "state": "end"}``
+      - LLM-level failures yield ``{"type": "error", "code": ..., "message": ...}``
+        followed by a ``thinking end`` frame; the connection stays open.
       - Any other / malformed payload yields an error frame.
       - On disconnect, the session's conversation history is cleared.
     """
@@ -111,7 +117,42 @@ async def _handle_client_message(
         return
 
     await websocket.send_json({"type": "thinking", "state": "start"})
-    parsed = await chat_service.handle_user_message(session_id, content)
+    try:
+        parsed = await chat_service.handle_user_message(session_id, content)
+    except (httpx.ConnectError, openai.APIConnectionError, ConnectionError):
+        _logger.error("ws_chat.llm_unreachable", session_id=session_id)
+        await websocket.send_json(
+            {
+                "type": "error",
+                "code": "LLM_UNREACHABLE",
+                "message": "LLM provider injoignable",
+            }
+        )
+        await websocket.send_json({"type": "thinking", "state": "end"})
+        return
+    except (TimeoutError, openai.APITimeoutError):
+        _logger.error("ws_chat.llm_timeout", session_id=session_id)
+        await websocket.send_json(
+            {
+                "type": "error",
+                "code": "LLM_TIMEOUT",
+                "message": "Timeout LLM",
+            }
+        )
+        await websocket.send_json({"type": "thinking", "state": "end"})
+        return
+    except Exception:
+        _logger.exception("ws_chat.internal_error", session_id=session_id)
+        await websocket.send_json(
+            {
+                "type": "error",
+                "code": "INTERNAL",
+                "message": "Erreur interne",
+            }
+        )
+        await websocket.send_json({"type": "thinking", "state": "end"})
+        return
+
     await websocket.send_json(
         {
             "type": "assistant_msg",
