@@ -3,6 +3,7 @@ import { WS_URL } from "../config";
 import { useWebSocket } from "../hooks/useWebSocket";
 import { useChatStore } from "../store/chatStore";
 import type { ChatMessage, ServerMessage } from "../types/ws";
+import { Dispatcher } from "./Dispatcher";
 
 export function ChatView() {
   const messages = useChatStore((s) => s.messages);
@@ -24,7 +25,7 @@ export function ChatView() {
           setWaiting(msg.state === "start");
           break;
         case "assistant_msg":
-          addAssistantMessage(msg.speech);
+          addAssistantMessage(msg.speech, msg.ui);
           break;
         case "error":
           addAssistantMessage(`[error] ${msg.message}`);
@@ -117,8 +118,9 @@ export function ChatView() {
 
 function Bubble({ message }: { message: ChatMessage }) {
   const isUser = message.role === "user";
+  const ui = message.ui ?? [];
   return (
-    <div className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
+    <div className={`flex flex-col gap-2 ${isUser ? "items-end" : "items-start"}`}>
       <div
         className={`max-w-[80%] whitespace-pre-wrap rounded-2xl px-3 py-2 text-sm ${
           isUser
@@ -128,6 +130,11 @@ function Bubble({ message }: { message: ChatMessage }) {
       >
         {message.content}
       </div>
+      {!isUser && ui.length > 0 && (
+        <div className="w-full max-w-[80%]">
+          <Dispatcher ui={ui} />
+        </div>
+      )}
     </div>
   );
 }

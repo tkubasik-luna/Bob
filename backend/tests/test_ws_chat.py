@@ -1,12 +1,51 @@
-"""WS echo plumbing tests for /ws/chat."""
+"""WS plumbing tests for /ws/chat — chat_service wired via DI seam."""
 
+from __future__ import annotations
+
+from collections.abc import Iterator
+from typing import cast
+
+import pytest
 from fastapi.testclient import TestClient
 
+from bob import conversation as conversation_module
+from bob import ws_router
+from bob.chat_service import ChatService
 from bob.main import app
+from bob.ui_registry import ComponentDescriptor, ParsedResponse
 from bob.ws_router import _sessions
 
 
-def test_ws_chat_echo_full_round_trip() -> None:
+class _FakeChatService:
+    """Stand-in for ChatService that records calls and returns a canned reply."""
+
+    def __init__(self, parsed: ParsedResponse) -> None:
+        self._parsed = parsed
+        self.calls: list[tuple[str, str]] = []
+
+    async def handle_user_message(self, session_id: str, user_content: str) -> ParsedResponse:
+        self.calls.append((session_id, user_content))
+        # Mimic real ChatService side-effect of growing the conversation history.
+        conversation_module.get_default_store().append(session_id, "user", user_content)
+        conversation_module.get_default_store().append(session_id, "assistant", self._parsed.speech)
+        return self._parsed
+
+
+@pytest.fixture()
+def fake_chat_service() -> Iterator[_FakeChatService]:
+    parsed = ParsedResponse(
+        speech="echo: hi",
+        ui=[ComponentDescriptor(component="Markdown", props={"content": "**bold**"})],
+    )
+    fake = _FakeChatService(parsed)
+    ws_router.set_chat_service_provider(lambda: cast(ChatService, fake))
+    try:
+        yield fake
+    finally:
+        ws_router.reset_chat_service_provider()
+
+
+def test_ws_chat_full_round_trip(fake_chat_service: _FakeChatService) -> None:
     client = TestClient(app)
     with client.websocket_connect("/ws/chat") as ws:
         session_frame = ws.receive_json()
@@ -15,22 +54,28 @@ def test_ws_chat_echo_full_round_trip() -> None:
         assert isinstance(session_id, str) and len(session_id) == 32
         assert session_id in _sessions
 
-        ws.send_json({"type": "user_msg", "content": "hello bob"})
+        ws.send_json({"type": "user_msg", "content": "hi"})
 
         thinking_start = ws.receive_json()
         assert thinking_start == {"type": "thinking", "state": "start"}
 
         assistant = ws.receive_json()
-        assert assistant == {"type": "assistant_msg", "speech": "hello bob", "ui": []}
+        assert assistant == {
+            "type": "assistant_msg",
+            "speech": "echo: hi",
+            "ui": [{"component": "Markdown", "props": {"content": "**bold**"}}],
+        }
 
         thinking_end = ws.receive_json()
         assert thinking_end == {"type": "thinking", "state": "end"}
 
-    # Session cleaned up on disconnect.
+    # Session-local state and conversation history both cleaned up on disconnect.
     assert session_id not in _sessions
+    assert conversation_module.get_default_store().get_history(session_id) == []
+    assert fake_chat_service.calls == [(session_id, "hi")]
 
 
-def test_ws_chat_rejects_unknown_type() -> None:
+def test_ws_chat_rejects_unknown_type(fake_chat_service: _FakeChatService) -> None:
     client = TestClient(app)
     with client.websocket_connect("/ws/chat") as ws:
         ws.receive_json()  # session frame
@@ -38,9 +83,10 @@ def test_ws_chat_rejects_unknown_type() -> None:
         err = ws.receive_json()
         assert err["type"] == "error"
         assert err["code"] == "bad_type"
+    assert fake_chat_service.calls == []
 
 
-def test_ws_chat_rejects_bad_content() -> None:
+def test_ws_chat_rejects_bad_content(fake_chat_service: _FakeChatService) -> None:
     client = TestClient(app)
     with client.websocket_connect("/ws/chat") as ws:
         ws.receive_json()
@@ -48,3 +94,4 @@ def test_ws_chat_rejects_bad_content() -> None:
         err = ws.receive_json()
         assert err["type"] == "error"
         assert err["code"] == "bad_content"
+    assert fake_chat_service.calls == []

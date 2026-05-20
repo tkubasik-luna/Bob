@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import type { ChatMessage, ConnectionStatus } from "../types/ws";
+import type { ChatMessage, ComponentDescriptor, ConnectionStatus } from "../types/ws";
 
 type ChatState = {
   messages: ChatMessage[];
@@ -7,7 +7,7 @@ type ChatState = {
   isWaitingResponse: boolean;
   sessionId: string | null;
   addUserMessage: (content: string) => void;
-  addAssistantMessage: (content: string) => void;
+  addAssistantMessage: (content: string, ui?: ComponentDescriptor[]) => void;
   setStatus: (status: ConnectionStatus) => void;
   setWaiting: (waiting: boolean) => void;
   setSessionId: (id: string | null) => void;
@@ -30,9 +30,9 @@ export const useChatStore = create<ChatState>((set) => ({
     set((state) => ({
       messages: [...state.messages, { id: randomId(), role: "user", content }],
     })),
-  addAssistantMessage: (content) =>
+  addAssistantMessage: (content, ui) =>
     set((state) => ({
-      messages: [...state.messages, { id: randomId(), role: "assistant", content }],
+      messages: [...state.messages, { id: randomId(), role: "assistant", content, ui }],
     })),
   setStatus: (connectionStatus) => set({ connectionStatus }),
   setWaiting: (isWaitingResponse) => set({ isWaitingResponse }),
