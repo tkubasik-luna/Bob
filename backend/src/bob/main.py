@@ -2,7 +2,10 @@
 
 from fastapi import FastAPI
 
+from bob.ws_router import router as ws_router
+
 app = FastAPI(title="Bob backend")
+app.include_router(ws_router)
 
 
 @app.get("/health")
