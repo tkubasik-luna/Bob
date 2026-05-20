@@ -49,7 +49,7 @@ def test_settings_crashes_when_required_var_missing(
     monkeypatch.setenv("LLM_MODEL", "qwen2.5-7b-instruct")
 
     with pytest.raises(ValidationError):
-        Settings()  # type: ignore[call-arg]
+        Settings(_env_file=None)  # type: ignore[call-arg]
 
 
 def test_settings_is_frozen(monkeypatch: pytest.MonkeyPatch, tmp_path: object) -> None:

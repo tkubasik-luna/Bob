@@ -61,6 +61,7 @@ class LMStudioClient(LLMClient):
             "model": self._settings.LLM_MODEL,
             "messages": messages,
             "timeout": self._settings.LLM_TIMEOUT_SECONDS,
+            "max_tokens": 4096,
         }
         if schema is not None:
             kwargs["response_format"] = {
@@ -72,8 +73,11 @@ class LMStudioClient(LLMClient):
         completion = await self._client.chat.completions.create(**kwargs)
         latency_ms = (time.perf_counter() - started) * 1000.0
 
-        content = completion.choices[0].message.content
-        raw = cast(str, content or "")
+        message = completion.choices[0].message
+        content = message.content or ""
+        if not content:
+            content = getattr(message, "reasoning_content", "") or ""
+        raw = cast(str, content)
 
         tokens_in: int | None = None
         tokens_out: int | None = None
