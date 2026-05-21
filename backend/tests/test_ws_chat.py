@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Iterator
 from typing import cast
 
@@ -12,6 +13,7 @@ from bob import conversation as conversation_module
 from bob import ws_router
 from bob.chat_service import ChatService
 from bob.main import app
+from bob.tts_service import KokoroTtsService, SynthesisResult
 from bob.ui_registry import ComponentDescriptor, ParsedResponse
 from bob.ws_router import _sessions
 
@@ -84,6 +86,99 @@ def test_ws_chat_rejects_unknown_type(fake_chat_service: _FakeChatService) -> No
         assert err["type"] == "error"
         assert err["code"] == "bad_type"
     assert fake_chat_service.calls == []
+
+
+class _SlowFakeTts:
+    """TTS double that blocks in ``synthesize`` until released or cancelled."""
+
+    def __init__(self) -> None:
+        self.release = asyncio.Event()
+        self.entered = asyncio.Event()
+        self.cancelled = False
+
+    async def synthesize(
+        self,
+        text: str,
+        *,
+        voice: str | None = None,
+        speed: float | None = None,
+    ) -> SynthesisResult:
+        self.entered.set()
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        # 4 bytes = 2 samples of silence; payload content doesn't matter for the test.
+        return SynthesisResult(pcm16=b"\x00\x00\x00\x00", sample_rate=24_000)
+
+
+def test_ws_chat_interrupts_in_flight_tts(fake_chat_service: _FakeChatService) -> None:
+    """A new user_msg must cancel a previous turn's TTS and emit audio_end."""
+
+    slow_tts = _SlowFakeTts()
+    ws_router.set_tts_service_provider(lambda: cast(KokoroTtsService, slow_tts))
+    try:
+        client = TestClient(app)
+        with client.websocket_connect("/ws/chat") as ws:
+            ws.receive_json()  # session
+            ws.send_json({"type": "user_msg", "content": "hi", "voice": True})
+            assert ws.receive_json()["type"] == "thinking"
+            first_assistant = ws.receive_json()
+            assert first_assistant["type"] == "assistant_msg"
+            first_msg_id = first_assistant["msg_id"]
+            assert ws.receive_json() == {"type": "thinking", "state": "end"}
+
+            # Second message arrives while TTS is still blocking inside synthesize().
+            ws.send_json({"type": "user_msg", "content": "stop"})
+
+            # First frame after interruption is the audio_end emitted by the
+            # cancelling path for the previous msg_id.
+            frame = ws.receive_json()
+            assert frame == {"type": "audio_end", "msg_id": first_msg_id}
+
+            # Then the normal flow for the new turn resumes.
+            assert ws.receive_json() == {"type": "thinking", "state": "start"}
+            second = ws.receive_json()
+            assert second["type"] == "assistant_msg"
+            assert second["msg_id"] != first_msg_id
+            assert ws.receive_json() == {"type": "thinking", "state": "end"}
+
+        # Cancellation actually propagated into the TTS coroutine.
+        assert slow_tts.cancelled is True
+    finally:
+        ws_router.reset_tts_service_provider()
+
+
+def test_ws_chat_interrupt_cancels_even_when_voice_off(
+    fake_chat_service: _FakeChatService,
+) -> None:
+    """Voice-off second message still cancels a voice-on first message's TTS."""
+
+    slow_tts = _SlowFakeTts()
+    ws_router.set_tts_service_provider(lambda: cast(KokoroTtsService, slow_tts))
+    try:
+        client = TestClient(app)
+        with client.websocket_connect("/ws/chat") as ws:
+            ws.receive_json()  # session
+            ws.send_json({"type": "user_msg", "content": "hi", "voice": True})
+            assert ws.receive_json()["type"] == "thinking"
+            first_assistant = ws.receive_json()
+            first_msg_id = first_assistant["msg_id"]
+            assert ws.receive_json() == {"type": "thinking", "state": "end"}
+
+            # New message without voice — must still cancel and emit audio_end.
+            ws.send_json({"type": "user_msg", "content": "silence"})
+            assert ws.receive_json() == {"type": "audio_end", "msg_id": first_msg_id}
+            assert ws.receive_json() == {"type": "thinking", "state": "start"}
+            second = ws.receive_json()
+            assert second["type"] == "assistant_msg"
+            assert ws.receive_json() == {"type": "thinking", "state": "end"}
+            # Crucially: no audio_chunk / audio_end for the new (voiceless) turn.
+
+        assert slow_tts.cancelled is True
+    finally:
+        ws_router.reset_tts_service_provider()
 
 
 def test_ws_chat_rejects_bad_content(fake_chat_service: _FakeChatService) -> None:

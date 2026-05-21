@@ -9,8 +9,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
+import os
 import uuid
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -21,6 +24,8 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from bob import conversation as conversation_module
 from bob import text_segmenter
 from bob.chat_service import ChatService, get_default_chat_service
+from bob.config import get_settings
+from bob.model_downloader import ensure_kokoro_ready
 from bob.tts_service import KokoroTtsService, get_default_tts_service
 
 # Max base64-encoded PCM bytes per `audio_chunk` frame. ~256 KB keeps single
@@ -30,8 +35,11 @@ _AUDIO_CHUNK_MAX_B64 = 256 * 1024
 router = APIRouter()
 _logger = structlog.get_logger(__name__)
 
-# In-memory per-session state. Keyed by session_id (uuid hex).
-# Kept module-level so it can be inspected from tests if needed.
+# Per-session shape:
+#   {
+#       "active_tts": list[tuple[str, asyncio.Task[None]]],
+#           # (msg_id, task) pairs for in-flight TTS synthesis/streaming.
+#   }
 _sessions: dict[str, dict[str, Any]] = {}
 
 # DI seam: tests may rebind this to a callable returning a fake ChatService.
@@ -76,21 +84,15 @@ def reset_tts_service_provider() -> None:
 async def chat_ws(websocket: WebSocket) -> None:
     """Bidirectional chat WebSocket.
 
-    Protocol:
-      - On connect, server sends ``{"type": "session", "session_id": <uuid hex>}``.
-      - For each client message ``{"type": "user_msg", "content": str}`` the
-        server replies with:
-          ``{"type": "thinking", "state": "start"}``
-          ``{"type": "assistant_msg", "speech": str, "ui": [...]}``
-          ``{"type": "thinking", "state": "end"}``
-      - LLM-level failures yield ``{"type": "error", "code": ..., "message": ...}``
-        followed by a ``thinking end`` frame; the connection stays open.
-      - Any other / malformed payload yields an error frame.
-      - On disconnect, the session's conversation history is cleared.
+    Interruption: when a new ``user_msg`` arrives while a previous reply is
+    still being synthesized/streamed as audio, any in-flight TTS task for that
+    session is cancelled before the new turn starts. The cancelling code path
+    emits a final ``audio_end`` for the interrupted ``msg_id`` so the client
+    can purge its playback queue cleanly.
     """
     await websocket.accept()
     session_id = uuid.uuid4().hex
-    _sessions[session_id] = {}
+    _sessions[session_id] = {"active_tts": []}
     chat_service = _chat_service_provider()
 
     try:
@@ -103,8 +105,45 @@ async def chat_ws(websocket: WebSocket) -> None:
         # Normal disconnect; just fall through to cleanup.
         pass
     finally:
+        # Socket is going away — cancel any in-flight TTS without emitting frames.
+        await _cancel_active_tts(session_id, emit_audio_end=False, websocket=None)
         _sessions.pop(session_id, None)
         conversation_module.get_default_store().clear(session_id)
+
+
+async def _cancel_active_tts(
+    session_id: str,
+    *,
+    emit_audio_end: bool,
+    websocket: WebSocket | None,
+) -> None:
+    """Cancel every in-flight TTS task for ``session_id``.
+
+    When ``emit_audio_end`` is true and a ``websocket`` is provided, a final
+    ``audio_end`` frame is sent for each cancelled ``msg_id`` so the client can
+    purge its playback queue.
+    """
+
+    session = _sessions.get(session_id)
+    if not session:
+        return
+    active: list[tuple[str, asyncio.Task[None]]] = session.get("active_tts", [])
+    if not active:
+        return
+
+    # Detach the list first so any done-callback that tries to mutate it during
+    # cancellation doesn't race.
+    session["active_tts"] = []
+
+    for msg_id, task in active:
+        if task.done():
+            continue
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
+        if emit_audio_end and websocket is not None:
+            with contextlib.suppress(Exception):
+                await websocket.send_json({"type": "audio_end", "msg_id": msg_id})
 
 
 async def _handle_client_message(
@@ -142,6 +181,12 @@ async def _handle_client_message(
         return
 
     voice_requested = bool(payload.get("voice"))
+
+    # Interruption: cancel any in-flight TTS for previous assistant turns of
+    # this session before handling the new user message. We do this regardless
+    # of whether the new request opts into voice — a fresh message always means
+    # "stop talking about the previous one".
+    await _cancel_active_tts(session_id, emit_audio_end=True, websocket=websocket)
 
     await websocket.send_json({"type": "thinking", "state": "start"})
     try:
@@ -192,7 +237,42 @@ async def _handle_client_message(
     await websocket.send_json({"type": "thinking", "state": "end"})
 
     if voice_requested and parsed.speech.strip():
-        await _synthesize_and_stream(websocket, session_id, msg_id, parsed.speech)
+        # Run synthesis as a background task so the WS read loop can observe
+        # the next user message (and cancel us) without waiting for audio to
+        # finish streaming.
+        task: asyncio.Task[None] = asyncio.create_task(
+            _synthesize_and_stream(websocket, session_id, msg_id, parsed.speech)
+        )
+        session = _sessions.get(session_id)
+        if session is not None:
+            session.setdefault("active_tts", []).append((msg_id, task))
+
+        def _remove_when_done(t: asyncio.Task[None], _msg_id: str = msg_id) -> None:
+            sess = _sessions.get(session_id)
+            if not sess:
+                return
+            active = sess.get("active_tts", [])
+            for i, (mid, tt) in enumerate(active):
+                if mid == _msg_id and tt is t:
+                    active.pop(i)
+                    break
+
+        task.add_done_callback(_remove_when_done)
+
+
+def _kokoro_model_files_present() -> bool:
+    """Return True iff both the Kokoro model + voices artifacts exist on disk."""
+
+    try:
+        settings = get_settings()
+    except Exception:
+        # If settings can't be read, fall back to "present" so we don't lie
+        # about a download that may not actually happen.
+        return True
+    model_dir = Path(settings.KOKORO_MODEL_DIR)
+    model_path = model_dir / settings.KOKORO_MODEL_FILENAME
+    voices_path = model_dir / settings.KOKORO_VOICES_FILENAME
+    return os.path.exists(model_path) and os.path.exists(voices_path)
 
 
 async def _synthesize_and_stream(
@@ -205,13 +285,16 @@ async def _synthesize_and_stream(
 
     Synthesis is pipelined: every sentence is dispatched to the TTS service
     immediately via ``asyncio.create_task`` so sentence ``N+1`` can be
-    synthesized while sentence ``N`` is still being sent over the wire (and
-    played by the frontend). We await tasks in order and emit ``audio_chunk``
-    frames sequentially so the client can chain playback gaplessly.
+    synthesized while sentence ``N`` is still being sent over the wire.
 
-    Errors during synthesis of a given sentence are logged and skipped; the
-    overall best-effort contract is preserved and an ``audio_end`` is always
-    emitted at the very end.
+    Cancellation: this coroutine runs as a background task and may be cancelled
+    by :func:`_cancel_active_tts` when a new user message arrives. The
+    cancelling path emits the final ``audio_end`` for the cancelled msg_id; we
+    bubble :class:`asyncio.CancelledError` here and do not emit it ourselves.
+
+    Errors are surfaced via an ``audio_error`` event so the frontend can show a
+    toast; the text response has already been sent so the user still sees the
+    reply.
     """
 
     sentences = [s for s in text_segmenter.segment(text) if s.strip()]
@@ -219,23 +302,62 @@ async def _synthesize_and_stream(
         await websocket.send_json({"type": "audio_end", "msg_id": msg_id})
         return
 
+    # Best-effort: detect a missing local model so the client can show a
+    # "Préparation de la voix…" toast while the download runs.
+    preparing = not _kokoro_model_files_present()
+    if preparing:
+        await websocket.send_json({"type": "tts_preparing", "msg_id": msg_id})
+        try:
+            await asyncio.to_thread(ensure_kokoro_ready)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _logger.exception(
+                "ws_chat.tts_download_failed", session_id=session_id, msg_id=msg_id
+            )
+            await websocket.send_json(
+                {
+                    "type": "audio_error",
+                    "msg_id": msg_id,
+                    "reason": f"téléchargement modèle: {exc}",
+                }
+            )
+            await websocket.send_json({"type": "audio_end", "msg_id": msg_id})
+            return
+
     tts = _tts_service_provider()
-    # Kick off all syntheses concurrently; await them in order below.
     tasks = [asyncio.create_task(tts.synthesize(sentence)) for sentence in sentences]
 
     step = _AUDIO_CHUNK_MAX_B64 - (_AUDIO_CHUNK_MAX_B64 % 4)
     seq = 0
+    error_emitted = False
     try:
+        if preparing:
+            # Signal the frontend that the prep toast can be dismissed; the
+            # first audio_chunk arrives immediately after.
+            await websocket.send_json({"type": "tts_ready", "msg_id": msg_id})
+
         for idx, task in enumerate(tasks):
             try:
                 result = await task
-            except Exception:
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
                 _logger.exception(
                     "ws_chat.tts_failed",
                     session_id=session_id,
                     msg_id=msg_id,
                     sentence_index=idx,
                 )
+                if not error_emitted:
+                    await websocket.send_json(
+                        {
+                            "type": "audio_error",
+                            "msg_id": msg_id,
+                            "reason": str(exc) or exc.__class__.__name__,
+                        }
+                    )
+                    error_emitted = True
                 continue
 
             pcm_b64 = base64.b64encode(result.pcm16).decode("ascii")
@@ -252,9 +374,16 @@ async def _synthesize_and_stream(
                     }
                 )
                 seq += 1
-    finally:
-        # Make sure no pending task is left dangling if we exit early.
+
+        await websocket.send_json({"type": "audio_end", "msg_id": msg_id})
+    except asyncio.CancelledError:
+        # Cancellation: the cancelling path emits the final audio_end. Cancel
+        # any still-pending synth tasks to free CPU.
         for task in tasks:
             if not task.done():
                 task.cancel()
-        await websocket.send_json({"type": "audio_end", "msg_id": msg_id})
+        raise
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
