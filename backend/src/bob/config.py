@@ -62,9 +62,7 @@ class Settings(BaseSettings):
                 if not value
             ]
             if missing:
-                raise ValueError(
-                    f"LLM_PROVIDER=lm_studio requires: {', '.join(missing)}"
-                )
+                raise ValueError(f"LLM_PROVIDER=lm_studio requires: {', '.join(missing)}")
         return self
 
     # Backend
@@ -73,6 +71,25 @@ class Settings(BaseSettings):
 
     # Logging
     LOG_LEVEL: str = "INFO"
+
+    # Kokoro TTS — local engine, model artifacts downloaded on first launch
+    # and cached under ``KOKORO_MODEL_DIR``. Sources match the upstream
+    # ``kokoro-onnx`` README (release assets from the GitHub project).
+    KOKORO_MODEL_DIR: Path = Path.home() / ".bob" / "models" / "kokoro"
+    KOKORO_MODEL_FILENAME: str = "kokoro-v1.0.onnx"
+    KOKORO_VOICES_FILENAME: str = "voices-v1.0.bin"
+    KOKORO_MODEL_URL: str = (
+        "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/"
+        "kokoro-v1.0.onnx"
+    )
+    KOKORO_VOICES_URL: str = (
+        "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/"
+        "voices-v1.0.bin"
+    )
+    KOKORO_DEFAULT_VOICE: str = "ff_siwis"
+    KOKORO_DEFAULT_SPEED: float = 1.0
+    KOKORO_DEFAULT_LANG: str = "fr-fr"
+    KOKORO_SAMPLE_RATE: int = 24000
 
 
 @lru_cache(maxsize=1)
