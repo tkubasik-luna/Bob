@@ -1,19 +1,20 @@
 """Application configuration loaded from environment / `.env`.
 
-Required environment variables (boot will crash if missing):
+Two LLM backends are supported, selected by ``LLM_PROVIDER``:
 
-- ``LLM_BASE_URL``
-- ``LLM_MODEL``
-- ``LLM_API_KEY``
-
-The remaining settings have defaults.
+- ``lm_studio`` (default): OpenAI-compatible HTTP endpoint. Requires
+  ``LLM_BASE_URL``, ``LLM_MODEL``, ``LLM_API_KEY``.
+- ``claude_cli``: subprocess call to the ``claude`` CLI in ``-p`` mode.
+  Requires ``claude`` on ``PATH`` (or set ``CLAUDE_CLI_BIN``).
 """
 
 from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
@@ -34,11 +35,37 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # LLM
-    LLM_BASE_URL: str
-    LLM_MODEL: str
-    LLM_API_KEY: str
+    # LLM provider selection
+    LLM_PROVIDER: Literal["lm_studio", "claude_cli"] = "lm_studio"
+
+    # LM Studio / OpenAI-compatible backend (required when LLM_PROVIDER=lm_studio)
+    LLM_BASE_URL: str | None = None
+    LLM_MODEL: str | None = None
+    LLM_API_KEY: str | None = None
     LLM_TIMEOUT_SECONDS: float = 60.0
+
+    # Claude CLI backend (used when LLM_PROVIDER=claude_cli)
+    CLAUDE_CLI_BIN: str = "claude"
+    CLAUDE_CLI_MODEL: str | None = None
+    CLAUDE_CLI_TIMEOUT_SECONDS: float = 120.0
+
+    @model_validator(mode="after")
+    def _validate_provider_requirements(self) -> Settings:
+        if self.LLM_PROVIDER == "lm_studio":
+            missing = [
+                name
+                for name, value in (
+                    ("LLM_BASE_URL", self.LLM_BASE_URL),
+                    ("LLM_MODEL", self.LLM_MODEL),
+                    ("LLM_API_KEY", self.LLM_API_KEY),
+                )
+                if not value
+            ]
+            if missing:
+                raise ValueError(
+                    f"LLM_PROVIDER=lm_studio requires: {', '.join(missing)}"
+                )
+        return self
 
     # Backend
     BACKEND_HOST: str = "127.0.0.1"
@@ -56,4 +83,4 @@ def get_settings() -> Settings:
     variable is missing — crashing the process early as designed.
     """
 
-    return Settings()  # type: ignore[call-arg]
+    return Settings()

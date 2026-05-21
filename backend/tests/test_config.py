@@ -10,10 +10,14 @@ from bob.config import Settings
 
 def _clear_env(monkeypatch: pytest.MonkeyPatch) -> None:
     for var in (
+        "LLM_PROVIDER",
         "LLM_BASE_URL",
         "LLM_MODEL",
         "LLM_API_KEY",
         "LLM_TIMEOUT_SECONDS",
+        "CLAUDE_CLI_BIN",
+        "CLAUDE_CLI_MODEL",
+        "CLAUDE_CLI_TIMEOUT_SECONDS",
         "BACKEND_HOST",
         "BACKEND_PORT",
         "LOG_LEVEL",
@@ -63,3 +67,28 @@ def test_settings_is_frozen(monkeypatch: pytest.MonkeyPatch, tmp_path: object) -
 
     with pytest.raises(ValidationError):
         settings.LLM_MODEL = "other"
+
+
+def test_settings_claude_cli_provider_does_not_require_lm_studio_vars(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: object
+) -> None:
+    _clear_env(monkeypatch)
+    monkeypatch.chdir(tmp_path)  # type: ignore[arg-type]
+    monkeypatch.setenv("LLM_PROVIDER", "claude_cli")
+
+    settings = Settings(_env_file=None)  # type: ignore[call-arg]
+
+    assert settings.LLM_PROVIDER == "claude_cli"
+    assert settings.LLM_BASE_URL is None
+    assert settings.CLAUDE_CLI_BIN == "claude"
+
+
+def test_settings_lm_studio_provider_requires_url_model_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: object
+) -> None:
+    _clear_env(monkeypatch)
+    monkeypatch.chdir(tmp_path)  # type: ignore[arg-type]
+    monkeypatch.setenv("LLM_PROVIDER", "lm_studio")
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)  # type: ignore[call-arg]

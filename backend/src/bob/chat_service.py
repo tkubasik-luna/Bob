@@ -17,7 +17,7 @@ from bob import response_parser
 from bob import ui_registry as ui_registry_module
 from bob.config import get_settings
 from bob.conversation import ConversationStore
-from bob.llm_client import LLMClient, LMStudioClient
+from bob.llm_client import ClaudeCliClient, LLMClient, LMStudioClient
 from bob.ui_registry import ParsedResponse
 
 
@@ -82,7 +82,12 @@ def get_default_chat_service() -> ChatService:
     """Build a :class:`ChatService` wired with the runtime defaults."""
 
     settings = get_settings()
+    client: LLMClient
+    if settings.LLM_PROVIDER == "claude_cli":
+        client = ClaudeCliClient(settings)
+    else:
+        client = LMStudioClient(settings)
     return ChatService(
-        llm_client=LMStudioClient(settings),
+        llm_client=client,
         conversation=conversation_module.get_default_store(),
     )
