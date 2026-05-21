@@ -1,10 +1,16 @@
 import { type KeyboardEvent, useCallback, useEffect, useRef, useState } from "react";
+import { enqueue as audioEnqueue, generateSineFloat32 } from "../audio/audioPlayer";
 import { WS_URL } from "../config";
+import { useVoiceMode } from "../hooks/useVoiceMode";
 import { useWebSocket } from "../hooks/useWebSocket";
 import { useChatStore } from "../store/chatStore";
 import type { ChatMessage, ServerMessage } from "../types/ws";
 import { Dispatcher } from "./Dispatcher";
 import { ToastContainer } from "./Toast";
+
+// Toggle the dev/temporary sine-wave test button. Flip to `false` (or gate on
+// import.meta.env.DEV) once the WS audio path is wired in issue 0010.
+const SHOW_AUDIO_TEST_BUTTON = import.meta.env.DEV;
 
 export function ChatView() {
   const messages = useChatStore((s) => s.messages);
@@ -39,6 +45,12 @@ export function ChatView() {
   );
 
   const { status, send } = useWebSocket({ url: WS_URL, onMessage: handleMessage });
+  const { voiceEnabled, toggle: toggleVoice } = useVoiceMode();
+
+  const playSineTest = useCallback(() => {
+    const sampleRate = 24_000;
+    audioEnqueue(generateSineFloat32(440, 1, sampleRate), sampleRate, "dev-sine");
+  }, []);
 
   // Mirror hook status into the store so the badge/UI stays reactive everywhere.
   useEffect(() => {
@@ -79,11 +91,24 @@ export function ChatView() {
       <ToastContainer />
       <header className="flex items-center justify-between border-b border-neutral-800 px-4 py-3">
         <h1 className="text-lg font-semibold tracking-tight">Bob</h1>
-        {connectionStatus !== "open" && (
-          <span className="rounded-full bg-red-900/40 px-2 py-0.5 text-xs text-red-200">
-            {connectionStatus === "connecting" ? "connexion…" : "déconnecté"}
-          </span>
-        )}
+        <div className="flex items-center gap-2">
+          {connectionStatus !== "open" && (
+            <span className="rounded-full bg-red-900/40 px-2 py-0.5 text-xs text-red-200">
+              {connectionStatus === "connecting" ? "connexion…" : "déconnecté"}
+            </span>
+          )}
+          {SHOW_AUDIO_TEST_BUTTON && (
+            <button
+              type="button"
+              onClick={playSineTest}
+              title="Lire un sinus 440Hz de test (dev)"
+              className="rounded-md border border-neutral-800 bg-neutral-900 px-2 py-1 text-xs text-neutral-300 hover:bg-neutral-800"
+            >
+              ♪ test
+            </button>
+          )}
+          <VoiceToggleButton enabled={voiceEnabled} onToggle={toggleVoice} />
+        </div>
       </header>
 
       <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 py-4">
@@ -139,6 +164,66 @@ function Bubble({ message }: { message: ChatMessage }) {
         </div>
       )}
     </div>
+  );
+}
+
+function VoiceToggleButton({ enabled, onToggle }: { enabled: boolean; onToggle: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      aria-pressed={enabled}
+      title={enabled ? "Désactiver la voix" : "Activer la voix"}
+      className={`flex h-8 w-8 items-center justify-center rounded-md border text-sm transition-colors ${
+        enabled
+          ? "border-blue-500/60 bg-blue-600/20 text-blue-200 hover:bg-blue-600/30"
+          : "border-neutral-800 bg-neutral-900 text-neutral-400 hover:bg-neutral-800"
+      }`}
+    >
+      {enabled ? <SpeakerIcon /> : <SpeakerMutedIcon />}
+    </button>
+  );
+}
+
+function SpeakerIcon() {
+  return (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className="h-4 w-4"
+      aria-hidden="true"
+    >
+      <title>Voix activée</title>
+      <path d="M11 5 6 9H2v6h4l5 4z" />
+      <path d="M15.54 8.46a5 5 0 0 1 0 7.07" />
+      <path d="M19.07 4.93a10 10 0 0 1 0 14.14" />
+    </svg>
+  );
+}
+
+function SpeakerMutedIcon() {
+  return (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className="h-4 w-4"
+      aria-hidden="true"
+    >
+      <title>Voix désactivée</title>
+      <path d="M11 5 6 9H2v6h4l5 4z" />
+      <line x1="22" y1="9" x2="16" y2="15" />
+      <line x1="16" y1="9" x2="22" y2="15" />
+    </svg>
   );
 }
 
