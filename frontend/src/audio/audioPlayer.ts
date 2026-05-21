@@ -17,7 +17,15 @@
  * duration. This produces gap-free continuous playback across successive enqueues.
  */
 
-export type SpeakingListener = (speaking: boolean) => void;
+/**
+ * Listener signature for the speaking observer.
+ *
+ * The argument is the `msg_id` of the bubble currently being played, or
+ * `null` when nothing is playing. Consumers (typically the chat store) use
+ * this to render a "Bob is speaking" indicator on the exact bubble being
+ * voiced, and to clear it on natural end OR on interruption.
+ */
+export type SpeakingListener = (speakingMsgId: string | null) => void;
 
 type ScheduledSource = {
   source: AudioBufferSourceNode;
@@ -29,7 +37,7 @@ let ctx: AudioContext | null = null;
 let nextStartTime = 0;
 const scheduled: ScheduledSource[] = [];
 const listeners = new Set<SpeakingListener>();
-let speaking = false;
+let speakingMsgId: string | null = null;
 
 function getContext(): AudioContext {
   if (!ctx) {
@@ -43,9 +51,9 @@ function getContext(): AudioContext {
   return ctx;
 }
 
-function setSpeaking(v: boolean): void {
-  if (speaking === v) return;
-  speaking = v;
+function setSpeakingMsgId(v: string | null): void {
+  if (speakingMsgId === v) return;
+  speakingMsgId = v;
   for (const l of listeners) l(v);
 }
 
@@ -96,14 +104,22 @@ export function enqueue(pcm: string | Float32Array, sampleRate: number, msgId: s
 
   const entry: ScheduledSource = { source, msgId, endTime };
   scheduled.push(entry);
-  setSpeaking(true);
+  // The msg_id "currently speaking" is whichever bubble owns the head of
+  // the schedule. Streaming chunks for the same msg_id arrive in order, so
+  // setting it on every enqueue is correct and idempotent.
+  setSpeakingMsgId(msgId);
 
   source.onended = () => {
     const idx = scheduled.indexOf(entry);
     if (idx >= 0) scheduled.splice(idx, 1);
     if (scheduled.length === 0) {
       nextStartTime = 0;
-      setSpeaking(false);
+      setSpeakingMsgId(null);
+    } else {
+      // Still playing — keep the msg_id of whatever is at the head of the
+      // remaining schedule. In practice all queued chunks belong to the
+      // same turn, so this just keeps the current id.
+      setSpeakingMsgId(scheduled[0].msgId);
     }
   };
 }
@@ -133,24 +149,29 @@ export function stop(msgId?: string): void {
 
   if (scheduled.length === 0) {
     nextStartTime = 0;
-    setSpeaking(false);
+    setSpeakingMsgId(null);
   } else {
     // Recompute nextStartTime from what's still scheduled.
     nextStartTime = Math.max(...scheduled.map((s) => s.endTime));
+    setSpeakingMsgId(scheduled[0].msgId);
   }
 }
 
 export function subscribeSpeaking(cb: SpeakingListener): () => void {
   listeners.add(cb);
   // Fire immediately with current state so subscribers can sync.
-  cb(speaking);
+  cb(speakingMsgId);
   return () => {
     listeners.delete(cb);
   };
 }
 
 export function isSpeaking(): boolean {
-  return speaking;
+  return speakingMsgId !== null;
+}
+
+export function getSpeakingMsgId(): string | null {
+  return speakingMsgId;
 }
 
 /**

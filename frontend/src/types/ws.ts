@@ -57,13 +57,40 @@ export type AudioEndMsg = {
   msg_id: string;
 };
 
+/** Backend emits this once before the first chunk when the local Kokoro
+ * model needs to be downloaded. The frontend shows a "Préparation de la
+ * voix…" info toast that is dismissed on the matching `tts_ready` (or
+ * `audio_error`) event. */
+export type TtsPreparingMsg = {
+  type: "tts_preparing";
+  msg_id: string;
+};
+
+/** Paired with `tts_preparing` — model is now loaded and synthesis is
+ * about to stream. Frontend dismisses the prep toast. */
+export type TtsReadyMsg = {
+  type: "tts_ready";
+  msg_id: string;
+};
+
+/** Synthesis (or initial download) failed. Text response has already been
+ * sent; the voice toggle stays ON so the next message retries. */
+export type AudioErrorMsg = {
+  type: "audio_error";
+  msg_id: string;
+  reason: string;
+};
+
 export type ServerMessage =
   | SessionMsg
   | AssistantMsg
   | ThinkingMsg
   | ErrorMsg
   | AudioChunkMsg
-  | AudioEndMsg;
+  | AudioEndMsg
+  | TtsPreparingMsg
+  | TtsReadyMsg
+  | AudioErrorMsg;
 
 export type ConnectionStatus = "connecting" | "open" | "closed";
 

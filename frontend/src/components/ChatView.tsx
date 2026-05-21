@@ -1,5 +1,9 @@
 import { type KeyboardEvent, useCallback, useEffect, useRef, useState } from "react";
-import { enqueue as audioEnqueue } from "../audio/audioPlayer";
+import {
+  enqueue as audioEnqueue,
+  stop as audioStop,
+  subscribeSpeaking,
+} from "../audio/audioPlayer";
 import { WS_URL } from "../config";
 import { useVoiceMode } from "../hooks/useVoiceMode";
 import { useWebSocket } from "../hooks/useWebSocket";
@@ -18,6 +22,29 @@ export function ChatView() {
   const setWaiting = useChatStore((s) => s.setWaiting);
   const setSessionId = useChatStore((s) => s.setSessionId);
   const pushToast = useChatStore((s) => s.pushToast);
+  const dismissToast = useChatStore((s) => s.dismissToast);
+  const speakingMsgId = useChatStore((s) => s.speakingMsgId);
+  const setSpeakingMsgId = useChatStore((s) => s.setSpeakingMsgId);
+
+  // Bridge audioPlayer → store so `Bubble` can render the wave indicator
+  // on the exact bubble currently being voiced. Cleared on natural end
+  // AND on interruption (audioPlayer.stop()), per acceptance criteria.
+  useEffect(() => {
+    const unsubscribe = subscribeSpeaking((id) => {
+      setSpeakingMsgId(id);
+    });
+    return unsubscribe;
+  }, [setSpeakingMsgId]);
+
+  // Stable id for the "Préparation de la voix…" toast — keyed by msg_id
+  // so concurrent first-message scenarios stay isolated.
+  const prepToastId = useCallback((msgId: string) => `tts-prep:${msgId}`, []);
+
+  // Tracks the msg_id of the most recently received assistant_msg. Audio
+  // frames carrying a different msg_id are stale (the user interrupted Bob)
+  // and must be dropped: the backend cancellation may race with chunks
+  // already in flight on the socket.
+  const currentMsgIdRef = useRef<string | null>(null);
 
   const handleMessage = useCallback(
     (msg: ServerMessage) => {
@@ -29,13 +56,38 @@ export function ChatView() {
           setWaiting(msg.state === "start");
           break;
         case "assistant_msg":
-          addAssistantMessage(msg.speech, msg.ui);
+          // New assistant turn → interrupt any audio still playing/queued from
+          // the previous turn before tagging this turn as current.
+          audioStop();
+          if (msg.msg_id) {
+            currentMsgIdRef.current = msg.msg_id;
+          }
+          addAssistantMessage(msg.speech, msg.ui, msg.msg_id);
           break;
         case "audio_chunk":
+          if (msg.msg_id !== currentMsgIdRef.current) {
+            // Late chunk from a cancelled (interrupted) turn — ignore.
+            break;
+          }
           audioEnqueue(msg.pcm_b64, msg.sample_rate, msg.msg_id);
           break;
         case "audio_end":
-          // Bubble indicator / done-tracking arrives in 0014. No-op for now.
+          // Defensive: if a prep toast somehow survived past audio_end,
+          // dismiss it now so the UI never gets stuck.
+          dismissToast(prepToastId(msg.msg_id));
+          break;
+        case "tts_preparing":
+          pushToast("Préparation de la voix…", {
+            kind: "info",
+            id: prepToastId(msg.msg_id),
+          });
+          break;
+        case "tts_ready":
+          dismissToast(prepToastId(msg.msg_id));
+          break;
+        case "audio_error":
+          dismissToast(prepToastId(msg.msg_id));
+          pushToast(`TTS indisponible : ${msg.reason}`, { kind: "error", code: "TTS" });
           break;
         case "error":
           pushToast(msg.message, msg.code);
@@ -43,7 +95,7 @@ export function ChatView() {
           break;
       }
     },
-    [addAssistantMessage, setSessionId, setWaiting, pushToast],
+    [addAssistantMessage, setSessionId, setWaiting, pushToast, dismissToast, prepToastId],
   );
 
   const { status, send } = useWebSocket({ url: WS_URL, onMessage: handleMessage });
@@ -101,7 +153,7 @@ export function ChatView() {
       <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 py-4">
         <div className="mx-auto flex max-w-2xl flex-col gap-3">
           {messages.map((m) => (
-            <Bubble key={m.id} message={m} />
+            <Bubble key={m.id} message={m} isSpeaking={speakingMsgId === m.id} />
           ))}
           {isWaitingResponse && <ThinkingDots />}
         </div>
@@ -131,19 +183,26 @@ export function ChatView() {
   );
 }
 
-function Bubble({ message }: { message: ChatMessage }) {
+function Bubble({
+  message,
+  isSpeaking = false,
+}: {
+  message: ChatMessage;
+  isSpeaking?: boolean;
+}) {
   const isUser = message.role === "user";
   const ui = message.ui ?? [];
   return (
     <div className={`flex flex-col gap-2 ${isUser ? "items-end" : "items-start"}`}>
       <div
-        className={`max-w-[80%] whitespace-pre-wrap rounded-2xl px-3 py-2 text-sm ${
+        className={`flex max-w-[80%] items-end gap-2 whitespace-pre-wrap rounded-2xl px-3 py-2 text-sm ${
           isUser
             ? "rounded-br-sm bg-blue-600 text-white"
             : "rounded-bl-sm bg-neutral-800 text-neutral-100"
         }`}
       >
-        {message.content}
+        <span className="min-w-0 flex-1">{message.content}</span>
+        {!isUser && isSpeaking && <SpeakingWaveIcon />}
       </div>
       {!isUser && ui.length > 0 && (
         <div className="w-full max-w-[80%]">
@@ -151,6 +210,22 @@ function Bubble({ message }: { message: ChatMessage }) {
         </div>
       )}
     </div>
+  );
+}
+
+/**
+ * Tiny three-bar animated equalizer shown on the bubble currently being
+ * voiced by Kokoro. Pure CSS animation via Tailwind `animate-pulse` with
+ * staggered delays — no extra deps. Hidden from screen readers by `aria-hidden`
+ * since the indicator is purely decorative (audio itself conveys the info).
+ */
+function SpeakingWaveIcon() {
+  return (
+    <span className="inline-flex h-4 items-end gap-0.5" aria-hidden="true" title="Bob parle">
+      <span className="block h-1.5 w-0.5 animate-pulse rounded-sm bg-blue-300 [animation-delay:-0.3s]" />
+      <span className="block h-3 w-0.5 animate-pulse rounded-sm bg-blue-300 [animation-delay:-0.15s]" />
+      <span className="block h-2 w-0.5 animate-pulse rounded-sm bg-blue-300" />
+    </span>
   );
 }
 
