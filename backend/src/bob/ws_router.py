@@ -7,6 +7,7 @@ without monkey-patching the FastAPI app or relying on dependency overrides.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import uuid
 from collections.abc import Callable
@@ -18,6 +19,7 @@ import structlog
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from bob import conversation as conversation_module
+from bob import text_segmenter
 from bob.chat_service import ChatService, get_default_chat_service
 from bob.tts_service import KokoroTtsService, get_default_tts_service
 
@@ -199,39 +201,60 @@ async def _synthesize_and_stream(
     msg_id: str,
     text: str,
 ) -> None:
-    """Run TTS for ``text`` and stream PCM frames over ``websocket``.
+    """Segment ``text`` into sentences and stream their PCM frames in order.
 
-    Errors during synthesis are logged but not propagated to the client as
-    fatal: voice is best-effort, the text response has already been sent.
+    Synthesis is pipelined: every sentence is dispatched to the TTS service
+    immediately via ``asyncio.create_task`` so sentence ``N+1`` can be
+    synthesized while sentence ``N`` is still being sent over the wire (and
+    played by the frontend). We await tasks in order and emit ``audio_chunk``
+    frames sequentially so the client can chain playback gaplessly.
+
+    Errors during synthesis of a given sentence are logged and skipped; the
+    overall best-effort contract is preserved and an ``audio_end`` is always
+    emitted at the very end.
     """
 
-    try:
-        tts = _tts_service_provider()
-        result = await tts.synthesize(text)
-    except Exception:
-        _logger.exception("ws_chat.tts_failed", session_id=session_id, msg_id=msg_id)
-        # Still close the audio stream so the client can release any
-        # speaking-state UI it set up speculatively.
+    sentences = [s for s in text_segmenter.segment(text) if s.strip()]
+    if not sentences:
         await websocket.send_json({"type": "audio_end", "msg_id": msg_id})
         return
 
-    pcm_b64 = base64.b64encode(result.pcm16).decode("ascii")
-    sample_rate = result.sample_rate
+    tts = _tts_service_provider()
+    # Kick off all syntheses concurrently; await them in order below.
+    tasks = [asyncio.create_task(tts.synthesize(sentence)) for sentence in sentences]
 
-    # Split into ≤_AUDIO_CHUNK_MAX_B64 base64 chunks. Slicing along base64
-    # boundaries that are multiples of 4 keeps each chunk individually
-    # decodable on the client.
     step = _AUDIO_CHUNK_MAX_B64 - (_AUDIO_CHUNK_MAX_B64 % 4)
-    for seq, start in enumerate(range(0, len(pcm_b64), step)):
-        chunk = pcm_b64[start : start + step]
-        await websocket.send_json(
-            {
-                "type": "audio_chunk",
-                "msg_id": msg_id,
-                "seq": seq,
-                "pcm_b64": chunk,
-                "sample_rate": sample_rate,
-            }
-        )
+    seq = 0
+    try:
+        for idx, task in enumerate(tasks):
+            try:
+                result = await task
+            except Exception:
+                _logger.exception(
+                    "ws_chat.tts_failed",
+                    session_id=session_id,
+                    msg_id=msg_id,
+                    sentence_index=idx,
+                )
+                continue
 
-    await websocket.send_json({"type": "audio_end", "msg_id": msg_id})
+            pcm_b64 = base64.b64encode(result.pcm16).decode("ascii")
+            sample_rate = result.sample_rate
+            for start in range(0, len(pcm_b64), step):
+                chunk = pcm_b64[start : start + step]
+                await websocket.send_json(
+                    {
+                        "type": "audio_chunk",
+                        "msg_id": msg_id,
+                        "seq": seq,
+                        "pcm_b64": chunk,
+                        "sample_rate": sample_rate,
+                    }
+                )
+                seq += 1
+    finally:
+        # Make sure no pending task is left dangling if we exit early.
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await websocket.send_json({"type": "audio_end", "msg_id": msg_id})
