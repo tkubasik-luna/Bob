@@ -1,5 +1,5 @@
 import { type KeyboardEvent, useCallback, useEffect, useRef, useState } from "react";
-import { enqueue as audioEnqueue, generateSineFloat32 } from "../audio/audioPlayer";
+import { enqueue as audioEnqueue } from "../audio/audioPlayer";
 import { WS_URL } from "../config";
 import { useVoiceMode } from "../hooks/useVoiceMode";
 import { useWebSocket } from "../hooks/useWebSocket";
@@ -7,10 +7,6 @@ import { useChatStore } from "../store/chatStore";
 import type { ChatMessage, ServerMessage } from "../types/ws";
 import { Dispatcher } from "./Dispatcher";
 import { ToastContainer } from "./Toast";
-
-// Toggle the dev/temporary sine-wave test button. Flip to `false` (or gate on
-// import.meta.env.DEV) once the WS audio path is wired in issue 0010.
-const SHOW_AUDIO_TEST_BUTTON = import.meta.env.DEV;
 
 export function ChatView() {
   const messages = useChatStore((s) => s.messages);
@@ -35,6 +31,12 @@ export function ChatView() {
         case "assistant_msg":
           addAssistantMessage(msg.speech, msg.ui);
           break;
+        case "audio_chunk":
+          audioEnqueue(msg.pcm_b64, msg.sample_rate, msg.msg_id);
+          break;
+        case "audio_end":
+          // Bubble indicator / done-tracking arrives in 0014. No-op for now.
+          break;
         case "error":
           pushToast(msg.message, msg.code);
           setWaiting(false);
@@ -46,11 +48,6 @@ export function ChatView() {
 
   const { status, send } = useWebSocket({ url: WS_URL, onMessage: handleMessage });
   const { voiceEnabled, toggle: toggleVoice } = useVoiceMode();
-
-  const playSineTest = useCallback(() => {
-    const sampleRate = 24_000;
-    audioEnqueue(generateSineFloat32(440, 1, sampleRate), sampleRate, "dev-sine");
-  }, []);
 
   // Mirror hook status into the store so the badge/UI stays reactive everywhere.
   useEffect(() => {
@@ -75,7 +72,7 @@ export function ChatView() {
   const submit = () => {
     if (!canSend) return;
     addUserMessage(trimmed);
-    send({ type: "user_msg", content: trimmed });
+    send({ type: "user_msg", content: trimmed, ...(voiceEnabled ? { voice: true } : {}) });
     setInput("");
   };
 
@@ -96,16 +93,6 @@ export function ChatView() {
             <span className="rounded-full bg-red-900/40 px-2 py-0.5 text-xs text-red-200">
               {connectionStatus === "connecting" ? "connexion…" : "déconnecté"}
             </span>
-          )}
-          {SHOW_AUDIO_TEST_BUTTON && (
-            <button
-              type="button"
-              onClick={playSineTest}
-              title="Lire un sinus 440Hz de test (dev)"
-              className="rounded-md border border-neutral-800 bg-neutral-900 px-2 py-1 text-xs text-neutral-300 hover:bg-neutral-800"
-            >
-              ♪ test
-            </button>
           )}
           <VoiceToggleButton enabled={voiceEnabled} onToggle={toggleVoice} />
         </div>

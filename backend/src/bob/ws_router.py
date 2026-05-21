@@ -7,6 +7,7 @@ without monkey-patching the FastAPI app or relying on dependency overrides.
 
 from __future__ import annotations
 
+import base64
 import uuid
 from collections.abc import Callable
 from typing import Any
@@ -18,6 +19,11 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from bob import conversation as conversation_module
 from bob.chat_service import ChatService, get_default_chat_service
+from bob.tts_service import KokoroTtsService, get_default_tts_service
+
+# Max base64-encoded PCM bytes per `audio_chunk` frame. ~256 KB keeps single
+# WS frames well within typical limits even after JSON encoding overhead.
+_AUDIO_CHUNK_MAX_B64 = 256 * 1024
 
 router = APIRouter()
 _logger = structlog.get_logger(__name__)
@@ -28,6 +34,9 @@ _sessions: dict[str, dict[str, Any]] = {}
 
 # DI seam: tests may rebind this to a callable returning a fake ChatService.
 _chat_service_provider: Callable[[], ChatService] = get_default_chat_service
+
+# DI seam: tests may rebind this to a callable returning a fake TTS service.
+_tts_service_provider: Callable[[], KokoroTtsService] = get_default_tts_service
 
 
 def set_chat_service_provider(provider: Callable[[], ChatService]) -> None:
@@ -45,6 +54,20 @@ def reset_chat_service_provider() -> None:
 
     global _chat_service_provider
     _chat_service_provider = get_default_chat_service
+
+
+def set_tts_service_provider(provider: Callable[[], KokoroTtsService]) -> None:
+    """Override the TTS-service factory used by the WS handler (tests only)."""
+
+    global _tts_service_provider
+    _tts_service_provider = provider
+
+
+def reset_tts_service_provider() -> None:
+    """Restore the default TTS-service factory."""
+
+    global _tts_service_provider
+    _tts_service_provider = get_default_tts_service
 
 
 @router.websocket("/ws/chat")
@@ -116,6 +139,8 @@ async def _handle_client_message(
         )
         return
 
+    voice_requested = bool(payload.get("voice"))
+
     await websocket.send_json({"type": "thinking", "state": "start"})
     try:
         parsed = await chat_service.handle_user_message(session_id, content)
@@ -153,11 +178,60 @@ async def _handle_client_message(
         await websocket.send_json({"type": "thinking", "state": "end"})
         return
 
+    msg_id = uuid.uuid4().hex
     await websocket.send_json(
         {
             "type": "assistant_msg",
+            "msg_id": msg_id,
             "speech": parsed.speech,
             "ui": [component.model_dump() for component in parsed.ui],
         }
     )
     await websocket.send_json({"type": "thinking", "state": "end"})
+
+    if voice_requested and parsed.speech.strip():
+        await _synthesize_and_stream(websocket, session_id, msg_id, parsed.speech)
+
+
+async def _synthesize_and_stream(
+    websocket: WebSocket,
+    session_id: str,
+    msg_id: str,
+    text: str,
+) -> None:
+    """Run TTS for ``text`` and stream PCM frames over ``websocket``.
+
+    Errors during synthesis are logged but not propagated to the client as
+    fatal: voice is best-effort, the text response has already been sent.
+    """
+
+    try:
+        tts = _tts_service_provider()
+        result = await tts.synthesize(text)
+    except Exception:
+        _logger.exception("ws_chat.tts_failed", session_id=session_id, msg_id=msg_id)
+        # Still close the audio stream so the client can release any
+        # speaking-state UI it set up speculatively.
+        await websocket.send_json({"type": "audio_end", "msg_id": msg_id})
+        return
+
+    pcm_b64 = base64.b64encode(result.pcm16).decode("ascii")
+    sample_rate = result.sample_rate
+
+    # Split into ≤_AUDIO_CHUNK_MAX_B64 base64 chunks. Slicing along base64
+    # boundaries that are multiples of 4 keeps each chunk individually
+    # decodable on the client.
+    step = _AUDIO_CHUNK_MAX_B64 - (_AUDIO_CHUNK_MAX_B64 % 4)
+    for seq, start in enumerate(range(0, len(pcm_b64), step)):
+        chunk = pcm_b64[start : start + step]
+        await websocket.send_json(
+            {
+                "type": "audio_chunk",
+                "msg_id": msg_id,
+                "seq": seq,
+                "pcm_b64": chunk,
+                "sample_rate": sample_rate,
+            }
+        )
+
+    await websocket.send_json({"type": "audio_end", "msg_id": msg_id})

@@ -60,11 +60,11 @@ def test_ws_chat_full_round_trip(fake_chat_service: _FakeChatService) -> None:
         assert thinking_start == {"type": "thinking", "state": "start"}
 
         assistant = ws.receive_json()
-        assert assistant == {
-            "type": "assistant_msg",
-            "speech": "echo: hi",
-            "ui": [{"component": "Markdown", "props": {"content": "**bold**"}}],
-        }
+        # `msg_id` is a fresh uuid hex; assert structurally and check the rest by equality.
+        assert assistant["type"] == "assistant_msg"
+        assert isinstance(assistant["msg_id"], str) and len(assistant["msg_id"]) == 32
+        assert assistant["speech"] == "echo: hi"
+        assert assistant["ui"] == [{"component": "Markdown", "props": {"content": "**bold**"}}]
 
         thinking_end = ws.receive_json()
         assert thinking_end == {"type": "thinking", "state": "end"}
