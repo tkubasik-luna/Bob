@@ -26,6 +26,7 @@ from bob import text_segmenter
 from bob.chat_service import ChatService, get_default_chat_service
 from bob.config import get_settings
 from bob.model_downloader import ensure_kokoro_ready
+from bob.spoken_text_cleaner import clean_for_speech
 from bob.tts_service import KokoroTtsService, get_default_tts_service
 
 # Max base64-encoded PCM bytes per `audio_chunk` frame. ~256 KB keeps single
@@ -297,7 +298,8 @@ async def _synthesize_and_stream(
     reply.
     """
 
-    sentences = [s for s in text_segmenter.segment(text) if s.strip()]
+    cleaned = clean_for_speech(text)
+    sentences = [s for s in text_segmenter.segment(cleaned) if s.strip()]
     if not sentences:
         await websocket.send_json({"type": "audio_end", "msg_id": msg_id})
         return
@@ -312,9 +314,7 @@ async def _synthesize_and_stream(
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            _logger.exception(
-                "ws_chat.tts_download_failed", session_id=session_id, msg_id=msg_id
-            )
+            _logger.exception("ws_chat.tts_download_failed", session_id=session_id, msg_id=msg_id)
             await websocket.send_json(
                 {
                     "type": "audio_error",
