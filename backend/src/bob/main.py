@@ -31,10 +31,13 @@ from bob import task_store as task_store_module
 from bob.config import get_settings
 from bob.db.migrations_runner import apply_migrations, default_migrations_dir
 from bob.debug_router import router as debug_router
+from bob.event_bus import EventBus, set_event_bus
 from bob.jarvis_prompt_loader import load_jarvis_prompt
 from bob.jarvis_store import JarvisStore
 from bob.llm.factory import build_subagent_client
 from bob.logging_setup import configure_logging
+from bob.orchestrator import get_default_orchestrator
+from bob.proactivity_handler import ProactivityHandler
 from bob.sub_agent_runner import SubAgentRunner
 from bob.task_scheduler import build_default_scheduler
 from bob.task_store import TaskStore
@@ -89,6 +92,14 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     task_scheduler_module.set_default_scheduler(scheduler)
     await scheduler.recover_after_restart()
 
+    # EventBus + proactivity wiring (slice #0021). The bus is process-wide;
+    # the handler is built lazily — it resolves the orchestrator each time so
+    # tests that swap singletons inside the lifespan still see fresh state.
+    bus = EventBus()
+    set_event_bus(bus)
+    proactivity = ProactivityHandler(orchestrator_factory=get_default_orchestrator)
+    bus.subscribe("task_state_changed", proactivity.on_task_state_changed)
+
     load_jarvis_prompt(data_dir)
 
     _logger.info(
@@ -110,6 +121,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        set_event_bus(None)
         task_scheduler_module.set_default_scheduler(None)
         task_store_module.set_default_store(None)
         jarvis_store_module.set_default_store(None)

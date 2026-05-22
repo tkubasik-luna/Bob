@@ -9,6 +9,7 @@ import pytest
 
 from bob import ws_events
 from bob.db.migrations_runner import apply_migrations, default_migrations_dir
+from bob.event_bus import EventBus
 from bob.llm.types import LLMResponse, ToolDefinition
 from bob.llm_client import LLMClient
 from bob.sub_agent_runner import SubAgentRunner
@@ -23,8 +24,10 @@ class _ScriptedClient(LLMClient):
         *,
         chat_value: str | None = None,
         chat_exc: BaseException | None = None,
+        chat_values: list[str] | None = None,
     ) -> None:
         self._chat_value = chat_value
+        self._chat_values = list(chat_values or [])
         self._chat_exc = chat_exc
         self.calls: list[dict[str, Any]] = []
 
@@ -37,6 +40,8 @@ class _ScriptedClient(LLMClient):
         self.calls.append({"messages": messages, "schema": schema, "session_id": session_id})
         if self._chat_exc is not None:
             raise self._chat_exc
+        if self._chat_values:
+            return self._chat_values.pop(0)
         assert self._chat_value is not None
         return self._chat_value
 
@@ -72,7 +77,7 @@ async def test_done_action_persists_result_and_transitions_to_done() -> None:
     task_id = _make_running_task(store)
 
     client = _ScriptedClient(chat_value='{"action": "done", "result": "ok"}')
-    runner = SubAgentRunner(subagent_client=client, task_store=store)
+    runner = SubAgentRunner(subagent_client=client, task_store=store, event_bus=EventBus())
 
     await runner.run(task_id)
 
@@ -97,7 +102,7 @@ async def test_done_action_fenced_json_parses() -> None:
 
     fenced = '```json\n{"action":"done","result":"X"}\n```'
     client = _ScriptedClient(chat_value=fenced)
-    runner = SubAgentRunner(subagent_client=client, task_store=store)
+    runner = SubAgentRunner(subagent_client=client, task_store=store, event_bus=EventBus())
 
     await runner.run(task_id)
 
@@ -117,7 +122,7 @@ async def test_invalid_json_marks_failed_no_result() -> None:
     task_id = _make_running_task(store)
 
     client = _ScriptedClient(chat_value="not json")
-    runner = SubAgentRunner(subagent_client=client, task_store=store)
+    runner = SubAgentRunner(subagent_client=client, task_store=store, event_bus=EventBus())
 
     await runner.run(task_id)
 
@@ -129,36 +134,12 @@ async def test_invalid_json_marks_failed_no_result() -> None:
 
 
 @pytest.mark.asyncio
-async def test_unsupported_ask_user_action_marks_failed_and_warns(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    store = _make_store()
-    task_id = _make_running_task(store)
-
-    client = _ScriptedClient(chat_value='{"action": "ask_user", "question": "?"}')
-    runner = SubAgentRunner(subagent_client=client, task_store=store)
-
-    await runner.run(task_id)
-
-    task = store.get_task(task_id)
-    assert task.state == "failed"
-    assert task.result is None
-    # structlog renders to stdout via ``PrintLoggerFactory``. The event name
-    # + warning level are present whether the JSON renderer is configured
-    # (when the FastAPI lifespan ran) or the default key-value renderer is in
-    # effect (isolated unit test).
-    out = capsys.readouterr().out
-    assert "sub_agent_runner.unsupported_action" in out
-    assert "warning" in out
-
-
-@pytest.mark.asyncio
 async def test_unsupported_progress_action_marks_failed() -> None:
     store = _make_store()
     task_id = _make_running_task(store)
 
     client = _ScriptedClient(chat_value='{"action": "progress", "status": "halfway"}')
-    runner = SubAgentRunner(subagent_client=client, task_store=store)
+    runner = SubAgentRunner(subagent_client=client, task_store=store, event_bus=EventBus())
 
     await runner.run(task_id)
 
@@ -173,7 +154,7 @@ async def test_llm_exception_marks_failed_and_does_not_reraise() -> None:
     task_id = _make_running_task(store)
 
     client = _ScriptedClient(chat_exc=RuntimeError("kaboom"))
-    runner = SubAgentRunner(subagent_client=client, task_store=store)
+    runner = SubAgentRunner(subagent_client=client, task_store=store, event_bus=EventBus())
 
     # Should NOT raise.
     await runner.run(task_id)
@@ -191,7 +172,7 @@ async def test_done_action_without_result_marks_failed() -> None:
     task_id = _make_running_task(store)
 
     client = _ScriptedClient(chat_value='{"action": "done"}')
-    runner = SubAgentRunner(subagent_client=client, task_store=store)
+    runner = SubAgentRunner(subagent_client=client, task_store=store, event_bus=EventBus())
 
     await runner.run(task_id)
 
@@ -218,7 +199,7 @@ async def test_done_action_emits_task_updated_and_task_result() -> None:
     ws_events.set_emitter(_emitter)
     try:
         client = _ScriptedClient(chat_value='{"action": "done", "result": "all good"}')
-        runner = SubAgentRunner(subagent_client=client, task_store=store)
+        runner = SubAgentRunner(subagent_client=client, task_store=store, event_bus=EventBus())
         await runner.run(task_id)
     finally:
         ws_events.set_emitter(None)
@@ -254,7 +235,7 @@ async def test_failure_path_emits_task_updated_failed_and_reason_result() -> Non
     ws_events.set_emitter(_emitter)
     try:
         client = _ScriptedClient(chat_exc=RuntimeError("kaboom"))
-        runner = SubAgentRunner(subagent_client=client, task_store=store)
+        runner = SubAgentRunner(subagent_client=client, task_store=store, event_bus=EventBus())
         await runner.run(task_id)
     finally:
         ws_events.set_emitter(None)
@@ -265,3 +246,118 @@ async def test_failure_path_emits_task_updated_failed_and_reason_result() -> Non
     assert updated["state"] == "failed"
     assert result["type"] == "task_result"
     assert "kaboom" in result["result"]
+
+
+# ---------------------------------------------------------------------------
+# ask_user action (slice #0021) — multi-turn flow
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ask_user_action_transitions_to_waiting_input_and_persists_question() -> None:
+    store = _make_store()
+    task_id = _make_running_task(store)
+
+    client = _ScriptedClient(chat_value='{"action": "ask_user", "question": "Quel ton ?"}')
+    runner = SubAgentRunner(subagent_client=client, task_store=store, event_bus=EventBus())
+
+    await runner.run(task_id)
+
+    task = store.get_task(task_id)
+    assert task.state == "waiting_input"
+    assert task.result is None
+
+    messages = store.get_task_messages(task_id)
+    assert any(
+        m.action == "ask_user" and m.role == "assistant" and m.content == "Quel ton ?"
+        for m in messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_ask_user_action_emits_task_updated_and_bus_event() -> None:
+    store = _make_store()
+    task_id = _make_running_task(store)
+
+    received_ws: list[dict[str, Any]] = []
+
+    async def _ws_emitter(event: dict[str, Any]) -> None:
+        received_ws.append(event)
+
+    bus = EventBus()
+    received_bus: list[dict[str, Any]] = []
+
+    async def _bus_subscriber(payload: dict[str, Any]) -> None:
+        received_bus.append(payload)
+
+    bus.subscribe("task_state_changed", _bus_subscriber)
+
+    ws_events.set_emitter(_ws_emitter)
+    try:
+        client = _ScriptedClient(
+            chat_value='{"action": "ask_user", "question": "Formel ou amical ?"}'
+        )
+        runner = SubAgentRunner(subagent_client=client, task_store=store, event_bus=bus)
+        await runner.run(task_id)
+    finally:
+        ws_events.set_emitter(None)
+
+    # WS: only task_updated (no task_result on ask_user).
+    assert [e["type"] for e in received_ws] == ["task_updated"]
+    assert received_ws[0]["state"] == "waiting_input"
+
+    # Wait one event-loop tick so the bus' fire-and-forget subscriber runs.
+    import asyncio
+
+    for _ in range(3):
+        await asyncio.sleep(0)
+    assert len(received_bus) == 1
+    payload = received_bus[0]
+    assert payload["task_id"] == task_id
+    assert payload["old_state"] == "running"
+    assert payload["new_state"] == "waiting_input"
+    assert payload["action"] == "ask_user"
+
+
+@pytest.mark.asyncio
+async def test_resume_after_forward_replays_history_and_completes() -> None:
+    """Round-trip: first turn ask_user → forward user answer → second turn done.
+
+    Simulates the orchestrator's forward_to_subtask behaviour by directly
+    appending the user message + transitioning waiting_input → running, then
+    re-running the runner with a fresh LLM canned response.
+    """
+
+    store = _make_store()
+    task_id = store.create_task(title="t", goal="Draft email")
+    store.update_state(task_id, "running")
+
+    bus = EventBus()
+    client = _ScriptedClient(
+        chat_values=[
+            '{"action": "ask_user", "question": "Formel ou amical ?"}',
+            '{"action": "done", "result": "Email draft here"}',
+        ]
+    )
+    runner = SubAgentRunner(subagent_client=client, task_store=store, event_bus=bus)
+
+    await runner.run(task_id)
+    assert store.get_task(task_id).state == "waiting_input"
+
+    # Simulate the orchestrator's forward_to_subtask handoff.
+    store.append_message(task_id, role="user", content="Amical.")
+    store.update_state(task_id, "running")
+
+    await runner.run(task_id)
+
+    task = store.get_task(task_id)
+    assert task.state == "done"
+    assert task.result == "Email draft here"
+
+    # The second LLM call must have seen the prior ask_user turn AND the
+    # forwarded user message in its history.
+    assert len(client.calls) == 2
+    second_call_msgs = client.calls[1]["messages"]
+    contents = [m["content"] for m in second_call_msgs]
+    assert "Formel ou amical ?" in contents
+    assert "Amical." in contents

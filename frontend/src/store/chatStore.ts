@@ -46,7 +46,12 @@ type ChatState = {
    * id from the `assistant_msg` frame) it is used as the React key AND as
    * the correlation id for audio playback / `speakingMsgId`. Falls back to
    * a generated id for older code paths / tests. */
-  addAssistantMessage: (content: string, ui?: ComponentDescriptor[], msgId?: string) => void;
+  addAssistantMessage: (
+    content: string,
+    ui?: ComponentDescriptor[],
+    msgId?: string,
+    proactive?: boolean,
+  ) => void;
   setStatus: (status: ConnectionStatus) => void;
   setWaiting: (waiting: boolean) => void;
   setSessionId: (id: string | null) => void;
@@ -85,9 +90,18 @@ export const useChatStore = create<ChatState>((set, get) => ({
     set((state) => ({
       messages: [...state.messages, { id: randomId(), role: "user", content }],
     })),
-  addAssistantMessage: (content, ui, msgId) =>
+  addAssistantMessage: (content, ui, msgId, proactive) =>
     set((state) => ({
-      messages: [...state.messages, { id: msgId ?? randomId(), role: "assistant", content, ui }],
+      messages: [
+        ...state.messages,
+        {
+          id: msgId ?? randomId(),
+          role: "assistant",
+          content,
+          ui,
+          ...(proactive ? { proactive: true } : {}),
+        },
+      ],
     })),
   setStatus: (connectionStatus) => set({ connectionStatus }),
   setWaiting: (isWaitingResponse) => set({ isWaitingResponse }),

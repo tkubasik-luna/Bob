@@ -64,7 +64,7 @@ _TEST_JARVIS_PROMPT = "Tu es Jarvis-de-test, ton calme et concis."
 class _RecordingScheduler:
     """Stand-in for :class:`TaskScheduler` in orchestrator tests.
 
-    Records each ``enqueue(task_id)`` call so tests can assert dispatch
+    Records each ``enqueue`` / ``resume`` call so tests can assert dispatch
     without spinning up real runner tasks. The fake transitions the task to
     ``running`` so existing assertions (``list_tasks(state="running")``)
     keep their meaning — that is the contract the real scheduler honours
@@ -74,9 +74,14 @@ class _RecordingScheduler:
     def __init__(self, task_store: TaskStore) -> None:
         self._task_store = task_store
         self.enqueued: list[str] = []
+        self.resumed: list[str] = []
 
     async def enqueue(self, task_id: str) -> None:
         self.enqueued.append(task_id)
+        self._task_store.update_state(task_id, "running")
+
+    async def resume(self, task_id: str) -> None:
+        self.resumed.append(task_id)
         self._task_store.update_state(task_id, "running")
 
 
@@ -286,7 +291,7 @@ async def test_fallback_when_both_chat_attempts_invalid() -> None:
 
 
 @pytest.mark.asyncio
-async def test_complete_call_sends_spawn_subtask_tool() -> None:
+async def test_complete_call_sends_spawn_subtask_and_forward_tools() -> None:
     orchestrator, jarvis_client, _sub, _store, _ts, _scheduler = _make_orchestrator(
         complete_responses=[LLMResponse(text="hello", tool_calls=[])],
         chat_responses=[_valid_payload("ok")],
@@ -296,8 +301,12 @@ async def test_complete_call_sends_spawn_subtask_tool() -> None:
 
     tools = jarvis_client.complete_calls[0]["tools"]
     assert tools is not None
-    assert [t.name for t in tools] == ["spawn_subtask"]
-    assert tools[0].parameters["required"] == ["title", "goal"]
+    names = [t.name for t in tools]
+    assert names == ["spawn_subtask", "forward_to_subtask"]
+    spawn_tool = tools[0]
+    forward_tool = tools[1]
+    assert spawn_tool.parameters["required"] == ["title", "goal"]
+    assert forward_tool.parameters["required"] == ["task_id", "response"]
 
 
 # ---------------------------------------------------------------------------
@@ -437,3 +446,206 @@ async def test_end_to_end_spawn_and_complete() -> None:
     assert final.result == "Here are 3 drafts: A, B, C"
     messages = task_store.get_task_messages(task_id)
     assert any(m.action == "done" for m in messages)
+
+
+# ---------------------------------------------------------------------------
+# forward_to_subtask tool dispatch (slice #0021)
+# ---------------------------------------------------------------------------
+
+
+def _forward_tool_call(*, task_id: str, response: str = "Amical.") -> ToolCall:
+    return ToolCall(
+        id=f"call_{uuid4().hex[:6]}",
+        name="forward_to_subtask",
+        arguments={"task_id": task_id, "response": response},
+    )
+
+
+@pytest.mark.asyncio
+async def test_forward_to_subtask_inserts_message_and_calls_resume() -> None:
+    """A ``forward_to_subtask`` tool call must append the user message + resume."""
+
+    orchestrator, jarvis_client, _sub, jarvis_store, task_store, scheduler = _make_orchestrator()
+
+    # Seed a task in waiting_input with a prior ask_user question.
+    target_id = task_store.create_task(title="Draft email", goal="Write a draft")
+    task_store.update_state(target_id, "running")
+    task_store.append_message(target_id, role="assistant", content="Quel ton ?", action="ask_user")
+    task_store.update_state(target_id, "waiting_input")
+
+    # Now feed the orchestrator a turn whose only tool call is a forward.
+    jarvis_client._complete_responses.append(
+        LLMResponse(
+            text=None,
+            tool_calls=[_forward_tool_call(task_id=target_id, response="Amical.")],
+        )
+    )
+
+    response = await orchestrator.process_user_message("s1", "Amical.")
+
+    assert response.forwarded_task_ids == [target_id]
+    assert response.spawned_task_ids == []
+    assert "transmets" in response.speech
+
+    assert scheduler.resumed == [target_id]
+    # Recording-scheduler transitions the task to running on resume.
+    assert task_store.get_task(target_id).state == "running"
+
+    # The user's reply was persisted as a ``user`` row on the task log.
+    forwarded_msg = [m for m in task_store.get_task_messages(target_id) if m.role == "user"]
+    assert [m.content for m in forwarded_msg] == ["Amical."]
+
+    # The orchestrator must have advertised the waiting_input task in its
+    # system prompt so Jarvis knows the task_id to forward to.
+    system_content = jarvis_client.complete_calls[-1]["messages"][0]["content"]
+    assert target_id in system_content
+    assert "Quel ton ?" in system_content
+
+    # Jarvis confirmation persisted in history.
+    history = jarvis_store.history()
+    assert history[-1]["role"] == "assistant"
+    assert "transmets" in history[-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_forward_to_unknown_task_falls_back_to_text() -> None:
+    """A forward to a missing task is dropped — orchestrator replies in text."""
+
+    bad_call = ToolCall(
+        id="call_bad",
+        name="forward_to_subtask",
+        arguments={"task_id": "does-not-exist", "response": "x"},
+    )
+    orchestrator, _jarvis_client, _sub, _js, task_store, scheduler = _make_orchestrator(
+        complete_responses=[LLMResponse(text=None, tool_calls=[bad_call])],
+        chat_responses=[_valid_payload("fallback")],
+    )
+
+    response = await orchestrator.process_user_message("s1", "Amical.")
+
+    assert response.speech == "fallback"
+    assert response.forwarded_task_ids == []
+    assert scheduler.resumed == []
+    assert task_store.list_tasks() == []
+
+
+@pytest.mark.asyncio
+async def test_forward_to_task_not_in_waiting_input_is_dropped() -> None:
+    """Forward must target a task in ``waiting_input``; running rejects it."""
+
+    orchestrator, jarvis_client, _sub, _js, task_store, scheduler = _make_orchestrator(
+        chat_responses=[_valid_payload("fallback")],
+    )
+    target_id = task_store.create_task(title="t", goal="g")
+    task_store.update_state(target_id, "running")  # Not waiting_input!
+
+    jarvis_client._complete_responses.append(
+        LLMResponse(
+            text=None,
+            tool_calls=[_forward_tool_call(task_id=target_id, response="x")],
+        )
+    )
+
+    response = await orchestrator.process_user_message("s1", "x")
+
+    assert response.forwarded_task_ids == []
+    assert response.speech == "fallback"
+    assert scheduler.resumed == []
+    # Original task untouched.
+    assert task_store.get_task(target_id).state == "running"
+
+
+# ---------------------------------------------------------------------------
+# generate_proactive_message (slice #0021)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_generate_proactive_message_emits_assistant_msg_with_flag() -> None:
+    received: list[dict[str, Any]] = []
+
+    async def _emitter(event: dict[str, Any]) -> None:
+        received.append(event)
+
+    ws_events.set_emitter(_emitter)
+    try:
+        orchestrator, jarvis_client, _sub, jarvis_store, task_store, _scheduler = (
+            _make_orchestrator(chat_responses=["Tu veux un ton plutôt formel ou amical ?"])
+        )
+        # Seed a task with an ask_user message.
+        task_id = task_store.create_task(title="Email manager", goal="Draft email")
+        task_store.update_state(task_id, "running")
+        task_store.append_message(
+            task_id,
+            role="assistant",
+            content="Quel ton : formel ou amical ?",
+            action="ask_user",
+        )
+        task_store.update_state(task_id, "waiting_input")
+
+        await orchestrator.generate_proactive_message(task_id, "ask_user")
+    finally:
+        ws_events.set_emitter(None)
+
+    assert len(received) == 1
+    event = received[0]
+    assert event["type"] == "assistant_msg"
+    assert event["proactive"] is True
+    assert event["speech"] == "Tu veux un ton plutôt formel ou amical ?"
+    assert event["ui"] == []
+    assert isinstance(event["msg_id"], str) and len(event["msg_id"]) == 32
+
+    # The paraphrase prompt referenced the task title + raw question.
+    chat_messages = jarvis_client.chat_calls[0]["messages"]
+    user_msg = chat_messages[-1]
+    assert user_msg["role"] == "user"
+    assert "Email manager" in user_msg["content"]
+    assert "Quel ton : formel ou amical ?" in user_msg["content"]
+    # Prompt instructs Jarvis to avoid the term "sub-agent" in the rephrased
+    # question; the instruction itself is allowed to mention it.
+    assert "Ne mentionne pas" in user_msg["content"]
+
+    # JarvisStore appended the paraphrased text so the next user turn sees it.
+    history = jarvis_store.history()
+    assert history[-1] == {
+        "role": "assistant",
+        "content": "Tu veux un ton plutôt formel ou amical ?",
+    }
+
+
+@pytest.mark.asyncio
+async def test_generate_proactive_message_unknown_task_is_silent() -> None:
+    received: list[dict[str, Any]] = []
+
+    async def _emitter(event: dict[str, Any]) -> None:
+        received.append(event)
+
+    ws_events.set_emitter(_emitter)
+    try:
+        orchestrator, _jc, _sub, _js, _ts, _scheduler = _make_orchestrator()
+        await orchestrator.generate_proactive_message("missing", "ask_user")
+    finally:
+        ws_events.set_emitter(None)
+
+    assert received == []
+
+
+@pytest.mark.asyncio
+async def test_generate_proactive_message_non_ask_user_kind_noops() -> None:
+    received: list[dict[str, Any]] = []
+
+    async def _emitter(event: dict[str, Any]) -> None:
+        received.append(event)
+
+    ws_events.set_emitter(_emitter)
+    try:
+        orchestrator, _jc, _sub, _js, task_store, _scheduler = _make_orchestrator()
+        task_id = task_store.create_task(title="t", goal="g")
+        task_store.update_state(task_id, "running")
+        task_store.set_result(task_id, "r")
+        task_store.update_state(task_id, "done")
+        await orchestrator.generate_proactive_message(task_id, "done")
+    finally:
+        ws_events.set_emitter(None)
+
+    assert received == []

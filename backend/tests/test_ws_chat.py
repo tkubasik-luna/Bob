@@ -74,6 +74,8 @@ def test_ws_chat_full_round_trip(fake_chat_service: _FakeOrchestrator) -> None:
         assert isinstance(assistant["msg_id"], str) and len(assistant["msg_id"]) == 32
         assert assistant["speech"] == "echo: hi"
         assert assistant["ui"] == [{"component": "Markdown", "props": {"content": "**bold**"}}]
+        # Standard turn → proactive must be ``False``.
+        assert assistant["proactive"] is False
 
         thinking_end = ws.receive_json()
         assert thinking_end == {"type": "thinking", "state": "end"}
@@ -282,6 +284,66 @@ def test_ws_chat_emits_task_events_on_spawn(clear_jarvis_history: None) -> None:
 
             assistant = ws.receive_json()
             assert assistant["type"] == "assistant_msg"
+            assert ws.receive_json() == {"type": "thinking", "state": "end"}
+    finally:
+        ws_router.reset_orchestrator_provider()
+
+
+class _ProactiveOrchestrator:
+    """Orchestrator double that emits a proactive ``assistant_msg`` ad hoc.
+
+    Simulates the slice #0021 path where the ProactivityHandler triggers a
+    Jarvis paraphrase pushing a message back through the WS emitter
+    *without* the user having spoken first. The handler runs in the bus'
+    background task — in this test we drive the emit ourselves to assert
+    the WS layer forwards the proactive flag faithfully.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+
+    async def process_user_message(
+        self, session_id: str, user_content: str
+    ) -> OrchestratorResponse:
+        self.calls.append((session_id, user_content))
+        store = jarvis_store_module.get_default_store()
+        store.append("user", user_content)
+        # Simulate a sub-agent emitting ask_user mid-turn → orchestrator
+        # pushes a proactive assistant_msg through the ws_events emitter.
+        await ws_events.emit(
+            {
+                "type": "assistant_msg",
+                "msg_id": "aaaaaaaa" * 4,
+                "speech": "Tu veux un ton plutôt formel ou amical ?",
+                "ui": [],
+                "proactive": True,
+            }
+        )
+        store.append("assistant", "ok")
+        return OrchestratorResponse(speech="ok", ui=[], spawned_task_ids=[])
+
+
+def test_ws_chat_forwards_proactive_assistant_msg(clear_jarvis_history: None) -> None:
+    """An emit({type: assistant_msg, proactive: True}) lands intact on the client."""
+
+    fake = _ProactiveOrchestrator()
+    ws_router.set_orchestrator_provider(lambda: cast(Orchestrator, fake))
+    try:
+        with TestClient(app) as client, client.websocket_connect("/ws/chat") as ws:
+            assert ws.receive_json()["type"] == "session"
+            ws.send_json({"type": "user_msg", "content": "Draft un email"})
+            assert ws.receive_json() == {"type": "thinking", "state": "start"}
+
+            proactive = ws.receive_json()
+            assert proactive["type"] == "assistant_msg"
+            assert proactive["proactive"] is True
+            assert proactive["speech"] == "Tu veux un ton plutôt formel ou amical ?"
+
+            final = ws.receive_json()
+            assert final["type"] == "assistant_msg"
+            assert final["proactive"] is False
+            assert final["speech"] == "ok"
+
             assert ws.receive_json() == {"type": "thinking", "state": "end"}
     finally:
         ws_router.reset_orchestrator_provider()

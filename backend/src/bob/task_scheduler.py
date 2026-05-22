@@ -122,8 +122,10 @@ class TaskScheduler:
         """Decrement the counter and promote the next pending task, if any.
 
         Fired by the runner asyncio task's done-callback. The runner itself
-        has already transitioned the task to ``done`` / ``failed`` (or it
-        crashed). We only manage scheduling state here.
+        has already transitioned the task to ``done`` / ``failed`` /
+        ``waiting_input`` (or it crashed). We only manage scheduling state
+        here. ``waiting_input`` frees the slot — :meth:`resume` re-acquires
+        one when the orchestrator forwards a user answer back.
         """
 
         next_id: str | None = None
@@ -143,6 +145,45 @@ class TaskScheduler:
                 terminated_task_id=task_id,
                 promoted_task_id=next_id,
             )
+
+    async def resume(self, task_id: str) -> None:
+        """Re-enqueue a task that was paused in ``waiting_input``.
+
+        Called by the orchestrator's ``forward_to_subtask`` path right after
+        appending the user's reply to the task's message log. Behaves like
+        :meth:`enqueue` but transitions ``waiting_input → running`` (instead
+        of ``pending → running``). When the running cap is saturated the
+        task is left in ``waiting_input`` and the resume is silently dropped
+        — for the slice scope cap=3 with all running is a deadlock scenario
+        we accept (the user will see no progress until a slot frees, and
+        :meth:`on_task_terminated` will not promote a waiting_input task by
+        itself).
+        """
+
+        try:
+            task = self._task_store.get_task(task_id)
+        except TaskStoreError:
+            _logger.warning("task_scheduler.resume_unknown_task", task_id=task_id)
+            return
+        if task.state != "waiting_input":
+            _logger.warning(
+                "task_scheduler.resume_wrong_state",
+                task_id=task_id,
+                state=task.state,
+            )
+            return
+
+        async with self._lock:
+            if len(self._running) >= self._cap:
+                _logger.warning(
+                    "task_scheduler.resume_no_slot",
+                    task_id=task_id,
+                    running=len(self._running),
+                    cap=self._cap,
+                )
+                return
+            self._running.add(task_id)
+        await self._activate(task_id)
 
     async def recover_after_restart(self) -> None:
         """Boot-time fixup: coerce stale ``running`` rows then re-enqueue.

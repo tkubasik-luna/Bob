@@ -151,6 +151,7 @@ async def _replay_history(websocket: WebSocket) -> None:
                     "speech": content,
                     "ui": [],
                     "replayed": True,
+                    "proactive": False,
                 }
             )
 
@@ -301,6 +302,7 @@ async def _handle_client_message(
             "msg_id": msg_id,
             "speech": response.speech,
             "ui": [component.model_dump() for component in response.ui],
+            "proactive": False,
         }
     )
     await websocket.send_json({"type": "thinking", "state": "end"})

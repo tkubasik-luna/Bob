@@ -64,14 +64,18 @@ export function ChatView() {
           setWaiting(msg.state === "start");
           break;
         case "assistant_msg":
-          // New assistant turn → interrupt any audio still playing/queued from
-          // the previous turn before tagging this turn as current.
-          audioStop();
-          audioStreamRef.current = null;
-          if (msg.msg_id) {
-            currentMsgIdRef.current = msg.msg_id;
+          // Proactive pushes (slice #0021) are auto-emitted by Jarvis without
+          // a user prompt — they must NOT interrupt the previous turn's audio
+          // and must NOT reset `currentMsgIdRef` (otherwise pending audio
+          // frames for the legitimate previous turn would be dropped).
+          if (!msg.proactive) {
+            audioStop();
+            audioStreamRef.current = null;
+            if (msg.msg_id) {
+              currentMsgIdRef.current = msg.msg_id;
+            }
           }
-          addAssistantMessage(msg.speech, msg.ui, msg.msg_id);
+          addAssistantMessage(msg.speech, msg.ui, msg.msg_id, msg.proactive);
           break;
         case "audio_start":
           if (msg.msg_id !== currentMsgIdRef.current) {
@@ -235,15 +239,30 @@ function Bubble({
   isSpeaking?: boolean;
 }) {
   const isUser = message.role === "user";
+  const isProactive = !isUser && message.proactive === true;
   const ui = message.ui ?? [];
+  // Proactive assistant pushes (e.g. paraphrased ask_user questions) carry a
+  // subtle left accent border + a small "auto" tag so the user can tell Bob
+  // spoke unprompted. The text styling stays consistent with regular bubbles
+  // so reading flow is unchanged.
+  const bubbleClass = isUser
+    ? "rounded-br-sm bg-blue-600 text-white"
+    : isProactive
+      ? "rounded-bl-sm border-l-2 border-amber-400/70 bg-neutral-800 text-neutral-100"
+      : "rounded-bl-sm bg-neutral-800 text-neutral-100";
   return (
     <div className={`flex flex-col gap-2 ${isUser ? "items-end" : "items-start"}`}>
+      {isProactive && (
+        <span
+          className="text-[10px] font-medium uppercase tracking-wide text-amber-300/80"
+          aria-label="Message proactif de Bob"
+          title="Bob a transmis cette question pour une tâche en cours"
+        >
+          Bob · auto
+        </span>
+      )}
       <div
-        className={`flex max-w-[80%] items-end gap-2 whitespace-pre-wrap rounded-2xl px-3 py-2 text-sm ${
-          isUser
-            ? "rounded-br-sm bg-blue-600 text-white"
-            : "rounded-bl-sm bg-neutral-800 text-neutral-100"
-        }`}
+        className={`flex max-w-[80%] items-end gap-2 whitespace-pre-wrap rounded-2xl px-3 py-2 text-sm ${bubbleClass}`}
       >
         <span className="min-w-0 flex-1">{message.content}</span>
         {!isUser && isSpeaking && <SpeakingWaveIcon />}

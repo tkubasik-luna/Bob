@@ -30,6 +30,12 @@ export type AssistantMsg = {
   msg_id?: string;
   speech: string;
   ui: ComponentDescriptor[];
+  /** Marks a message Bob pushed without a matching user prompt (slice #0021).
+   * Set to `true` by `Orchestrator.generate_proactive_message` when a
+   * sub-agent emits `ask_user` and Jarvis paraphrases the question for the
+   * user. The frontend uses it to render a subtle visual cue distinguishing
+   * the message from regular replies. Default `false` server-side. */
+  proactive?: boolean;
 };
 
 export type ThinkingMsg = {
@@ -154,4 +160,7 @@ export type ChatMessage = {
   role: "user" | "assistant";
   content: string;
   ui?: ComponentDescriptor[];
+  /** `true` for assistant bubbles Bob pushed without a user prompt (slice
+   * #0021). Renders a subtle border accent in `Bubble`. */
+  proactive?: boolean;
 };

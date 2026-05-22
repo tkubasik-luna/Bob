@@ -331,3 +331,92 @@ def test_cap_must_be_positive() -> None:
             cap=0,
             runner_factory=_ControlledRunner(store).runner_factory,
         )
+
+
+# ---------------------------------------------------------------------------
+# resume() — slice #0021 forward_to_subtask handoff
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_resume_promotes_waiting_input_to_running() -> None:
+    """``resume`` must transition waiting_input → running and schedule a runner."""
+
+    store = _make_store()
+    runner = _ControlledRunner(store)
+    scheduler = TaskScheduler(task_store=store, cap=3, runner_factory=runner.runner_factory)
+
+    # Seed a task directly in waiting_input via the legal pending→running→waiting_input
+    # transition chain.
+    tid = _create_pending(store, title="paused")
+    store.update_state(tid, "running")
+    store.update_state(tid, "waiting_input")
+
+    await scheduler.resume(tid)
+    await asyncio.sleep(0)
+
+    assert store.get_task(tid).state == "running"
+    assert scheduler.running_task_ids() == {tid}
+    assert tid in runner.started
+
+    await runner.release(tid)
+
+
+@pytest.mark.asyncio
+async def test_resume_no_slot_leaves_task_waiting_input() -> None:
+    """When cap is saturated, ``resume`` must leave the task unchanged."""
+
+    store = _make_store()
+    runner = _ControlledRunner(store)
+    scheduler = TaskScheduler(task_store=store, cap=1, runner_factory=runner.runner_factory)
+
+    # Fill the cap with one running task.
+    blocking = _create_pending(store, title="blocker")
+    await scheduler.enqueue(blocking)
+    await asyncio.sleep(0)
+    assert store.get_task(blocking).state == "running"
+
+    # Now create a paused task and try to resume it — cap is full.
+    paused = _create_pending(store, title="paused")
+    store.update_state(paused, "running")
+    store.update_state(paused, "waiting_input")
+    # First we must free the blocking task from running so we can re-add via
+    # the cap-saturated path. Actually we want cap saturated so leave blocker
+    # running, but the slot is taken — resume should drop.
+    await scheduler.resume(paused)
+    await asyncio.sleep(0)
+
+    assert store.get_task(paused).state == "waiting_input"
+    assert scheduler.running_task_ids() == {blocking}
+
+    await runner.release(blocking)
+
+
+@pytest.mark.asyncio
+async def test_resume_wrong_state_is_dropped() -> None:
+    """``resume`` on a task that isn't in waiting_input is a no-op."""
+
+    store = _make_store()
+    runner = _ControlledRunner(store)
+    scheduler = TaskScheduler(task_store=store, cap=3, runner_factory=runner.runner_factory)
+
+    # Pending task — resume should refuse.
+    pending = _create_pending(store, title="pending")
+    await scheduler.resume(pending)
+    await asyncio.sleep(0)
+
+    assert store.get_task(pending).state == "pending"
+    assert scheduler.running_task_ids() == set()
+    assert pending not in runner.started
+
+
+@pytest.mark.asyncio
+async def test_resume_unknown_task_is_dropped() -> None:
+    store = _make_store()
+    runner = _ControlledRunner(store)
+    scheduler = TaskScheduler(task_store=store, cap=3, runner_factory=runner.runner_factory)
+
+    await scheduler.resume("nonexistent-task-id")
+    await asyncio.sleep(0)
+
+    assert scheduler.running_task_ids() == set()
