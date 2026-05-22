@@ -15,8 +15,10 @@ dependencies = [
     "structlog>=24.4",
     "openai>=1.54",
     "jsonschema>=4.23",
-    "kokoro-onnx>=0.4",
+    "kokoro>=0.9.4",
+    "misaki[fr]>=0.9.4",
     "numpy>=2.0",
+    "torch>=2.4",
 ]
 
 [dependency-groups]
@@ -57,7 +59,7 @@ module = ["jsonschema.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
-module = ["kokoro_onnx.*"]
+module = ["kokoro.*", "misaki.*", "torch.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

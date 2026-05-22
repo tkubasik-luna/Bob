@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from typing import cast
 
 import pytest
@@ -13,7 +13,7 @@ from bob import conversation as conversation_module
 from bob import ws_router
 from bob.chat_service import ChatService
 from bob.main import app
-from bob.tts_service import KokoroTtsService, SynthesisResult
+from bob.tts_service import KokoroTtsService, SynthesisChunk
 from bob.ui_registry import ComponentDescriptor, ParsedResponse
 from bob.ws_router import _sessions
 
@@ -89,28 +89,28 @@ def test_ws_chat_rejects_unknown_type(fake_chat_service: _FakeChatService) -> No
 
 
 class _SlowFakeTts:
-    """TTS double that blocks in ``synthesize`` until released or cancelled."""
+    """TTS double whose ``synthesize_stream`` blocks until released or cancelled."""
 
     def __init__(self) -> None:
         self.release = asyncio.Event()
         self.entered = asyncio.Event()
         self.cancelled = False
 
-    async def synthesize(
+    async def synthesize_stream(
         self,
         text: str,
         *,
         voice: str | None = None,
         speed: float | None = None,
-    ) -> SynthesisResult:
+    ) -> AsyncIterator[SynthesisChunk]:
         self.entered.set()
         try:
             await self.release.wait()
         except asyncio.CancelledError:
             self.cancelled = True
             raise
-        # 4 bytes = 2 samples of silence; payload content doesn't matter for the test.
-        return SynthesisResult(pcm16=b"\x00\x00\x00\x00", sample_rate=24_000)
+        # 4 bytes = 2 samples of silence; payload content doesn't matter.
+        yield SynthesisChunk(pcm16=b"\x00\x00\x00\x00", sample_rate=24_000)
 
 
 def test_ws_chat_interrupts_in_flight_tts(fake_chat_service: _FakeChatService) -> None:

@@ -4,6 +4,8 @@ import type { ClientMessage, ConnectionStatus, ServerMessage } from "../types/ws
 type Options = {
   url: string;
   onMessage: (msg: ServerMessage) => void;
+  /** Optional handler for binary frames (raw PCM from TTS). */
+  onBinary?: (data: ArrayBuffer) => void;
 };
 
 type UseWebSocketResult = {
@@ -21,7 +23,7 @@ const BACKOFF_STEPS_MS = [500, 1000, 2000, 4000, 8000, 10000];
  *
  * The `onMessage` callback is read via a ref so callers don't have to memoize it.
  */
-export function useWebSocket({ url, onMessage }: Options): UseWebSocketResult {
+export function useWebSocket({ url, onMessage, onBinary }: Options): UseWebSocketResult {
   const [status, setStatus] = useState<ConnectionStatus>("connecting");
 
   const wsRef = useRef<WebSocket | null>(null);
@@ -29,12 +31,16 @@ export function useWebSocket({ url, onMessage }: Options): UseWebSocketResult {
   const attemptRef = useRef(0);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const onMessageRef = useRef(onMessage);
+  const onBinaryRef = useRef(onBinary);
   const closedByUserRef = useRef(false);
 
-  // Keep latest callback reachable from stable handlers.
+  // Keep latest callbacks reachable from stable handlers.
   useEffect(() => {
     onMessageRef.current = onMessage;
   }, [onMessage]);
+  useEffect(() => {
+    onBinaryRef.current = onBinary;
+  }, [onBinary]);
 
   const flushQueue = useCallback(() => {
     const ws = wsRef.current;
@@ -51,6 +57,7 @@ export function useWebSocket({ url, onMessage }: Options): UseWebSocketResult {
     setStatus("connecting");
 
     const ws = new WebSocket(url);
+    ws.binaryType = "arraybuffer";
     wsRef.current = ws;
 
     ws.onopen = () => {
@@ -60,12 +67,16 @@ export function useWebSocket({ url, onMessage }: Options): UseWebSocketResult {
     };
 
     ws.onmessage = (event) => {
+      if (event.data instanceof ArrayBuffer) {
+        onBinaryRef.current?.(event.data);
+        return;
+      }
       if (typeof event.data !== "string") return;
       try {
         const parsed = JSON.parse(event.data) as ServerMessage;
         onMessageRef.current(parsed);
       } catch {
-        // Ignore malformed frames silently for now; logging arrives in 0007.
+        // Ignore malformed frames silently for now.
       }
     };
 

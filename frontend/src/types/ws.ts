@@ -43,12 +43,13 @@ export type ErrorMsg = {
   code?: string;
 };
 
-export type AudioChunkMsg = {
-  type: "audio_chunk";
+/** JSON header sent once per assistant turn just before the first PCM frame.
+ *  Subsequent binary WS frames (ArrayBuffer) carry the raw s16le mono PCM
+ *  at the announced `sample_rate`, and belong to this `msg_id` until the
+ *  matching `audio_end`. */
+export type AudioStartMsg = {
+  type: "audio_start";
   msg_id: string;
-  seq: number;
-  /** Base64-encoded s16le mono PCM. */
-  pcm_b64: string;
   sample_rate: number;
 };
 
@@ -86,7 +87,7 @@ export type ServerMessage =
   | AssistantMsg
   | ThinkingMsg
   | ErrorMsg
-  | AudioChunkMsg
+  | AudioStartMsg
   | AudioEndMsg
   | TtsPreparingMsg
   | TtsReadyMsg

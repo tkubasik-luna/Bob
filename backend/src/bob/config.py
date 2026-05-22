@@ -72,24 +72,17 @@ class Settings(BaseSettings):
     # Logging
     LOG_LEVEL: str = "INFO"
 
-    # Kokoro TTS — local engine, model artifacts downloaded on first launch
-    # and cached under ``KOKORO_MODEL_DIR``. Sources match the upstream
-    # ``kokoro-onnx`` README (release assets from the GitHub project).
-    KOKORO_MODEL_DIR: Path = Path.home() / ".bob" / "models" / "kokoro"
-    KOKORO_MODEL_FILENAME: str = "kokoro-v1.0.onnx"
-    KOKORO_VOICES_FILENAME: str = "voices-v1.0.bin"
-    KOKORO_MODEL_URL: str = (
-        "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/"
-        "kokoro-v1.0.onnx"
-    )
-    KOKORO_VOICES_URL: str = (
-        "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/"
-        "voices-v1.0.bin"
-    )
+    # Kokoro TTS — local engine via the upstream ``kokoro`` (KPipeline) package.
+    # Model weights are downloaded by Hugging Face's cache the first time the
+    # pipeline is instantiated (``hexgrad/Kokoro-82M``); no manual artifacts.
+    # ``KOKORO_LANG_CODE`` is the single-letter pipeline language ('f' = French,
+    # 'a' = American English, 'b' = British English, etc.) used by KPipeline +
+    # misaki G2P. Sample rate is a model constant exposed by
+    # :data:`bob.tts_service.KOKORO_SAMPLE_RATE` — not a settings dial.
+    KOKORO_LANG_CODE: str = "f"
     KOKORO_DEFAULT_VOICE: str = "ff_siwis"
     KOKORO_DEFAULT_SPEED: float = 1.0
-    KOKORO_DEFAULT_LANG: str = "fr-fr"
-    KOKORO_SAMPLE_RATE: int = 24000
+    KOKORO_HF_REPO_ID: str = "hexgrad/Kokoro-82M"
 
 
 @lru_cache(maxsize=1)

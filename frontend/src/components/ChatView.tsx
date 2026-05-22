@@ -42,9 +42,13 @@ export function ChatView() {
 
   // Tracks the msg_id of the most recently received assistant_msg. Audio
   // frames carrying a different msg_id are stale (the user interrupted Bob)
-  // and must be dropped: the backend cancellation may race with chunks
+  // and must be dropped: the backend cancellation may race with frames
   // already in flight on the socket.
   const currentMsgIdRef = useRef<string | null>(null);
+  // The current audio stream (msg_id + sample_rate) announced via the most
+  // recent `audio_start`. Subsequent binary frames are decoded against this
+  // sample rate and tagged with this msg_id until `audio_end`.
+  const audioStreamRef = useRef<{ msgId: string; sampleRate: number } | null>(null);
 
   const handleMessage = useCallback(
     (msg: ServerMessage) => {
@@ -59,19 +63,21 @@ export function ChatView() {
           // New assistant turn → interrupt any audio still playing/queued from
           // the previous turn before tagging this turn as current.
           audioStop();
+          audioStreamRef.current = null;
           if (msg.msg_id) {
             currentMsgIdRef.current = msg.msg_id;
           }
           addAssistantMessage(msg.speech, msg.ui, msg.msg_id);
           break;
-        case "audio_chunk":
+        case "audio_start":
           if (msg.msg_id !== currentMsgIdRef.current) {
-            // Late chunk from a cancelled (interrupted) turn — ignore.
+            // Header from a cancelled turn — ignore.
             break;
           }
-          audioEnqueue(msg.pcm_b64, msg.sample_rate, msg.msg_id);
+          audioStreamRef.current = { msgId: msg.msg_id, sampleRate: msg.sample_rate };
           break;
         case "audio_end":
+          audioStreamRef.current = null;
           // Defensive: if a prep toast somehow survived past audio_end,
           // dismiss it now so the UI never gets stuck.
           dismissToast(prepToastId(msg.msg_id));
@@ -86,6 +92,7 @@ export function ChatView() {
           dismissToast(prepToastId(msg.msg_id));
           break;
         case "audio_error":
+          audioStreamRef.current = null;
           dismissToast(prepToastId(msg.msg_id));
           pushToast(`TTS indisponible : ${msg.reason}`, { kind: "error", code: "TTS" });
           break;
@@ -98,7 +105,18 @@ export function ChatView() {
     [addAssistantMessage, setSessionId, setWaiting, pushToast, dismissToast, prepToastId],
   );
 
-  const { status, send } = useWebSocket({ url: WS_URL, onMessage: handleMessage });
+  const handleBinary = useCallback((data: ArrayBuffer) => {
+    const stream = audioStreamRef.current;
+    if (!stream) return;
+    if (stream.msgId !== currentMsgIdRef.current) return;
+    audioEnqueue(data, stream.sampleRate, stream.msgId);
+  }, []);
+
+  const { status, send } = useWebSocket({
+    url: WS_URL,
+    onMessage: handleMessage,
+    onBinary: handleBinary,
+  });
   const { voiceEnabled, toggle: toggleVoice } = useVoiceMode();
 
   // Mirror hook status into the store so the badge/UI stays reactive everywhere.
