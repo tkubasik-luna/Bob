@@ -41,7 +41,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from bob import jarvis_store as jarvis_store_module
 from bob import text_segmenter
-from bob.chat_service import ChatService, get_default_chat_service
+from bob.orchestrator import Orchestrator, get_default_orchestrator
 from bob.spoken_text_cleaner import clean_for_speech
 from bob.tts_service import KokoroTtsService, get_default_tts_service
 
@@ -52,18 +52,18 @@ _logger = structlog.get_logger(__name__)
 #   {"active_tts": list[tuple[str, asyncio.Task[None]]]}
 _sessions: dict[str, dict[str, Any]] = {}
 
-_chat_service_provider: Callable[[], ChatService] = get_default_chat_service
+_orchestrator_provider: Callable[[], Orchestrator] = get_default_orchestrator
 _tts_service_provider: Callable[[], KokoroTtsService] = get_default_tts_service
 
 
-def set_chat_service_provider(provider: Callable[[], ChatService]) -> None:
-    global _chat_service_provider
-    _chat_service_provider = provider
+def set_orchestrator_provider(provider: Callable[[], Orchestrator]) -> None:
+    global _orchestrator_provider
+    _orchestrator_provider = provider
 
 
-def reset_chat_service_provider() -> None:
-    global _chat_service_provider
-    _chat_service_provider = get_default_chat_service
+def reset_orchestrator_provider() -> None:
+    global _orchestrator_provider
+    _orchestrator_provider = get_default_orchestrator
 
 
 def set_tts_service_provider(provider: Callable[[], KokoroTtsService]) -> None:
@@ -89,7 +89,7 @@ async def chat_ws(websocket: WebSocket) -> None:
     await websocket.accept()
     session_id = uuid.uuid4().hex
     _sessions[session_id] = {"active_tts": []}
-    chat_service = _chat_service_provider()
+    orchestrator = _orchestrator_provider()
 
     try:
         await websocket.send_json({"type": "session", "session_id": session_id})
@@ -97,7 +97,7 @@ async def chat_ws(websocket: WebSocket) -> None:
 
         while True:
             payload = await websocket.receive_json()
-            await _handle_client_message(websocket, payload, session_id, chat_service)
+            await _handle_client_message(websocket, payload, session_id, orchestrator)
     except WebSocketDisconnect:
         pass
     finally:
@@ -175,7 +175,7 @@ async def _handle_client_message(
     websocket: WebSocket,
     payload: Any,
     session_id: str,
-    chat_service: ChatService,
+    orchestrator: Orchestrator,
 ) -> None:
     if not isinstance(payload, dict):
         await websocket.send_json(
@@ -213,7 +213,7 @@ async def _handle_client_message(
 
     await websocket.send_json({"type": "thinking", "state": "start"})
     try:
-        parsed = await chat_service.handle_user_message(session_id, content)
+        response = await orchestrator.process_user_message(session_id, content)
     except (httpx.ConnectError, openai.APIConnectionError, ConnectionError):
         _logger.error("ws_chat.llm_unreachable", session_id=session_id)
         await websocket.send_json(
@@ -241,15 +241,15 @@ async def _handle_client_message(
         {
             "type": "assistant_msg",
             "msg_id": msg_id,
-            "speech": parsed.speech,
-            "ui": [component.model_dump() for component in parsed.ui],
+            "speech": response.speech,
+            "ui": [component.model_dump() for component in response.ui],
         }
     )
     await websocket.send_json({"type": "thinking", "state": "end"})
 
-    if voice_requested and parsed.speech.strip():
+    if voice_requested and response.speech.strip():
         task: asyncio.Task[None] = asyncio.create_task(
-            _synthesize_and_stream(websocket, session_id, msg_id, parsed.speech)
+            _synthesize_and_stream(websocket, session_id, msg_id, response.speech)
         )
         session = _sessions.get(session_id)
         if session is not None:

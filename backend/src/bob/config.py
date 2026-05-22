@@ -49,6 +49,19 @@ class Settings(BaseSettings):
     CLAUDE_CLI_MODEL: str | None = None
     CLAUDE_CLI_TIMEOUT_SECONDS: float = 120.0
 
+    # Orchestrator backends — slice #0018.
+    # When unset they fall back to ``LLM_PROVIDER`` so callers can route the
+    # Jarvis role and the sub-agent role to different backends if they want
+    # (e.g. fast local LM Studio for Jarvis, claude-cli for sub-agents) while
+    # the default keeps everything on a single backend.
+    JARVIS_BACKEND: str | None = None
+    SUBAGENT_BACKEND: str | None = None
+
+    # Implicit cap on concurrent running sub-tasks. The real cap + queue land
+    # in slice #0020; this field exists now so callers can reference it
+    # without breaking the config contract when the cap is wired up.
+    MAX_RUNNING_TASKS: int = 3
+
     @model_validator(mode="after")
     def _validate_provider_requirements(self) -> Settings:
         if self.LLM_PROVIDER == "lm_studio":

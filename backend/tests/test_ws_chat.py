@@ -1,4 +1,4 @@
-"""WS plumbing tests for /ws/chat — chat_service wired via DI seam.
+"""WS plumbing tests for /ws/chat — orchestrator wired via DI seam.
 
 These tests exercise the WebSocket app via :class:`fastapi.testclient.TestClient`
 inside a ``with`` block so the FastAPI lifespan runs and primes the
@@ -17,43 +17,45 @@ from fastapi.testclient import TestClient
 
 from bob import jarvis_store as jarvis_store_module
 from bob import ws_router
-from bob.chat_service import ChatService
 from bob.main import app
+from bob.orchestrator import Orchestrator, OrchestratorResponse
 from bob.tts_service import KokoroTtsService, SynthesisChunk
-from bob.ui_registry import ComponentDescriptor, ParsedResponse
+from bob.ui_registry import ComponentDescriptor
 from bob.ws_router import _sessions
 
 
-class _FakeChatService:
-    """Stand-in for ChatService that records calls and returns a canned reply."""
+class _FakeOrchestrator:
+    """Stand-in for Orchestrator that records calls and returns a canned reply."""
 
-    def __init__(self, parsed: ParsedResponse) -> None:
-        self._parsed = parsed
+    def __init__(self, response: OrchestratorResponse) -> None:
+        self._response = response
         self.calls: list[tuple[str, str]] = []
 
-    async def handle_user_message(self, session_id: str, user_content: str) -> ParsedResponse:
+    async def process_user_message(
+        self, session_id: str, user_content: str
+    ) -> OrchestratorResponse:
         self.calls.append((session_id, user_content))
         store = jarvis_store_module.get_default_store()
         store.append("user", user_content)
-        store.append("assistant", self._parsed.speech)
-        return self._parsed
+        store.append("assistant", self._response.speech)
+        return self._response
 
 
 @pytest.fixture()
-def fake_chat_service(clear_jarvis_history: None) -> Iterator[_FakeChatService]:
-    parsed = ParsedResponse(
+def fake_chat_service(clear_jarvis_history: None) -> Iterator[_FakeOrchestrator]:
+    response = OrchestratorResponse(
         speech="echo: hi",
         ui=[ComponentDescriptor(component="Markdown", props={"content": "**bold**"})],
     )
-    fake = _FakeChatService(parsed)
-    ws_router.set_chat_service_provider(lambda: cast(ChatService, fake))
+    fake = _FakeOrchestrator(response)
+    ws_router.set_orchestrator_provider(lambda: cast(Orchestrator, fake))
     try:
         yield fake
     finally:
-        ws_router.reset_chat_service_provider()
+        ws_router.reset_orchestrator_provider()
 
 
-def test_ws_chat_full_round_trip(fake_chat_service: _FakeChatService) -> None:
+def test_ws_chat_full_round_trip(fake_chat_service: _FakeOrchestrator) -> None:
     with TestClient(app) as client, client.websocket_connect("/ws/chat") as ws:
         session_frame = ws.receive_json()
         assert session_frame["type"] == "session"
@@ -103,7 +105,7 @@ def test_ws_chat_replays_history_on_connect(clear_jarvis_history: None) -> None:
             assert replay_assistant["replayed"] is True
 
 
-def test_ws_chat_rejects_unknown_type(fake_chat_service: _FakeChatService) -> None:
+def test_ws_chat_rejects_unknown_type(fake_chat_service: _FakeOrchestrator) -> None:
     with TestClient(app) as client, client.websocket_connect("/ws/chat") as ws:
         ws.receive_json()  # session frame
         ws.send_json({"type": "nope"})
@@ -137,7 +139,7 @@ class _SlowFakeTts:
         yield SynthesisChunk(pcm16=b"\x00\x00\x00\x00", sample_rate=24_000)
 
 
-def test_ws_chat_interrupts_in_flight_tts(fake_chat_service: _FakeChatService) -> None:
+def test_ws_chat_interrupts_in_flight_tts(fake_chat_service: _FakeOrchestrator) -> None:
     """A new user_msg must cancel a previous turn's TTS and emit audio_end."""
 
     slow_tts = _SlowFakeTts()
@@ -169,7 +171,7 @@ def test_ws_chat_interrupts_in_flight_tts(fake_chat_service: _FakeChatService) -
 
 
 def test_ws_chat_interrupt_cancels_even_when_voice_off(
-    fake_chat_service: _FakeChatService,
+    fake_chat_service: _FakeOrchestrator,
 ) -> None:
     """Voice-off second message still cancels a voice-on first message's TTS."""
 
@@ -196,7 +198,7 @@ def test_ws_chat_interrupt_cancels_even_when_voice_off(
         ws_router.reset_tts_service_provider()
 
 
-def test_ws_chat_rejects_bad_content(fake_chat_service: _FakeChatService) -> None:
+def test_ws_chat_rejects_bad_content(fake_chat_service: _FakeOrchestrator) -> None:
     with TestClient(app) as client, client.websocket_connect("/ws/chat") as ws:
         ws.receive_json()
         ws.send_json({"type": "user_msg", "content": 42})
