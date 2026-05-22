@@ -36,6 +36,7 @@ pending row.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import Callable, Coroutine
 from typing import Any
 
@@ -81,6 +82,16 @@ class TaskScheduler:
         # asyncio may garbage-collect a still-running coroutine — see PEP 715
         # discussion and ruff's RUF006. Cleared in the task's own callback.
         self._followups: set[asyncio.Task[None]] = set()
+        # Slice #0023 — per-task asyncio handle so :meth:`cancel` can call
+        # ``task.cancel()`` on the runner directly (real asyncio cancellation,
+        # not a polled flag). Populated by :meth:`_activate`, cleared in the
+        # done-callback.
+        self._runners: dict[str, asyncio.Task[None]] = {}
+        # Slice #0023 — task ids currently being cancelled. The runner's
+        # done-callback runs after :meth:`cancel` already transitioned the
+        # task to ``failed`` and persisted the reason; the callback must
+        # only free the slot + promote a pending row, NOT touch state again.
+        self._cancelling: set[str] = set()
 
     @property
     def cap(self) -> int:
@@ -126,8 +137,14 @@ class TaskScheduler:
         ``waiting_input`` (or it crashed). We only manage scheduling state
         here. ``waiting_input`` frees the slot — :meth:`resume` re-acquires
         one when the orchestrator forwards a user answer back.
+
+        Slice #0023: when a task is being cancelled by :meth:`cancel`,
+        ``task_id`` is in :attr:`_cancelling`. We still free the slot + promote
+        a pending row but skip any state inspection — :meth:`cancel` already
+        owns the ``running → failed`` transition.
         """
 
+        cancelling = task_id in self._cancelling
         next_id: str | None = None
         async with self._lock:
             self._running.discard(task_id)
@@ -138,6 +155,8 @@ class TaskScheduler:
                 if pending:
                     next_id = pending[0].id
                     self._running.add(next_id)
+            if cancelling:
+                self._cancelling.discard(task_id)
         if next_id is not None:
             await self._activate(next_id)
             _logger.info(
@@ -211,6 +230,87 @@ class TaskScheduler:
         for task in pending:
             await self.enqueue(task.id)
 
+    async def cancel(self, task_id: str, *, reason: str = "user_cancelled") -> None:
+        """Cancel a task (slice #0023) regardless of its current state.
+
+        Three paths depending on current state:
+
+        - ``done`` / ``failed``: silent no-op. A request to cancel an
+          already-terminal task is benign — the UI may double-fire on
+          slow networks, or Jarvis may issue a cancel for a task that
+          finished in between.
+        - ``pending`` / ``waiting_input``: no asyncio runner is observing
+          the task. We just transition to ``failed`` (legal from both
+          source states), persist ``reason`` in ``task.result``, and emit
+          ``task_updated`` + ``task_result``. ``pending`` rows do not
+          occupy a slot in :attr:`_running` so promotion is a no-op; for
+          ``waiting_input`` the slot was already freed when the runner
+          returned.
+        - ``running``: real :func:`asyncio.Task.cancel`. The runner's
+          ``await self._client.chat(...)`` (or any other await point) will
+          raise :class:`asyncio.CancelledError`. We mark the task as being
+          cancelled in :attr:`_cancelling` so the runner's done-callback
+          does not race us — the callback then only handles slot bookkeeping
+          and pending-promotion. Once the runner has actually returned we
+          persist the failed state + reason ourselves.
+
+        Cancellation of an unknown ``task_id`` logs a warning and returns
+        without raising.
+        """
+
+        try:
+            task = self._task_store.get_task(task_id)
+        except TaskStoreError:
+            _logger.warning("task_scheduler.cancel_unknown_task", task_id=task_id)
+            return
+
+        if task.state in ("done", "failed"):
+            _logger.info(
+                "task_scheduler.cancel_already_terminal",
+                task_id=task_id,
+                state=task.state,
+            )
+            return
+
+        if task.state in ("pending", "waiting_input"):
+            # No asyncio task to cancel — just persist the failure state.
+            await self._finalize_cancelled(task_id, reason=reason)
+            # ``pending`` did not occupy a slot; ``waiting_input`` already
+            # freed it. Either way nothing to promote here — the cap was
+            # not reduced by this cancellation.
+            return
+
+        # state == "running" — cancel the asyncio task driving the runner.
+        runner_task = self._runners.get(task_id)
+        # Mark before cancelling so the done-callback (which fires
+        # synchronously when ``runner_task`` resolves) sees the flag.
+        self._cancelling.add(task_id)
+
+        if runner_task is None:
+            # In-memory state out of sync with the SQL row (task says
+            # ``running`` but we never registered a runner). Defensive only:
+            # the regular code paths always populate ``self._runners`` before
+            # transitioning. Treat it like a pending cancel.
+            _logger.warning(
+                "task_scheduler.cancel_missing_runner",
+                task_id=task_id,
+            )
+            await self._finalize_cancelled(task_id, reason=reason)
+            await self._free_slot_and_promote(task_id)
+            return
+
+        if not runner_task.done():
+            runner_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await runner_task
+
+        # The done-callback fires when ``runner_task`` resolves. It checks
+        # ``self._cancelling`` and only frees the slot + promotes a pending
+        # row — it does NOT re-transition the state. Persist the failed
+        # state + reason here so the caller (WS handler or Jarvis tool) can
+        # rely on the state being settled by the time ``cancel`` returns.
+        await self._finalize_cancelled(task_id, reason=reason)
+
     # --- Internals -----------------------------------------------------------
 
     async def _activate(self, task_id: str) -> None:
@@ -253,6 +353,9 @@ class TaskScheduler:
 
         runner_coro = self._runner_factory(task_id)
         runner_task = asyncio.create_task(runner_coro)
+        # Slice #0023 — track the asyncio handle so :meth:`cancel` can call
+        # ``task.cancel()`` on it. Cleared in the done-callback.
+        self._runners[task_id] = runner_task
         runner_task.add_done_callback(self._make_done_callback(task_id))
         _logger.info(
             "task_scheduler.promoted",
@@ -267,6 +370,89 @@ class TaskScheduler:
         async with self._lock:
             self._running.discard(task_id)
 
+    async def _finalize_cancelled(self, task_id: str, *, reason: str) -> None:
+        """Persist the failed state + reason for a cancelled task; emit events.
+
+        Used by :meth:`cancel` for all paths (pending / waiting_input /
+        running). The current state may be terminal already if the task
+        finished between the cancel decision and this call — guard against
+        the invalid transition. ``set_result`` is always idempotent so we
+        try it regardless to capture the reason.
+        """
+
+        # Reload to learn whether the task is still cancellable. We may
+        # race with the runner finishing naturally — accept the loss.
+        try:
+            task = self._task_store.get_task(task_id)
+        except TaskStoreError:
+            _logger.warning("task_scheduler.cancel_finalize_unknown_task", task_id=task_id)
+            return
+
+        if task.state in ("done", "failed"):
+            _logger.info(
+                "task_scheduler.cancel_finalize_already_terminal",
+                task_id=task_id,
+                state=task.state,
+            )
+            return
+
+        try:
+            self._task_store.set_result(task_id, reason)
+            self._task_store.update_state(task_id, "failed")
+        except TaskStoreError:
+            _logger.exception(
+                "task_scheduler.cancel_finalize_failed",
+                task_id=task_id,
+            )
+            return
+
+        try:
+            updated = self._task_store.get_task(task_id)
+        except TaskStoreError:
+            _logger.exception(
+                "task_scheduler.cancel_finalize_reload_failed",
+                task_id=task_id,
+            )
+            return
+
+        await ws_events.emit(
+            {
+                "type": "task_updated",
+                "task_id": task_id,
+                "state": updated.state,
+                "needs_attention": updated.needs_attention,
+                "updated_at": updated.updated_at,
+            }
+        )
+        await ws_events.emit(
+            {
+                "type": "task_result",
+                "task_id": task_id,
+                "result": reason,
+            }
+        )
+
+    async def _free_slot_and_promote(self, task_id: str) -> None:
+        """Defensive fallback used by :meth:`cancel` when no runner is tracked.
+
+        Mirrors the slot bookkeeping :meth:`on_task_terminated` does, but
+        without any state inspection — the caller has already finalised the
+        state. Should only fire in pathological "running row with no runner"
+        situations.
+        """
+
+        next_id: str | None = None
+        async with self._lock:
+            self._running.discard(task_id)
+            self._cancelling.discard(task_id)
+            if len(self._running) < self._cap:
+                pending = self._task_store.list_tasks(state="pending", limit=1)
+                if pending:
+                    next_id = pending[0].id
+                    self._running.add(next_id)
+        if next_id is not None:
+            await self._activate(next_id)
+
     def _make_done_callback(self, task_id: str) -> Callable[[asyncio.Task[None]], None]:
         """Return a done-callback closure that re-enters via :meth:`on_task_terminated`.
 
@@ -276,9 +462,12 @@ class TaskScheduler:
         """
 
         def _callback(runner_task: asyncio.Task[None]) -> None:
+            # Drop the runner handle — :meth:`cancel` no longer needs it.
+            self._runners.pop(task_id, None)
             # Surface unexpected exceptions from the runner — but never raise
             # them out of the callback, that would log "Task exception was
             # never retrieved" at warning level and confuse debugging.
+            # ``CancelledError`` from :meth:`cancel` is expected — don't log it.
             exc = runner_task.exception() if not runner_task.cancelled() else None
             if exc is not None:
                 _logger.error(

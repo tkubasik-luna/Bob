@@ -23,6 +23,14 @@ NOT publish on ``task_state_changed`` (state stays ``running``), so the
 :class:`ProactivityHandler` never fires on progress and Jarvis stays
 silent in the main chat.
 
+Slice #0023 adds cancellation: :class:`TaskScheduler` can call
+``runner_task.cancel()`` on the asyncio handle. The cancellation point is
+typically the ``await self._client.chat(...)`` inside the loop. The runner
+re-raises :class:`asyncio.CancelledError` so the scheduler's done-callback
+observes a cancelled task; the scheduler then owns the ``running → failed``
+transition + reason persistence. The runner does NOT attempt any further
+state writes after cancellation — that would race the scheduler.
+
 State machine guarantees:
 
 - A task can enter the runner in state ``pending`` (just spawned, slot free)
@@ -42,11 +50,13 @@ State machine guarantees:
   cap exceeded) the runner transitions ``→ failed`` and records a system
   message describing the failure reason. The runner never re-raises — the
   surrounding ``asyncio.create_task`` would otherwise log an
-  unhandled-exception warning.
+  unhandled-exception warning. ``asyncio.CancelledError`` is the one
+  exception that DOES propagate (slice #0023).
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
@@ -209,6 +219,16 @@ class SubAgentRunner:
 
             try:
                 raw = await self._client.chat(messages, session_id=task_id)
+            except asyncio.CancelledError:
+                # Slice #0023: the scheduler cancelled us via
+                # ``runner_task.cancel()``. Re-raise so the asyncio task
+                # ends with ``cancelled() is True`` and the scheduler's
+                # done-callback observes it. The scheduler owns the
+                # ``running → failed`` transition + reason persistence —
+                # we must NOT call self._fail here (it would write a system
+                # message and emit events the scheduler is about to emit
+                # itself with the proper reason).
+                raise
             except Exception as exc:
                 _logger.exception("sub_agent_runner.llm_failed", task_id=task_id)
                 await self._fail(task_id, f"LLM call failed: {exc}")

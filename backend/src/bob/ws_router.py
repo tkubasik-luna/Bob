@@ -40,6 +40,7 @@ import structlog
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from bob import jarvis_store as jarvis_store_module
+from bob import task_scheduler as task_scheduler_module
 from bob import task_store as task_store_module
 from bob import text_segmenter, ws_events
 from bob.orchestrator import Orchestrator, get_default_orchestrator
@@ -232,6 +233,49 @@ async def _cancel_active_tts(
                 await websocket.send_json({"type": "audio_end", "msg_id": msg_id})
 
 
+async def _handle_cancel_task(websocket: WebSocket, payload: dict[str, Any]) -> None:
+    """Client → ``cancel_task`` cancels a non-terminal task (slice #0023).
+
+    Sidebar cancel button on a ``pending`` / ``running`` / ``waiting_input``
+    card posts this event. The scheduler:
+
+    - is permissive: cancelling a ``done`` / ``failed`` task is a silent
+      no-op (UI may race a natural completion);
+    - owns the asyncio cancellation of any in-flight runner;
+    - transitions the row to ``failed`` with ``result="user_cancelled"``
+      and emits ``task_updated`` + ``task_result``.
+
+    The frontend repopulates the card from those events — no echo from
+    this WS handler is needed beyond error reporting.
+    """
+
+    task_id = payload.get("task_id")
+    if not isinstance(task_id, str) or not task_id:
+        await websocket.send_json(
+            {
+                "type": "error",
+                "code": "bad_cancel",
+                "message": "cancel_task.task_id must be a non-empty string",
+            }
+        )
+        return
+
+    try:
+        scheduler = task_scheduler_module.get_default_scheduler()
+    except RuntimeError:
+        # Scheduler not primed — narrow test setups bypass the lifespan.
+        await websocket.send_json(
+            {
+                "type": "error",
+                "code": "scheduler_unavailable",
+                "message": "task scheduler unavailable",
+            }
+        )
+        return
+
+    await scheduler.cancel(task_id, reason="user_cancelled")
+
+
 async def _handle_dismiss_task(websocket: WebSocket, payload: dict[str, Any]) -> None:
     """Client → ``dismiss_task`` hides a done/failed task from the sidebar.
 
@@ -343,6 +387,10 @@ async def _handle_client_message(
         return
 
     msg_type = payload.get("type")
+
+    if msg_type == "cancel_task":
+        await _handle_cancel_task(websocket, payload)
+        return
 
     if msg_type == "dismiss_task":
         await _handle_dismiss_task(websocket, payload)

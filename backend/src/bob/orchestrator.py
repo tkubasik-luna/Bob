@@ -54,21 +54,27 @@ _logger = structlog.get_logger(__name__)
 
 _SPAWN_CONFIRMATION = "D'accord, je m'en occupe. Je te dis dès que c'est prêt."
 _FORWARD_CONFIRMATION = "Compris, je transmets à la tâche."
+_CANCEL_CONFIRMATION = "Compris, j'annule."
 
 
 _TOOLS_SYSTEM_ADDENDUM = (
-    "\n\nTu disposes de deux outils :\n"
+    "\n\nTu disposes de trois outils :\n"
     "- ``spawn_subtask`` : pour déléguer une tâche longue ou autonome à un "
     "sub-agent en arrière-plan.\n"
     "- ``forward_to_subtask`` : pour transmettre la réponse de l'utilisateur "
     "à une sous-tâche en attente d'input. Tu connais l'``id`` de chaque "
     "sous-tâche concernée via le résumé des tâches actives ci-dessous.\n"
+    "- ``cancel_subtask`` : pour annuler une sous-tâche en cours quand "
+    "l'utilisateur demande explicitement de l'arrêter (\"annule X\", "
+    '"laisse tomber").\n'
     "Pour CE message, tu dois EXCLUSIVEMENT :\n"
     "- soit appeler ``spawn_subtask`` (un seul appel) si la demande mérite "
     "d'être déléguée ;\n"
     "- soit appeler ``forward_to_subtask`` si l'utilisateur répond à une "
     "question préalablement transmise par toi pour le compte d'une tâche en "
     "cours ;\n"
+    "- soit appeler ``cancel_subtask`` si l'utilisateur demande explicitement "
+    "d'annuler / arrêter une tâche listée dans le résumé ;\n"
     "- soit répondre directement en texte si aucune action n'est requise.\n"
     "Ne fais jamais deux appels en parallèle."
 )
@@ -140,6 +146,34 @@ _FORWARD_TO_SUBTASK_TOOL = ToolDefinition(
 )
 
 
+_CANCEL_SUBTASK_TOOL = ToolDefinition(
+    name="cancel_subtask",
+    description=(
+        "Annule une sous-tâche en cours. À appeler quand l'utilisateur "
+        'demande explicitement d\'arrêter une tâche ("annule X", "laisse '
+        'tomber"). Tu peux fournir une raison concise (sinon "user_cancelled" '
+        "est utilisé)."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": (
+                    "ID de la sous-tâche à annuler. Le résumé des tâches "
+                    "actives en tête de prompt liste l'``id`` exact."
+                ),
+            },
+            "reason": {
+                "type": "string",
+                "description": "Raison brève. Default 'user_cancelled'.",
+            },
+        },
+        "required": ["task_id"],
+    },
+)
+
+
 class _PromptsLike(Protocol):
     def render(self, name: str, **kwargs: object) -> str: ...
 
@@ -149,6 +183,8 @@ class _SchedulerLike(Protocol):
 
     async def resume(self, task_id: str) -> None: ...
 
+    async def cancel(self, task_id: str, *, reason: str = ...) -> None: ...
+
 
 @dataclass(frozen=True)
 class OrchestratorResponse:
@@ -157,17 +193,21 @@ class OrchestratorResponse:
     - ``speech`` is the user-visible reply text (also routed through TTS).
     - ``ui`` carries the structured UI components from the no-spawn path.
       Empty when the turn resulted in one or more ``spawn_subtask`` /
-      ``forward_to_subtask`` calls.
+      ``forward_to_subtask`` / ``cancel_subtask`` calls.
     - ``spawned_task_ids`` lists every task created by this turn. Empty
       when no spawn happened (forwards or plain-text replies).
     - ``forwarded_task_ids`` lists every task the user's message was
       forwarded to. Empty when the turn didn't include a forward.
+    - ``cancelled_task_ids`` lists every task cancelled by this turn via
+      the ``cancel_subtask`` tool. Empty when the turn didn't include a
+      cancellation.
     """
 
     speech: str
     ui: list[ComponentDescriptor] = field(default_factory=list)
     spawned_task_ids: list[str] = field(default_factory=list)
     forwarded_task_ids: list[str] = field(default_factory=list)
+    cancelled_task_ids: list[str] = field(default_factory=list)
 
 
 class Orchestrator:
@@ -212,25 +252,34 @@ class Orchestrator:
 
         decision = await self._jarvis_client.complete(
             messages,
-            tools=[_SPAWN_SUBTASK_TOOL, _FORWARD_TO_SUBTASK_TOOL],
+            tools=[_SPAWN_SUBTASK_TOOL, _FORWARD_TO_SUBTASK_TOOL, _CANCEL_SUBTASK_TOOL],
             session_id=session_id,
         )
 
         if decision.is_tool_call:
-            spawned_task_ids, forwarded_task_ids = await self._dispatch_tool_calls(
-                decision.tool_calls
-            )
-            if spawned_task_ids or forwarded_task_ids:
-                # Forwards take priority over spawns in the speech we emit so
-                # the user gets the matching confirmation. Both should not
-                # normally coexist (we instruct Jarvis to pick one path).
-                speech = _FORWARD_CONFIRMATION if forwarded_task_ids else _SPAWN_CONFIRMATION
+            (
+                spawned_task_ids,
+                forwarded_task_ids,
+                cancelled_task_ids,
+            ) = await self._dispatch_tool_calls(decision.tool_calls)
+            if spawned_task_ids or forwarded_task_ids or cancelled_task_ids:
+                # Pick the speech to match the dominant action. We instruct
+                # Jarvis to pick one path so coexistence is rare; if multiple
+                # happen we prioritise the most user-visible signal: cancel
+                # → forward → spawn.
+                if cancelled_task_ids:
+                    speech = _CANCEL_CONFIRMATION
+                elif forwarded_task_ids:
+                    speech = _FORWARD_CONFIRMATION
+                else:
+                    speech = _SPAWN_CONFIRMATION
                 self._jarvis_store.append("assistant", speech)
                 return OrchestratorResponse(
                     speech=speech,
                     ui=[],
                     spawned_task_ids=spawned_task_ids,
                     forwarded_task_ids=forwarded_task_ids,
+                    cancelled_task_ids=cancelled_task_ids,
                 )
             # All tool calls were rejected (bad args, unknown tool). Fall
             # through to the plain-text path so the user still gets a reply.
@@ -378,15 +427,19 @@ class Orchestrator:
             *({"role": m["role"], "content": m["content"]} for m in history),
         ]
 
-    async def _dispatch_tool_calls(self, tool_calls: list[Any]) -> tuple[list[str], list[str]]:
-        """Dispatch every valid spawn / forward call. Returns (spawned, forwarded).
+    async def _dispatch_tool_calls(
+        self, tool_calls: list[Any]
+    ) -> tuple[list[str], list[str], list[str]]:
+        """Dispatch every valid spawn / forward / cancel call.
 
-        Invalid calls (wrong name, missing args, bad arg types) are skipped
-        with a warning so the orchestrator can still proceed.
+        Returns ``(spawned, forwarded, cancelled)``. Invalid calls (wrong
+        name, missing args, bad arg types) are skipped with a warning so the
+        orchestrator can still proceed.
         """
 
         spawned: list[str] = []
         forwarded: list[str] = []
+        cancelled: list[str] = []
         for call in tool_calls:
             if call.name == _SPAWN_SUBTASK_TOOL.name:
                 task_id = await self._dispatch_spawn(call)
@@ -396,12 +449,16 @@ class Orchestrator:
                 task_id = await self._dispatch_forward(call)
                 if task_id is not None:
                     forwarded.append(task_id)
+            elif call.name == _CANCEL_SUBTASK_TOOL.name:
+                task_id = await self._dispatch_cancel(call)
+                if task_id is not None:
+                    cancelled.append(task_id)
             else:
                 _logger.warning(
                     "orchestrator.unknown_tool",
                     tool_name=call.name,
                 )
-        return spawned, forwarded
+        return spawned, forwarded, cancelled
 
     async def _dispatch_spawn(self, call: Any) -> str | None:
         """Persist a single ``spawn_subtask`` call and hand it to the scheduler.
@@ -501,6 +558,39 @@ class Orchestrator:
 
         await self._task_scheduler.resume(target_id)
         _logger.info("orchestrator.forwarded_to_subtask", task_id=target_id)
+        return target_id
+
+    async def _dispatch_cancel(self, call: Any) -> str | None:
+        """Route a ``cancel_subtask`` tool call to the scheduler.
+
+        The scheduler is permissive: cancelling an unknown / terminal task
+        is a no-op, so we don't pre-validate the task_id here. We only
+        validate the argument shape so a malformed call doesn't crash the
+        orchestrator turn.
+
+        The reason — when omitted by Jarvis — defaults to ``user_cancelled``
+        to match the WS sidebar path; Jarvis may override with a brief
+        contextual reason ("trop long", "plus utile", …).
+        """
+
+        target_id = call.arguments.get("task_id")
+        if not isinstance(target_id, str) or not target_id.strip():
+            _logger.warning("orchestrator.cancel_bad_task_id", arguments=call.arguments)
+            return None
+
+        raw_reason = call.arguments.get("reason")
+        reason = (
+            raw_reason.strip()
+            if isinstance(raw_reason, str) and raw_reason.strip()
+            else "user_cancelled"
+        )
+
+        await self._task_scheduler.cancel(target_id, reason=reason)
+        _logger.info(
+            "orchestrator.cancelled_subtask",
+            task_id=target_id,
+            reason=reason,
+        )
         return target_id
 
     async def _reply_with_structured_response(

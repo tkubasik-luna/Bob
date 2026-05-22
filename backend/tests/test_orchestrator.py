@@ -64,17 +64,20 @@ _TEST_JARVIS_PROMPT = "Tu es Jarvis-de-test, ton calme et concis."
 class _RecordingScheduler:
     """Stand-in for :class:`TaskScheduler` in orchestrator tests.
 
-    Records each ``enqueue`` / ``resume`` call so tests can assert dispatch
-    without spinning up real runner tasks. The fake transitions the task to
-    ``running`` so existing assertions (``list_tasks(state="running")``)
-    keep their meaning — that is the contract the real scheduler honours
-    when a slot is free.
+    Records each ``enqueue`` / ``resume`` / ``cancel`` call so tests can
+    assert dispatch without spinning up real runner tasks. The fake
+    transitions the task to ``running`` (on enqueue / resume) so existing
+    assertions (``list_tasks(state="running")``) keep their meaning — that
+    is the contract the real scheduler honours when a slot is free. The
+    ``cancel`` fake is non-transitioning: tests asserting the dispatch only
+    care that the call landed with the right args.
     """
 
     def __init__(self, task_store: TaskStore) -> None:
         self._task_store = task_store
         self.enqueued: list[str] = []
         self.resumed: list[str] = []
+        self.cancelled: list[tuple[str, str]] = []
 
     async def enqueue(self, task_id: str) -> None:
         self.enqueued.append(task_id)
@@ -83,6 +86,9 @@ class _RecordingScheduler:
     async def resume(self, task_id: str) -> None:
         self.resumed.append(task_id)
         self._task_store.update_state(task_id, "running")
+
+    async def cancel(self, task_id: str, *, reason: str = "user_cancelled") -> None:
+        self.cancelled.append((task_id, reason))
 
 
 def _make_orchestrator(
@@ -291,7 +297,7 @@ async def test_fallback_when_both_chat_attempts_invalid() -> None:
 
 
 @pytest.mark.asyncio
-async def test_complete_call_sends_spawn_subtask_and_forward_tools() -> None:
+async def test_complete_call_sends_spawn_forward_and_cancel_tools() -> None:
     orchestrator, jarvis_client, _sub, _store, _ts, _scheduler = _make_orchestrator(
         complete_responses=[LLMResponse(text="hello", tool_calls=[])],
         chat_responses=[_valid_payload("ok")],
@@ -302,11 +308,13 @@ async def test_complete_call_sends_spawn_subtask_and_forward_tools() -> None:
     tools = jarvis_client.complete_calls[0]["tools"]
     assert tools is not None
     names = [t.name for t in tools]
-    assert names == ["spawn_subtask", "forward_to_subtask"]
+    assert names == ["spawn_subtask", "forward_to_subtask", "cancel_subtask"]
     spawn_tool = tools[0]
     forward_tool = tools[1]
+    cancel_tool = tools[2]
     assert spawn_tool.parameters["required"] == ["title", "goal"]
     assert forward_tool.parameters["required"] == ["task_id", "response"]
+    assert cancel_tool.parameters["required"] == ["task_id"]
 
 
 # ---------------------------------------------------------------------------
@@ -688,3 +696,113 @@ async def test_generate_proactive_message_non_ask_user_kind_noops() -> None:
         ws_events.set_emitter(None)
 
     assert received == []
+
+
+# ---------------------------------------------------------------------------
+# cancel_subtask tool dispatch (slice #0023)
+# ---------------------------------------------------------------------------
+
+
+def _cancel_tool_call(*, task_id: str, reason: str | None = None) -> ToolCall:
+    args: dict[str, Any] = {"task_id": task_id}
+    if reason is not None:
+        args["reason"] = reason
+    return ToolCall(
+        id=f"call_{uuid4().hex[:6]}",
+        name="cancel_subtask",
+        arguments=args,
+    )
+
+
+@pytest.mark.asyncio
+async def test_cancel_subtask_routes_to_scheduler_with_default_reason() -> None:
+    """A ``cancel_subtask`` tool call lands on the scheduler with the default reason."""
+
+    orchestrator, jarvis_client, _sub, jarvis_store, task_store, scheduler = _make_orchestrator()
+
+    target_id = task_store.create_task(title="In flight", goal="Long task")
+    task_store.update_state(target_id, "running")
+
+    jarvis_client._complete_responses.append(
+        LLMResponse(
+            text=None,
+            tool_calls=[_cancel_tool_call(task_id=target_id)],
+        )
+    )
+
+    response = await orchestrator.process_user_message("s1", "annule la tâche")
+
+    assert response.cancelled_task_ids == [target_id]
+    assert response.spawned_task_ids == []
+    assert response.forwarded_task_ids == []
+    assert response.speech == "Compris, j'annule."
+
+    # Reason defaults to "user_cancelled" when Jarvis omits it.
+    assert scheduler.cancelled == [(target_id, "user_cancelled")]
+
+    # Jarvis confirmation persisted in the singleton thread.
+    history = jarvis_store.history()
+    assert history[-1] == {"role": "assistant", "content": "Compris, j'annule."}
+
+
+@pytest.mark.asyncio
+async def test_cancel_subtask_forwards_custom_reason() -> None:
+    """A custom ``reason`` arg is passed verbatim to the scheduler."""
+
+    orchestrator, jarvis_client, _sub, _js, task_store, scheduler = _make_orchestrator()
+
+    target_id = task_store.create_task(title="In flight", goal="Long task")
+    task_store.update_state(target_id, "running")
+
+    jarvis_client._complete_responses.append(
+        LLMResponse(
+            text=None,
+            tool_calls=[_cancel_tool_call(task_id=target_id, reason="plus utile")],
+        )
+    )
+
+    response = await orchestrator.process_user_message("s1", "laisse tomber")
+
+    assert response.cancelled_task_ids == [target_id]
+    assert scheduler.cancelled == [(target_id, "plus utile")]
+
+
+@pytest.mark.asyncio
+async def test_cancel_subtask_with_bad_task_id_falls_back_to_text() -> None:
+    """A malformed tool call (missing task_id) is dropped; text reply wins."""
+
+    bad_call = ToolCall(
+        id="call_bad",
+        name="cancel_subtask",
+        arguments={"reason": "nope"},
+    )
+    orchestrator, _jc, _sub, _js, _ts, scheduler = _make_orchestrator(
+        complete_responses=[LLMResponse(text=None, tool_calls=[bad_call])],
+        chat_responses=[_valid_payload("fallback")],
+    )
+
+    response = await orchestrator.process_user_message("s1", "anything")
+
+    assert response.speech == "fallback"
+    assert response.cancelled_task_ids == []
+    assert scheduler.cancelled == []
+
+
+@pytest.mark.asyncio
+async def test_cancel_subtask_empty_reason_falls_back_to_default() -> None:
+    """An empty / whitespace reason still hands "user_cancelled" to the scheduler."""
+
+    orchestrator, jarvis_client, _sub, _js, task_store, scheduler = _make_orchestrator()
+    target_id = task_store.create_task(title="In flight", goal="Long task")
+    task_store.update_state(target_id, "running")
+
+    jarvis_client._complete_responses.append(
+        LLMResponse(
+            text=None,
+            tool_calls=[_cancel_tool_call(task_id=target_id, reason="   ")],
+        )
+    )
+
+    await orchestrator.process_user_message("s1", "annule")
+
+    assert scheduler.cancelled == [(target_id, "user_cancelled")]

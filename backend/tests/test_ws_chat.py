@@ -505,3 +505,75 @@ def test_ws_chat_request_task_messages_rejects_bad_payload(
         err = ws.receive_json()
         assert err["type"] == "error"
         assert err["code"] == "bad_request_messages"
+
+
+# ---------------------------------------------------------------------------
+# Slice #0023 — cancel_task WS client→server event.
+# ---------------------------------------------------------------------------
+
+
+def test_ws_chat_cancel_task_routes_to_scheduler(clear_jarvis_history: None) -> None:
+    """A ``cancel_task`` WS event must reach ``TaskScheduler.cancel``.
+
+    We swap the singleton scheduler for a recording fake so this test
+    asserts WS dispatch in isolation from the asyncio cancellation logic
+    (covered in :mod:`test_task_scheduler`).
+    """
+
+    from bob import task_scheduler as task_scheduler_module
+
+    recorded: list[tuple[str, str]] = []
+
+    class _FakeScheduler:
+        async def cancel(self, task_id: str, *, reason: str = "user_cancelled") -> None:
+            recorded.append((task_id, reason))
+
+        async def enqueue(self, task_id: str) -> None:  # pragma: no cover — unused
+            return None
+
+        async def resume(self, task_id: str) -> None:  # pragma: no cover — unused
+            return None
+
+    with TestClient(app) as client:
+        # The lifespan primed a real scheduler; install our fake on top.
+        previous = task_scheduler_module._DEFAULT_SCHEDULER
+        task_scheduler_module.set_default_scheduler(cast(object, _FakeScheduler()))  # type: ignore[arg-type]
+        try:
+            with client.websocket_connect("/ws/chat") as ws:
+                assert ws.receive_json()["type"] == "session"
+                ws.send_json({"type": "cancel_task", "task_id": "abc"})
+                # No echo expected — the backend just calls scheduler.cancel.
+                # Send a follow-up to flush + assert no error came back.
+                ws.send_json({"type": "request_task_messages", "task_id": "abc"})
+                err = ws.receive_json()
+                # request_task_messages will fail with unknown_task since
+                # we never created the row — that's fine, we just needed
+                # something to round-trip the socket.
+                assert err["type"] == "error"
+                assert err["code"] == "unknown_task"
+        finally:
+            task_scheduler_module.set_default_scheduler(previous)
+
+    assert recorded == [("abc", "user_cancelled")]
+
+
+def test_ws_chat_cancel_task_rejects_bad_payload(clear_jarvis_history: None) -> None:
+    """Non-string / empty task_id surfaces a ``bad_cancel`` error code."""
+
+    with TestClient(app) as client, client.websocket_connect("/ws/chat") as ws:
+        assert ws.receive_json()["type"] == "session"
+        ws.send_json({"type": "cancel_task", "task_id": 42})
+        err = ws.receive_json()
+        assert err["type"] == "error"
+        assert err["code"] == "bad_cancel"
+
+
+def test_ws_chat_cancel_task_empty_id_rejected(clear_jarvis_history: None) -> None:
+    """Empty-string task_id is also rejected (must be non-empty)."""
+
+    with TestClient(app) as client, client.websocket_connect("/ws/chat") as ws:
+        assert ws.receive_json()["type"] == "session"
+        ws.send_json({"type": "cancel_task", "task_id": ""})
+        err = ws.receive_json()
+        assert err["type"] == "error"
+        assert err["code"] == "bad_cancel"

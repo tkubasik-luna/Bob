@@ -32,7 +32,18 @@ export type RequestTaskMessagesMsg = {
   task_id: string;
 };
 
-export type ClientMessage = UserMsg | DismissTaskMsg | RequestTaskMessagesMsg;
+/** Slice #0023 — sidebar cancel button on a non-terminal card. Backend
+ * routes this to `TaskScheduler.cancel(task_id, reason="user_cancelled")`
+ * which interrupts the asyncio runner if any, then transitions the row
+ * to `failed` with the reason persisted in `task.result`. The frontend
+ * relies on the resulting `task_updated` + `task_result` events to
+ * repopulate the card — no echo from this client→server event itself. */
+export type CancelTaskMsg = {
+  type: "cancel_task";
+  task_id: string;
+};
+
+export type ClientMessage = UserMsg | DismissTaskMsg | RequestTaskMessagesMsg | CancelTaskMsg;
 
 // Server → client
 export type SessionMsg = {

@@ -420,3 +420,289 @@ async def test_resume_unknown_task_is_dropped() -> None:
     await asyncio.sleep(0)
 
     assert scheduler.running_task_ids() == set()
+
+
+# ---------------------------------------------------------------------------
+# cancel() — slice #0023 user cancellation paths
+# ---------------------------------------------------------------------------
+
+
+class _CancellableRunner:
+    """Factory whose runners block on a never-set event until cancelled.
+
+    Unlike :class:`_ControlledRunner` (whose ``release`` lets the runner
+    finish naturally), this one expects :meth:`TaskScheduler.cancel` to
+    drive the asyncio cancellation. It records whether the cancellation
+    actually fired (``CancelledError`` raised) so tests can assert real
+    asyncio interruption, not a polled flag.
+    """
+
+    def __init__(self, store: TaskStore) -> None:
+        self._store = store
+        self.started: list[str] = []
+        self.cancelled: list[str] = []
+
+    def runner_factory(self, task_id: str) -> Coroutine[Any, Any, None]:
+        async def _run() -> None:
+            self.started.append(task_id)
+            try:
+                # Block on an unbounded sleep — the scheduler's
+                # ``task.cancel()`` will raise CancelledError here.
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled.append(task_id)
+                raise
+
+        return _run()
+
+
+@pytest.mark.asyncio
+async def test_cancel_running_task_interrupts_and_frees_slot() -> None:
+    """Cancelling a running task cancels the asyncio runner, persists
+    ``failed`` + reason in task.result, frees the slot, promotes pending."""
+
+    store = _make_store()
+    runner = _CancellableRunner(store)
+    scheduler = TaskScheduler(task_store=store, cap=1, runner_factory=runner.runner_factory)
+
+    received: list[dict[str, Any]] = []
+
+    async def _emitter(event: dict[str, Any]) -> None:
+        received.append(event)
+
+    ws_events.set_emitter(_emitter)
+    try:
+        target = _create_pending(store, title="target")
+        queued = _create_pending(store, title="queued")
+        await scheduler.enqueue(target)
+        await scheduler.enqueue(queued)
+        # Let the runner reach its await point.
+        for _ in range(3):
+            await asyncio.sleep(0)
+        assert store.get_task(target).state == "running"
+        assert store.get_task(queued).state == "pending"
+
+        await scheduler.cancel(target)
+        # Allow the on_task_terminated follow-up + promotion of ``queued``.
+        for _ in range(3):
+            await asyncio.sleep(0)
+    finally:
+        ws_events.set_emitter(None)
+
+    final_target = store.get_task(target)
+    assert final_target.state == "failed"
+    assert final_target.result == "user_cancelled"
+    # The asyncio runner actually saw CancelledError — not just a flag.
+    assert target in runner.cancelled
+
+    # The queued task was promoted to running once the slot freed.
+    assert store.get_task(queued).state == "running"
+    assert scheduler.running_task_ids() == {queued}
+
+    # The cancellation surfaced task_updated(failed) + task_result events.
+    updated_failed = [
+        e
+        for e in received
+        if e.get("type") == "task_updated"
+        and e.get("task_id") == target
+        and e.get("state") == "failed"
+    ]
+    assert len(updated_failed) == 1
+    result_evts = [
+        e for e in received if e.get("type") == "task_result" and e.get("task_id") == target
+    ]
+    assert result_evts == [{"type": "task_result", "task_id": target, "result": "user_cancelled"}]
+
+    # Cleanup the freshly-promoted task to keep the loop tidy.
+    await scheduler.cancel(queued)
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_cancel_pending_task_transitions_to_failed_without_promotion() -> None:
+    """Cancelling a pending row directly fails it; no slot bookkeeping."""
+
+    store = _make_store()
+    runner = _CancellableRunner(store)
+    # cap=1 so we can park ``queued`` in pending.
+    scheduler = TaskScheduler(task_store=store, cap=1, runner_factory=runner.runner_factory)
+
+    blocking = _create_pending(store, title="blocking")
+    queued = _create_pending(store, title="queued")
+    await scheduler.enqueue(blocking)
+    await scheduler.enqueue(queued)
+    for _ in range(3):
+        await asyncio.sleep(0)
+    assert store.get_task(blocking).state == "running"
+    assert store.get_task(queued).state == "pending"
+
+    received: list[dict[str, Any]] = []
+
+    async def _emitter(event: dict[str, Any]) -> None:
+        received.append(event)
+
+    ws_events.set_emitter(_emitter)
+    try:
+        await scheduler.cancel(queued, reason="trop long")
+        for _ in range(3):
+            await asyncio.sleep(0)
+    finally:
+        ws_events.set_emitter(None)
+
+    final_queued = store.get_task(queued)
+    assert final_queued.state == "failed"
+    assert final_queued.result == "trop long"
+    # The cancellation did NOT free a real slot — blocking still occupies it.
+    assert scheduler.running_task_ids() == {blocking}
+    # No asyncio runner ever started for queued.
+    assert queued not in runner.started
+
+    # Cleanup.
+    await scheduler.cancel(blocking)
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_cancel_waiting_input_task_transitions_to_failed() -> None:
+    """Cancelling a waiting_input task moves it directly to failed."""
+
+    store = _make_store()
+    runner = _CancellableRunner(store)
+    scheduler = TaskScheduler(task_store=store, cap=3, runner_factory=runner.runner_factory)
+
+    tid = _create_pending(store, title="paused")
+    store.update_state(tid, "running")
+    store.update_state(tid, "waiting_input")
+
+    await scheduler.cancel(tid)
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    final = store.get_task(tid)
+    assert final.state == "failed"
+    assert final.result == "user_cancelled"
+    # No runner was ever scheduled (the task was waiting_input).
+    assert tid not in runner.started
+
+
+@pytest.mark.asyncio
+async def test_cancel_done_task_is_silent_noop() -> None:
+    """Cancelling a done task does nothing — no exception, no state change."""
+
+    store = _make_store()
+    runner = _CancellableRunner(store)
+    scheduler = TaskScheduler(task_store=store, cap=3, runner_factory=runner.runner_factory)
+
+    tid = _create_pending(store, title="finished")
+    store.update_state(tid, "running")
+    store.set_result(tid, "all good")
+    store.update_state(tid, "done")
+
+    received: list[dict[str, Any]] = []
+
+    async def _emitter(event: dict[str, Any]) -> None:
+        received.append(event)
+
+    ws_events.set_emitter(_emitter)
+    try:
+        await scheduler.cancel(tid)
+    finally:
+        ws_events.set_emitter(None)
+
+    assert store.get_task(tid).state == "done"
+    assert store.get_task(tid).result == "all good"
+    # No events emitted for an already-terminal cancel.
+    assert received == []
+
+
+@pytest.mark.asyncio
+async def test_cancel_failed_task_is_silent_noop() -> None:
+    """Cancelling a failed task does nothing."""
+
+    store = _make_store()
+    runner = _CancellableRunner(store)
+    scheduler = TaskScheduler(task_store=store, cap=3, runner_factory=runner.runner_factory)
+
+    tid = _create_pending(store, title="broken")
+    store.update_state(tid, "running")
+    store.set_result(tid, "kaboom")
+    store.update_state(tid, "failed")
+
+    await scheduler.cancel(tid)
+
+    assert store.get_task(tid).state == "failed"
+    assert store.get_task(tid).result == "kaboom"
+
+
+@pytest.mark.asyncio
+async def test_cancel_unknown_task_id_is_silent() -> None:
+    """Cancelling an unknown id logs a warning but does not raise."""
+
+    store = _make_store()
+    runner = _CancellableRunner(store)
+    scheduler = TaskScheduler(task_store=store, cap=3, runner_factory=runner.runner_factory)
+
+    # Must not raise.
+    await scheduler.cancel("nonexistent-task-id")
+    assert scheduler.running_task_ids() == set()
+
+
+@pytest.mark.asyncio
+async def test_cancel_uses_custom_reason_in_result_and_event() -> None:
+    """The ``reason`` arg lands verbatim on task.result and in task_result."""
+
+    store = _make_store()
+    runner = _CancellableRunner(store)
+    scheduler = TaskScheduler(task_store=store, cap=3, runner_factory=runner.runner_factory)
+
+    received: list[dict[str, Any]] = []
+
+    async def _emitter(event: dict[str, Any]) -> None:
+        received.append(event)
+
+    ws_events.set_emitter(_emitter)
+    try:
+        tid = _create_pending(store, title="t")
+        await scheduler.enqueue(tid)
+        for _ in range(3):
+            await asyncio.sleep(0)
+        await scheduler.cancel(tid, reason="plus utile")
+        for _ in range(3):
+            await asyncio.sleep(0)
+    finally:
+        ws_events.set_emitter(None)
+
+    assert store.get_task(tid).result == "plus utile"
+    result_evts = [
+        e for e in received if e.get("type") == "task_result" and e.get("task_id") == tid
+    ]
+    assert result_evts[-1]["result"] == "plus utile"
+
+
+@pytest.mark.asyncio
+async def test_cancel_after_natural_completion_is_noop() -> None:
+    """Race: task finishes between the cancel decision and finalize → no double transition.
+
+    Drive the runner to ``done`` first, then call ``cancel``. The cancel
+    path sees state == done and short-circuits — no exception, no
+    overwriting of the existing result.
+    """
+
+    store = _make_store()
+    runner = _ControlledRunner(store)
+    scheduler = TaskScheduler(task_store=store, cap=3, runner_factory=runner.runner_factory)
+
+    tid = _create_pending(store, title="finishes-first")
+    await scheduler.enqueue(tid)
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    # Drive runner to natural completion.
+    await runner.release(tid)
+    assert store.get_task(tid).state == "done"
+
+    # Now race a cancel — should be a silent no-op.
+    await scheduler.cancel(tid, reason="should-not-overwrite")
+    assert store.get_task(tid).state == "done"
