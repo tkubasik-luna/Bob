@@ -577,3 +577,81 @@ def test_ws_chat_cancel_task_empty_id_rejected(clear_jarvis_history: None) -> No
         err = ws.receive_json()
         assert err["type"] == "error"
         assert err["code"] == "bad_cancel"
+
+
+# ---------------------------------------------------------------------------
+# Slice #0025 — client_typing WS event.
+# ---------------------------------------------------------------------------
+
+
+class _TypingRecordingOrchestrator:
+    """Orchestrator double recording ``set_user_typing`` calls."""
+
+    def __init__(self) -> None:
+        self.typing_calls: list[bool] = []
+
+    async def process_user_message(
+        self, session_id: str, user_content: str
+    ) -> OrchestratorResponse:
+        return OrchestratorResponse(speech="ok", ui=[])
+
+    def set_user_typing(self, value: bool) -> None:
+        self.typing_calls.append(value)
+
+
+def test_ws_chat_client_typing_updates_orchestrator(clear_jarvis_history: None) -> None:
+    """A ``client_typing`` event must call ``Orchestrator.set_user_typing``."""
+
+    fake = _TypingRecordingOrchestrator()
+    ws_router.set_orchestrator_provider(lambda: cast(Orchestrator, fake))
+    try:
+        with TestClient(app) as client, client.websocket_connect("/ws/chat") as ws:
+            assert ws.receive_json()["type"] == "session"
+            ws.send_json({"type": "client_typing", "typing": True})
+            ws.send_json({"type": "client_typing", "typing": False})
+            # No echo — flush via a round-trip on an unknown task that
+            # returns an error frame.
+            ws.send_json({"type": "request_task_messages", "task_id": "nope"})
+            err = ws.receive_json()
+            assert err["type"] == "error"
+            assert err["code"] == "unknown_task"
+    finally:
+        ws_router.reset_orchestrator_provider()
+
+    assert fake.typing_calls == [True, False]
+
+
+def test_ws_chat_client_typing_rejects_bad_payload(clear_jarvis_history: None) -> None:
+    """A non-bool ``typing`` field must surface a ``bad_typing`` error code."""
+
+    fake = _TypingRecordingOrchestrator()
+    ws_router.set_orchestrator_provider(lambda: cast(Orchestrator, fake))
+    try:
+        with TestClient(app) as client, client.websocket_connect("/ws/chat") as ws:
+            assert ws.receive_json()["type"] == "session"
+            ws.send_json({"type": "client_typing", "typing": "yes"})
+            err = ws.receive_json()
+            assert err["type"] == "error"
+            assert err["code"] == "bad_typing"
+    finally:
+        ws_router.reset_orchestrator_provider()
+
+    assert fake.typing_calls == []
+
+
+def test_ws_chat_client_typing_missing_field_rejected(clear_jarvis_history: None) -> None:
+    """Missing ``typing`` field must also fail with ``bad_typing``."""
+
+    fake = _TypingRecordingOrchestrator()
+    ws_router.set_orchestrator_provider(lambda: cast(Orchestrator, fake))
+    try:
+        with TestClient(app) as client, client.websocket_connect("/ws/chat") as ws:
+            assert ws.receive_json()["type"] == "session"
+            ws.send_json({"type": "client_typing"})
+            err = ws.receive_json()
+            assert err["type"] == "error"
+            assert err["code"] == "bad_typing"
+    finally:
+        ws_router.reset_orchestrator_provider()
+
+    assert fake.typing_calls == []

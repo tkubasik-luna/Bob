@@ -37,8 +37,8 @@ async def test_ask_user_event_invokes_orchestrator() -> None:
 
 
 @pytest.mark.asyncio
-async def test_done_event_is_noop_in_this_slice() -> None:
-    """Slice #0025 will wire ``done`` synthesis; for now it must be a no-op."""
+async def test_done_event_dispatches_to_done_synthesis() -> None:
+    """Slice #0025: ``done`` state transitions trigger a ``done`` proactive event."""
 
     fake = _FakeOrchestrator()
     handler = ProactivityHandler(orchestrator_factory=lambda: fake)
@@ -52,7 +52,30 @@ async def test_done_event_is_noop_in_this_slice() -> None:
         }
     )
 
-    assert fake.calls == []
+    assert fake.calls == [("abc", "done")]
+
+
+@pytest.mark.asyncio
+async def test_done_event_without_action_still_dispatches() -> None:
+    """The ``action`` field on the payload is optional for the done branch.
+
+    The sub-agent runner sets ``action="done"`` when transitioning to done,
+    but the handler must remain robust if upstream evolves and the field
+    disappears. The state itself is the gating signal.
+    """
+
+    fake = _FakeOrchestrator()
+    handler = ProactivityHandler(orchestrator_factory=lambda: fake)
+
+    await handler.on_task_state_changed(
+        {
+            "task_id": "abc",
+            "old_state": "running",
+            "new_state": "done",
+        }
+    )
+
+    assert fake.calls == [("abc", "done")]
 
 
 @pytest.mark.asyncio

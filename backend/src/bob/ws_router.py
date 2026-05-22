@@ -315,6 +315,35 @@ async def _handle_dismiss_task(websocket: WebSocket, payload: dict[str, Any]) ->
         )
 
 
+async def _handle_client_typing(
+    websocket: WebSocket, payload: dict[str, Any], orchestrator: Orchestrator
+) -> None:
+    """Client → ``client_typing`` heartbeat (slice #0025).
+
+    Frontend sends ``{"type": "client_typing", "typing": true/false}`` on
+    keystroke (debounced 500 ms) and on submit. We update the orchestrator's
+    typing flag so any proactive push currently queued (e.g. a paraphrased
+    ``ask_user`` question or a ``done`` synthesis) is held back while the
+    user is composing. The flag also auto-resets after 2 s server-side, so a
+    missed trailing ``false`` cannot starve the queue forever.
+
+    Returns a ``bad_typing`` error code when ``typing`` is not a bool — the
+    contract is strict to avoid silently swallowing typos.
+    """
+
+    typing = payload.get("typing")
+    if not isinstance(typing, bool):
+        await websocket.send_json(
+            {
+                "type": "error",
+                "code": "bad_typing",
+                "message": "client_typing.typing must be a boolean",
+            }
+        )
+        return
+    orchestrator.set_user_typing(typing)
+
+
 async def _handle_request_task_messages(websocket: WebSocket, payload: dict[str, Any]) -> None:
     """Client → return the full ``task_messages`` log for a task.
 
@@ -398,6 +427,10 @@ async def _handle_client_message(
 
     if msg_type == "request_task_messages":
         await _handle_request_task_messages(websocket, payload)
+        return
+
+    if msg_type == "client_typing":
+        await _handle_client_typing(websocket, payload, orchestrator)
         return
 
     if msg_type != "user_msg":

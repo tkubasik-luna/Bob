@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+from collections.abc import Callable
 from typing import Any
 from uuid import uuid4
 
@@ -603,12 +604,17 @@ async def test_forward_to_task_not_in_waiting_input_is_dropped() -> None:
 
 
 # ---------------------------------------------------------------------------
-# generate_proactive_message (slice #0021)
+# generate_proactive_message (slices #0021/#0025)
+#
+# Slice #0025 wraps generation in a queue gated by user idleness. The
+# rendering tests below invoke the internal ``_do_*`` methods directly so we
+# don't have to drive the flusher loop; the queue + buffering behaviour gets
+# its own dedicated set of tests further down.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_generate_proactive_message_emits_assistant_msg_with_flag() -> None:
+async def test_do_generate_ask_user_paraphrase_emits_assistant_msg_with_flag() -> None:
     received: list[dict[str, Any]] = []
 
     async def _emitter(event: dict[str, Any]) -> None:
@@ -630,7 +636,7 @@ async def test_generate_proactive_message_emits_assistant_msg_with_flag() -> Non
         )
         task_store.update_state(task_id, "waiting_input")
 
-        await orchestrator.generate_proactive_message(task_id, "ask_user")
+        await orchestrator._do_generate_ask_user_paraphrase(task_id)
     finally:
         ws_events.set_emitter(None)
 
@@ -661,7 +667,7 @@ async def test_generate_proactive_message_emits_assistant_msg_with_flag() -> Non
 
 
 @pytest.mark.asyncio
-async def test_generate_proactive_message_unknown_task_is_silent() -> None:
+async def test_do_generate_ask_user_paraphrase_unknown_task_is_silent() -> None:
     received: list[dict[str, Any]] = []
 
     async def _emitter(event: dict[str, Any]) -> None:
@@ -670,7 +676,7 @@ async def test_generate_proactive_message_unknown_task_is_silent() -> None:
     ws_events.set_emitter(_emitter)
     try:
         orchestrator, _jc, _sub, _js, _ts, _scheduler = _make_orchestrator()
-        await orchestrator.generate_proactive_message("missing", "ask_user")
+        await orchestrator._do_generate_ask_user_paraphrase("missing")
     finally:
         ws_events.set_emitter(None)
 
@@ -678,7 +684,151 @@ async def test_generate_proactive_message_unknown_task_is_silent() -> None:
 
 
 @pytest.mark.asyncio
-async def test_generate_proactive_message_non_ask_user_kind_noops() -> None:
+async def test_generate_proactive_message_unknown_kind_does_not_enqueue() -> None:
+    """Only ``ask_user`` and ``done`` are accepted; anything else is dropped."""
+
+    received: list[dict[str, Any]] = []
+
+    async def _emitter(event: dict[str, Any]) -> None:
+        received.append(event)
+
+    ws_events.set_emitter(_emitter)
+    try:
+        orchestrator, _jc, _sub, _js, _ts, _scheduler = _make_orchestrator()
+        await orchestrator.generate_proactive_message("anything", "progress")
+    finally:
+        ws_events.set_emitter(None)
+
+    assert received == []
+    assert orchestrator._proactive_queue.qsize() == 0
+
+
+# ---------------------------------------------------------------------------
+# generate_done_synthesis (slice #0025)
+# ---------------------------------------------------------------------------
+
+
+def _seed_done_task(task_store: TaskStore, *, title: str, result: str) -> str:
+    """Helper: create a task in ``done`` state with ``result`` set."""
+
+    task_id = task_store.create_task(title=title, goal="g")
+    task_store.update_state(task_id, "running")
+    task_store.set_result(task_id, result)
+    task_store.update_state(task_id, "done")
+    return task_id
+
+
+@pytest.mark.asyncio
+async def test_do_generate_done_synthesis_emits_assistant_msg_with_flag() -> None:
+    """Direct invocation of ``_do_generate_done_synthesis`` emits the WS event."""
+
+    received: list[dict[str, Any]] = []
+
+    async def _emitter(event: dict[str, Any]) -> None:
+        received.append(event)
+
+    ws_events.set_emitter(_emitter)
+    try:
+        orchestrator, jarvis_client, _sub, jarvis_store, task_store, _scheduler = (
+            _make_orchestrator(
+                chat_responses=["La recherche est finie. En résumé : 3 papiers pertinents."],
+            )
+        )
+        task_id = _seed_done_task(
+            task_store, title="Recherche papier RAG", result="3 résultats trouvés"
+        )
+
+        await orchestrator._do_generate_done_synthesis(task_id)
+    finally:
+        ws_events.set_emitter(None)
+
+    assert len(received) == 1
+    event = received[0]
+    assert event["type"] == "assistant_msg"
+    assert event["proactive"] is True
+    assert event["speech"] == "La recherche est finie. En résumé : 3 papiers pertinents."
+    assert event["ui"] == []
+    assert isinstance(event["msg_id"], str) and len(event["msg_id"]) == 32
+
+    # Prompt referenced the task title + raw result text.
+    chat_messages = jarvis_client.chat_calls[0]["messages"]
+    user_msg = chat_messages[-1]
+    assert user_msg["role"] == "user"
+    assert "Recherche papier RAG" in user_msg["content"]
+    assert "3 résultats trouvés" in user_msg["content"]
+    assert "2-3 lignes" in user_msg["content"]
+
+    # Persisted in history so the user's next turn sees it.
+    history = jarvis_store.history()
+    assert history[-1] == {
+        "role": "assistant",
+        "content": "La recherche est finie. En résumé : 3 papiers pertinents.",
+    }
+
+
+@pytest.mark.asyncio
+async def test_do_generate_done_synthesis_unknown_task_is_silent() -> None:
+    received: list[dict[str, Any]] = []
+
+    async def _emitter(event: dict[str, Any]) -> None:
+        received.append(event)
+
+    ws_events.set_emitter(_emitter)
+    try:
+        orchestrator, _jc, _sub, _js, _ts, _scheduler = _make_orchestrator()
+        await orchestrator._do_generate_done_synthesis("missing")
+    finally:
+        ws_events.set_emitter(None)
+
+    assert received == []
+
+
+@pytest.mark.asyncio
+async def test_do_generate_done_synthesis_handles_empty_result() -> None:
+    """A task without a stored result still synthesises (empty string fed in)."""
+
+    received: list[dict[str, Any]] = []
+
+    async def _emitter(event: dict[str, Any]) -> None:
+        received.append(event)
+
+    ws_events.set_emitter(_emitter)
+    try:
+        orchestrator, _jc, _sub, _js, task_store, _scheduler = _make_orchestrator(
+            chat_responses=["C'est terminé."],
+        )
+        # No set_result → ``result`` is None on the row.
+        task_id = task_store.create_task(title="T", goal="g")
+        task_store.update_state(task_id, "running")
+        task_store.update_state(task_id, "done")
+        await orchestrator._do_generate_done_synthesis(task_id)
+    finally:
+        ws_events.set_emitter(None)
+
+    assert len(received) == 1
+    assert received[0]["speech"] == "C'est terminé."
+
+
+# ---------------------------------------------------------------------------
+# Proactive queue + buffer race conditions (slice #0025)
+# ---------------------------------------------------------------------------
+
+
+async def _wait_until(predicate: Callable[[], bool], timeout: float = 1.0) -> bool:
+    """Spin until ``predicate()`` is truthy, or return False after ``timeout``."""
+
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        if predicate():
+            return True
+        await asyncio.sleep(0.01)
+    return bool(predicate())
+
+
+@pytest.mark.asyncio
+async def test_generate_proactive_message_enqueues_event() -> None:
+    """``generate_proactive_message`` puts a tuple on the queue (no immediate emit)."""
+
     received: list[dict[str, Any]] = []
 
     async def _emitter(event: dict[str, Any]) -> None:
@@ -687,15 +837,168 @@ async def test_generate_proactive_message_non_ask_user_kind_noops() -> None:
     ws_events.set_emitter(_emitter)
     try:
         orchestrator, _jc, _sub, _js, task_store, _scheduler = _make_orchestrator()
-        task_id = task_store.create_task(title="t", goal="g")
-        task_store.update_state(task_id, "running")
-        task_store.set_result(task_id, "r")
-        task_store.update_state(task_id, "done")
+        task_id = _seed_done_task(task_store, title="T", result="r")
+        # Loop not started — the event sits in the queue.
         await orchestrator.generate_proactive_message(task_id, "done")
     finally:
         ws_events.set_emitter(None)
 
     assert received == []
+    assert orchestrator._proactive_queue.qsize() == 1
+    queued_id, queued_kind = await orchestrator._proactive_queue.get()
+    assert queued_id == task_id
+    assert queued_kind == "done"
+
+
+@pytest.mark.asyncio
+async def test_proactive_loop_buffers_while_thinking_then_flushes_when_idle() -> None:
+    """Race condition: an event enqueued while ``_jarvis_state="thinking"`` is held."""
+
+    received: list[dict[str, Any]] = []
+
+    async def _emitter(event: dict[str, Any]) -> None:
+        received.append(event)
+
+    ws_events.set_emitter(_emitter)
+    try:
+        orchestrator, _jc, _sub, _js, task_store, _scheduler = _make_orchestrator(
+            chat_responses=["Synthèse OK."],
+        )
+        task_id = _seed_done_task(task_store, title="T", result="r")
+
+        # Simulate Jarvis being mid-turn.
+        orchestrator._jarvis_state = "thinking"
+        orchestrator.start_proactive_loop()
+        try:
+            await orchestrator.generate_proactive_message(task_id, "done")
+
+            # Give the flusher a couple of ticks; nothing should land yet
+            # because state is still "thinking".
+            await asyncio.sleep(0.15)
+            assert received == []
+
+            # Flip to idle → the flusher unblocks and emits.
+            orchestrator._jarvis_state = "idle"
+            flushed = await _wait_until(lambda: len(received) == 1)
+            assert flushed
+            assert received[0]["proactive"] is True
+            assert received[0]["speech"] == "Synthèse OK."
+        finally:
+            await orchestrator.stop_proactive_loop()
+    finally:
+        ws_events.set_emitter(None)
+
+
+@pytest.mark.asyncio
+async def test_proactive_loop_respects_user_typing_then_flushes_on_reset() -> None:
+    """User typing buffers the event; flush happens after ``set_user_typing(False)``."""
+
+    received: list[dict[str, Any]] = []
+
+    async def _emitter(event: dict[str, Any]) -> None:
+        received.append(event)
+
+    ws_events.set_emitter(_emitter)
+    try:
+        orchestrator, _jc, _sub, _js, task_store, _scheduler = _make_orchestrator(
+            chat_responses=["Synthèse OK."],
+        )
+        task_id = _seed_done_task(task_store, title="T", result="r")
+
+        # The user is typing — buffer should hold.
+        orchestrator.set_user_typing(True)
+        orchestrator.start_proactive_loop()
+        try:
+            await orchestrator.generate_proactive_message(task_id, "done")
+            await asyncio.sleep(0.15)
+            assert received == []
+
+            # Stop typing → flush within a couple of poll cycles.
+            orchestrator.set_user_typing(False)
+            flushed = await _wait_until(lambda: len(received) == 1)
+            assert flushed
+            assert received[0]["speech"] == "Synthèse OK."
+        finally:
+            await orchestrator.stop_proactive_loop()
+    finally:
+        ws_events.set_emitter(None)
+
+
+@pytest.mark.asyncio
+async def test_proactive_loop_flushes_fifo_when_idle() -> None:
+    """Two enqueued events come out FIFO once the gate opens."""
+
+    received: list[dict[str, Any]] = []
+
+    async def _emitter(event: dict[str, Any]) -> None:
+        received.append(event)
+
+    ws_events.set_emitter(_emitter)
+    try:
+        orchestrator, _jc, _sub, _js, task_store, _scheduler = _make_orchestrator(
+            chat_responses=["First done.", "Second done."],
+        )
+        first = _seed_done_task(task_store, title="First", result="r1")
+        second = _seed_done_task(task_store, title="Second", result="r2")
+
+        orchestrator._jarvis_state = "thinking"
+        orchestrator.start_proactive_loop()
+        try:
+            await orchestrator.generate_proactive_message(first, "done")
+            await orchestrator.generate_proactive_message(second, "done")
+            await asyncio.sleep(0.1)
+            assert received == []
+
+            orchestrator._jarvis_state = "idle"
+            flushed = await _wait_until(lambda: len(received) == 2, timeout=2.0)
+            assert flushed
+            assert [e["speech"] for e in received] == ["First done.", "Second done."]
+        finally:
+            await orchestrator.stop_proactive_loop()
+    finally:
+        ws_events.set_emitter(None)
+
+
+@pytest.mark.asyncio
+async def test_set_user_typing_auto_resets_after_grace_window(monkeypatch: Any) -> None:
+    """A True typing flag flips back to False on its own after the debounce."""
+
+    from bob import orchestrator as orch_module
+
+    # Shrink the grace window so the test stays fast.
+    monkeypatch.setattr(orch_module, "_USER_TYPING_GRACE_S", 0.05)
+
+    orchestrator, _jc, _sub, _js, _ts, _scheduler = _make_orchestrator()
+    orchestrator.set_user_typing(True)
+    assert orchestrator._user_typing is True
+    await asyncio.sleep(0.15)
+    assert orchestrator._user_typing is False
+
+
+@pytest.mark.asyncio
+async def test_process_user_message_sets_thinking_then_idle() -> None:
+    """The user-turn entry point flips state to ``thinking`` and back to ``idle``."""
+
+    orchestrator, _jc, _sub, _js, _ts, _scheduler = _make_orchestrator(
+        complete_responses=[LLMResponse(text="just chatting", tool_calls=[])],
+        chat_responses=[_valid_payload("ok")],
+    )
+    assert orchestrator._jarvis_state == "idle"
+    await orchestrator.process_user_message("s1", "hi")
+    # Back to idle after the turn returns.
+    assert orchestrator._jarvis_state == "idle"
+
+
+@pytest.mark.asyncio
+async def test_process_user_message_resets_state_on_exception() -> None:
+    """Errors raised by the LLM still reset ``_jarvis_state`` via the finally clause."""
+
+    orchestrator, _jc, _sub, _js, _ts, _scheduler = _make_orchestrator(
+        complete_responses=[],  # FakeLLMClient.complete will raise AssertionError
+    )
+    with pytest.raises(AssertionError):
+        await orchestrator.process_user_message("s1", "hi")
+    assert orchestrator._jarvis_state == "idle"
 
 
 # ---------------------------------------------------------------------------

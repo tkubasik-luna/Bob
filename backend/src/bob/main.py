@@ -26,6 +26,7 @@ import structlog
 from fastapi import FastAPI
 
 from bob import jarvis_store as jarvis_store_module
+from bob import orchestrator as orchestrator_module
 from bob import task_scheduler as task_scheduler_module
 from bob import task_store as task_store_module
 from bob.config import get_settings
@@ -92,11 +93,16 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     task_scheduler_module.set_default_scheduler(scheduler)
     await scheduler.recover_after_restart()
 
-    # EventBus + proactivity wiring (slice #0021). The bus is process-wide;
-    # the handler is built lazily — it resolves the orchestrator each time so
-    # tests that swap singletons inside the lifespan still see fresh state.
+    # EventBus + proactivity wiring (slice #0021, #0025). The bus is
+    # process-wide; the handler resolves the orchestrator each call so tests
+    # that swap singletons inside the lifespan still see fresh state. Slice
+    # #0025 makes the orchestrator a true singleton so its proactive queue +
+    # typing flag are shared across the WS handler and the bus subscriber;
+    # the flusher runs as a background task for the whole lifespan.
     bus = EventBus()
     set_event_bus(bus)
+    orchestrator = get_default_orchestrator()
+    orchestrator.start_proactive_loop()
     proactivity = ProactivityHandler(orchestrator_factory=get_default_orchestrator)
     bus.subscribe("task_state_changed", proactivity.on_task_state_changed)
 
@@ -121,6 +127,8 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        await orchestrator.stop_proactive_loop()
+        orchestrator_module.set_default_orchestrator(None)
         set_event_bus(None)
         task_scheduler_module.set_default_scheduler(None)
         task_store_module.set_default_store(None)

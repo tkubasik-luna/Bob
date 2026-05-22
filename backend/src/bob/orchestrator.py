@@ -17,11 +17,27 @@ used by the WebSocket layer and the smoke CLI. The orchestrator:
    structured-output path (JSON schema + ``response_parser``) so the
    server-driven UI contract from slice #0016 still applies.
 
-Slice #0021 also adds :meth:`generate_proactive_message`: when a sub-agent
+Slice #0021 added :meth:`generate_proactive_message`: when a sub-agent
 emits ``ask_user`` the :class:`ProactivityHandler` invokes this method.
 Jarvis paraphrases the raw question in his own tone and the orchestrator
 pushes a single ``assistant_msg`` with ``proactive: true`` back through the
 WS emitter — no user turn triggered it.
+
+Slice #0025 extends proactivity to ``done`` events (sub-task synthesis) and
+introduces a per-instance buffering layer so proactive pushes do not race
+with the user. Two flags gate the flush:
+
+- ``_jarvis_state`` — set to ``thinking`` while a user turn is running, back
+  to ``idle`` on exit. Buffer holds while non-idle so a paraphrased question
+  doesn't pop in front of the user's own reply.
+- ``_user_typing`` — flipped to ``true`` by ``client_typing`` WS heartbeats
+  and back to ``false`` either on the next ``client_typing=false`` or
+  automatically after 2 s of inactivity (server-side debounce).
+
+Events arriving while either flag is active queue on
+``_proactive_queue`` and flush FIFO once both clear. The background flusher
+task is started by :meth:`start_proactive_loop` (called from the FastAPI
+lifespan) and cancelled by :meth:`stop_proactive_loop`.
 
 Persistence: Jarvis history lives in a singleton
 :class:`bob.jarvis_store.JarvisStore` (SQLite-backed). ``session_id`` is
@@ -30,10 +46,12 @@ forwarded to the LLM call log only.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import uuid
 from dataclasses import dataclass, field
 from types import ModuleType
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 import structlog
 
@@ -89,6 +107,37 @@ _ASK_USER_PARAPHRASE_TEMPLATE = (
     "ton ton, en 1-2 phrases max. Ne mentionne pas le mot 'sub-agent', "
     "dis 'la tâche'."
 )
+
+
+# Slice #0025: hard-coded template used by ``generate_done_synthesis`` to
+# announce a sub-task's completion in Jarvis' tone. Same pinning rationale as
+# the ask_user paraphrase — no jarvis.md tuning, ships deterministically.
+_DONE_SYNTHESIS_TEMPLATE = (
+    "La sous-tâche '{task_title}' vient de terminer. "
+    "Résultat brut : '{result}'. "
+    "Annonce-le à l'utilisateur dans ton ton, en 2-3 lignes max. "
+    "Résume les points clés, propose une suite si pertinent."
+)
+
+
+# Debounce window before ``_user_typing`` falls back to false on its own. The
+# frontend already debounces keystrokes at 500ms, but a network hiccup could
+# drop the trailing ``client_typing=false`` — we don't want a proactive push
+# to stay queued forever.
+_USER_TYPING_GRACE_S = 2.0
+
+# Polling cadence used by the flusher while waiting for ``_jarvis_state`` and
+# ``_user_typing`` to clear. Small enough to feel instant; the loop only ever
+# spins after pulling an event from the queue.
+_FLUSH_POLL_INTERVAL_S = 0.05
+
+
+# Event kinds accepted by the proactive queue. The literal is exposed so
+# call sites (handler + tests) cannot smuggle in a typo.
+ProactiveEventKind = Literal["ask_user", "done"]
+
+
+JarvisState = Literal["idle", "thinking"]
 
 
 _SPAWN_SUBTASK_TOOL = ToolDefinition(
@@ -232,6 +281,16 @@ class Orchestrator:
         self._prompts = prompts
         self._ui_registry = ui_registry
 
+        # Slice #0025 — proactive buffering layer. The queue + flusher live
+        # on the instance so tests can build an Orchestrator without auto-
+        # starting the loop (and drain manually). Production wiring calls
+        # ``start_proactive_loop()`` from the FastAPI lifespan.
+        self._jarvis_state: JarvisState = "idle"
+        self._user_typing: bool = False
+        self._proactive_queue: asyncio.Queue[tuple[str, ProactiveEventKind]] = asyncio.Queue()
+        self._flusher_task: asyncio.Task[None] | None = None
+        self._typing_reset_task: asyncio.Task[None] | None = None
+
     async def process_user_message(
         self,
         session_id: str,
@@ -239,80 +298,203 @@ class Orchestrator:
     ) -> OrchestratorResponse:
         """Run one full turn — may spawn 0..N sub-tasks or forward to one before replying."""
 
-        self._jarvis_store.append("user", user_content)
+        self._jarvis_state = "thinking"
+        try:
+            self._jarvis_store.append("user", user_content)
 
-        system_content = self._build_system_prompt()
-        waiting_context = self._build_waiting_input_addendum()
-        history = self._jarvis_store.history()
-        complete_system = system_content + _TOOLS_SYSTEM_ADDENDUM + waiting_context
-        messages: list[dict[str, Any]] = [
-            {"role": "system", "content": complete_system},
-            *({"role": m["role"], "content": m["content"]} for m in history),
-        ]
+            system_content = self._build_system_prompt()
+            waiting_context = self._build_waiting_input_addendum()
+            history = self._jarvis_store.history()
+            complete_system = system_content + _TOOLS_SYSTEM_ADDENDUM + waiting_context
+            messages: list[dict[str, Any]] = [
+                {"role": "system", "content": complete_system},
+                *({"role": m["role"], "content": m["content"]} for m in history),
+            ]
 
-        decision = await self._jarvis_client.complete(
-            messages,
-            tools=[_SPAWN_SUBTASK_TOOL, _FORWARD_TO_SUBTASK_TOOL, _CANCEL_SUBTASK_TOOL],
-            session_id=session_id,
-        )
-
-        if decision.is_tool_call:
-            (
-                spawned_task_ids,
-                forwarded_task_ids,
-                cancelled_task_ids,
-            ) = await self._dispatch_tool_calls(decision.tool_calls)
-            if spawned_task_ids or forwarded_task_ids or cancelled_task_ids:
-                # Pick the speech to match the dominant action. We instruct
-                # Jarvis to pick one path so coexistence is rare; if multiple
-                # happen we prioritise the most user-visible signal: cancel
-                # → forward → spawn.
-                if cancelled_task_ids:
-                    speech = _CANCEL_CONFIRMATION
-                elif forwarded_task_ids:
-                    speech = _FORWARD_CONFIRMATION
-                else:
-                    speech = _SPAWN_CONFIRMATION
-                self._jarvis_store.append("assistant", speech)
-                return OrchestratorResponse(
-                    speech=speech,
-                    ui=[],
-                    spawned_task_ids=spawned_task_ids,
-                    forwarded_task_ids=forwarded_task_ids,
-                    cancelled_task_ids=cancelled_task_ids,
-                )
-            # All tool calls were rejected (bad args, unknown tool). Fall
-            # through to the plain-text path so the user still gets a reply.
-            _logger.warning(
-                "orchestrator.tool_call_dropped_all",
+            decision = await self._jarvis_client.complete(
+                messages,
+                tools=[_SPAWN_SUBTASK_TOOL, _FORWARD_TO_SUBTASK_TOOL, _CANCEL_SUBTASK_TOOL],
                 session_id=session_id,
-                tool_call_count=len(decision.tool_calls),
             )
 
-        return await self._reply_with_structured_response(
-            session_id=session_id,
-            base_messages=self._rebuild_chat_messages(system_content),
-        )
+            if decision.is_tool_call:
+                (
+                    spawned_task_ids,
+                    forwarded_task_ids,
+                    cancelled_task_ids,
+                ) = await self._dispatch_tool_calls(decision.tool_calls)
+                if spawned_task_ids or forwarded_task_ids or cancelled_task_ids:
+                    # Pick the speech to match the dominant action. We instruct
+                    # Jarvis to pick one path so coexistence is rare; if multiple
+                    # happen we prioritise the most user-visible signal: cancel
+                    # → forward → spawn.
+                    if cancelled_task_ids:
+                        speech = _CANCEL_CONFIRMATION
+                    elif forwarded_task_ids:
+                        speech = _FORWARD_CONFIRMATION
+                    else:
+                        speech = _SPAWN_CONFIRMATION
+                    self._jarvis_store.append("assistant", speech)
+                    return OrchestratorResponse(
+                        speech=speech,
+                        ui=[],
+                        spawned_task_ids=spawned_task_ids,
+                        forwarded_task_ids=forwarded_task_ids,
+                        cancelled_task_ids=cancelled_task_ids,
+                    )
+                # All tool calls were rejected (bad args, unknown tool). Fall
+                # through to the plain-text path so the user still gets a reply.
+                _logger.warning(
+                    "orchestrator.tool_call_dropped_all",
+                    session_id=session_id,
+                    tool_call_count=len(decision.tool_calls),
+                )
+
+            return await self._reply_with_structured_response(
+                session_id=session_id,
+                base_messages=self._rebuild_chat_messages(system_content),
+            )
+        finally:
+            self._jarvis_state = "idle"
 
     async def generate_proactive_message(self, task_id: str, event_kind: str) -> None:
-        """Push a proactive ``assistant_msg`` paraphrasing a sub-agent event.
+        """Enqueue a proactive Jarvis push for ``task_id``.
 
-        Slice #0021 only handles ``event_kind="ask_user"``. The runner has
-        already persisted the question on the task; we look it up, ask Jarvis
-        to paraphrase it, append the paraphrase to the singleton thread, and
-        emit a WS ``assistant_msg`` with ``proactive: true``.
+        Slice #0021 handled ``ask_user``. Slice #0025 adds ``done`` and routes
+        both kinds through ``_proactive_queue`` so the flusher can defer
+        emission while the user is mid-turn (``_jarvis_state="thinking"``) or
+        typing (``_user_typing=True``).
 
-        Errors (unknown task, missing question, LLM failure) are logged and
-        swallowed — proactivity must never crash the producer subscriber.
+        Errors at render time (unknown task, missing question, LLM failure,
+        empty output) are logged and swallowed inside the renderers —
+        proactivity must never crash the producer subscriber.
         """
 
-        if event_kind != "ask_user":
+        if event_kind not in ("ask_user", "done"):
             _logger.info(
                 "orchestrator.proactive_event_ignored",
                 task_id=task_id,
                 event_kind=event_kind,
             )
             return
+
+        kind: ProactiveEventKind = event_kind  # type: ignore[assignment]
+        await self._proactive_queue.put((task_id, kind))
+        _logger.debug(
+            "orchestrator.proactive_enqueued",
+            task_id=task_id,
+            event_kind=event_kind,
+            queue_size=self._proactive_queue.qsize(),
+        )
+
+    async def generate_done_synthesis(self, task_id: str) -> None:
+        """Public wrapper for slice #0025: enqueue a ``done`` synthesis.
+
+        Kept distinct from :meth:`generate_proactive_message` so call sites
+        (and tests) can be explicit about what they want. Under the hood it
+        just delegates to the unified queue path.
+        """
+
+        await self.generate_proactive_message(task_id, "done")
+
+    # --- Proactive flusher ---------------------------------------------------
+
+    def start_proactive_loop(self) -> None:
+        """Start the background flusher that drains ``_proactive_queue``.
+
+        Idempotent: a second call is a no-op while the previous task is
+        still alive. Called from the FastAPI lifespan once the orchestrator
+        singleton is wired; tests can call it explicitly when they need the
+        loop, otherwise they invoke ``_do_*`` directly.
+        """
+
+        if self._flusher_task is not None and not self._flusher_task.done():
+            return
+        self._flusher_task = asyncio.create_task(self._flush_proactive_loop())
+
+    async def stop_proactive_loop(self) -> None:
+        """Cancel the background flusher (and any pending typing reset)."""
+
+        task = self._flusher_task
+        self._flusher_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+        reset = self._typing_reset_task
+        self._typing_reset_task = None
+        if reset is not None and not reset.done():
+            reset.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await reset
+
+    def set_user_typing(self, value: bool) -> None:
+        """Update the typing flag (with a 2s grace timer on the True path).
+
+        Called from the WS layer when a ``client_typing`` event arrives.
+        Setting True schedules an auto-reset to False after
+        :data:`_USER_TYPING_GRACE_S` so a missing trailing False (network
+        hiccup, browser tab killed mid-typing) cannot starve the queue.
+        Each True restarts the timer.
+        """
+
+        self._user_typing = value
+        # Cancel any pending reset; we'll reschedule below if value is True.
+        reset = self._typing_reset_task
+        self._typing_reset_task = None
+        if reset is not None and not reset.done():
+            reset.cancel()
+
+        if value:
+            try:
+                self._typing_reset_task = asyncio.create_task(self._auto_reset_typing())
+            except RuntimeError:
+                # No running loop (sync call sites in narrow tests). The
+                # flag is still honoured for the next flusher pass; manual
+                # reset via ``set_user_typing(False)`` is always available.
+                self._typing_reset_task = None
+
+    async def _auto_reset_typing(self) -> None:
+        """Reset ``_user_typing`` to False after the grace window."""
+
+        try:
+            await asyncio.sleep(_USER_TYPING_GRACE_S)
+        except asyncio.CancelledError:
+            return
+        self._user_typing = False
+        self._typing_reset_task = None
+
+    async def _flush_proactive_loop(self) -> None:
+        """Drain ``_proactive_queue`` FIFO, gating each event on user idleness."""
+
+        while True:
+            try:
+                task_id, kind = await self._proactive_queue.get()
+            except asyncio.CancelledError:
+                return
+            try:
+                # Park until Jarvis is idle AND the user has stopped typing.
+                # Polling is cheap (50ms) and only happens while there's an
+                # event to flush; the rest of the time the loop is parked on
+                # ``queue.get()``.
+                while self._jarvis_state != "idle" or self._user_typing:
+                    await asyncio.sleep(_FLUSH_POLL_INTERVAL_S)
+
+                if kind == "ask_user":
+                    await self._do_generate_ask_user_paraphrase(task_id)
+                else:
+                    await self._do_generate_done_synthesis(task_id)
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                _logger.exception(
+                    "orchestrator.proactive_flush_failed",
+                    task_id=task_id,
+                    event_kind=kind,
+                )
+
+    async def _do_generate_ask_user_paraphrase(self, task_id: str) -> None:
+        """Synthesise + push the paraphrased ``ask_user`` question for ``task_id``."""
 
         try:
             task = self._task_store.get_task(task_id)
@@ -335,27 +517,59 @@ class Orchestrator:
             task_title=task.title,
             raw_question=question,
         )
+        text = await self._render_proactive_text(task_id, prompt)
+        if text is None:
+            return
+        await self._push_proactive_assistant_msg(text)
+
+    async def _do_generate_done_synthesis(self, task_id: str) -> None:
+        """Synthesise + push the ``done`` announcement for ``task_id``."""
+
+        try:
+            task = self._task_store.get_task(task_id)
+        except TaskStoreError:
+            _logger.warning(
+                "orchestrator.proactive_task_missing",
+                task_id=task_id,
+            )
+            return
+
+        result_text = task.result if task.result is not None else ""
+        prompt = _DONE_SYNTHESIS_TEMPLATE.format(
+            task_title=task.title,
+            result=result_text,
+        )
+        text = await self._render_proactive_text(task_id, prompt)
+        if text is None:
+            return
+        await self._push_proactive_assistant_msg(text)
+
+    async def _render_proactive_text(self, task_id: str, prompt: str) -> str | None:
+        """Run a single-turn chat() and return the trimmed text (or None)."""
+
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": self._jarvis_prompt},
             {"role": "user", "content": prompt},
         ]
-
         try:
-            paraphrased = await self._jarvis_client.chat(messages, session_id=task_id)
+            raw = await self._jarvis_client.chat(messages, session_id=task_id)
         except Exception:
             _logger.exception(
                 "orchestrator.proactive_llm_failed",
                 task_id=task_id,
             )
-            return
-
-        text = paraphrased.strip()
+            return None
+        text = raw.strip()
         if not text:
             _logger.warning(
-                "orchestrator.proactive_empty_paraphrase",
+                "orchestrator.proactive_empty_text",
                 task_id=task_id,
             )
-            return
+            return None
+        return text
+
+    async def _push_proactive_assistant_msg(self, text: str) -> None:
+        """Persist ``text`` in the Jarvis thread and emit the WS event."""
 
         # Persist in the singleton thread so the next user turn sees it as
         # part of the conversation history.
@@ -621,23 +835,49 @@ class Orchestrator:
         )
 
 
+# Process-wide singleton. Slice #0025 turns the per-call factory into a true
+# cached instance so the WS layer, the proactivity handler and the lifespan
+# all share the same ``_jarvis_state`` / ``_user_typing`` / queue state.
+# ``set_default_orchestrator`` is exposed for tests so they can install a
+# narrow double when needed.
+_DEFAULT_ORCHESTRATOR: Orchestrator | None = None
+
+
+def set_default_orchestrator(orchestrator: Orchestrator | None) -> None:
+    """Install (or clear) the process-wide singleton :class:`Orchestrator`."""
+
+    global _DEFAULT_ORCHESTRATOR
+    _DEFAULT_ORCHESTRATOR = orchestrator
+
+
 def get_default_orchestrator() -> Orchestrator:
-    """Build an :class:`Orchestrator` wired with runtime defaults.
+    """Return the cached :class:`Orchestrator` singleton, building it on first use.
+
+    The instance is cached so the WS handler, the proactivity handler and
+    the lifespan flusher all share the same buffering state. Tests that need
+    a clean slate can call :func:`set_default_orchestrator(None)` to discard
+    the cached instance, or install a narrow double directly.
 
     Relies on the singletons primed by :func:`bob.main.lifespan` — the
     :class:`TaskStore`, the :class:`TaskScheduler` (already wired with its
     sub-agent runner factory at boot), and the Jarvis prompt loader. Tests
-    that bypass the lifespan should use the DI constructor directly.
+    that bypass the lifespan should use the DI constructor directly and
+    install the result via :func:`set_default_orchestrator`.
     """
+
+    global _DEFAULT_ORCHESTRATOR
+    if _DEFAULT_ORCHESTRATOR is not None:
+        return _DEFAULT_ORCHESTRATOR
 
     from bob.jarvis_prompt_loader import load_jarvis_prompt
     from bob.llm.factory import build_jarvis_client
 
     settings = get_settings()
-    return Orchestrator(
+    _DEFAULT_ORCHESTRATOR = Orchestrator(
         jarvis_client=build_jarvis_client(settings),
         jarvis_store=jarvis_store_module.get_default_store(),
         task_store=task_store_module.get_default_store(),
         task_scheduler=task_scheduler.get_default_scheduler(),
         jarvis_prompt=load_jarvis_prompt(settings.BOB_DATA_DIR),
     )
+    return _DEFAULT_ORCHESTRATOR

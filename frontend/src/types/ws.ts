@@ -43,7 +43,22 @@ export type CancelTaskMsg = {
   task_id: string;
 };
 
-export type ClientMessage = UserMsg | DismissTaskMsg | RequestTaskMessagesMsg | CancelTaskMsg;
+/** Slice #0025 — heartbeat indicating whether the user is currently
+ * composing a message. Frontend debounces keystrokes (500 ms) and sends
+ * `true` on first keystroke + `false` on inactivity or submit. The backend
+ * holds proactive Jarvis pushes (paraphrased questions, done synthesis)
+ * while typing is true so they don't pop in front of the user's reply. */
+export type ClientTypingMsg = {
+  type: "client_typing";
+  typing: boolean;
+};
+
+export type ClientMessage =
+  | UserMsg
+  | DismissTaskMsg
+  | RequestTaskMessagesMsg
+  | CancelTaskMsg
+  | ClientTypingMsg;
 
 // Server → client
 export type SessionMsg = {

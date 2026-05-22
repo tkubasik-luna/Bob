@@ -1,4 +1,11 @@
-import { type KeyboardEvent, useCallback, useEffect, useRef, useState } from "react";
+import {
+  type ChangeEvent,
+  type KeyboardEvent,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 import {
   enqueue as audioEnqueue,
   stop as audioStop,
@@ -177,10 +184,59 @@ export function ChatView() {
   const trimmed = input.trim();
   const canSend = trimmed.length > 0 && status === "open";
 
+  // Slice #0025 — typing heartbeat. We send `client_typing: true` on the
+  // first keystroke of a fresh composition, then `false` after 500 ms of
+  // inactivity (or on submit). The backend holds proactive Jarvis pushes
+  // while typing is true so they don't interrupt the user mid-thought.
+  const typingActiveRef = useRef(false);
+  const typingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const clearTypingTimer = useCallback(() => {
+    if (typingTimerRef.current !== null) {
+      clearTimeout(typingTimerRef.current);
+      typingTimerRef.current = null;
+    }
+  }, []);
+
+  const stopTyping = useCallback(() => {
+    clearTypingTimer();
+    if (typingActiveRef.current) {
+      typingActiveRef.current = false;
+      send({ type: "client_typing", typing: false });
+    }
+  }, [clearTypingTimer, send]);
+
+  const noteTyping = useCallback(() => {
+    if (!typingActiveRef.current) {
+      typingActiveRef.current = true;
+      send({ type: "client_typing", typing: true });
+    }
+    clearTypingTimer();
+    typingTimerRef.current = setTimeout(() => {
+      typingTimerRef.current = null;
+      typingActiveRef.current = false;
+      send({ type: "client_typing", typing: false });
+    }, 500);
+  }, [clearTypingTimer, send]);
+
+  // Drop any pending timer on unmount so we don't leak it across reloads.
+  useEffect(() => clearTypingTimer, [clearTypingTimer]);
+
+  const onInputChange = (e: ChangeEvent<HTMLTextAreaElement>) => {
+    const next = e.target.value;
+    setInput(next);
+    if (next.length === 0) {
+      stopTyping();
+    } else {
+      noteTyping();
+    }
+  };
+
   const submit = () => {
     if (!canSend) return;
     addUserMessage(trimmed);
     send({ type: "user_msg", content: trimmed, ...(voiceEnabled ? { voice: true } : {}) });
+    stopTyping();
     setInput("");
   };
 
@@ -220,7 +276,7 @@ export function ChatView() {
           <div className="mx-auto flex max-w-2xl items-end gap-2">
             <textarea
               value={input}
-              onChange={(e) => setInput(e.target.value)}
+              onChange={onInputChange}
               onKeyDown={onKeyDown}
               rows={2}
               placeholder="Écris un message à Bob…"
