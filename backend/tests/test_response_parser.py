@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+from bob.llm.types import LLMResponse, ToolDefinition
 from bob.llm_client import LLMClient
 from bob.response_parser import parse
 
@@ -28,6 +29,14 @@ class FakeLLMClient(LLMClient):
         if not self._responses:
             raise AssertionError("FakeLLMClient ran out of canned responses")
         return self._responses.pop(0)
+
+    async def complete(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[ToolDefinition] | None = None,
+        session_id: str | None = None,
+    ) -> LLMResponse:
+        raise NotImplementedError("FakeLLMClient does not exercise complete()")
 
 
 def _valid_payload_str() -> str:

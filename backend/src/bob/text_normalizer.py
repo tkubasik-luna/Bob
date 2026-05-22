@@ -78,10 +78,7 @@ _INVISIBLE_SPACE_RE = re.compile(
 )
 
 # Decorative punctuation → comma.
-_DECORATIVE_RE = re.compile(
-    "[•·●◦▪■□◆◇"
-    "►▶▸‣⁃]"
-)
+_DECORATIVE_RE = re.compile("[•·●◦▪■□◆◇►▶▸‣⁃]")
 
 # Safe character set: word chars (incl. unicode letters/digits), whitespace,
 # and the punctuation espeak/misaki handle reliably + currency / parens.

@@ -37,7 +37,7 @@ Copy `.env.example` to `.env` at repo root.
 
 Two LLM backends:
 
-- `LLM_PROVIDER=lm_studio` (default) — OpenAI-compatible HTTP endpoint. Set `LLM_BASE_URL`, `LLM_MODEL`, `LLM_API_KEY`.
+- `LLM_PROVIDER=lm_studio` (default) — OpenAI-compatible HTTP endpoint. Set `LLM_BASE_URL`, `LLM_MODEL`, `LLM_API_KEY`. The LM Studio model must support function calling (e.g. Qwen2.5, Llama 3.1 Instruct) for the `LLMClient.complete()` tool-calling API.
 - `LLM_PROVIDER=claude_cli` — shells out to the `claude` CLI in `-p` mode. Requires `claude` on `PATH` (or `CLAUDE_CLI_BIN=/path/to/claude`). Optional `CLAUDE_CLI_MODEL` (e.g. `sonnet`, `opus`).
 
 `scripts/dev.sh` includes an interactive provider picker (rewrites `LLM_PROVIDER` in `.env`). Non-interactive override: `BOB_PROVIDER=claude_cli ./scripts/dev.sh`, or flags `--lm` / `--claude` / `--provider=<value>`.
