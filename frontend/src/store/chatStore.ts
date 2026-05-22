@@ -5,6 +5,9 @@ import type {
   ConnectionStatus,
   Task,
   TaskCreatedMsg,
+  TaskMessage,
+  TaskMessageMsg,
+  TaskMessagesSnapshotMsg,
   TaskResultMsg,
   TaskUpdatedMsg,
 } from "../types/ws";
@@ -41,6 +44,13 @@ type ChatState = {
   /** Sub-tasks driven by `task_*` WS events (slice #0019). Keyed by id so
    * each event is an idempotent upsert. */
   tasks: Record<string, Task>;
+  /** Slice #0024 — per-task transcript cache. Populated by snapshot replies
+   * and merged on every `task_message` live event (dedupe by `id`). Lives
+   * on the store so the drawer can read it reactively. */
+  taskMessages: Record<string, TaskMessage[]>;
+  /** Slice #0024 — id of the task whose drawer is currently open, or `null`
+   * when the drawer is closed. */
+  openTaskId: string | null;
   addUserMessage: (content: string) => void;
   /** Add an assistant message. When `msgId` is provided (server-issued
    * id from the `assistant_msg` frame) it is used as the React key AND as
@@ -68,6 +78,17 @@ type ChatState = {
   upsertTaskUpdated: (msg: TaskUpdatedMsg) => void;
   /** Persist the final result payload on a task; never changes state. */
   setTaskResult: (msg: TaskResultMsg) => void;
+  /** Slice #0024 — drop the task from the in-memory map (sidebar hide).
+   * Backend persistence is the WS event the caller fires alongside this. */
+  dismissTask: (taskId: string) => void;
+  /** Slice #0024 — open the drawer on a specific task, or close it (`null`). */
+  openTask: (taskId: string | null) => void;
+  /** Slice #0024 — replace the cached transcript for a task with the
+   * server-provided snapshot. */
+  setTaskMessagesSnapshot: (msg: TaskMessagesSnapshotMsg) => void;
+  /** Slice #0024 — append a live message to a task's cached transcript.
+   * Dedupes by `message_id` so re-running the snapshot fetch is safe. */
+  appendTaskMessage: (msg: TaskMessageMsg) => void;
 };
 
 function randomId(): string {
@@ -86,6 +107,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
   toasts: [],
   speakingMsgId: null,
   tasks: {},
+  taskMessages: {},
+  openTaskId: null,
   addUserMessage: (content) =>
     set((state) => ({
       messages: [...state.messages, { id: randomId(), role: "user", content }],
@@ -164,6 +187,43 @@ export const useChatStore = create<ChatState>((set, get) => ({
         tasks: {
           ...state.tasks,
           [msg.task_id]: { ...existing, result: msg.result },
+        },
+      };
+    }),
+  dismissTask: (taskId) =>
+    set((state) => {
+      // Slice #0024 — hide the card from the sidebar without losing the
+      // backend row. The drawer auto-closes if it was showing this task,
+      // and we keep the cached transcript around in case the user wants
+      // to inspect it again later (the backend row survives).
+      if (!(taskId in state.tasks) && state.openTaskId !== taskId) return state;
+      const { [taskId]: _removed, ...rest } = state.tasks;
+      return {
+        tasks: rest,
+        openTaskId: state.openTaskId === taskId ? null : state.openTaskId,
+      };
+    }),
+  openTask: (openTaskId) => set({ openTaskId }),
+  setTaskMessagesSnapshot: (msg) =>
+    set((state) => ({
+      taskMessages: { ...state.taskMessages, [msg.task_id]: msg.messages },
+    })),
+  appendTaskMessage: (msg) =>
+    set((state) => {
+      const existing = state.taskMessages[msg.task_id] ?? [];
+      // Dedupe by `id` so a snapshot + live message round-trip is idempotent.
+      if (existing.some((m) => m.id === msg.message_id)) return state;
+      const next: TaskMessage = {
+        id: msg.message_id,
+        role: msg.role,
+        content: msg.content,
+        action: msg.action,
+        created_at: msg.created_at,
+      };
+      return {
+        taskMessages: {
+          ...state.taskMessages,
+          [msg.task_id]: [...existing, next],
         },
       };
     }),

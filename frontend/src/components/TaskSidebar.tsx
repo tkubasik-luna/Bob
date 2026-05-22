@@ -1,7 +1,12 @@
 import { useMemo } from "react";
 import { useChatStore } from "../store/chatStore";
-import type { Task } from "../types/ws";
+import type { ClientMessage, Task } from "../types/ws";
 import { TaskCard } from "./TaskCard";
+
+type Props = {
+  /** Send a WS event upstream — `ChatView` plumbs this from `useWebSocket`. */
+  onSend: (msg: ClientMessage) => void;
+};
 
 /**
  * Right-hand panel showing every live sub-task. Reads `tasks` from the
@@ -10,13 +15,28 @@ import { TaskCard } from "./TaskCard";
  * Ordering: chronological (oldest first) so a new spawn slides under the
  * existing ones rather than re-ordering everything. Sticky header so the
  * title stays anchored while the list scrolls.
+ *
+ * Slice #0024 wires two actions on each card:
+ *  - Click body → `openTask(id)` opens the drawer on this task.
+ *  - Click × on terminal cards → `dismiss_task` WS event + in-memory drop.
  */
-export function TaskSidebar() {
+export function TaskSidebar({ onSend }: Props) {
   const tasks = useChatStore((s) => s.tasks);
+  const openTask = useChatStore((s) => s.openTask);
+  const dismissTask = useChatStore((s) => s.dismissTask);
+
   const ordered = useMemo<Task[]>(
     () => Object.values(tasks).sort((a, b) => a.createdAt.localeCompare(b.createdAt)),
     [tasks],
   );
+
+  const handleDismiss = (task: Task) => {
+    // Optimistic update: drop locally first so the UI is snappy, then tell
+    // the backend to persist the flag. A no-op when the WS is closed —
+    // useWebSocket queues the event for the next reconnect.
+    dismissTask(task.id);
+    onSend({ type: "dismiss_task", task_id: task.id });
+  };
 
   return (
     <aside className="flex h-full w-[320px] flex-none flex-col border-l border-neutral-800 bg-neutral-950">
@@ -30,7 +50,7 @@ export function TaskSidebar() {
           <ul className="flex flex-col gap-2">
             {ordered.map((task) => (
               <li key={task.id}>
-                <TaskCard task={task} />
+                <TaskCard task={task} onOpen={(t) => openTask(t.id)} onDismiss={handleDismiss} />
               </li>
             ))}
           </ul>

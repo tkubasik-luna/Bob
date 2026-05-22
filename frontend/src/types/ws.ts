@@ -16,7 +16,23 @@ export type UserMsg = {
   voice?: boolean;
 };
 
-export type ClientMessage = UserMsg;
+/** Slice #0024 — client tells the backend to hide a done/failed task from
+ * future sidebar replays. The SQLite row is preserved (dismissed flag) so
+ * the drawer can still render it if directly addressed. */
+export type DismissTaskMsg = {
+  type: "dismiss_task";
+  task_id: string;
+};
+
+/** Slice #0024 — drawer-open: ask the backend for the full transcript of a
+ * task. Backend replies with a single ``task_messages_snapshot``. Live
+ * appends after open arrive via ``task_message`` push events. */
+export type RequestTaskMessagesMsg = {
+  type: "request_task_messages";
+  task_id: string;
+};
+
+export type ClientMessage = UserMsg | DismissTaskMsg | RequestTaskMessagesMsg;
 
 // Server → client
 export type SessionMsg = {
@@ -103,6 +119,21 @@ export type Task = {
   result?: string;
   createdAt: string;
   updatedAt?: string;
+  /** Slice #0024 — the user has dismissed the card from the sidebar.
+   * Defaults to `false` on the wire (backend filters dismissed=true out
+   * of replay). The frontend simply drops the task from its map on
+   * dismiss so the flag is rarely surfaced here. */
+  dismissed?: boolean;
+};
+
+/** Slice #0024 — one row in a task's transcript, rendered inside the
+ * drawer. Mirrors `bob.task_store.TaskMessage` on the backend. */
+export type TaskMessage = {
+  id: number;
+  role: "system" | "user" | "assistant" | "tool";
+  content: string;
+  action: "done" | "ask_user" | "progress" | null;
+  created_at: string;
 };
 
 /** Emitted on spawn (state=pending) and on WS connect for every known task
@@ -139,6 +170,27 @@ export type TaskResultMsg = {
   replayed?: boolean;
 };
 
+/** Slice #0024 — full transcript snapshot for a task. Emitted in response
+ * to a client `request_task_messages` event when the drawer opens. */
+export type TaskMessagesSnapshotMsg = {
+  type: "task_messages_snapshot";
+  task_id: string;
+  messages: TaskMessage[];
+};
+
+/** Slice #0024 — live append: emitted by the sub-agent runner and the
+ * orchestrator whenever they persist a row via `task_store.append_message`.
+ * The drawer dedupes against the snapshot via `message_id`. */
+export type TaskMessageMsg = {
+  type: "task_message";
+  task_id: string;
+  message_id: number;
+  role: "system" | "user" | "assistant" | "tool";
+  content: string;
+  action: "done" | "ask_user" | "progress" | null;
+  created_at: string;
+};
+
 export type ServerMessage =
   | SessionMsg
   | AssistantMsg
@@ -151,7 +203,9 @@ export type ServerMessage =
   | AudioErrorMsg
   | TaskCreatedMsg
   | TaskUpdatedMsg
-  | TaskResultMsg;
+  | TaskResultMsg
+  | TaskMessagesSnapshotMsg
+  | TaskMessageMsg;
 
 export type ConnectionStatus = "connecting" | "open" | "closed";
 

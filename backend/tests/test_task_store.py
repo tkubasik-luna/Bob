@@ -296,6 +296,67 @@ def test_role_check_constraint_rejects_unknown_role() -> None:
         )
 
 
+def test_dismiss_task_sets_flag_and_filters_from_list(fresh_task_store: TaskStore) -> None:
+    """Dismissed tasks drop from ``list_tasks()`` but ``get_task`` keeps them."""
+
+    a = fresh_task_store.create_task(title="A", goal="ga")
+    b = fresh_task_store.create_task(title="B", goal="gb")
+    fresh_task_store.update_state(a, "running")
+    fresh_task_store.update_state(a, "done")
+
+    fresh_task_store.dismiss_task(a)
+
+    # Default list excludes dismissed.
+    listed = [task.id for task in fresh_task_store.list_tasks()]
+    assert listed == [b]
+
+    # Explicit include surfaces every row.
+    full = [task.id for task in fresh_task_store.list_tasks(include_dismissed=True)]
+    assert full == [a, b]
+
+    # get_task always works; the flag is exposed for the drawer.
+    dismissed_task = fresh_task_store.get_task(a)
+    assert dismissed_task.dismissed is True
+
+    not_dismissed = fresh_task_store.get_task(b)
+    assert not_dismissed.dismissed is False
+
+
+def test_dismiss_task_unknown_raises(fresh_task_store: TaskStore) -> None:
+    with pytest.raises(TaskStoreError):
+        fresh_task_store.dismiss_task("missing-id")
+
+
+def test_dismiss_task_is_orthogonal_to_state(fresh_task_store: TaskStore) -> None:
+    """The data layer accepts dismissal in any state — UI restricts to done/failed."""
+
+    task_id = fresh_task_store.create_task(title="T", goal="g")
+    # Still ``pending`` — should not raise.
+    fresh_task_store.dismiss_task(task_id)
+    assert fresh_task_store.get_task(task_id).dismissed is True
+
+
+def test_dismissed_flag_survives_reopen(tmp_path: Path) -> None:
+    """A fresh TaskStore on the same DB file still sees the dismissed flag."""
+
+    db_path = tmp_path / "bob.db"
+
+    first_conn = sqlite3.connect(db_path)
+    apply_migrations(first_conn, default_migrations_dir())
+    first = TaskStore(first_conn)
+    task_id = first.create_task(title="T", goal="g")
+    first.update_state(task_id, "running")
+    first.update_state(task_id, "done")
+    first.dismiss_task(task_id)
+    first_conn.close()
+
+    second_conn = sqlite3.connect(db_path)
+    apply_migrations(second_conn, default_migrations_dir())
+    second = TaskStore(second_conn)
+    assert second.get_task(task_id).dismissed is True
+    assert second.list_tasks() == []
+
+
 def test_get_default_store_raises_before_priming() -> None:
     """Accessing the singleton before boot raises a clear error."""
 

@@ -471,10 +471,33 @@ class Orchestrator:
             return None
 
         try:
-            self._task_store.append_message(target_id, role="user", content=response_text)
+            message_id = self._task_store.append_message(
+                target_id, role="user", content=response_text
+            )
         except TaskStoreError:
             _logger.exception("orchestrator.forward_append_failed", task_id=target_id)
             return None
+
+        # Surface the forwarded user reply on any open drawer for this task
+        # so the transcript reflects the live multi-turn flow.
+        try:
+            for msg in self._task_store.get_task_messages(target_id):
+                if msg.id != message_id:
+                    continue
+                await ws_events.emit(
+                    {
+                        "type": "task_message",
+                        "task_id": target_id,
+                        "message_id": msg.id,
+                        "role": msg.role,
+                        "content": msg.content,
+                        "action": msg.action,
+                        "created_at": msg.created_at,
+                    }
+                )
+                break
+        except TaskStoreError:
+            _logger.exception("orchestrator.forward_emit_message_failed", task_id=target_id)
 
         await self._task_scheduler.resume(target_id)
         _logger.info("orchestrator.forwarded_to_subtask", task_id=target_id)

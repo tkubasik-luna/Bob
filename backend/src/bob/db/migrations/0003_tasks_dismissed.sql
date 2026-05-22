@@ -1,0 +1,11 @@
+-- 0003 — Add ``dismissed`` flag to tasks for sidebar housekeeping (slice #0024).
+--
+-- A task in state ``done`` or ``failed`` can be hidden from the sidebar by the
+-- user without removing the SQLite row. The replay path in :mod:`bob.ws_router`
+-- filters dismissed rows out (``list_tasks`` default) so the sidebar stays
+-- clean while history is preserved.
+--
+-- SQLite's ``ALTER TABLE … ADD COLUMN`` is not idempotent on its own, but the
+-- migrations runner records applied filenames in ``_migrations`` and skips
+-- re-runs at the file level, so this script is safe across boots.
+ALTER TABLE tasks ADD COLUMN dismissed INTEGER NOT NULL DEFAULT 0;

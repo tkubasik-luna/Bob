@@ -164,9 +164,11 @@ async def _replay_active_tasks(websocket: WebSocket) -> None:
     The ``replayed: true`` flag lets the frontend distinguish if it wants —
     the current frontend simply upserts unconditionally.
 
-    Slice #0024 will introduce dismiss filtering; for now every known task is
-    surfaced. Silently skips when the task store hasn't been primed (narrow
-    test setups that bypass the lifespan).
+    Slice #0024 introduced ``dismissed`` filtering — :meth:`TaskStore.list_tasks`
+    defaults to ``include_dismissed=False`` so user-hidden tasks stay out of
+    the replay (their rows are still in SQLite for the drawer). Silently
+    skips when the task store hasn't been primed (narrow test setups that
+    bypass the lifespan).
     """
 
     try:
@@ -230,6 +232,104 @@ async def _cancel_active_tts(
                 await websocket.send_json({"type": "audio_end", "msg_id": msg_id})
 
 
+async def _handle_dismiss_task(websocket: WebSocket, payload: dict[str, Any]) -> None:
+    """Client → ``dismiss_task`` hides a done/failed task from the sidebar.
+
+    The data layer is permissive (any state can be dismissed). The UI only
+    surfaces the button on terminal states; the WS layer trusts that and
+    just flips the flag. No response event is needed — the frontend already
+    drops the card from its in-memory map on click.
+    """
+
+    task_id = payload.get("task_id")
+    if not isinstance(task_id, str) or not task_id:
+        await websocket.send_json(
+            {
+                "type": "error",
+                "code": "bad_dismiss",
+                "message": "dismiss_task.task_id must be a non-empty string",
+            }
+        )
+        return
+
+    try:
+        store = task_store_module.get_default_store()
+    except RuntimeError:
+        # Store not primed — narrow test setups. Don't leak a 500.
+        await websocket.send_json(
+            {"type": "error", "code": "store_unavailable", "message": "task store unavailable"}
+        )
+        return
+
+    from bob.task_store import TaskStoreError
+
+    try:
+        store.dismiss_task(task_id)
+    except TaskStoreError:
+        await websocket.send_json(
+            {"type": "error", "code": "unknown_task", "message": "task not found"}
+        )
+
+
+async def _handle_request_task_messages(websocket: WebSocket, payload: dict[str, Any]) -> None:
+    """Client → return the full ``task_messages`` log for a task.
+
+    Used by the drawer to render the transcript on open. Live updates after
+    open arrive via the ``task_message`` push (emitted from sub-agent /
+    orchestrator code paths that call :meth:`TaskStore.append_message`).
+    """
+
+    task_id = payload.get("task_id")
+    if not isinstance(task_id, str) or not task_id:
+        await websocket.send_json(
+            {
+                "type": "error",
+                "code": "bad_request_messages",
+                "message": "request_task_messages.task_id must be a non-empty string",
+            }
+        )
+        return
+
+    try:
+        store = task_store_module.get_default_store()
+    except RuntimeError:
+        await websocket.send_json(
+            {"type": "error", "code": "store_unavailable", "message": "task store unavailable"}
+        )
+        return
+
+    from bob.task_store import TaskStoreError
+
+    try:
+        # ``get_task`` validates the id and surfaces a clean error to the
+        # client. The message log itself does not enforce existence so we
+        # check the task row up front.
+        store.get_task(task_id)
+    except TaskStoreError:
+        await websocket.send_json(
+            {"type": "error", "code": "unknown_task", "message": "task not found"}
+        )
+        return
+
+    messages = store.get_task_messages(task_id)
+    await websocket.send_json(
+        {
+            "type": "task_messages_snapshot",
+            "task_id": task_id,
+            "messages": [
+                {
+                    "id": msg.id,
+                    "role": msg.role,
+                    "content": msg.content,
+                    "action": msg.action,
+                    "created_at": msg.created_at,
+                }
+                for msg in messages
+            ],
+        }
+    )
+
+
 async def _handle_client_message(
     websocket: WebSocket,
     payload: Any,
@@ -243,6 +343,15 @@ async def _handle_client_message(
         return
 
     msg_type = payload.get("type")
+
+    if msg_type == "dismiss_task":
+        await _handle_dismiss_task(websocket, payload)
+        return
+
+    if msg_type == "request_task_messages":
+        await _handle_request_task_messages(websocket, payload)
+        return
+
     if msg_type != "user_msg":
         await websocket.send_json(
             {

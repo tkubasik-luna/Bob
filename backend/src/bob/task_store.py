@@ -35,7 +35,9 @@ class Task:
     ``needs_attention`` is the UI hint flag — set when the task is blocked
     waiting on the user. ``result`` is the final payload once ``state`` is
     ``done`` (or, optionally, ``failed``). Both nullable strings on the SQL
-    side are surfaced as ``str | None``.
+    side are surfaced as ``str | None``. ``dismissed`` is the slice #0024
+    "user hid this row from the sidebar" flag — preserved in SQLite so
+    history stays intact while the live sidebar can be cleaned.
     """
 
     id: str
@@ -47,6 +49,7 @@ class Task:
     parent_task_id: str | None
     created_at: str
     updated_at: str
+    dismissed: bool
 
 
 @dataclass(frozen=True)
@@ -105,12 +108,17 @@ class TaskStore:
         return task_id
 
     def get_task(self, task_id: str) -> Task:
-        """Return the task or raise :class:`TaskStoreError` if not found."""
+        """Return the task or raise :class:`TaskStoreError` if not found.
+
+        Dismissed tasks are still returned — the dismissal only affects the
+        :meth:`list_tasks` replay path, not individual lookups (the drawer
+        needs to render dismissed tasks if directly addressed).
+        """
 
         with self._lock:
             cursor = self._conn.execute(
                 "SELECT id, title, goal, state, needs_attention, result, parent_task_id,"
-                " created_at, updated_at FROM tasks WHERE id = ?",
+                " created_at, updated_at, dismissed FROM tasks WHERE id = ?",
                 (task_id,),
             )
             row = cursor.fetchone()
@@ -124,17 +132,28 @@ class TaskStore:
         *,
         state: TaskState | None = None,
         limit: int | None = None,
+        include_dismissed: bool = False,
     ) -> list[Task]:
-        """Return tasks in creation order, optionally filtered by state."""
+        """Return tasks in creation order, optionally filtered by state.
+
+        By default dismissed tasks are excluded so the sidebar replay path
+        stays clean. Pass ``include_dismissed=True`` to get the full set
+        (debug / admin paths).
+        """
 
         query = (
             "SELECT id, title, goal, state, needs_attention, result, parent_task_id,"
-            " created_at, updated_at FROM tasks"
+            " created_at, updated_at, dismissed FROM tasks"
         )
+        where: list[str] = []
         params: list[object] = []
         if state is not None:
-            query += " WHERE state = ?"
+            where.append("state = ?")
             params.append(state)
+        if not include_dismissed:
+            where.append("dismissed = 0")
+        if where:
+            query += " WHERE " + " AND ".join(where)
         # ``datetime('now')`` has second-precision so ties are likely in tests
         # and bursty boot-up flows. Break ties by sqlite's implicit ``rowid``
         # which monotonically reflects INSERT order — gives a deterministic
@@ -202,6 +221,25 @@ class TaskStore:
             if cursor.rowcount == 0:
                 raise TaskStoreError(f"task not found: {task_id}")
 
+    def dismiss_task(self, task_id: str) -> None:
+        """Flip ``dismissed`` to true so the task hides from sidebar replays.
+
+        The row stays in SQLite — :meth:`get_task` still returns it and the
+        drawer can still render it if the frontend addresses it directly.
+        Raises :class:`TaskStoreError` when the task does not exist. No
+        state-transition validation: dismiss is orthogonal to the lifecycle
+        (the UI only exposes the button for ``done`` / ``failed`` cards, but
+        the data layer stays permissive).
+        """
+
+        with self._lock, self._conn:
+            cursor = self._conn.execute(
+                "UPDATE tasks SET dismissed = 1, updated_at = datetime('now') WHERE id = ?",
+                (task_id,),
+            )
+            if cursor.rowcount == 0:
+                raise TaskStoreError(f"task not found: {task_id}")
+
     # --- Message log ---------------------------------------------------------
 
     def append_message(
@@ -260,6 +298,7 @@ def _row_to_task(row: tuple[object, ...]) -> Task:
         parent_task_id,
         created_at,
         updated_at,
+        dismissed,
     ) = row
     assert isinstance(id_, str)
     assert isinstance(title, str)
@@ -270,6 +309,7 @@ def _row_to_task(row: tuple[object, ...]) -> Task:
     assert parent_task_id is None or isinstance(parent_task_id, str)
     assert isinstance(created_at, str)
     assert isinstance(updated_at, str)
+    assert isinstance(dismissed, int)
     # ``state`` is constrained by the SQL CHECK to the TaskState set — the
     # cast to the Literal alias is safe.
     return Task(
@@ -282,6 +322,7 @@ def _row_to_task(row: tuple[object, ...]) -> Task:
         parent_task_id=parent_task_id,
         created_at=created_at,
         updated_at=updated_at,
+        dismissed=bool(dismissed),
     )
 
 

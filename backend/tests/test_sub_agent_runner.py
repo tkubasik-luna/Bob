@@ -204,8 +204,15 @@ async def test_done_action_emits_task_updated_and_task_result() -> None:
     finally:
         ws_events.set_emitter(None)
 
-    assert len(received) == 2
-    updated, result = received
+    # Slice #0024 adds a leading ``task_message`` for the appended done entry.
+    assert [e["type"] for e in received] == ["task_message", "task_updated", "task_result"]
+    message_evt, updated, result = received
+
+    assert message_evt["task_id"] == task_id
+    assert message_evt["role"] == "assistant"
+    assert message_evt["content"] == "all good"
+    assert message_evt["action"] == "done"
+    assert isinstance(message_evt["message_id"], int)
 
     assert updated["type"] == "task_updated"
     assert updated["task_id"] == task_id
@@ -240,8 +247,11 @@ async def test_failure_path_emits_task_updated_failed_and_reason_result() -> Non
     finally:
         ws_events.set_emitter(None)
 
-    assert len(received) == 2
-    updated, result = received
+    # Slice #0024 adds a leading ``task_message`` for the appended system reason.
+    assert [e["type"] for e in received] == ["task_message", "task_updated", "task_result"]
+    message_evt, updated, result = received
+    assert message_evt["role"] == "system"
+    assert "kaboom" in message_evt["content"]
     assert updated["type"] == "task_updated"
     assert updated["state"] == "failed"
     assert result["type"] == "task_result"
@@ -302,9 +312,12 @@ async def test_ask_user_action_emits_task_updated_and_bus_event() -> None:
     finally:
         ws_events.set_emitter(None)
 
-    # WS: only task_updated (no task_result on ask_user).
-    assert [e["type"] for e in received_ws] == ["task_updated"]
-    assert received_ws[0]["state"] == "waiting_input"
+    # WS: task_message for the question + task_updated (no task_result on ask_user).
+    assert [e["type"] for e in received_ws] == ["task_message", "task_updated"]
+    assert received_ws[0]["role"] == "assistant"
+    assert received_ws[0]["action"] == "ask_user"
+    assert received_ws[0]["content"] == "Formel ou amical ?"
+    assert received_ws[1]["state"] == "waiting_input"
 
     # Wait one event-loop tick so the bus' fire-and-forget subscriber runs.
     import asyncio

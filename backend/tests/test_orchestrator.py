@@ -508,6 +508,45 @@ async def test_forward_to_subtask_inserts_message_and_calls_resume() -> None:
 
 
 @pytest.mark.asyncio
+async def test_forward_to_subtask_emits_task_message_event() -> None:
+    """The forwarded user reply surfaces as a ``task_message`` WS event."""
+
+    orchestrator, jarvis_client, _sub, _js, task_store, _scheduler = _make_orchestrator()
+
+    target_id = task_store.create_task(title="Draft email", goal="Write a draft")
+    task_store.update_state(target_id, "running")
+    task_store.append_message(target_id, role="assistant", content="Quel ton ?", action="ask_user")
+    task_store.update_state(target_id, "waiting_input")
+
+    jarvis_client._complete_responses.append(
+        LLMResponse(
+            text=None,
+            tool_calls=[_forward_tool_call(task_id=target_id, response="Amical.")],
+        )
+    )
+
+    received: list[dict[str, Any]] = []
+
+    async def _emitter(event: dict[str, Any]) -> None:
+        received.append(event)
+
+    ws_events.set_emitter(_emitter)
+    try:
+        await orchestrator.process_user_message("s1", "Amical.")
+    finally:
+        ws_events.set_emitter(None)
+
+    task_messages = [e for e in received if e["type"] == "task_message"]
+    assert len(task_messages) == 1
+    evt = task_messages[0]
+    assert evt["task_id"] == target_id
+    assert evt["role"] == "user"
+    assert evt["content"] == "Amical."
+    assert evt["action"] is None
+    assert isinstance(evt["message_id"], int)
+
+
+@pytest.mark.asyncio
 async def test_forward_to_unknown_task_falls_back_to_text() -> None:
     """A forward to a missing task is dropped — orchestrator replies in text."""
 

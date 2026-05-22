@@ -392,3 +392,116 @@ def test_ws_chat_replays_active_tasks_on_connect(clear_jarvis_history: None) -> 
                 "result": "result text",
                 "replayed": True,
             }
+
+
+# ---------------------------------------------------------------------------
+# Slice #0024 — dismiss_task + request_task_messages WS client→server events.
+# ---------------------------------------------------------------------------
+
+
+def test_ws_chat_dismiss_task_hides_from_replay(clear_jarvis_history: None) -> None:
+    """Dismissed tasks are not re-emitted on a fresh connection."""
+
+    with TestClient(app) as client:
+        store = task_store_module.get_default_store()
+        keep_id = store.create_task(title="Keep me", goal="K")
+        dismiss_id = store.create_task(title="Hide me", goal="H")
+        store.update_state(dismiss_id, "running")
+        store.set_result(dismiss_id, "done text")
+        store.update_state(dismiss_id, "done")
+
+        with client.websocket_connect("/ws/chat") as ws:
+            assert ws.receive_json()["type"] == "session"
+            # Drain initial replay (both tasks visible).
+            ws.receive_json()  # task_created keep
+            ws.receive_json()  # task_created dismiss
+            ws.receive_json()  # task_result dismiss
+
+            ws.send_json({"type": "dismiss_task", "task_id": dismiss_id})
+            # Backend does not echo a confirmation for dismiss; assert by reconnecting.
+
+        # Reconnect: dismissed task must NOT be replayed.
+        with client.websocket_connect("/ws/chat") as ws2:
+            assert ws2.receive_json()["type"] == "session"
+            evt = ws2.receive_json()
+            assert evt["type"] == "task_created"
+            assert evt["task_id"] == keep_id
+
+            # No further task events expected. We assert by sending a quick
+            # request_task_messages for the dismissed task and verifying the
+            # backend still has the row (dismissed != deleted).
+            ws2.send_json({"type": "request_task_messages", "task_id": dismiss_id})
+            snapshot = ws2.receive_json()
+            assert snapshot["type"] == "task_messages_snapshot"
+            assert snapshot["task_id"] == dismiss_id
+
+        # The row is still in SQLite; the flag persists.
+        assert store.get_task(dismiss_id).dismissed is True
+
+
+def test_ws_chat_dismiss_task_rejects_bad_payload(clear_jarvis_history: None) -> None:
+    """Missing / non-string task_id surfaces a ``bad_dismiss`` error code."""
+
+    with TestClient(app) as client, client.websocket_connect("/ws/chat") as ws:
+        assert ws.receive_json()["type"] == "session"
+        ws.send_json({"type": "dismiss_task", "task_id": 42})
+        err = ws.receive_json()
+        assert err["type"] == "error"
+        assert err["code"] == "bad_dismiss"
+
+
+def test_ws_chat_dismiss_task_unknown_id_emits_error(clear_jarvis_history: None) -> None:
+    """An unknown task id is reported as ``unknown_task`` without crashing the WS."""
+
+    with TestClient(app) as client, client.websocket_connect("/ws/chat") as ws:
+        assert ws.receive_json()["type"] == "session"
+        ws.send_json({"type": "dismiss_task", "task_id": "nope"})
+        err = ws.receive_json()
+        assert err["type"] == "error"
+        assert err["code"] == "unknown_task"
+
+
+def test_ws_chat_request_task_messages_returns_snapshot(
+    clear_jarvis_history: None,
+) -> None:
+    """The drawer can fetch the full transcript via a snapshot reply."""
+
+    with TestClient(app) as client:
+        store = task_store_module.get_default_store()
+        task_id = store.create_task(title="T", goal="g")
+        store.append_message(task_id, role="user", content="hello")
+        store.append_message(task_id, role="assistant", content="hi", action="progress")
+
+        with client.websocket_connect("/ws/chat") as ws:
+            assert ws.receive_json()["type"] == "session"
+            ws.receive_json()  # task_created replay
+
+            ws.send_json({"type": "request_task_messages", "task_id": task_id})
+            snapshot = ws.receive_json()
+            assert snapshot["type"] == "task_messages_snapshot"
+            assert snapshot["task_id"] == task_id
+            assert [m["content"] for m in snapshot["messages"]] == ["hello", "hi"]
+            assert [m["role"] for m in snapshot["messages"]] == ["user", "assistant"]
+            assert [m["action"] for m in snapshot["messages"]] == [None, "progress"]
+
+
+def test_ws_chat_request_task_messages_unknown_id_emits_error(
+    clear_jarvis_history: None,
+) -> None:
+    with TestClient(app) as client, client.websocket_connect("/ws/chat") as ws:
+        assert ws.receive_json()["type"] == "session"
+        ws.send_json({"type": "request_task_messages", "task_id": "nope"})
+        err = ws.receive_json()
+        assert err["type"] == "error"
+        assert err["code"] == "unknown_task"
+
+
+def test_ws_chat_request_task_messages_rejects_bad_payload(
+    clear_jarvis_history: None,
+) -> None:
+    with TestClient(app) as client, client.websocket_connect("/ws/chat") as ws:
+        assert ws.receive_json()["type"] == "session"
+        ws.send_json({"type": "request_task_messages", "task_id": 7})
+        err = ws.receive_json()
+        assert err["type"] == "error"
+        assert err["code"] == "bad_request_messages"

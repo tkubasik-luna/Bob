@@ -10,6 +10,7 @@ import { useWebSocket } from "../hooks/useWebSocket";
 import { useChatStore } from "../store/chatStore";
 import type { ChatMessage, ServerMessage } from "../types/ws";
 import { Dispatcher } from "./Dispatcher";
+import { TaskDrawer } from "./TaskDrawer";
 import { TaskSidebar } from "./TaskSidebar";
 import { ToastContainer } from "./Toast";
 
@@ -29,6 +30,8 @@ export function ChatView() {
   const upsertTaskCreated = useChatStore((s) => s.upsertTaskCreated);
   const upsertTaskUpdated = useChatStore((s) => s.upsertTaskUpdated);
   const setTaskResult = useChatStore((s) => s.setTaskResult);
+  const setTaskMessagesSnapshot = useChatStore((s) => s.setTaskMessagesSnapshot);
+  const appendTaskMessage = useChatStore((s) => s.appendTaskMessage);
 
   // Bridge audioPlayer → store so `Bubble` can render the wave indicator
   // on the exact bubble currently being voiced. Cleared on natural end
@@ -117,6 +120,12 @@ export function ChatView() {
         case "task_result":
           setTaskResult(msg);
           break;
+        case "task_messages_snapshot":
+          setTaskMessagesSnapshot(msg);
+          break;
+        case "task_message":
+          appendTaskMessage(msg);
+          break;
       }
     },
     [
@@ -129,6 +138,8 @@ export function ChatView() {
       upsertTaskCreated,
       upsertTaskUpdated,
       setTaskResult,
+      setTaskMessagesSnapshot,
+      appendTaskMessage,
     ],
   );
 
@@ -226,7 +237,8 @@ export function ChatView() {
           </div>
         </div>
       </div>
-      <TaskSidebar />
+      <TaskSidebar onSend={send} />
+      <TaskDrawer onSend={send} />
     </div>
   );
 }

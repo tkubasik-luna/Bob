@@ -234,7 +234,7 @@ class SubAgentRunner:
     async def _handle_done(self, task_id: str, result: str) -> None:
         try:
             self._task_store.set_result(task_id, result)
-            self._task_store.append_message(
+            message_id = self._task_store.append_message(
                 task_id, role="assistant", content=result, action="done"
             )
             self._task_store.update_state(task_id, "done")
@@ -248,6 +248,11 @@ class SubAgentRunner:
             _logger.exception("sub_agent_runner.reload_done_failed", task_id=task_id)
             return
 
+        await _emit_task_message(
+            self._task_store,
+            task_id,
+            message_id=message_id,
+        )
         await ws_events.emit(
             {
                 "type": "task_updated",
@@ -284,7 +289,7 @@ class SubAgentRunner:
         """
 
         try:
-            self._task_store.append_message(
+            message_id = self._task_store.append_message(
                 task_id, role="assistant", content=question, action="ask_user"
             )
             self._task_store.update_state(task_id, "waiting_input")
@@ -298,6 +303,11 @@ class SubAgentRunner:
             _logger.exception("sub_agent_runner.reload_ask_user_failed", task_id=task_id)
             return
 
+        await _emit_task_message(
+            self._task_store,
+            task_id,
+            message_id=message_id,
+        )
         await ws_events.emit(
             {
                 "type": "task_updated",
@@ -329,7 +339,7 @@ class SubAgentRunner:
             previous = "running"
 
         try:
-            self._task_store.append_message(task_id, role="system", content=reason)
+            message_id = self._task_store.append_message(task_id, role="system", content=reason)
             self._task_store.update_state(task_id, "failed")
         except TaskStoreError:
             _logger.exception("sub_agent_runner.persist_failed_failed", task_id=task_id)
@@ -341,6 +351,11 @@ class SubAgentRunner:
             _logger.exception("sub_agent_runner.reload_failed_failed", task_id=task_id)
             return
 
+        await _emit_task_message(
+            self._task_store,
+            task_id,
+            message_id=message_id,
+        )
         await ws_events.emit(
             {
                 "type": "task_updated",
@@ -365,3 +380,34 @@ class SubAgentRunner:
                 "new_state": "failed",
             },
         )
+
+
+async def _emit_task_message(store: TaskStore, task_id: str, *, message_id: int) -> None:
+    """Push a ``task_message`` WS event for a freshly-appended task message.
+
+    Used by the runner and the orchestrator to surface live transcript
+    updates so an open drawer can append the new line without re-fetching
+    the whole snapshot. We re-read the row to pick up the SQL DEFAULT
+    ``created_at`` and the ``role`` / ``action`` exactly as stored —
+    avoids drift between what the caller passed in and what the DB
+    persisted.
+    """
+
+    try:
+        for msg in store.get_task_messages(task_id):
+            if msg.id != message_id:
+                continue
+            await ws_events.emit(
+                {
+                    "type": "task_message",
+                    "task_id": task_id,
+                    "message_id": msg.id,
+                    "role": msg.role,
+                    "content": msg.content,
+                    "action": msg.action,
+                    "created_at": msg.created_at,
+                }
+            )
+            return
+    except TaskStoreError:
+        _logger.exception("sub_agent_runner.emit_task_message_lookup_failed", task_id=task_id)
