@@ -22,12 +22,14 @@ import structlog
 from fastapi import FastAPI
 
 from bob import jarvis_store as jarvis_store_module
+from bob import task_store as task_store_module
 from bob.config import get_settings
 from bob.db.migrations_runner import apply_migrations, default_migrations_dir
 from bob.debug_router import router as debug_router
 from bob.jarvis_prompt_loader import load_jarvis_prompt
 from bob.jarvis_store import JarvisStore
 from bob.logging_setup import configure_logging
+from bob.task_store import TaskStore
 from bob.tts_service import get_default_tts_service
 from bob.ws_router import router as ws_router
 
@@ -59,6 +61,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
     store = JarvisStore(conn)
     jarvis_store_module.set_default_store(store)
+    task_store_module.set_default_store(TaskStore(conn))
 
     load_jarvis_prompt(data_dir)
 
@@ -81,6 +84,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        task_store_module.set_default_store(None)
         jarvis_store_module.set_default_store(None)
         conn.close()
 
