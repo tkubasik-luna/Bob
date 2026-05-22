@@ -6,7 +6,10 @@ Lifespan wiring (boot, in order):
 2. Ensure ``BOB_DATA_DIR`` exists; open SQLite at ``{BOB_DATA_DIR}/bob.db`` and
    run all pending migrations. Prime the :class:`bob.jarvis_store.JarvisStore`
    singleton + bootstrap the ``jarvis.md`` personality file.
-3. Preload + warm the Kokoro TTS pipeline so the first user message is fast.
+3. Build the :class:`TaskScheduler`, install it as the singleton and run
+   ``recover_after_restart`` so any task left in ``running`` by a previous
+   process is coerced back to ``pending`` then re-promoted under the cap.
+4. Preload + warm the Kokoro TTS pipeline so the first user message is fast.
 
 Shutdown: release the SQLite connection.
 """
@@ -15,20 +18,25 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Coroutine
 from contextlib import asynccontextmanager
+from typing import Any
 
 import structlog
 from fastapi import FastAPI
 
 from bob import jarvis_store as jarvis_store_module
+from bob import task_scheduler as task_scheduler_module
 from bob import task_store as task_store_module
 from bob.config import get_settings
 from bob.db.migrations_runner import apply_migrations, default_migrations_dir
 from bob.debug_router import router as debug_router
 from bob.jarvis_prompt_loader import load_jarvis_prompt
 from bob.jarvis_store import JarvisStore
+from bob.llm.factory import build_subagent_client
 from bob.logging_setup import configure_logging
+from bob.sub_agent_runner import SubAgentRunner
+from bob.task_scheduler import build_default_scheduler
 from bob.task_store import TaskStore
 from bob.tts_service import get_default_tts_service
 from bob.ws_router import router as ws_router
@@ -61,7 +69,25 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
     store = JarvisStore(conn)
     jarvis_store_module.set_default_store(store)
-    task_store_module.set_default_store(TaskStore(conn))
+    task_store = TaskStore(conn)
+    task_store_module.set_default_store(task_store)
+
+    # Sub-agent runner factory used by the scheduler. We build the LLM client
+    # once and reuse it across every runner invocation — the underlying
+    # client is stateless and the orchestrator's previous wiring did the
+    # same (one client instance, many calls).
+    subagent_client = build_subagent_client(settings)
+
+    def _runner_factory(task_id: str) -> Coroutine[Any, Any, None]:
+        runner = SubAgentRunner(
+            subagent_client=subagent_client,
+            task_store=task_store,
+        )
+        return runner.run(task_id)
+
+    scheduler = build_default_scheduler(settings, task_store, _runner_factory)
+    task_scheduler_module.set_default_scheduler(scheduler)
+    await scheduler.recover_after_restart()
 
     load_jarvis_prompt(data_dir)
 
@@ -84,6 +110,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        task_scheduler_module.set_default_scheduler(None)
         task_store_module.set_default_store(None)
         jarvis_store_module.set_default_store(None)
         conn.close()

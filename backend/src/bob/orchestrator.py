@@ -8,8 +8,8 @@ the smoke CLI. The orchestrator:
 2. Asks Jarvis (LLM) whether to spawn a sub-task via the ``spawn_subtask``
    tool definition. If Jarvis emits a tool call:
    - Creates the task in :class:`TaskStore` (state ``pending``).
-   - Transitions ``pending → running``.
-   - Schedules a :class:`SubAgentRunner` as a background ``asyncio.Task``.
+   - Hands the task to :class:`TaskScheduler` which decides whether to
+     promote it to ``running`` now or leave it queued.
    - Returns a hard-coded confirmation as the user-visible reply.
 3. Otherwise (no tool call → plain text reply), falls through to the
    structured-output path (JSON schema + ``response_parser``) so the
@@ -21,8 +21,6 @@ Persistence: history lives in a singleton :class:`bob.jarvis_store.JarvisStore`
 
 from __future__ import annotations
 
-import asyncio
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from types import ModuleType
 from typing import Any, Protocol
@@ -31,15 +29,15 @@ import structlog
 
 from bob import jarvis_store as jarvis_store_module
 from bob import prompts as prompts_module
-from bob import response_parser, ws_events
+from bob import response_parser, task_scheduler, ws_events
 from bob import task_store as task_store_module
 from bob import ui_registry as ui_registry_module
 from bob.config import get_settings
 from bob.jarvis_store import JarvisStore
 from bob.llm.types import ToolDefinition
 from bob.llm_client import LLMClient
-from bob.sub_agent_runner import SubAgentRunner
-from bob.task_store import TaskStore, TaskStoreError
+from bob.task_scheduler import TaskScheduler
+from bob.task_store import TaskStore
 from bob.ui_registry import ComponentDescriptor
 
 _logger = structlog.get_logger(__name__)
@@ -105,9 +103,6 @@ class OrchestratorResponse:
     spawned_task_ids: list[str] = field(default_factory=list)
 
 
-SubAgentRunnerFactory = Callable[[str], asyncio.Task[None]]
-
-
 class Orchestrator:
     """Run one full user → assistant turn end-to-end, with optional spawn."""
 
@@ -115,29 +110,20 @@ class Orchestrator:
         self,
         *,
         jarvis_client: LLMClient,
-        subagent_client: LLMClient,
         jarvis_store: JarvisStore,
         task_store: TaskStore,
+        task_scheduler: TaskScheduler,
         jarvis_prompt: str,
-        sub_agent_runner_factory: SubAgentRunnerFactory | None = None,
         prompts: _PromptsLike = prompts_module,
         ui_registry: ModuleType = ui_registry_module,
     ) -> None:
         self._jarvis_client = jarvis_client
-        self._subagent_client = subagent_client
         self._jarvis_store = jarvis_store
         self._task_store = task_store
+        self._task_scheduler = task_scheduler
         self._jarvis_prompt = jarvis_prompt
         self._prompts = prompts
         self._ui_registry = ui_registry
-        self._sub_agent_runner_factory = sub_agent_runner_factory or self._default_runner_factory
-
-    def _default_runner_factory(self, task_id: str) -> asyncio.Task[None]:
-        runner = SubAgentRunner(
-            subagent_client=self._subagent_client,
-            task_store=self._task_store,
-        )
-        return asyncio.create_task(runner.run(task_id))
 
     async def process_user_message(
         self,
@@ -206,14 +192,15 @@ class Orchestrator:
         ]
 
     async def _dispatch_spawns(self, tool_calls: list[Any]) -> list[str]:
-        """Persist every valid ``spawn_subtask`` call and schedule its runner.
+        """Persist every valid ``spawn_subtask`` call and hand it to the scheduler.
 
         Invalid calls (wrong name, missing args, bad arg types) are skipped
         with a warning so the orchestrator can still proceed.
 
-        Emits ``task_created`` (state=pending) immediately after creation, then
-        ``task_updated`` (state=running) after the transition, so the frontend
-        sidebar shows the full lifecycle.
+        Emits ``task_created`` (state=pending) immediately after creation.
+        The scheduler is responsible for the ``pending → running`` transition
+        + the matching ``task_updated`` event, since promotion can be deferred
+        when the running cap is saturated.
         """
 
         spawned: list[str] = []
@@ -245,25 +232,7 @@ class Orchestrator:
                     "created_at": created.created_at,
                 }
             )
-            try:
-                self._task_store.update_state(task_id, "running")
-            except TaskStoreError:
-                _logger.exception(
-                    "orchestrator.spawn_transition_failed",
-                    task_id=task_id,
-                )
-                continue
-            running = self._task_store.get_task(task_id)
-            await ws_events.emit(
-                {
-                    "type": "task_updated",
-                    "task_id": task_id,
-                    "state": running.state,
-                    "needs_attention": running.needs_attention,
-                    "updated_at": running.updated_at,
-                }
-            )
-            self._sub_agent_runner_factory(task_id)
+            await self._task_scheduler.enqueue(task_id)
             _logger.info("orchestrator.spawned_subtask", task_id=task_id, title=title)
             spawned.append(task_id)
         return spawned
@@ -298,18 +267,20 @@ class Orchestrator:
 def get_default_orchestrator() -> Orchestrator:
     """Build an :class:`Orchestrator` wired with runtime defaults.
 
-    Relies on the singletons primed by :func:`bob.main.lifespan`. Tests that
-    bypass the lifespan should use the DI constructor directly.
+    Relies on the singletons primed by :func:`bob.main.lifespan` — the
+    :class:`TaskStore`, the :class:`TaskScheduler` (already wired with its
+    sub-agent runner factory at boot), and the Jarvis prompt loader. Tests
+    that bypass the lifespan should use the DI constructor directly.
     """
 
     from bob.jarvis_prompt_loader import load_jarvis_prompt
-    from bob.llm.factory import build_jarvis_client, build_subagent_client
+    from bob.llm.factory import build_jarvis_client
 
     settings = get_settings()
     return Orchestrator(
         jarvis_client=build_jarvis_client(settings),
-        subagent_client=build_subagent_client(settings),
         jarvis_store=jarvis_store_module.get_default_store(),
         task_store=task_store_module.get_default_store(),
+        task_scheduler=task_scheduler.get_default_scheduler(),
         jarvis_prompt=load_jarvis_prompt(settings.BOB_DATA_DIR),
     )

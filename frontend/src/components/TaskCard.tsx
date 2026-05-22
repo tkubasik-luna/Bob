@@ -26,6 +26,10 @@ const STATE_LABEL: Record<TaskState, string> = {
  * One row in the sidebar. Minimalist by design: state dot + truncated title
  * + HH:MM timestamp. The whole card is the click target so the future drawer
  * (#0024) can be wired without restructuring the markup.
+ *
+ * Pending tasks (cap saturated, awaiting a free slot — slice #0020) carry a
+ * small "En attente" sub-label so the user knows the task hasn't started
+ * yet, distinct from running tasks where the blue dot alone is enough.
  */
 export function TaskCard({ task, onClick }: Props) {
   const time = formatTime(task.createdAt);
@@ -40,7 +44,12 @@ export function TaskCard({ task, onClick }: Props) {
         title={STATE_LABEL[task.state]}
         className={`block h-2.5 w-2.5 flex-none rounded-full ${STATE_DOT_CLASSES[task.state]}`}
       />
-      <span className="min-w-0 flex-1 truncate text-sm text-neutral-100">{task.title}</span>
+      <span className="flex min-w-0 flex-1 flex-col">
+        <span className="truncate text-sm text-neutral-100">{task.title}</span>
+        {task.state === "pending" && (
+          <span className="truncate text-xs text-neutral-500">En attente</span>
+        )}
+      </span>
       <span className="flex-none text-xs text-neutral-500 tabular-nums">{time}</span>
     </button>
   );

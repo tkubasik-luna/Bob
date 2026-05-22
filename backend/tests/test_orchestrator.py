@@ -16,6 +16,8 @@ from bob.jarvis_store import JarvisStore
 from bob.llm.types import LLMResponse, ToolCall, ToolDefinition
 from bob.llm_client import LLMClient
 from bob.orchestrator import _SPAWN_CONFIRMATION, Orchestrator
+from bob.sub_agent_runner import SubAgentRunner
+from bob.task_scheduler import TaskScheduler
 from bob.task_store import TaskStore
 
 
@@ -59,12 +61,31 @@ class FakeLLMClient(LLMClient):
 _TEST_JARVIS_PROMPT = "Tu es Jarvis-de-test, ton calme et concis."
 
 
+class _RecordingScheduler:
+    """Stand-in for :class:`TaskScheduler` in orchestrator tests.
+
+    Records each ``enqueue(task_id)`` call so tests can assert dispatch
+    without spinning up real runner tasks. The fake transitions the task to
+    ``running`` so existing assertions (``list_tasks(state="running")``)
+    keep their meaning — that is the contract the real scheduler honours
+    when a slot is free.
+    """
+
+    def __init__(self, task_store: TaskStore) -> None:
+        self._task_store = task_store
+        self.enqueued: list[str] = []
+
+    async def enqueue(self, task_id: str) -> None:
+        self.enqueued.append(task_id)
+        self._task_store.update_state(task_id, "running")
+
+
 def _make_orchestrator(
     *,
     complete_responses: list[LLMResponse] | None = None,
     chat_responses: list[str] | None = None,
-    runner_factory: Any = None,
-) -> tuple[Orchestrator, FakeLLMClient, FakeLLMClient, JarvisStore, TaskStore]:
+    scheduler: Any = None,
+) -> tuple[Orchestrator, FakeLLMClient, FakeLLMClient, JarvisStore, TaskStore, Any]:
     jarvis_client = FakeLLMClient(
         complete_responses=complete_responses,
         chat_responses=chat_responses,
@@ -74,15 +95,16 @@ def _make_orchestrator(
     apply_migrations(conn, default_migrations_dir())
     jarvis_store = JarvisStore(conn)
     task_store = TaskStore(conn)
+    if scheduler is None:
+        scheduler = _RecordingScheduler(task_store)
     orchestrator = Orchestrator(
         jarvis_client=jarvis_client,
-        subagent_client=subagent_client,
         jarvis_store=jarvis_store,
         task_store=task_store,
+        task_scheduler=scheduler,
         jarvis_prompt=_TEST_JARVIS_PROMPT,
-        sub_agent_runner_factory=runner_factory,
     )
-    return orchestrator, jarvis_client, subagent_client, jarvis_store, task_store
+    return orchestrator, jarvis_client, subagent_client, jarvis_store, task_store, scheduler
 
 
 def _spawn_tool_call(*, title: str = "Buy milk", goal: str = "Acheter du lait") -> ToolCall:
@@ -97,13 +119,6 @@ def _valid_payload(speech: str = "Bonjour Tom") -> str:
     return json.dumps({"speech": speech, "ui": []})
 
 
-def _noop_runner_factory(_task_id: str) -> asyncio.Task[None]:
-    async def _noop() -> None:
-        return None
-
-    return asyncio.create_task(_noop())
-
-
 # ---------------------------------------------------------------------------
 # Spawn path
 # ---------------------------------------------------------------------------
@@ -111,20 +126,15 @@ def _noop_runner_factory(_task_id: str) -> asyncio.Task[None]:
 
 @pytest.mark.asyncio
 async def test_process_user_message_spawns_subtask_when_tool_call() -> None:
-    spawned_task_ids: list[str] = []
-
-    def runner_factory(task_id: str) -> asyncio.Task[None]:
-        spawned_task_ids.append(task_id)
-        return _noop_runner_factory(task_id)
-
-    orchestrator, jarvis_client, _sub_client, jarvis_store, task_store = _make_orchestrator(
-        complete_responses=[
-            LLMResponse(
-                text=None,
-                tool_calls=[_spawn_tool_call(title="Drafts", goal="Draft 3 thanks emails")],
-            )
-        ],
-        runner_factory=runner_factory,
+    orchestrator, jarvis_client, _sub_client, jarvis_store, task_store, scheduler = (
+        _make_orchestrator(
+            complete_responses=[
+                LLMResponse(
+                    text=None,
+                    tool_calls=[_spawn_tool_call(title="Drafts", goal="Draft 3 thanks emails")],
+                )
+            ],
+        )
     )
 
     response = await orchestrator.process_user_message("s1", "Draft 3 thanks emails")
@@ -132,7 +142,7 @@ async def test_process_user_message_spawns_subtask_when_tool_call() -> None:
     assert response.speech == _SPAWN_CONFIRMATION
     assert response.ui == []
     assert len(response.spawned_task_ids) == 1
-    assert response.spawned_task_ids == spawned_task_ids
+    assert response.spawned_task_ids == scheduler.enqueued
 
     running = task_store.list_tasks(state="running")
     assert len(running) == 1
@@ -158,10 +168,11 @@ async def test_spawn_with_invalid_args_falls_back_to_text() -> None:
         name="spawn_subtask",
         arguments={"title": "no goal here"},
     )
-    orchestrator, jarvis_client, _sub_client, _jarvis_store, task_store = _make_orchestrator(
-        complete_responses=[LLMResponse(text=None, tool_calls=[bad_call])],
-        chat_responses=[_valid_payload("Fallback reply")],
-        runner_factory=_noop_runner_factory,
+    orchestrator, jarvis_client, _sub_client, _jarvis_store, task_store, scheduler = (
+        _make_orchestrator(
+            complete_responses=[LLMResponse(text=None, tool_calls=[bad_call])],
+            chat_responses=[_valid_payload("Fallback reply")],
+        )
     )
 
     response = await orchestrator.process_user_message("s1", "anything")
@@ -169,6 +180,7 @@ async def test_spawn_with_invalid_args_falls_back_to_text() -> None:
     assert response.speech == "Fallback reply"
     assert response.spawned_task_ids == []
     assert task_store.list_tasks() == []
+    assert scheduler.enqueued == []
     assert len(jarvis_client.complete_calls) == 1
     assert len(jarvis_client.chat_calls) == 1
 
@@ -180,7 +192,7 @@ async def test_spawn_with_invalid_args_falls_back_to_text() -> None:
 
 @pytest.mark.asyncio
 async def test_no_tool_call_routes_to_structured_chat() -> None:
-    orchestrator, jarvis_client, _sub, jarvis_store, task_store = _make_orchestrator(
+    orchestrator, jarvis_client, _sub, jarvis_store, task_store, _scheduler = _make_orchestrator(
         complete_responses=[LLMResponse(text="just chatting", tool_calls=[])],
         chat_responses=[
             json.dumps(
@@ -215,7 +227,7 @@ async def test_no_tool_call_routes_to_structured_chat() -> None:
 
 @pytest.mark.asyncio
 async def test_no_tool_call_uses_jarvis_prompt_in_system_message() -> None:
-    orchestrator, jarvis_client, _sub, _store, _ts = _make_orchestrator(
+    orchestrator, jarvis_client, _sub, _store, _ts, _scheduler = _make_orchestrator(
         complete_responses=[LLMResponse(text="just chatting", tool_calls=[])],
         chat_responses=[_valid_payload("ok")],
     )
@@ -235,7 +247,7 @@ async def test_no_tool_call_uses_jarvis_prompt_in_system_message() -> None:
 
 @pytest.mark.asyncio
 async def test_parser_retry_does_not_pollute_jarvis_history() -> None:
-    orchestrator, jarvis_client, _sub, jarvis_store, _ts = _make_orchestrator(
+    orchestrator, jarvis_client, _sub, jarvis_store, _ts, _scheduler = _make_orchestrator(
         complete_responses=[LLMResponse(text="just chatting", tool_calls=[])],
         chat_responses=["not json at all", _valid_payload("retry-ok")],
     )
@@ -252,7 +264,7 @@ async def test_parser_retry_does_not_pollute_jarvis_history() -> None:
 
 @pytest.mark.asyncio
 async def test_fallback_when_both_chat_attempts_invalid() -> None:
-    orchestrator, jarvis_client, _sub, jarvis_store, _ts = _make_orchestrator(
+    orchestrator, jarvis_client, _sub, jarvis_store, _ts, _scheduler = _make_orchestrator(
         complete_responses=[LLMResponse(text="just chatting", tool_calls=[])],
         chat_responses=["garbage first", "garbage retry"],
     )
@@ -275,7 +287,7 @@ async def test_fallback_when_both_chat_attempts_invalid() -> None:
 
 @pytest.mark.asyncio
 async def test_complete_call_sends_spawn_subtask_tool() -> None:
-    orchestrator, jarvis_client, _sub, _store, _ts = _make_orchestrator(
+    orchestrator, jarvis_client, _sub, _store, _ts, _scheduler = _make_orchestrator(
         complete_responses=[LLMResponse(text="hello", tool_calls=[])],
         chat_responses=[_valid_payload("ok")],
     )
@@ -299,9 +311,14 @@ async def test_complete_call_sends_spawn_subtask_tool() -> None:
 
 
 @pytest.mark.asyncio
-async def test_spawn_emits_task_created_then_task_updated() -> None:
-    """On spawn the orchestrator must emit a pending `task_created` then a
-    running `task_updated`, so the sidebar shows the full lifecycle."""
+async def test_spawn_emits_task_created_via_orchestrator() -> None:
+    """On spawn the orchestrator emits the `task_created` event itself.
+
+    The matching `task_updated` (pending → running) is the scheduler's
+    responsibility — covered in :mod:`test_task_scheduler`. With a
+    recording-scheduler double here, only the ``task_created`` event is
+    emitted from the orchestrator path.
+    """
 
     received: list[dict[str, Any]] = []
 
@@ -310,14 +327,13 @@ async def test_spawn_emits_task_created_then_task_updated() -> None:
 
     ws_events.set_emitter(_emitter)
     try:
-        orchestrator, _jc, _sc, _js, task_store = _make_orchestrator(
+        orchestrator, _jc, _sc, _js, task_store, _scheduler = _make_orchestrator(
             complete_responses=[
                 LLMResponse(
                     text=None,
                     tool_calls=[_spawn_tool_call(title="T", goal="G")],
                 )
             ],
-            runner_factory=_noop_runner_factory,
         )
 
         response = await orchestrator.process_user_message("s1", "hi")
@@ -326,23 +342,17 @@ async def test_spawn_emits_task_created_then_task_updated() -> None:
     finally:
         ws_events.set_emitter(None)
 
-    # Filter task events only (no other types are emitted in this slice).
     task_events = [e for e in received if e["task_id"] == task_id]
-    assert len(task_events) == 2
-
-    created, updated = task_events
+    assert len(task_events) == 1
+    created = task_events[0]
     assert created["type"] == "task_created"
     assert created["state"] == "pending"
     assert created["title"] == "T"
     assert created["goal"] == "G"
     assert isinstance(created["created_at"], str)
 
-    assert updated["type"] == "task_updated"
-    assert updated["state"] == "running"
-    assert updated["needs_attention"] is False
-    assert isinstance(updated["updated_at"], str)
-
-    # Sanity: task_store agrees the row ended in `running`.
+    # The fake scheduler still transitions the task to running, mirroring
+    # what the real one does when a slot is free.
     running = task_store.list_tasks(state="running")
     assert [t.id for t in running] == [task_id]
 
@@ -363,10 +373,9 @@ async def test_spawn_with_invalid_args_does_not_emit_events() -> None:
             name="spawn_subtask",
             arguments={"title": "no goal"},
         )
-        orchestrator, _jc, _sc, _js, _ts = _make_orchestrator(
+        orchestrator, _jc, _sc, _js, _ts, _scheduler = _make_orchestrator(
             complete_responses=[LLMResponse(text=None, tool_calls=[bad])],
             chat_responses=[_valid_payload("fallback")],
-            runner_factory=_noop_runner_factory,
         )
         response = await orchestrator.process_user_message("s1", "x")
         assert response.spawned_task_ids == []
@@ -398,12 +407,16 @@ async def test_end_to_end_spawn_and_complete() -> None:
     jarvis_store = JarvisStore(conn)
     task_store = TaskStore(conn)
 
-    # Default factory wires a real SubAgentRunner around ``subagent_client``.
+    def _runner_factory(tid: str) -> Any:
+        runner = SubAgentRunner(subagent_client=subagent_client, task_store=task_store)
+        return runner.run(tid)
+
+    scheduler = TaskScheduler(task_store=task_store, cap=3, runner_factory=_runner_factory)
     orchestrator = Orchestrator(
         jarvis_client=jarvis_client,
-        subagent_client=subagent_client,
         jarvis_store=jarvis_store,
         task_store=task_store,
+        task_scheduler=scheduler,
         jarvis_prompt=_TEST_JARVIS_PROMPT,
     )
 
