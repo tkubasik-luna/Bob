@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+from bob import ws_events
 from bob.db.migrations_runner import apply_migrations, default_migrations_dir
 from bob.llm.types import LLMResponse, ToolDefinition
 from bob.llm_client import LLMClient
@@ -197,3 +198,70 @@ async def test_done_action_without_result_marks_failed() -> None:
     task = store.get_task(task_id)
     assert task.state == "failed"
     assert task.result is None
+
+
+# ---------------------------------------------------------------------------
+# WS event emission (slice #0019)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_done_action_emits_task_updated_and_task_result() -> None:
+    store = _make_store()
+    task_id = _make_running_task(store)
+
+    received: list[dict[str, Any]] = []
+
+    async def _emitter(event: dict[str, Any]) -> None:
+        received.append(event)
+
+    ws_events.set_emitter(_emitter)
+    try:
+        client = _ScriptedClient(chat_value='{"action": "done", "result": "all good"}')
+        runner = SubAgentRunner(subagent_client=client, task_store=store)
+        await runner.run(task_id)
+    finally:
+        ws_events.set_emitter(None)
+
+    assert len(received) == 2
+    updated, result = received
+
+    assert updated["type"] == "task_updated"
+    assert updated["task_id"] == task_id
+    assert updated["state"] == "done"
+    assert updated["needs_attention"] is False
+    assert isinstance(updated["updated_at"], str)
+
+    assert result == {
+        "type": "task_result",
+        "task_id": task_id,
+        "result": "all good",
+    }
+
+
+@pytest.mark.asyncio
+async def test_failure_path_emits_task_updated_failed_and_reason_result() -> None:
+    """LLM exception → ``failed`` state with the reason surfaced as task_result."""
+
+    store = _make_store()
+    task_id = _make_running_task(store)
+
+    received: list[dict[str, Any]] = []
+
+    async def _emitter(event: dict[str, Any]) -> None:
+        received.append(event)
+
+    ws_events.set_emitter(_emitter)
+    try:
+        client = _ScriptedClient(chat_exc=RuntimeError("kaboom"))
+        runner = SubAgentRunner(subagent_client=client, task_store=store)
+        await runner.run(task_id)
+    finally:
+        ws_events.set_emitter(None)
+
+    assert len(received) == 2
+    updated, result = received
+    assert updated["type"] == "task_updated"
+    assert updated["state"] == "failed"
+    assert result["type"] == "task_result"
+    assert "kaboom" in result["result"]

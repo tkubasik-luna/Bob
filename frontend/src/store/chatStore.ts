@@ -1,5 +1,13 @@
 import { create } from "zustand";
-import type { ChatMessage, ComponentDescriptor, ConnectionStatus } from "../types/ws";
+import type {
+  ChatMessage,
+  ComponentDescriptor,
+  ConnectionStatus,
+  Task,
+  TaskCreatedMsg,
+  TaskResultMsg,
+  TaskUpdatedMsg,
+} from "../types/ws";
 
 export type ToastKind = "error" | "info";
 
@@ -30,6 +38,9 @@ type ChatState = {
   /** msg_id of the assistant bubble currently being voiced by audioPlayer,
    * or null when nothing is playing. Driven by `subscribeSpeaking`. */
   speakingMsgId: string | null;
+  /** Sub-tasks driven by `task_*` WS events (slice #0019). Keyed by id so
+   * each event is an idempotent upsert. */
+  tasks: Record<string, Task>;
   addUserMessage: (content: string) => void;
   /** Add an assistant message. When `msgId` is provided (server-issued
    * id from the `assistant_msg` frame) it is used as the React key AND as
@@ -42,6 +53,16 @@ type ChatState = {
   setSpeakingMsgId: (msgId: string | null) => void;
   pushToast: (message: string, codeOrOptions?: string | PushToastOptions) => string;
   dismissToast: (id: string) => void;
+  /** Insert a freshly-spawned task (or refresh one already present at
+   * reconnect). Live events arrive with `state=pending`; replayed events
+   * carry the current state. */
+  upsertTaskCreated: (msg: TaskCreatedMsg) => void;
+  /** Merge state / attention / updatedAt onto an existing task; create the
+   * task on the fly when the event lands before the matching `task_created`
+   * (defensive against races / replay reordering). */
+  upsertTaskUpdated: (msg: TaskUpdatedMsg) => void;
+  /** Persist the final result payload on a task; never changes state. */
+  setTaskResult: (msg: TaskResultMsg) => void;
 };
 
 function randomId(): string {
@@ -59,6 +80,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   sessionId: null,
   toasts: [],
   speakingMsgId: null,
+  tasks: {},
   addUserMessage: (content) =>
     set((state) => ({
       messages: [...state.messages, { id: randomId(), role: "user", content }],
@@ -71,6 +93,66 @@ export const useChatStore = create<ChatState>((set, get) => ({
   setWaiting: (isWaitingResponse) => set({ isWaitingResponse }),
   setSessionId: (sessionId) => set({ sessionId }),
   setSpeakingMsgId: (speakingMsgId) => set({ speakingMsgId }),
+  upsertTaskCreated: (msg) =>
+    set((state) => {
+      const existing = state.tasks[msg.task_id];
+      const next: Task = {
+        // Preserve any prior fields (result, updatedAt) so a late-arriving
+        // task_created (e.g. on reconnect) never erases progress.
+        ...(existing ?? {}),
+        id: msg.task_id,
+        title: msg.title,
+        goal: msg.goal,
+        state: msg.state,
+        createdAt: msg.created_at,
+      };
+      return { tasks: { ...state.tasks, [msg.task_id]: next } };
+    }),
+  upsertTaskUpdated: (msg) =>
+    set((state) => {
+      const existing = state.tasks[msg.task_id];
+      const base: Task = existing ?? {
+        id: msg.task_id,
+        title: msg.task_id,
+        goal: "",
+        state: msg.state,
+        createdAt: msg.updated_at,
+      };
+      const next: Task = {
+        ...base,
+        state: msg.state,
+        updatedAt: msg.updated_at,
+        ...(msg.needs_attention !== undefined ? { needsAttention: msg.needs_attention } : {}),
+      };
+      return { tasks: { ...state.tasks, [msg.task_id]: next } };
+    }),
+  setTaskResult: (msg) =>
+    set((state) => {
+      const existing = state.tasks[msg.task_id];
+      if (!existing) {
+        // task_result before task_created: keep the result so the next
+        // task_created upsert preserves it via the spread.
+        return {
+          tasks: {
+            ...state.tasks,
+            [msg.task_id]: {
+              id: msg.task_id,
+              title: msg.task_id,
+              goal: "",
+              state: "done",
+              createdAt: new Date().toISOString(),
+              result: msg.result,
+            },
+          },
+        };
+      }
+      return {
+        tasks: {
+          ...state.tasks,
+          [msg.task_id]: { ...existing, result: msg.result },
+        },
+      };
+    }),
   pushToast: (message, codeOrOptions) => {
     const opts: PushToastOptions =
       typeof codeOrOptions === "string" ? { code: codeOrOptions } : (codeOrOptions ?? {});

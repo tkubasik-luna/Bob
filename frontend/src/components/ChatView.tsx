@@ -10,6 +10,7 @@ import { useWebSocket } from "../hooks/useWebSocket";
 import { useChatStore } from "../store/chatStore";
 import type { ChatMessage, ServerMessage } from "../types/ws";
 import { Dispatcher } from "./Dispatcher";
+import { TaskSidebar } from "./TaskSidebar";
 import { ToastContainer } from "./Toast";
 
 export function ChatView() {
@@ -25,6 +26,9 @@ export function ChatView() {
   const dismissToast = useChatStore((s) => s.dismissToast);
   const speakingMsgId = useChatStore((s) => s.speakingMsgId);
   const setSpeakingMsgId = useChatStore((s) => s.setSpeakingMsgId);
+  const upsertTaskCreated = useChatStore((s) => s.upsertTaskCreated);
+  const upsertTaskUpdated = useChatStore((s) => s.upsertTaskUpdated);
+  const setTaskResult = useChatStore((s) => s.setTaskResult);
 
   // Bridge audioPlayer → store so `Bubble` can render the wave indicator
   // on the exact bubble currently being voiced. Cleared on natural end
@@ -100,9 +104,28 @@ export function ChatView() {
           pushToast(msg.message, msg.code);
           setWaiting(false);
           break;
+        case "task_created":
+          upsertTaskCreated(msg);
+          break;
+        case "task_updated":
+          upsertTaskUpdated(msg);
+          break;
+        case "task_result":
+          setTaskResult(msg);
+          break;
       }
     },
-    [addAssistantMessage, setSessionId, setWaiting, pushToast, dismissToast, prepToastId],
+    [
+      addAssistantMessage,
+      setSessionId,
+      setWaiting,
+      pushToast,
+      dismissToast,
+      prepToastId,
+      upsertTaskCreated,
+      upsertTaskUpdated,
+      setTaskResult,
+    ],
   );
 
   const handleBinary = useCallback((data: ArrayBuffer) => {
@@ -154,49 +177,52 @@ export function ChatView() {
   };
 
   return (
-    <div className="relative flex h-full flex-col bg-neutral-950 text-neutral-100">
+    <div className="relative flex h-full bg-neutral-950 text-neutral-100">
       <ToastContainer />
-      <header className="flex items-center justify-between border-b border-neutral-800 px-4 py-3">
-        <h1 className="text-lg font-semibold tracking-tight">Bob</h1>
-        <div className="flex items-center gap-2">
-          {connectionStatus !== "open" && (
-            <span className="rounded-full bg-red-900/40 px-2 py-0.5 text-xs text-red-200">
-              {connectionStatus === "connecting" ? "connexion…" : "déconnecté"}
-            </span>
-          )}
-          <VoiceToggleButton enabled={voiceEnabled} onToggle={toggleVoice} />
-        </div>
-      </header>
+      <div className="flex h-full min-w-0 flex-1 flex-col">
+        <header className="flex items-center justify-between border-b border-neutral-800 px-4 py-3">
+          <h1 className="text-lg font-semibold tracking-tight">Bob</h1>
+          <div className="flex items-center gap-2">
+            {connectionStatus !== "open" && (
+              <span className="rounded-full bg-red-900/40 px-2 py-0.5 text-xs text-red-200">
+                {connectionStatus === "connecting" ? "connexion…" : "déconnecté"}
+              </span>
+            )}
+            <VoiceToggleButton enabled={voiceEnabled} onToggle={toggleVoice} />
+          </div>
+        </header>
 
-      <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 py-4">
-        <div className="mx-auto flex max-w-2xl flex-col gap-3">
-          {messages.map((m) => (
-            <Bubble key={m.id} message={m} isSpeaking={speakingMsgId === m.id} />
-          ))}
-          {isWaitingResponse && <ThinkingDots />}
+        <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 py-4">
+          <div className="mx-auto flex max-w-2xl flex-col gap-3">
+            {messages.map((m) => (
+              <Bubble key={m.id} message={m} isSpeaking={speakingMsgId === m.id} />
+            ))}
+            {isWaitingResponse && <ThinkingDots />}
+          </div>
+        </div>
+
+        <div className="border-t border-neutral-800 px-4 py-3">
+          <div className="mx-auto flex max-w-2xl items-end gap-2">
+            <textarea
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={onKeyDown}
+              rows={2}
+              placeholder="Écris un message à Bob…"
+              className="flex-1 resize-none rounded-md border border-neutral-800 bg-neutral-900 px-3 py-2 text-sm text-neutral-100 placeholder-neutral-500 focus:border-neutral-600 focus:outline-none"
+            />
+            <button
+              type="button"
+              onClick={submit}
+              disabled={!canSend}
+              className="rounded-md bg-neutral-100 px-4 py-2 text-sm font-medium text-neutral-900 disabled:cursor-not-allowed disabled:bg-neutral-800 disabled:text-neutral-500"
+            >
+              Envoyer
+            </button>
+          </div>
         </div>
       </div>
-
-      <div className="border-t border-neutral-800 px-4 py-3">
-        <div className="mx-auto flex max-w-2xl items-end gap-2">
-          <textarea
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={onKeyDown}
-            rows={2}
-            placeholder="Écris un message à Bob…"
-            className="flex-1 resize-none rounded-md border border-neutral-800 bg-neutral-900 px-3 py-2 text-sm text-neutral-100 placeholder-neutral-500 focus:border-neutral-600 focus:outline-none"
-          />
-          <button
-            type="button"
-            onClick={submit}
-            disabled={!canSend}
-            className="rounded-md bg-neutral-100 px-4 py-2 text-sm font-medium text-neutral-900 disabled:cursor-not-allowed disabled:bg-neutral-800 disabled:text-neutral-500"
-          >
-            Envoyer
-          </button>
-        </div>
-      </div>
+      <TaskSidebar />
     </div>
   );
 }

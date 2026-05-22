@@ -31,7 +31,7 @@ import structlog
 
 from bob import jarvis_store as jarvis_store_module
 from bob import prompts as prompts_module
-from bob import response_parser
+from bob import response_parser, ws_events
 from bob import task_store as task_store_module
 from bob import ui_registry as ui_registry_module
 from bob.config import get_settings
@@ -162,7 +162,7 @@ class Orchestrator:
         )
 
         if decision.is_tool_call:
-            spawned_task_ids = self._dispatch_spawns(decision.tool_calls)
+            spawned_task_ids = await self._dispatch_spawns(decision.tool_calls)
             if spawned_task_ids:
                 self._jarvis_store.append("assistant", _SPAWN_CONFIRMATION)
                 return OrchestratorResponse(
@@ -205,11 +205,15 @@ class Orchestrator:
             *({"role": m["role"], "content": m["content"]} for m in history),
         ]
 
-    def _dispatch_spawns(self, tool_calls: list[Any]) -> list[str]:
+    async def _dispatch_spawns(self, tool_calls: list[Any]) -> list[str]:
         """Persist every valid ``spawn_subtask`` call and schedule its runner.
 
         Invalid calls (wrong name, missing args, bad arg types) are skipped
         with a warning so the orchestrator can still proceed.
+
+        Emits ``task_created`` (state=pending) immediately after creation, then
+        ``task_updated`` (state=running) after the transition, so the frontend
+        sidebar shows the full lifecycle.
         """
 
         spawned: list[str] = []
@@ -230,6 +234,17 @@ class Orchestrator:
                 continue
 
             task_id = self._task_store.create_task(title=title, goal=goal)
+            created = self._task_store.get_task(task_id)
+            await ws_events.emit(
+                {
+                    "type": "task_created",
+                    "task_id": task_id,
+                    "title": created.title,
+                    "goal": created.goal,
+                    "state": created.state,
+                    "created_at": created.created_at,
+                }
+            )
             try:
                 self._task_store.update_state(task_id, "running")
             except TaskStoreError:
@@ -238,6 +253,16 @@ class Orchestrator:
                     task_id=task_id,
                 )
                 continue
+            running = self._task_store.get_task(task_id)
+            await ws_events.emit(
+                {
+                    "type": "task_updated",
+                    "task_id": task_id,
+                    "state": running.state,
+                    "needs_attention": running.needs_attention,
+                    "updated_at": running.updated_at,
+                }
+            )
             self._sub_agent_runner_factory(task_id)
             _logger.info("orchestrator.spawned_subtask", task_id=task_id, title=title)
             spawned.append(task_id)

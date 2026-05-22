@@ -72,11 +72,7 @@ function s16leBytesToFloat32(bytes: ArrayBuffer | Uint8Array): Float32Array {
  *   - ArrayBuffer of s16le mono PCM (binary WS frame), OR
  *   - a pre-decoded Float32Array (used by the dev sine generator).
  */
-export function enqueue(
-  pcm: ArrayBuffer | Float32Array,
-  sampleRate: number,
-  msgId: string,
-): void {
+export function enqueue(pcm: ArrayBuffer | Float32Array, sampleRate: number, msgId: string): void {
   const audioCtx = getContext();
   if (audioCtx.state === "suspended") {
     void audioCtx.resume();

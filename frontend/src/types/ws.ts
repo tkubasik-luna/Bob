@@ -82,6 +82,57 @@ export type AudioErrorMsg = {
   reason: string;
 };
 
+/** Lifecycle state of a sub-task in the sidebar. Mirrors
+ * `bob.task_store.TaskState` on the backend. */
+export type TaskState = "pending" | "running" | "waiting_input" | "done" | "failed";
+
+/** A sub-task rendered in the right-hand sidebar. The frontend keeps a
+ * `Record<string, Task>` so each WS event can upsert by `id`. */
+export type Task = {
+  id: string;
+  title: string;
+  goal: string;
+  state: TaskState;
+  needsAttention?: boolean;
+  result?: string;
+  createdAt: string;
+  updatedAt?: string;
+};
+
+/** Emitted on spawn (state=pending) and on WS connect for every known task
+ * (state = current state). Frontend upserts unconditionally. */
+export type TaskCreatedMsg = {
+  type: "task_created";
+  task_id: string;
+  title: string;
+  goal: string;
+  state: TaskState;
+  created_at: string;
+  /** Set on tasks replayed at connect time so the frontend can distinguish
+   * historical events if it ever needs to. Live events omit the flag. */
+  replayed?: boolean;
+};
+
+/** Emitted on every state / attention transition past the initial spawn. */
+export type TaskUpdatedMsg = {
+  type: "task_updated";
+  task_id: string;
+  state: TaskState;
+  needs_attention?: boolean;
+  updated_at: string;
+  replayed?: boolean;
+};
+
+/** Emitted when a task gets its final result payload. Sent right after the
+ * matching `task_updated` on the live path, and replayed at connect time
+ * for tasks that already had a result persisted. */
+export type TaskResultMsg = {
+  type: "task_result";
+  task_id: string;
+  result: string;
+  replayed?: boolean;
+};
+
 export type ServerMessage =
   | SessionMsg
   | AssistantMsg
@@ -91,7 +142,10 @@ export type ServerMessage =
   | AudioEndMsg
   | TtsPreparingMsg
   | TtsReadyMsg
-  | AudioErrorMsg;
+  | AudioErrorMsg
+  | TaskCreatedMsg
+  | TaskUpdatedMsg
+  | TaskResultMsg;
 
 export type ConnectionStatus = "connecting" | "open" | "closed";
 

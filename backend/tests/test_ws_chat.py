@@ -16,7 +16,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from bob import jarvis_store as jarvis_store_module
-from bob import ws_router
+from bob import task_store as task_store_module
+from bob import ws_events, ws_router
 from bob.main import app
 from bob.orchestrator import Orchestrator, OrchestratorResponse
 from bob.tts_service import KokoroTtsService, SynthesisChunk
@@ -206,3 +207,126 @@ def test_ws_chat_rejects_bad_content(fake_chat_service: _FakeOrchestrator) -> No
         assert err["type"] == "error"
         assert err["code"] == "bad_content"
     assert fake_chat_service.calls == []
+
+
+# ---------------------------------------------------------------------------
+# Task events: emitted on the live connection + replayed on reconnect.
+# ---------------------------------------------------------------------------
+
+
+class _SpawningOrchestrator:
+    """Orchestrator double that creates a task and emits the matching events.
+
+    Mirrors the real :meth:`Orchestrator._dispatch_spawns` flow without going
+    through the LLM: useful to verify the WS handler installs an emitter that
+    routes events back to the connected client.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+
+    async def process_user_message(
+        self, session_id: str, user_content: str
+    ) -> OrchestratorResponse:
+        self.calls.append((session_id, user_content))
+        store = task_store_module.get_default_store()
+        task_id = store.create_task(title="Drafts", goal="Draft 3 emails")
+        created = store.get_task(task_id)
+        await ws_events.emit(
+            {
+                "type": "task_created",
+                "task_id": task_id,
+                "title": created.title,
+                "goal": created.goal,
+                "state": created.state,
+                "created_at": created.created_at,
+            }
+        )
+        store.update_state(task_id, "running")
+        running = store.get_task(task_id)
+        await ws_events.emit(
+            {
+                "type": "task_updated",
+                "task_id": task_id,
+                "state": running.state,
+                "needs_attention": running.needs_attention,
+                "updated_at": running.updated_at,
+            }
+        )
+        return OrchestratorResponse(speech="ok", ui=[], spawned_task_ids=[task_id])
+
+
+def test_ws_chat_emits_task_events_on_spawn(clear_jarvis_history: None) -> None:
+    """A user_msg that triggers a spawn must surface task_created+task_updated."""
+
+    fake = _SpawningOrchestrator()
+    ws_router.set_orchestrator_provider(lambda: cast(Orchestrator, fake))
+    try:
+        with TestClient(app) as client, client.websocket_connect("/ws/chat") as ws:
+            session = ws.receive_json()
+            assert session["type"] == "session"
+
+            ws.send_json({"type": "user_msg", "content": "spawn please"})
+            assert ws.receive_json() == {"type": "thinking", "state": "start"}
+
+            created = ws.receive_json()
+            assert created["type"] == "task_created"
+            assert created["title"] == "Drafts"
+            assert created["state"] == "pending"
+            task_id = created["task_id"]
+
+            updated = ws.receive_json()
+            assert updated["type"] == "task_updated"
+            assert updated["task_id"] == task_id
+            assert updated["state"] == "running"
+
+            assistant = ws.receive_json()
+            assert assistant["type"] == "assistant_msg"
+            assert ws.receive_json() == {"type": "thinking", "state": "end"}
+    finally:
+        ws_router.reset_orchestrator_provider()
+
+
+def test_ws_chat_replays_active_tasks_on_connect(clear_jarvis_history: None) -> None:
+    """Pre-existing tasks in the store are pushed as task_created on a fresh WS."""
+
+    with TestClient(app) as client:
+        store = task_store_module.get_default_store()
+        pending_id = store.create_task(title="Pending one", goal="P")
+        running_id = store.create_task(title="Running one", goal="R")
+        store.update_state(running_id, "running")
+        done_id = store.create_task(title="Done one", goal="D")
+        store.update_state(done_id, "running")
+        store.set_result(done_id, "result text")
+        store.update_state(done_id, "done")
+
+        with client.websocket_connect("/ws/chat") as ws:
+            assert ws.receive_json()["type"] == "session"
+
+            # task_created in creation order.
+            evt1 = ws.receive_json()
+            assert evt1["type"] == "task_created"
+            assert evt1["task_id"] == pending_id
+            assert evt1["state"] == "pending"
+            assert evt1["replayed"] is True
+
+            evt2 = ws.receive_json()
+            assert evt2["type"] == "task_created"
+            assert evt2["task_id"] == running_id
+            assert evt2["state"] == "running"
+            assert evt2["replayed"] is True
+
+            evt3 = ws.receive_json()
+            assert evt3["type"] == "task_created"
+            assert evt3["task_id"] == done_id
+            assert evt3["state"] == "done"
+            assert evt3["replayed"] is True
+
+            # The done task also has a result, so task_result is replayed too.
+            evt4 = ws.receive_json()
+            assert evt4 == {
+                "type": "task_result",
+                "task_id": done_id,
+                "result": "result text",
+                "replayed": True,
+            }

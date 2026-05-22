@@ -10,6 +10,7 @@ from uuid import uuid4
 
 import pytest
 
+from bob import ws_events
 from bob.db.migrations_runner import apply_migrations, default_migrations_dir
 from bob.jarvis_store import JarvisStore
 from bob.llm.types import LLMResponse, ToolCall, ToolDefinition
@@ -290,6 +291,89 @@ async def test_complete_call_sends_spawn_subtask_tool() -> None:
 # ---------------------------------------------------------------------------
 # End-to-end: Jarvis spawns → SubAgentRunner completes → task=done + result.
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# WS event emission (slice #0019)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_spawn_emits_task_created_then_task_updated() -> None:
+    """On spawn the orchestrator must emit a pending `task_created` then a
+    running `task_updated`, so the sidebar shows the full lifecycle."""
+
+    received: list[dict[str, Any]] = []
+
+    async def _emitter(event: dict[str, Any]) -> None:
+        received.append(event)
+
+    ws_events.set_emitter(_emitter)
+    try:
+        orchestrator, _jc, _sc, _js, task_store = _make_orchestrator(
+            complete_responses=[
+                LLMResponse(
+                    text=None,
+                    tool_calls=[_spawn_tool_call(title="T", goal="G")],
+                )
+            ],
+            runner_factory=_noop_runner_factory,
+        )
+
+        response = await orchestrator.process_user_message("s1", "hi")
+        assert len(response.spawned_task_ids) == 1
+        task_id = response.spawned_task_ids[0]
+    finally:
+        ws_events.set_emitter(None)
+
+    # Filter task events only (no other types are emitted in this slice).
+    task_events = [e for e in received if e["task_id"] == task_id]
+    assert len(task_events) == 2
+
+    created, updated = task_events
+    assert created["type"] == "task_created"
+    assert created["state"] == "pending"
+    assert created["title"] == "T"
+    assert created["goal"] == "G"
+    assert isinstance(created["created_at"], str)
+
+    assert updated["type"] == "task_updated"
+    assert updated["state"] == "running"
+    assert updated["needs_attention"] is False
+    assert isinstance(updated["updated_at"], str)
+
+    # Sanity: task_store agrees the row ended in `running`.
+    running = task_store.list_tasks(state="running")
+    assert [t.id for t in running] == [task_id]
+
+
+@pytest.mark.asyncio
+async def test_spawn_with_invalid_args_does_not_emit_events() -> None:
+    """When all tool calls are dropped, no task events are emitted."""
+
+    received: list[dict[str, Any]] = []
+
+    async def _emitter(event: dict[str, Any]) -> None:
+        received.append(event)
+
+    ws_events.set_emitter(_emitter)
+    try:
+        bad = ToolCall(
+            id="call_bad",
+            name="spawn_subtask",
+            arguments={"title": "no goal"},
+        )
+        orchestrator, _jc, _sc, _js, _ts = _make_orchestrator(
+            complete_responses=[LLMResponse(text=None, tool_calls=[bad])],
+            chat_responses=[_valid_payload("fallback")],
+            runner_factory=_noop_runner_factory,
+        )
+        response = await orchestrator.process_user_message("s1", "x")
+        assert response.spawned_task_ids == []
+    finally:
+        ws_events.set_emitter(None)
+
+    assert received == []
 
 
 @pytest.mark.asyncio

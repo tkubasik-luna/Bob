@@ -27,6 +27,7 @@ from typing import Any
 
 import structlog
 
+from bob import ws_events
 from bob.llm_client import LLMClient
 from bob.task_store import TaskStore, TaskStoreError
 
@@ -138,7 +139,7 @@ class SubAgentRunner:
             raw = await self._client.chat(messages, session_id=task_id)
         except Exception as exc:
             _logger.exception("sub_agent_runner.llm_failed", task_id=task_id)
-            self._fail(task_id, f"LLM call failed: {exc}")
+            await self._fail(task_id, f"LLM call failed: {exc}")
             return
 
         try:
@@ -150,12 +151,12 @@ class SubAgentRunner:
                 reason=str(exc),
                 raw_preview=raw[:200],
             )
-            self._fail(task_id, f"sub-agent response invalid: {exc}")
+            await self._fail(task_id, f"sub-agent response invalid: {exc}")
             return
 
         action = action_payload["action"]
         if action == "done":
-            self._handle_done(task_id, action_payload["result"])
+            await self._handle_done(task_id, action_payload["result"])
             return
 
         # Slice #0018 only supports ``done``. Anything else is a parse error
@@ -165,9 +166,9 @@ class SubAgentRunner:
             task_id=task_id,
             action=action,
         )
-        self._fail(task_id, f"action {action!r} not supported in this slice")
+        await self._fail(task_id, f"action {action!r} not supported in this slice")
 
-    def _handle_done(self, task_id: str, result: str) -> None:
+    async def _handle_done(self, task_id: str, result: str) -> None:
         try:
             self._task_store.set_result(task_id, result)
             self._task_store.append_message(
@@ -176,8 +177,32 @@ class SubAgentRunner:
             self._task_store.update_state(task_id, "done")
         except TaskStoreError:
             _logger.exception("sub_agent_runner.persist_done_failed", task_id=task_id)
+            return
 
-    def _fail(self, task_id: str, reason: str) -> None:
+        try:
+            task = self._task_store.get_task(task_id)
+        except TaskStoreError:
+            _logger.exception("sub_agent_runner.reload_done_failed", task_id=task_id)
+            return
+
+        await ws_events.emit(
+            {
+                "type": "task_updated",
+                "task_id": task_id,
+                "state": task.state,
+                "needs_attention": task.needs_attention,
+                "updated_at": task.updated_at,
+            }
+        )
+        await ws_events.emit(
+            {
+                "type": "task_result",
+                "task_id": task_id,
+                "result": result,
+            }
+        )
+
+    async def _fail(self, task_id: str, reason: str) -> None:
         """Mark ``task_id`` as failed with a system message describing ``reason``."""
 
         try:
@@ -185,3 +210,27 @@ class SubAgentRunner:
             self._task_store.update_state(task_id, "failed")
         except TaskStoreError:
             _logger.exception("sub_agent_runner.persist_failed_failed", task_id=task_id)
+            return
+
+        try:
+            task = self._task_store.get_task(task_id)
+        except TaskStoreError:
+            _logger.exception("sub_agent_runner.reload_failed_failed", task_id=task_id)
+            return
+
+        await ws_events.emit(
+            {
+                "type": "task_updated",
+                "task_id": task_id,
+                "state": task.state,
+                "needs_attention": task.needs_attention,
+                "updated_at": task.updated_at,
+            }
+        )
+        await ws_events.emit(
+            {
+                "type": "task_result",
+                "task_id": task_id,
+                "result": reason,
+            }
+        )

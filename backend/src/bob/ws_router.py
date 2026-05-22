@@ -40,7 +40,8 @@ import structlog
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from bob import jarvis_store as jarvis_store_module
-from bob import text_segmenter
+from bob import task_store as task_store_module
+from bob import text_segmenter, ws_events
 from bob.orchestrator import Orchestrator, get_default_orchestrator
 from bob.spoken_text_cleaner import clean_for_speech
 from bob.tts_service import KokoroTtsService, get_default_tts_service
@@ -91,9 +92,24 @@ async def chat_ws(websocket: WebSocket) -> None:
     _sessions[session_id] = {"active_tts": []}
     orchestrator = _orchestrator_provider()
 
+    async def _session_emit(event: dict[str, Any]) -> None:
+        """Forward a task event from the orchestrator / sub-agent to this WS."""
+
+        try:
+            await websocket.send_json(event)
+        except Exception:
+            _logger.exception(
+                "ws_chat.task_event_emit_failed",
+                session_id=session_id,
+                event_type=event.get("type"),
+            )
+
+    ws_events.set_emitter(_session_emit)
+
     try:
         await websocket.send_json({"type": "session", "session_id": session_id})
         await _replay_history(websocket)
+        await _replay_active_tasks(websocket)
 
         while True:
             payload = await websocket.receive_json()
@@ -101,6 +117,7 @@ async def chat_ws(websocket: WebSocket) -> None:
     except WebSocketDisconnect:
         pass
     finally:
+        ws_events.set_emitter(None)
         await _cancel_active_tts(session_id, emit_audio_end=False, websocket=None)
         _sessions.pop(session_id, None)
         # NOTE: Jarvis history is persistent across disconnects (PRD 0003).
@@ -133,6 +150,47 @@ async def _replay_history(websocket: WebSocket) -> None:
                     "msg_id": uuid.uuid4().hex,
                     "speech": content,
                     "ui": [],
+                    "replayed": True,
+                }
+            )
+
+
+async def _replay_active_tasks(websocket: WebSocket) -> None:
+    """Replay the task store on connect so the sidebar reconstructs at reload.
+
+    Emits one ``task_created`` per task (current state, not necessarily
+    ``pending``) plus a ``task_result`` when the task already has a result.
+    The ``replayed: true`` flag lets the frontend distinguish if it wants —
+    the current frontend simply upserts unconditionally.
+
+    Slice #0024 will introduce dismiss filtering; for now every known task is
+    surfaced. Silently skips when the task store hasn't been primed (narrow
+    test setups that bypass the lifespan).
+    """
+
+    try:
+        store = task_store_module.get_default_store()
+    except RuntimeError:
+        return
+
+    for task in store.list_tasks():
+        await websocket.send_json(
+            {
+                "type": "task_created",
+                "task_id": task.id,
+                "title": task.title,
+                "goal": task.goal,
+                "state": task.state,
+                "created_at": task.created_at,
+                "replayed": True,
+            }
+        )
+        if task.result is not None:
+            await websocket.send_json(
+                {
+                    "type": "task_result",
+                    "task_id": task.id,
+                    "result": task.result,
                     "replayed": True,
                 }
             )
