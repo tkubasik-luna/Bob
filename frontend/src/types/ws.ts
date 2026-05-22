@@ -124,6 +124,11 @@ export type Task = {
    * of replay). The frontend simply drops the task from its map on
    * dismiss so the flag is rarely surfaced here. */
   dismissed?: boolean;
+  /** Slice #0022 — latest intermediate status emitted by the sub-agent
+   * via the `progress` action. Only meaningful while `state === "running"`;
+   * the store clears it on any transition out of `running` so a stale
+   * status never lingers under a `done` / `failed` card. */
+  progressStatus?: string;
 };
 
 /** Slice #0024 — one row in a task's transcript, rendered inside the
@@ -150,13 +155,21 @@ export type TaskCreatedMsg = {
   replayed?: boolean;
 };
 
-/** Emitted on every state / attention transition past the initial spawn. */
+/** Emitted on every state / attention transition past the initial spawn.
+ *
+ * Slice #0022 adds the optional `progress_status` field: the sub-agent
+ * runner sets it on the `task_updated` event that follows a `progress`
+ * action emit (state stays `running`). State-only transitions (e.g.
+ * `pending → running`, `running → done`) omit the field. The store keeps
+ * the latest non-null value on the task while it stays `running` and
+ * clears it on any other transition. */
 export type TaskUpdatedMsg = {
   type: "task_updated";
   task_id: string;
   state: TaskState;
   needs_attention?: boolean;
   updated_at: string;
+  progress_status?: string;
   replayed?: boolean;
 };
 

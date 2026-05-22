@@ -64,6 +64,13 @@ export function TaskCard({ task, onOpen, onDismiss }: Props) {
         {task.state === "pending" && (
           <span className="truncate text-xs text-neutral-500">En attente</span>
         )}
+        {/* Slice #0022 — live progress status from the sub-agent. Only
+            rendered while the task is actually running; the store clears
+            the field on any other transition so we never show a stale
+            line under a `done` / `failed` card. */}
+        {task.state === "running" && task.progressStatus && (
+          <span className="truncate text-xs text-zinc-500 italic">{task.progressStatus}</span>
+        )}
       </span>
       <span className="flex-none text-xs text-neutral-500 tabular-nums">{time}</span>
       {isTerminal && onDismiss && (

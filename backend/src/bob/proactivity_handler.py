@@ -14,6 +14,12 @@ The handler is intentionally tiny: it knows how to read a
 ``task_state_changed`` payload and dispatch to the right orchestrator
 method. Anything else (paraphrase prompt, WS emission) lives in the
 orchestrator.
+
+Note (slice #0022): the handler is subscribed exclusively to
+``task_state_changed``. ``progress`` events publish on
+``task_message_added`` only (no state transition) so this handler does not
+fire on progress — Jarvis stays silent in the main chat while progress
+statuses flow to the sidebar.
 """
 
 from __future__ import annotations

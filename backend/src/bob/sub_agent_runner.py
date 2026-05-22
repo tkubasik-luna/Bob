@@ -12,6 +12,17 @@ Slice #0021 extends the runner to support ``ask_user`` in addition to
 answer appended to its message log; ``run`` is then re-invoked and re-enters
 the loop with the full history in scope.
 
+Slice #0022 extends the runner with ``progress``: the sub-agent may emit
+``progress(status)`` zero or more times to surface a live intermediate
+status to the sidebar without terminating the task. A single ``run`` call
+loops until the LLM emits a terminal action (``done`` / ``ask_user``); a
+hard cap of :data:`MAX_PROGRESS_ITERATIONS` consecutive ``progress`` emits
+without a terminal transitions the task to ``failed`` with reason
+``max_iterations_exceeded`` to prevent infinite loops. ``progress`` does
+NOT publish on ``task_state_changed`` (state stays ``running``), so the
+:class:`ProactivityHandler` never fires on progress and Jarvis stays
+silent in the main chat.
+
 State machine guarantees:
 
 - A task can enter the runner in state ``pending`` (just spawned, slot free)
@@ -23,11 +34,15 @@ State machine guarantees:
 - On ``ask_user`` the runner appends the question to the message log,
   transitions ``running → waiting_input`` and returns. The EventBus
   publishes ``task_state_changed`` so the proactivity handler can react.
-- On any error (LLM exception, parse failure, unsupported action) the runner
-  transitions ``→ failed`` and records a system message describing the
-  failure reason. The runner never re-raises — the surrounding
-  ``asyncio.create_task`` would otherwise log an unhandled-exception
-  warning.
+- On ``progress`` the runner appends the status to the message log, emits a
+  ``task_updated`` event carrying ``progress_status`` (state stays
+  ``running``), publishes ``task_message_added`` on the bus, and re-iterates.
+  No ``task_state_changed`` event — the state did not change.
+- On any error (LLM exception, parse failure, unsupported action, progress
+  cap exceeded) the runner transitions ``→ failed`` and records a system
+  message describing the failure reason. The runner never re-raises — the
+  surrounding ``asyncio.create_task`` would otherwise log an
+  unhandled-exception warning.
 """
 
 from __future__ import annotations
@@ -51,10 +66,17 @@ _SYSTEM_PROMPT_TEMPLATE = (
     '  - {{"action": "done", "result": "<result text>"}} when the goal is achieved.\n'
     '  - {{"action": "ask_user", "question": "<question>"}} when you need '
     "clarification from the user (kept minimal — one focused question).\n"
-    '  - {{"action": "progress", "status": "<status>"}} for intermediate status '
-    "(NOT USED in this slice).\n"
+    '  - {{"action": "progress", "status": "<status>"}} to surface an '
+    'intermediate status (e.g. "analysing document 3 of 10"). Use sparingly '
+    "for long-running work; the loop will re-invoke you immediately so always "
+    "follow up with done or ask_user once the work is complete.\n"
     "Respond with the JSON object ONLY, no markdown fences, no prose around it."
 )
+
+# Hard cap on consecutive ``progress`` emits without a terminal action
+# (``done`` / ``ask_user``). Beyond this the runner fails the task with
+# reason ``max_iterations_exceeded`` to prevent infinite progress loops.
+MAX_PROGRESS_ITERATIONS = 10
 
 
 def _strip_code_fence(text: str) -> str:
@@ -146,7 +168,13 @@ class SubAgentRunner:
         return self._explicit_bus if self._explicit_bus is not None else get_event_bus()
 
     async def run(self, task_id: str) -> None:
-        """Run the sub-agent for ``task_id``; never re-raises."""
+        """Run the sub-agent for ``task_id``; never re-raises.
+
+        Iterates within a single call to support the ``progress`` action: the
+        LLM may emit progress events back-to-back, and only ``done`` /
+        ``ask_user`` exit the loop. A consecutive-progress cap of
+        :data:`MAX_PROGRESS_ITERATIONS` guards against infinite loops.
+        """
 
         try:
             task = self._task_store.get_task(task_id)
@@ -166,44 +194,69 @@ class SubAgentRunner:
             )
             return
 
-        messages = self._build_messages(task)
+        progress_count = 0
+        while True:
+            # Reload the task on each iteration so the message log is fresh
+            # for the next LLM call (progress entries get persisted between
+            # turns and must be replayed back to the model).
+            try:
+                task = self._task_store.get_task(task_id)
+            except TaskStoreError:
+                _logger.exception("sub_agent_runner.task_reload_failed", task_id=task_id)
+                return
 
-        try:
-            raw = await self._client.chat(messages, session_id=task_id)
-        except Exception as exc:
-            _logger.exception("sub_agent_runner.llm_failed", task_id=task_id)
-            await self._fail(task_id, f"LLM call failed: {exc}")
-            return
+            messages = self._build_messages(task)
 
-        try:
-            action_payload = _parse_action(raw)
-        except _ParseError as exc:
+            try:
+                raw = await self._client.chat(messages, session_id=task_id)
+            except Exception as exc:
+                _logger.exception("sub_agent_runner.llm_failed", task_id=task_id)
+                await self._fail(task_id, f"LLM call failed: {exc}")
+                return
+
+            try:
+                action_payload = _parse_action(raw)
+            except _ParseError as exc:
+                _logger.warning(
+                    "sub_agent_runner.parse_failed",
+                    task_id=task_id,
+                    reason=str(exc),
+                    raw_preview=raw[:200],
+                )
+                await self._fail(task_id, f"sub-agent response invalid: {exc}")
+                return
+
+            action = action_payload["action"]
+            if action == "done":
+                await self._handle_done(task_id, action_payload["result"])
+                return
+
+            if action == "ask_user":
+                await self._handle_ask_user(task_id, action_payload["question"])
+                return
+
+            if action == "progress":
+                progress_count += 1
+                if progress_count > MAX_PROGRESS_ITERATIONS:
+                    _logger.warning(
+                        "sub_agent_runner.progress_cap_exceeded",
+                        task_id=task_id,
+                        cap=MAX_PROGRESS_ITERATIONS,
+                    )
+                    await self._fail(task_id, "max_iterations_exceeded")
+                    return
+                await self._handle_progress(task_id, action_payload["status"])
+                continue
+
+            # Defensive — ``_parse_action`` already filters unknown actions,
+            # but mypy needs the explicit branch.
             _logger.warning(
-                "sub_agent_runner.parse_failed",
+                "sub_agent_runner.unsupported_action",
                 task_id=task_id,
-                reason=str(exc),
-                raw_preview=raw[:200],
+                action=action,
             )
-            await self._fail(task_id, f"sub-agent response invalid: {exc}")
+            await self._fail(task_id, f"action {action!r} not supported")
             return
-
-        action = action_payload["action"]
-        if action == "done":
-            await self._handle_done(task_id, action_payload["result"])
-            return
-
-        if action == "ask_user":
-            await self._handle_ask_user(task_id, action_payload["question"])
-            return
-
-        # ``progress`` is reserved for a later slice. For now treat it as a
-        # protocol violation so we don't silently drop transitions.
-        _logger.warning(
-            "sub_agent_runner.unsupported_action",
-            task_id=task_id,
-            action=action,
-        )
-        await self._fail(task_id, f"action {action!r} not supported in this slice")
 
     def _build_messages(self, task: Task) -> list[dict[str, Any]]:
         """Build the LLM message list, including any prior turns persisted in the log.
@@ -276,6 +329,60 @@ class SubAgentRunner:
                 "old_state": "running",
                 "new_state": "done",
                 "action": "done",
+            },
+        )
+
+    async def _handle_progress(self, task_id: str, status: str) -> None:
+        """Persist a progress status, emit WS events, leave state ``running``.
+
+        ``task_state_changed`` is intentionally NOT published: the state did
+        not change. The :class:`ProactivityHandler` is subscribed only to
+        ``task_state_changed`` so it stays silent on progress events —
+        Jarvis does not surface intermediate statuses in the main chat.
+
+        ``task_message_added`` IS published so future subscribers (and tests)
+        can observe progress emissions on the bus without coupling to the
+        WS layer.
+        """
+
+        try:
+            message_id = self._task_store.append_message(
+                task_id, role="assistant", content=status, action="progress"
+            )
+        except TaskStoreError:
+            _logger.exception("sub_agent_runner.persist_progress_failed", task_id=task_id)
+            return
+
+        try:
+            task = self._task_store.get_task(task_id)
+        except TaskStoreError:
+            _logger.exception("sub_agent_runner.reload_progress_failed", task_id=task_id)
+            return
+
+        await _emit_task_message(
+            self._task_store,
+            task_id,
+            message_id=message_id,
+        )
+        await ws_events.emit(
+            {
+                "type": "task_updated",
+                "task_id": task_id,
+                "state": task.state,
+                "needs_attention": task.needs_attention,
+                "updated_at": task.updated_at,
+                "progress_status": status,
+            }
+        )
+        # Bus notification — explicitly NOT ``task_state_changed``: state
+        # did not transition, so the proactivity handler must not fire.
+        await self._bus.publish(
+            "task_message_added",
+            {
+                "task_id": task_id,
+                "message_id": message_id,
+                "role": "assistant",
+                "action": "progress",
             },
         )
 

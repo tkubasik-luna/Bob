@@ -161,6 +161,17 @@ export const useChatStore = create<ChatState>((set, get) => ({
         updatedAt: msg.updated_at,
         ...(msg.needs_attention !== undefined ? { needsAttention: msg.needs_attention } : {}),
       };
+      // Slice #0022 — progress_status only lives on `running` tasks. If
+      // the event carries one (progress emit), store it; on any non-running
+      // transition (done / failed / waiting_input) clear the field so a
+      // stale status never lingers under a terminal card.
+      if (msg.state === "running") {
+        if (msg.progress_status !== undefined) {
+          next.progressStatus = msg.progress_status;
+        }
+      } else {
+        next.progressStatus = undefined;
+      }
       return { tasks: { ...state.tasks, [msg.task_id]: next } };
     }),
   setTaskResult: (msg) =>

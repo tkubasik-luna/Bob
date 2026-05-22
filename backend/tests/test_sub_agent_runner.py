@@ -134,21 +134,6 @@ async def test_invalid_json_marks_failed_no_result() -> None:
 
 
 @pytest.mark.asyncio
-async def test_unsupported_progress_action_marks_failed() -> None:
-    store = _make_store()
-    task_id = _make_running_task(store)
-
-    client = _ScriptedClient(chat_value='{"action": "progress", "status": "halfway"}')
-    runner = SubAgentRunner(subagent_client=client, task_store=store, event_bus=EventBus())
-
-    await runner.run(task_id)
-
-    task = store.get_task(task_id)
-    assert task.state == "failed"
-    assert task.result is None
-
-
-@pytest.mark.asyncio
 async def test_llm_exception_marks_failed_and_does_not_reraise() -> None:
     store = _make_store()
     task_id = _make_running_task(store)
@@ -374,3 +359,176 @@ async def test_resume_after_forward_replays_history_and_completes() -> None:
     contents = [m["content"] for m in second_call_msgs]
     assert "Formel ou amical ?" in contents
     assert "Amical." in contents
+
+
+# ---------------------------------------------------------------------------
+# progress action (slice #0022) — intermediate status loop
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_progress_sequence_then_done_persists_messages_and_emits_events() -> None:
+    """3 progress emits then done: state ends ``done``, all 4 messages logged."""
+
+    store = _make_store()
+    task_id = _make_running_task(store)
+
+    received_ws: list[dict[str, Any]] = []
+
+    async def _emitter(event: dict[str, Any]) -> None:
+        received_ws.append(event)
+
+    ws_events.set_emitter(_emitter)
+    try:
+        client = _ScriptedClient(
+            chat_values=[
+                '{"action": "progress", "status": "step 1"}',
+                '{"action": "progress", "status": "step 2"}',
+                '{"action": "progress", "status": "step 3"}',
+                '{"action": "done", "result": "all good"}',
+            ]
+        )
+        runner = SubAgentRunner(subagent_client=client, task_store=store, event_bus=EventBus())
+        await runner.run(task_id)
+    finally:
+        ws_events.set_emitter(None)
+
+    task = store.get_task(task_id)
+    assert task.state == "done"
+    assert task.result == "all good"
+
+    # 3 progress assistant messages + 1 done assistant message in the log.
+    messages = store.get_task_messages(task_id)
+    progress_msgs = [m for m in messages if m.action == "progress"]
+    done_msgs = [m for m in messages if m.action == "done"]
+    assert [m.content for m in progress_msgs] == ["step 1", "step 2", "step 3"]
+    assert len(done_msgs) == 1
+    assert done_msgs[0].content == "all good"
+    assert all(m.role == "assistant" for m in progress_msgs + done_msgs)
+
+    # WS event sequence: each progress emits (task_message, task_updated),
+    # then done emits (task_message, task_updated, task_result).
+    event_types = [e["type"] for e in received_ws]
+    assert event_types == [
+        "task_message",
+        "task_updated",  # progress 1
+        "task_message",
+        "task_updated",  # progress 2
+        "task_message",
+        "task_updated",  # progress 3
+        "task_message",
+        "task_updated",  # done
+        "task_result",
+    ]
+    # Each progress task_updated carries ``progress_status`` and keeps
+    # ``state="running"``; the final ``done`` task_updated drops the field.
+    progress_updates = [
+        e for e in received_ws if e["type"] == "task_updated" and e["state"] == "running"
+    ]
+    assert [e["progress_status"] for e in progress_updates] == ["step 1", "step 2", "step 3"]
+
+    done_update = next(
+        e for e in received_ws if e["type"] == "task_updated" and e["state"] == "done"
+    )
+    assert "progress_status" not in done_update
+
+    # The 4 LLM calls all received the same goal but each subsequent call
+    # also saw the previously persisted progress entries in its history.
+    assert len(client.calls) == 4
+    fourth_call_msgs = client.calls[3]["messages"]
+    contents = [m["content"] for m in fourth_call_msgs]
+    assert "step 1" in contents
+    assert "step 2" in contents
+    assert "step 3" in contents
+
+
+@pytest.mark.asyncio
+async def test_progress_cap_exceeded_fails_with_max_iterations_reason() -> None:
+    """11 consecutive progress emits → state ``failed`` with the cap reason."""
+
+    store = _make_store()
+    task_id = _make_running_task(store)
+
+    received_ws: list[dict[str, Any]] = []
+
+    async def _emitter(event: dict[str, Any]) -> None:
+        received_ws.append(event)
+
+    ws_events.set_emitter(_emitter)
+    try:
+        client = _ScriptedClient(
+            chat_values=[f'{{"action": "progress", "status": "step {i}"}}' for i in range(1, 12)]
+        )
+        runner = SubAgentRunner(subagent_client=client, task_store=store, event_bus=EventBus())
+        await runner.run(task_id)
+    finally:
+        ws_events.set_emitter(None)
+
+    task = store.get_task(task_id)
+    assert task.state == "failed"
+    # ``_fail`` only writes the reason on a system message + ``task_result``
+    # event; ``task.result`` is reserved for ``done`` payloads.
+    assert task.result is None
+
+    # Only the first 10 progress emits made it through; the 11th tripped
+    # the cap before persisting.
+    messages = store.get_task_messages(task_id)
+    progress_msgs = [m for m in messages if m.action == "progress"]
+    assert len(progress_msgs) == 10
+    # The system row carrying the failure reason is also present.
+    system_msgs = [m for m in messages if m.role == "system"]
+    assert any("max_iterations_exceeded" in m.content for m in system_msgs)
+
+    # The final task_result event surfaces the cap reason verbatim.
+    results = [e for e in received_ws if e["type"] == "task_result"]
+    assert len(results) == 1
+    assert results[0]["result"] == "max_iterations_exceeded"
+
+
+@pytest.mark.asyncio
+async def test_progress_does_not_trigger_proactivity_handler() -> None:
+    """ProactivityHandler must stay silent on progress emits (no state change)."""
+
+    store = _make_store()
+    task_id = _make_running_task(store)
+
+    bus = EventBus()
+    state_change_payloads: list[dict[str, Any]] = []
+    message_added_payloads: list[dict[str, Any]] = []
+
+    async def _on_state_changed(payload: dict[str, Any]) -> None:
+        state_change_payloads.append(payload)
+
+    async def _on_message_added(payload: dict[str, Any]) -> None:
+        message_added_payloads.append(payload)
+
+    bus.subscribe("task_state_changed", _on_state_changed)
+    bus.subscribe("task_message_added", _on_message_added)
+
+    client = _ScriptedClient(
+        chat_values=[
+            '{"action": "progress", "status": "step 1"}',
+            '{"action": "progress", "status": "step 2"}',
+            '{"action": "done", "result": "ok"}',
+        ]
+    )
+    runner = SubAgentRunner(subagent_client=client, task_store=store, event_bus=bus)
+    await runner.run(task_id)
+
+    # Let the bus' fire-and-forget subscriber tasks finish.
+    import asyncio
+
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    # Progress did NOT publish ``task_state_changed`` — only the final
+    # ``done`` did (running → done).
+    assert len(state_change_payloads) == 1
+    assert state_change_payloads[0]["new_state"] == "done"
+    assert state_change_payloads[0]["action"] == "done"
+
+    # Both progress emits published on the ``task_message_added`` topic.
+    progress_added = [p for p in message_added_payloads if p.get("action") == "progress"]
+    assert len(progress_added) == 2
+    assert all(p["role"] == "assistant" for p in progress_added)
+    assert all(p["task_id"] == task_id for p in progress_added)
