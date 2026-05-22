@@ -295,6 +295,47 @@ async def test_claude_cli_complete_parses_tool_call_json(
 
 
 @pytest.mark.asyncio
+async def test_claude_cli_complete_parses_tool_call_with_trailing_prose(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Claude often appends a confirmation sentence after the tool-call JSON.
+
+    Regression for slice #0003: ``json.loads`` on the full reply fails when
+    Claude tacks on natural-language text after the closing brace, which
+    caused the tool call to be silently dropped and the orchestrator to fall
+    through to the structured-output text path (no task spawned).
+    """
+
+    client = ClaudeCliClient(_claude_settings())
+    payload = (
+        '{"tool_calls": [{"id": "call_1", "name": "spawn_subtask", '
+        '"arguments": {"title": "Draft email", "goal": "Write three variants."}}]}'
+        "\n\nTâche lancée. Résultat dans quelques instants."
+    )
+
+    async def _fake_chat(
+        messages: list[dict[str, Any]],
+        schema: dict[str, Any] | None = None,
+        session_id: str | None = None,
+    ) -> str:
+        return payload
+
+    monkeypatch.setattr(client, "chat", _fake_chat)
+
+    response = await client.complete(
+        messages=[{"role": "user", "content": "draft"}],
+        tools=[_spawn_tool()],
+    )
+
+    assert response.is_tool_call is True
+    assert response.text is None
+    assert len(response.tool_calls) == 1
+    call = response.tool_calls[0]
+    assert call.name == "spawn_subtask"
+    assert call.arguments == {"title": "Draft email", "goal": "Write three variants."}
+
+
+@pytest.mark.asyncio
 async def test_claude_cli_complete_returns_text_when_model_skips_tool(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

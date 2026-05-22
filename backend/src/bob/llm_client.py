@@ -497,8 +497,13 @@ class ClaudeCliClient(LLMClient):
         if not stripped.startswith("{"):
             return LLMResponse(text=raw, tool_calls=[])
 
+        # Use ``raw_decode`` so a leading JSON object is recognised even when
+        # Claude appends prose after it (observed in practice — the model
+        # emits ``{"tool_calls": [...]}`` followed by a confirmation
+        # sentence). Strict ``json.loads`` on the full string would fail and
+        # the tool call would be silently lost.
         try:
-            payload = json.loads(stripped)
+            payload, _consumed = json.JSONDecoder().raw_decode(stripped)
         except json.JSONDecodeError:
             return LLMResponse(text=raw, tool_calls=[])
 
