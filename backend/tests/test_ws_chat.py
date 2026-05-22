@@ -1,4 +1,10 @@
-"""WS plumbing tests for /ws/chat — chat_service wired via DI seam."""
+"""WS plumbing tests for /ws/chat — chat_service wired via DI seam.
+
+These tests exercise the WebSocket app via :class:`fastapi.testclient.TestClient`
+inside a ``with`` block so the FastAPI lifespan runs and primes the
+:class:`bob.jarvis_store.JarvisStore` singleton (backed by the test SQLite
+file under ``BOB_DATA_DIR``, set up in :mod:`conftest`).
+"""
 
 from __future__ import annotations
 
@@ -9,7 +15,7 @@ from typing import cast
 import pytest
 from fastapi.testclient import TestClient
 
-from bob import conversation as conversation_module
+from bob import jarvis_store as jarvis_store_module
 from bob import ws_router
 from bob.chat_service import ChatService
 from bob.main import app
@@ -27,14 +33,14 @@ class _FakeChatService:
 
     async def handle_user_message(self, session_id: str, user_content: str) -> ParsedResponse:
         self.calls.append((session_id, user_content))
-        # Mimic real ChatService side-effect of growing the conversation history.
-        conversation_module.get_default_store().append(session_id, "user", user_content)
-        conversation_module.get_default_store().append(session_id, "assistant", self._parsed.speech)
+        store = jarvis_store_module.get_default_store()
+        store.append("user", user_content)
+        store.append("assistant", self._parsed.speech)
         return self._parsed
 
 
 @pytest.fixture()
-def fake_chat_service() -> Iterator[_FakeChatService]:
+def fake_chat_service(clear_jarvis_history: None) -> Iterator[_FakeChatService]:
     parsed = ParsedResponse(
         speech="echo: hi",
         ui=[ComponentDescriptor(component="Markdown", props={"content": "**bold**"})],
@@ -48,8 +54,7 @@ def fake_chat_service() -> Iterator[_FakeChatService]:
 
 
 def test_ws_chat_full_round_trip(fake_chat_service: _FakeChatService) -> None:
-    client = TestClient(app)
-    with client.websocket_connect("/ws/chat") as ws:
+    with TestClient(app) as client, client.websocket_connect("/ws/chat") as ws:
         session_frame = ws.receive_json()
         assert session_frame["type"] == "session"
         session_id = session_frame["session_id"]
@@ -62,7 +67,6 @@ def test_ws_chat_full_round_trip(fake_chat_service: _FakeChatService) -> None:
         assert thinking_start == {"type": "thinking", "state": "start"}
 
         assistant = ws.receive_json()
-        # `msg_id` is a fresh uuid hex; assert structurally and check the rest by equality.
         assert assistant["type"] == "assistant_msg"
         assert isinstance(assistant["msg_id"], str) and len(assistant["msg_id"]) == 32
         assert assistant["speech"] == "echo: hi"
@@ -71,15 +75,36 @@ def test_ws_chat_full_round_trip(fake_chat_service: _FakeChatService) -> None:
         thinking_end = ws.receive_json()
         assert thinking_end == {"type": "thinking", "state": "end"}
 
-    # Session-local state and conversation history both cleaned up on disconnect.
     assert session_id not in _sessions
-    assert conversation_module.get_default_store().get_history(session_id) == []
     assert fake_chat_service.calls == [(session_id, "hi")]
 
 
+def test_ws_chat_replays_history_on_connect(clear_jarvis_history: None) -> None:
+    """A fresh WS connection re-emits previously persisted Jarvis messages."""
+
+    with TestClient(app) as client:
+        store = jarvis_store_module.get_default_store()
+        store.append("user", "previous question")
+        store.append("assistant", "previous answer")
+
+        with client.websocket_connect("/ws/chat") as ws:
+            session = ws.receive_json()
+            assert session["type"] == "session"
+
+            replay_user = ws.receive_json()
+            assert replay_user["type"] == "user_msg"
+            assert replay_user["content"] == "previous question"
+            assert replay_user["replayed"] is True
+
+            replay_assistant = ws.receive_json()
+            assert replay_assistant["type"] == "assistant_msg"
+            assert replay_assistant["speech"] == "previous answer"
+            assert replay_assistant["ui"] == []
+            assert replay_assistant["replayed"] is True
+
+
 def test_ws_chat_rejects_unknown_type(fake_chat_service: _FakeChatService) -> None:
-    client = TestClient(app)
-    with client.websocket_connect("/ws/chat") as ws:
+    with TestClient(app) as client, client.websocket_connect("/ws/chat") as ws:
         ws.receive_json()  # session frame
         ws.send_json({"type": "nope"})
         err = ws.receive_json()
@@ -109,7 +134,6 @@ class _SlowFakeTts:
         except asyncio.CancelledError:
             self.cancelled = True
             raise
-        # 4 bytes = 2 samples of silence; payload content doesn't matter.
         yield SynthesisChunk(pcm16=b"\x00\x00\x00\x00", sample_rate=24_000)
 
 
@@ -119,8 +143,7 @@ def test_ws_chat_interrupts_in_flight_tts(fake_chat_service: _FakeChatService) -
     slow_tts = _SlowFakeTts()
     ws_router.set_tts_service_provider(lambda: cast(KokoroTtsService, slow_tts))
     try:
-        client = TestClient(app)
-        with client.websocket_connect("/ws/chat") as ws:
+        with TestClient(app) as client, client.websocket_connect("/ws/chat") as ws:
             ws.receive_json()  # session
             ws.send_json({"type": "user_msg", "content": "hi", "voice": True})
             assert ws.receive_json()["type"] == "thinking"
@@ -129,22 +152,17 @@ def test_ws_chat_interrupts_in_flight_tts(fake_chat_service: _FakeChatService) -
             first_msg_id = first_assistant["msg_id"]
             assert ws.receive_json() == {"type": "thinking", "state": "end"}
 
-            # Second message arrives while TTS is still blocking inside synthesize().
             ws.send_json({"type": "user_msg", "content": "stop"})
 
-            # First frame after interruption is the audio_end emitted by the
-            # cancelling path for the previous msg_id.
             frame = ws.receive_json()
             assert frame == {"type": "audio_end", "msg_id": first_msg_id}
 
-            # Then the normal flow for the new turn resumes.
             assert ws.receive_json() == {"type": "thinking", "state": "start"}
             second = ws.receive_json()
             assert second["type"] == "assistant_msg"
             assert second["msg_id"] != first_msg_id
             assert ws.receive_json() == {"type": "thinking", "state": "end"}
 
-        # Cancellation actually propagated into the TTS coroutine.
         assert slow_tts.cancelled is True
     finally:
         ws_router.reset_tts_service_provider()
@@ -158,8 +176,7 @@ def test_ws_chat_interrupt_cancels_even_when_voice_off(
     slow_tts = _SlowFakeTts()
     ws_router.set_tts_service_provider(lambda: cast(KokoroTtsService, slow_tts))
     try:
-        client = TestClient(app)
-        with client.websocket_connect("/ws/chat") as ws:
+        with TestClient(app) as client, client.websocket_connect("/ws/chat") as ws:
             ws.receive_json()  # session
             ws.send_json({"type": "user_msg", "content": "hi", "voice": True})
             assert ws.receive_json()["type"] == "thinking"
@@ -167,14 +184,12 @@ def test_ws_chat_interrupt_cancels_even_when_voice_off(
             first_msg_id = first_assistant["msg_id"]
             assert ws.receive_json() == {"type": "thinking", "state": "end"}
 
-            # New message without voice — must still cancel and emit audio_end.
             ws.send_json({"type": "user_msg", "content": "silence"})
             assert ws.receive_json() == {"type": "audio_end", "msg_id": first_msg_id}
             assert ws.receive_json() == {"type": "thinking", "state": "start"}
             second = ws.receive_json()
             assert second["type"] == "assistant_msg"
             assert ws.receive_json() == {"type": "thinking", "state": "end"}
-            # Crucially: no audio_chunk / audio_end for the new (voiceless) turn.
 
         assert slow_tts.cancelled is True
     finally:
@@ -182,8 +197,7 @@ def test_ws_chat_interrupt_cancels_even_when_voice_off(
 
 
 def test_ws_chat_rejects_bad_content(fake_chat_service: _FakeChatService) -> None:
-    client = TestClient(app)
-    with client.websocket_connect("/ws/chat") as ws:
+    with TestClient(app) as client, client.websocket_connect("/ws/chat") as ws:
         ws.receive_json()
         ws.send_json({"type": "user_msg", "content": 42})
         err = ws.receive_json()

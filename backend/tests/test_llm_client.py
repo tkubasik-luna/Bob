@@ -121,7 +121,7 @@ async def test_chat_returns_empty_string_when_content_is_none() -> None:
 
 
 def _claude_settings(**overrides: Any) -> Settings:
-    base = {
+    base: dict[str, Any] = {
         "LLM_PROVIDER": "claude_cli",
         "CLAUDE_CLI_BIN": "claude",
         "CLAUDE_CLI_TIMEOUT_SECONDS": 30.0,
@@ -241,9 +241,7 @@ async def test_claude_cli_chat_raises_when_wrapper_is_error(
 ) -> None:
     client = ClaudeCliClient(_claude_settings())
     fake_proc = _FakeProc(
-        stdout=json.dumps(
-            {"result": "Not logged in", "is_error": True}
-        ).encode("utf-8")
+        stdout=json.dumps({"result": "Not logged in", "is_error": True}).encode("utf-8")
     )
 
     async def _fake_exec(*argv: str, **kwargs: Any) -> _FakeProc:
@@ -261,9 +259,7 @@ async def test_claude_cli_chat_strips_markdown_code_fence(
 ) -> None:
     client = ClaudeCliClient(_claude_settings())
     fenced = '```json\n{"speech": "ok", "ui": []}\n```'
-    fake_proc = _FakeProc(
-        stdout=json.dumps({"result": fenced, "is_error": False}).encode("utf-8")
-    )
+    fake_proc = _FakeProc(stdout=json.dumps({"result": fenced, "is_error": False}).encode("utf-8"))
 
     async def _fake_exec(*argv: str, **kwargs: Any) -> _FakeProc:
         return fake_proc

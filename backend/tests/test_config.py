@@ -32,7 +32,7 @@ def test_settings_loads_from_env(monkeypatch: pytest.MonkeyPatch, tmp_path: obje
     monkeypatch.setenv("LLM_MODEL", "qwen2.5-7b-instruct")
     monkeypatch.setenv("LLM_API_KEY", "lm-studio")
 
-    settings = Settings()  # type: ignore[call-arg]
+    settings = Settings()
 
     assert settings.LLM_BASE_URL == "http://localhost:1234/v1"
     assert settings.LLM_MODEL == "qwen2.5-7b-instruct"
@@ -63,7 +63,7 @@ def test_settings_is_frozen(monkeypatch: pytest.MonkeyPatch, tmp_path: object) -
     monkeypatch.setenv("LLM_MODEL", "qwen2.5-7b-instruct")
     monkeypatch.setenv("LLM_API_KEY", "lm-studio")
 
-    settings = Settings()  # type: ignore[call-arg]
+    settings = Settings()
 
     with pytest.raises(ValidationError):
         settings.LLM_MODEL = "other"

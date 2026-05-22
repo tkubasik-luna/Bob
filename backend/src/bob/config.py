@@ -72,6 +72,11 @@ class Settings(BaseSettings):
     # Logging
     LOG_LEVEL: str = "INFO"
 
+    # Persistence — Jarvis thread + future task data live under this directory.
+    # Resolved lazily so tests can override via ``BOB_DATA_DIR`` env var with a
+    # tmp path; the boot path in :mod:`bob.main` ensures the directory exists.
+    BOB_DATA_DIR: Path = Path.home() / ".bob"
+
     # Kokoro TTS — local engine via the upstream ``kokoro`` (KPipeline) package.
     # Model weights are downloaded by Hugging Face's cache the first time the
     # pipeline is instantiated (``hexgrad/Kokoro-82M``); no manual artifacts.

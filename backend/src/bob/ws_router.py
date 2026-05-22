@@ -39,7 +39,7 @@ import openai
 import structlog
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
-from bob import conversation as conversation_module
+from bob import jarvis_store as jarvis_store_module
 from bob import text_segmenter
 from bob.chat_service import ChatService, get_default_chat_service
 from bob.spoken_text_cleaner import clean_for_speech
@@ -93,6 +93,7 @@ async def chat_ws(websocket: WebSocket) -> None:
 
     try:
         await websocket.send_json({"type": "session", "session_id": session_id})
+        await _replay_history(websocket)
 
         while True:
             payload = await websocket.receive_json()
@@ -102,7 +103,39 @@ async def chat_ws(websocket: WebSocket) -> None:
     finally:
         await _cancel_active_tts(session_id, emit_audio_end=False, websocket=None)
         _sessions.pop(session_id, None)
-        conversation_module.get_default_store().clear(session_id)
+        # NOTE: Jarvis history is persistent across disconnects (PRD 0003).
+
+
+async def _replay_history(websocket: WebSocket) -> None:
+    """Push persisted Jarvis history to a freshly-connected client.
+
+    Each persisted message is sent in the same shape the live chat path uses
+    (``user_msg`` / ``assistant_msg``) with an added ``replayed: true`` flag,
+    so existing frontend handlers don't need new event types. Silently skips
+    when the store hasn't been primed (narrow test setups that bypass the
+    lifespan).
+    """
+
+    try:
+        store = jarvis_store_module.get_default_store()
+    except RuntimeError:
+        return
+
+    for msg in store.history():
+        role = msg.get("role")
+        content = msg.get("content", "")
+        if role == "user":
+            await websocket.send_json({"type": "user_msg", "content": content, "replayed": True})
+        elif role == "assistant":
+            await websocket.send_json(
+                {
+                    "type": "assistant_msg",
+                    "msg_id": uuid.uuid4().hex,
+                    "speech": content,
+                    "ui": [],
+                    "replayed": True,
+                }
+            )
 
 
 async def _cancel_active_tts(
