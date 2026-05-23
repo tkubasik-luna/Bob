@@ -1,4 +1,4 @@
-import { act, render } from "@testing-library/react";
+import { act, fireEvent, render } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 // Vitest 4 + jsdom 29 ships without `localStorage`; the dev tweaks store
@@ -184,6 +184,69 @@ describe("SphereUI — overlay auto-trigger integration", () => {
     // The transcript line stays mounted in this branch — short plain text
     // belongs there per the PRD.
     expect(container.querySelector(".hud-transcript")).not.toBeNull();
+  });
+
+  test("dismissed overlay does not reopen on same assistant message", () => {
+    // Regression: the open-trigger effect was keyed on `overlayContent` so
+    // closing the overlay flipped it back to `null`, the effect re-fired
+    // against the unchanged store, and the same message reopened the card —
+    // an infinite reopen loop. Now we dedupe on the message id via a ref.
+    const { container } = render(<SphereUI />);
+
+    act(() => {
+      useChatStore.setState({
+        messages: [
+          makeAssistantMessage(
+            "a1",
+            "# Heading\n\nlong content with **structure** and lists:\n\n- one\n- two\n- three",
+          ),
+        ],
+      });
+    });
+    expect(container.querySelector(".overlay-card")).not.toBeNull();
+
+    // User dismisses via global Esc. Overlay closes.
+    act(() => {
+      fireEvent.keyDown(window, { key: "Escape" });
+    });
+    expect(container.querySelector(".overlay-card")).toBeNull();
+
+    // Force a re-render against the SAME message (no store change). The
+    // dedup ref must keep the overlay closed.
+    act(() => {
+      useChatStore.setState({
+        messages: [...useChatStore.getState().messages],
+      });
+    });
+    expect(container.querySelector(".overlay-card")).toBeNull();
+  });
+
+  test("a NEW overlay-worthy message reopens the overlay after a prior dismiss", () => {
+    const { container } = render(<SphereUI />);
+
+    act(() => {
+      useChatStore.setState({
+        messages: [makeAssistantMessage("a1", "# First\n\n- one\n- two\n- three\n- four")],
+      });
+    });
+    expect(container.querySelector(".overlay-card")).not.toBeNull();
+
+    act(() => {
+      fireEvent.keyDown(window, { key: "Escape" });
+    });
+    expect(container.querySelector(".overlay-card")).toBeNull();
+
+    // A different assistant message lands. Dedup ref keys on id, so the new
+    // id triggers re-evaluation and re-open.
+    act(() => {
+      useChatStore.setState({
+        messages: [
+          makeAssistantMessage("a1", "# First\n\n- one\n- two\n- three\n- four"),
+          makeAssistantMessage("a2", "## Second\n\n| a | b |\n|---|---|\n| 1 | 2 |"),
+        ],
+      });
+    });
+    expect(container.querySelector(".overlay-card")).not.toBeNull();
   });
 
   test("renders the Tauri drag region as the first child of the .app wrapper (#0036)", () => {

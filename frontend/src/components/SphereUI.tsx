@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useChatWsBridge } from "../hooks/useChatWsBridge";
 import { shouldOverlayResponse } from "../lib/overlayHeuristic";
 import { SphereCanvas } from "../sphere/SphereCanvas";
@@ -56,22 +56,29 @@ export function SphereUI() {
   // never auto-dismisses the open card — only Esc / X / backdrop / DISMISS do.
   const messages = useChatStore((s) => s.messages);
   const [overlayContent, setOverlayContent] = useState<string | null>(null);
+  // Track the id of the last assistant message we evaluated against the
+  // overlay heuristic. Keying on id (not content) means: once the user
+  // dismisses the overlay via Esc / X / backdrop / DISMISS, the effect won't
+  // reopen the same message even though `overlayContent` flips back to null.
+  // A *new* assistant message (different id) re-triggers evaluation.
+  const lastEvaluatedMsgIdRef = useRef<string | null>(null);
   useEffect(() => {
     // Walk back to the most recent non-empty assistant message; older entries
     // are uninteresting because the heuristic is evaluated per *latest* turn.
-    let lastAssistant: string | null = null;
+    let lastAssistant: { id: string; content: string } | null = null;
     for (let i = messages.length - 1; i >= 0; i--) {
       const m = messages[i];
       if (m.role === "assistant" && m.content.length > 0) {
-        lastAssistant = m.content;
+        lastAssistant = { id: m.id, content: m.content };
         break;
       }
     }
     if (lastAssistant === null) return;
-    if (!shouldOverlayResponse(lastAssistant)) return;
-    if (lastAssistant === overlayContent) return;
-    setOverlayContent(lastAssistant);
-  }, [messages, overlayContent]);
+    if (lastEvaluatedMsgIdRef.current === lastAssistant.id) return;
+    lastEvaluatedMsgIdRef.current = lastAssistant.id;
+    if (!shouldOverlayResponse(lastAssistant.content)) return;
+    setOverlayContent(lastAssistant.content);
+  }, [messages]);
 
   const overlayOpen = overlayContent !== null;
   return (
