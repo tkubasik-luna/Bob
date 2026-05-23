@@ -697,6 +697,40 @@ body {
   }
 }
 
+/* ============ INPUT FIELD (under transcript) ============ */
+.hud-input {
+  margin-top: 14px;
+  pointer-events: auto;
+}
+.hud-input-field {
+  display: block;
+  width: 100%;
+  resize: none;
+  background: var(--hud-fill);
+  border: 1px solid var(--hud-rule);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  letter-spacing: 0.01em;
+  line-height: 1.4;
+  padding: 10px 14px;
+  outline: none;
+  transition: border-color 200ms ease, box-shadow 200ms ease;
+  max-height: calc(1.4em * 4 + 20px);
+  overflow-y: auto;
+}
+.hud-input-field::placeholder {
+  color: var(--ink-faint);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+}
+.hud-input-field:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 18px color-mix(in oklab, var(--accent) 25%, transparent);
+}
+
 /* ============ THOUGHTS STREAM ============ */
 .hud-thoughts-stage {
   position: absolute;
