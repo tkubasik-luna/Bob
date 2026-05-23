@@ -3,8 +3,9 @@ import { type Mock, beforeEach, describe, expect, test, vi } from "vitest";
 import type { ClientMessage } from "../../types/ws";
 
 // Voice mode mock — lets us flip the toggle per test so we can assert the
-// `voice` flag piggybacks on the WS frame. Default OFF (matches the real
-// hook's initial value).
+// `voice` flag piggybacks on the WS frame. Default OFF here so the existing
+// assertions don't have to opt out of voice; the real hook defaults ON but
+// tests are self-contained and explicit about which branch they exercise.
 const voiceEnabledRef = vi.hoisted(() => ({ value: false }));
 vi.mock("../../hooks/useVoiceMode", () => ({
   useVoiceMode: () => ({

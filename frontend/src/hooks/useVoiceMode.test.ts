@@ -11,10 +11,11 @@ import { useVoiceMode } from "./useVoiceMode";
  */
 describe("useVoiceMode — shared state across mounts", () => {
   beforeEach(() => {
-    // Reset to default. Mount-and-toggle until back to `false` so other test
-    // files that already imported the module don't bleed state across files.
+    // Reset to the module default (voice ON). Mount-and-toggle until back to
+    // `true` so other test files that already mutated the store don't bleed
+    // state across files.
     const { result, unmount } = renderHook(() => useVoiceMode());
-    if (result.current.voiceEnabled) {
+    if (!result.current.voiceEnabled) {
       act(() => {
         result.current.toggle();
       });
@@ -22,19 +23,24 @@ describe("useVoiceMode — shared state across mounts", () => {
     unmount();
   });
 
+  test("default is voice ON", () => {
+    const { result } = renderHook(() => useVoiceMode());
+    expect(result.current.voiceEnabled).toBe(true);
+  });
+
   test("two mounts see the same voiceEnabled value", () => {
     const a = renderHook(() => useVoiceMode());
     const b = renderHook(() => useVoiceMode());
 
-    expect(a.result.current.voiceEnabled).toBe(false);
-    expect(b.result.current.voiceEnabled).toBe(false);
+    expect(a.result.current.voiceEnabled).toBe(true);
+    expect(b.result.current.voiceEnabled).toBe(true);
 
     act(() => {
       a.result.current.toggle();
     });
 
-    expect(a.result.current.voiceEnabled).toBe(true);
-    expect(b.result.current.voiceEnabled).toBe(true);
+    expect(a.result.current.voiceEnabled).toBe(false);
+    expect(b.result.current.voiceEnabled).toBe(false);
   });
 
   test("toggle from one consumer flips the other", () => {
@@ -44,13 +50,13 @@ describe("useVoiceMode — shared state across mounts", () => {
     act(() => {
       b.result.current.toggle();
     });
-    expect(a.result.current.voiceEnabled).toBe(true);
-    expect(b.result.current.voiceEnabled).toBe(true);
+    expect(a.result.current.voiceEnabled).toBe(false);
+    expect(b.result.current.voiceEnabled).toBe(false);
 
     act(() => {
       a.result.current.toggle();
     });
-    expect(a.result.current.voiceEnabled).toBe(false);
-    expect(b.result.current.voiceEnabled).toBe(false);
+    expect(a.result.current.voiceEnabled).toBe(true);
+    expect(b.result.current.voiceEnabled).toBe(true);
   });
 });

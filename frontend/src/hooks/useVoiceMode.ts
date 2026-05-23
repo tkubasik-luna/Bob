@@ -14,7 +14,11 @@ type VoiceModeStore = {
 };
 
 const useVoiceModeStore = create<VoiceModeStore>((set) => ({
-  voiceEnabled: false,
+  // Default ON — most user prompts expect Bob to speak. Mute is the explicit
+  // gesture (button bottom-right or `M` key). Backend session default still
+  // boots at `voice_mode=false` to be safe; the frontend re-syncs on every
+  // WS `open` (`useChatWsBridge`) so the backend flips to true within ms.
+  voiceEnabled: true,
   toggle: () => set((s) => ({ voiceEnabled: !s.voiceEnabled })),
 }));
 
