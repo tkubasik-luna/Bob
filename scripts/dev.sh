@@ -76,7 +76,7 @@ echo "[bob] backend → http://$HOST:$PORT"
 (
   cd "$ROOT/backend"
   uv sync --quiet
-  exec uv run uvicorn bob.main:app --host "$HOST" --port "$PORT"
+  exec uv run uvicorn bob.main:app --reload --host "$HOST" --port "$PORT"
 ) &
 PIDS+=($!)
 
