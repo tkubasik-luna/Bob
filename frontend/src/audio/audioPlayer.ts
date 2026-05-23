@@ -30,6 +30,7 @@ type ScheduledSource = {
 };
 
 let ctx: AudioContext | null = null;
+let analyser: AnalyserNode | null = null;
 let nextStartTime = 0;
 const scheduled: ScheduledSource[] = [];
 const listeners = new Set<SpeakingListener>();
@@ -42,7 +43,32 @@ function getContext(): AudioContext {
       (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
     ctx = new Ctor();
   }
+  // Lazy-init the shared AnalyserNode at the same time as the context so the
+  // routing graph (source -> analyser -> destination) is ready before the first
+  // enqueue connects to it. `getAnalyser()` only returns non-null once we hit
+  // this branch, which preserves the legacy ChatView path: nothing changes if
+  // no consumer ever calls into the analyser, but every source we schedule
+  // *does* pass through it once it exists.
+  if (!analyser) {
+    analyser = ctx.createAnalyser();
+    analyser.fftSize = 1024;
+    analyser.connect(ctx.destination);
+  }
   return ctx;
+}
+
+/**
+ * Return the shared AnalyserNode used to tap the live TTS signal, or `null`
+ * when no AudioContext has been created yet (no audio has ever played).
+ *
+ * The analyser is a singleton lazily created on the first `enqueue(...)` call
+ * (same gesture-gated moment as the AudioContext). The Web Audio graph is
+ * `source -> analyser -> destination`, so reading time-domain data here gives
+ * a faithful RMS of the audio that is about to hit the speakers — both for
+ * the sphere reactivity hook and any future consumer.
+ */
+export function getAnalyser(): AnalyserNode | null {
+  return analyser;
 }
 
 function setSpeakingMsgId(v: string | null): void {
@@ -86,7 +112,15 @@ export function enqueue(pcm: ArrayBuffer | Float32Array, sampleRate: number, msg
 
   const source = audioCtx.createBufferSource();
   source.buffer = buffer;
-  source.connect(audioCtx.destination);
+  // Route through the shared analyser when it exists (always, post-getContext)
+  // so consumers like `useAudioLevel` can read the live RMS. The analyser is
+  // wired to the destination during `getContext()`, so connecting here is
+  // enough to keep audio audible.
+  if (analyser) {
+    source.connect(analyser);
+  } else {
+    source.connect(audioCtx.destination);
+  }
 
   const startAt = Math.max(audioCtx.currentTime, nextStartTime);
   source.start(startAt);

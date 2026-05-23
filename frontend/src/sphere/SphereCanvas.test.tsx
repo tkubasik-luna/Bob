@@ -1,4 +1,5 @@
 import { render, screen } from "@testing-library/react";
+import { createRef } from "react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { SphereCanvas, type SphereCanvasProps } from "./SphereCanvas";
 
@@ -183,5 +184,23 @@ describe("SphereCanvas", () => {
     expect(screen.getByText(/WebGL2 required/i)).toBeInTheDocument();
     expect(document.querySelector(".hud-error")).not.toBeNull();
     expect(document.querySelector(".sphere-canvas")).toBeNull();
+  });
+
+  test("renders frames when an audioLevelRef is provided (real audio tap)", async () => {
+    installContextStub((type) => (type === "webgl2" ? glStub : make2dStub()));
+    // Force the ref to a strong "voice is talking" level — the canvas should
+    // still render (the loop reads .current each frame; the value flows into
+    // the `audio` uniform via the lerp).
+    const audioLevelRef = createRef<number>();
+    (audioLevelRef as { current: number }).current = 0.8;
+    render(<SphereCanvas {...baseProps} audioLevelRef={audioLevelRef} />);
+
+    await new Promise<void>((resolve) => {
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => resolve());
+      });
+    });
+
+    expect(glStub.__renderCalls).toBeGreaterThan(0);
   });
 });

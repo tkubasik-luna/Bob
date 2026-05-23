@@ -20,6 +20,11 @@ export type SphereCanvasProps = {
   theme: SphereTheme;
   mood: SphereMood;
   audioLevel?: number;
+  /** Live RMS of the outgoing TTS signal in [0, 1], read once per rAF tick.
+   * Provided by `useAudioLevel` (issue #0033). When omitted (legacy callers
+   * and tests), the canvas treats the level as a constant 0 — no oscillation,
+   * no sinusoidal simulation. */
+  audioLevelRef?: React.RefObject<number>;
 };
 
 type Rgb = [number, number, number];
@@ -136,7 +141,7 @@ function drawGlyphOverlay(
 }
 
 export function SphereCanvas(props: SphereCanvasProps): JSX.Element {
-  const { state, variant, motion, glow, theme, mood, audioLevel } = props;
+  const { state, variant, motion, glow, theme, mood, audioLevel, audioLevelRef } = props;
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const glyphRef = useRef<HTMLCanvasElement | null>(null);
@@ -150,7 +155,14 @@ export function SphereCanvas(props: SphereCanvasProps): JSX.Element {
   const motionRef = useRef<number>(motion);
   const glowRef = useRef<number>(glow);
   const moodRef = useRef<SphereMood>(mood);
-  const audioLevelRef = useRef<number>(audioLevel ?? 0);
+  const audioLevelPropRef = useRef<number>(audioLevel ?? 0);
+  // Capture the (optionally-passed) ref from props so the rAF loop can read
+  // the live RMS without re-installing every render. Stored in a ref so swaps
+  // are picked up immediately without restarting the loop.
+  const externalAudioLevelRef = useRef<React.RefObject<number> | undefined>(audioLevelRef);
+  useEffect(() => {
+    externalAudioLevelRef.current = audioLevelRef;
+  }, [audioLevelRef]);
 
   const stateWeightsRef = useRef<StateWeights>({
     idle: 1,
@@ -183,7 +195,7 @@ export function SphereCanvas(props: SphereCanvasProps): JSX.Element {
     moodRef.current = mood;
   }, [mood]);
   useEffect(() => {
-    audioLevelRef.current = audioLevel ?? 0;
+    audioLevelPropRef.current = audioLevel ?? 0;
   }, [audioLevel]);
 
   // Mount the renderer once per theme (the renderer itself does not depend on
@@ -225,20 +237,12 @@ export function SphereCanvas(props: SphereCanvasProps): JSX.Element {
 
       const target = targetStateRef.current;
 
-      // Audio: use real audioLevel when provided, otherwise simulate a
-      // speech-like envelope during speak (mockup fallback).
-      const speaking = target === "speak" ? 1 : 0;
-      const provided = audioLevelRef.current;
-      const fakeAudio =
-        speaking *
-        Math.max(
-          0,
-          0.4 +
-            0.3 * Math.sin(t * 5.2) +
-            0.2 * Math.sin(t * 11.7 + 1.0) +
-            0.15 * Math.sin(t * 23.1 + 2.4),
-        );
-      const audioTarget = provided > 0 ? provided : fakeAudio;
+      // Audio: real tap from `useAudioLevel` when provided (issue #0033). The
+      // legacy `audioLevel` number prop is honoured as a fallback for callers
+      // that compute their own level (none in V1, but kept for compatibility).
+      // No more sinusoidal simulation — silent input naturally produces ~0.
+      const tap = externalAudioLevelRef.current?.current;
+      const audioTarget = tap ?? audioLevelPropRef.current ?? 0;
       audioRef.current = lerp(audioRef.current, audioTarget, 0.25);
 
       // Crossfade state weights -- ~250ms to settle.

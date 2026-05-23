@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { useChatWsBridge } from "../hooks/useChatWsBridge";
 import { shouldOverlayResponse } from "../lib/overlayHeuristic";
 import { SphereCanvas } from "../sphere/SphereCanvas";
+import { useAudioLevel } from "../sphere/useAudioLevel";
 import { type SphereDerivedState, useSphereState } from "../sphere/useSphereState";
 import { useDevTweaksStore } from "../state/devTweaksStore";
 import { useChatStore } from "../store/chatStore";
@@ -43,6 +44,10 @@ export function SphereUI() {
   // change the leaf signature.
   const transcriptState = forcedStateForTranscript(effectiveState);
   const { send } = useChatWsBridge();
+  // Tap the live TTS RMS so the sphere pulses with the actual voice. The
+  // hook returns a stable ref — passing it down keeps SphereCanvas's rAF
+  // loop reading the latest value without triggering a parent re-render.
+  const audioLevelRef = useAudioLevel();
   // Overlay state — owned here so the transcript line can hide while the
   // overlay carries the visual context. The opening trigger is driven by the
   // last assistant message (`shouldOverlayResponse` heuristic from #0026).
@@ -80,6 +85,7 @@ export function SphereUI() {
           glow={glow}
           theme={theme}
           mood={mood}
+          audioLevelRef={audioLevelRef}
         />
         <div className="hud-zone tr">
           <HudTasks />
