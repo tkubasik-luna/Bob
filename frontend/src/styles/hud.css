@@ -731,6 +731,28 @@ body {
   box-shadow: 0 0 18px color-mix(in oklab, var(--accent) 25%, transparent);
 }
 
+/* ============ MUTE TOGGLE (bottom-right) ============ */
+.hud-mute {
+  position: absolute;
+  bottom: 18px;
+  right: 36px;
+  z-index: 7;
+  appearance: none;
+  background: transparent;
+  border: 0;
+  padding: 4px;
+  color: var(--ink-dim);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: color 160ms ease;
+  pointer-events: auto;
+}
+.hud-mute:hover {
+  color: var(--ink);
+}
+
 /* ============ THOUGHTS STREAM ============ */
 .hud-thoughts-stage {
   position: absolute;

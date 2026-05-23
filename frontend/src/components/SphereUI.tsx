@@ -10,6 +10,7 @@ import { DevControls } from "./sphere/DevControls";
 import { HudTasks } from "./sphere/HudTasks";
 import { InputField } from "./sphere/InputField";
 import { MarkdownOverlay } from "./sphere/MarkdownOverlay";
+import { MuteToggle } from "./sphere/MuteToggle";
 import { TranscriptLine } from "./sphere/TranscriptLine";
 import { SphereWsContext } from "./sphere/sphereWsContext";
 
@@ -95,6 +96,7 @@ export function SphereUI() {
           <InputField />
         </div>
         <MarkdownOverlay content={overlayContent} onClose={() => setOverlayContent(null)} />
+        <MuteToggle />
         <DevControls />
       </div>
     </SphereWsContext.Provider>
