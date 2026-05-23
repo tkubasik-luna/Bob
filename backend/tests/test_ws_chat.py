@@ -655,3 +655,59 @@ def test_ws_chat_client_typing_missing_field_rejected(clear_jarvis_history: None
         ws_router.reset_orchestrator_provider()
 
     assert fake.typing_calls == []
+
+
+# ----------------------------------------------------------------------
+# PRD 0004 — `voice_mode` sticky session flag.
+# ----------------------------------------------------------------------
+
+
+def test_ws_chat_voice_mode_rejects_bad_payload(clear_jarvis_history: None) -> None:
+    """Non-bool ``enabled`` field must surface a ``bad_voice_mode`` error."""
+
+    fake = _TypingRecordingOrchestrator()
+    ws_router.set_orchestrator_provider(lambda: cast(Orchestrator, fake))
+    try:
+        with TestClient(app) as client, client.websocket_connect("/ws/chat") as ws:
+            assert ws.receive_json()["type"] == "session"
+            ws.send_json({"type": "voice_mode", "enabled": "yes"})
+            err = ws.receive_json()
+            assert err["type"] == "error"
+            assert err["code"] == "bad_voice_mode"
+    finally:
+        ws_router.reset_orchestrator_provider()
+
+
+def test_ws_chat_voice_mode_missing_field_rejected(clear_jarvis_history: None) -> None:
+    """Missing ``enabled`` field must also fail with ``bad_voice_mode``."""
+
+    fake = _TypingRecordingOrchestrator()
+    ws_router.set_orchestrator_provider(lambda: cast(Orchestrator, fake))
+    try:
+        with TestClient(app) as client, client.websocket_connect("/ws/chat") as ws:
+            assert ws.receive_json()["type"] == "session"
+            ws.send_json({"type": "voice_mode"})
+            err = ws.receive_json()
+            assert err["type"] == "error"
+            assert err["code"] == "bad_voice_mode"
+    finally:
+        ws_router.reset_orchestrator_provider()
+
+
+def test_ws_chat_voice_mode_accepted_silently(clear_jarvis_history: None) -> None:
+    """Valid ``voice_mode`` frame is accepted without echo (sticky session state)."""
+
+    fake = _TypingRecordingOrchestrator()
+    ws_router.set_orchestrator_provider(lambda: cast(Orchestrator, fake))
+    try:
+        with TestClient(app) as client, client.websocket_connect("/ws/chat") as ws:
+            assert ws.receive_json()["type"] == "session"
+            ws.send_json({"type": "voice_mode", "enabled": True})
+            # No echo. Flush via an unknown-task request that returns a
+            # well-known error frame so the connection round-trips.
+            ws.send_json({"type": "request_task_messages", "task_id": "nope"})
+            err = ws.receive_json()
+            assert err["type"] == "error"
+            assert err["code"] == "unknown_task"
+    finally:
+        ws_router.reset_orchestrator_provider()

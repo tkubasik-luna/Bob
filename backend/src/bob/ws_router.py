@@ -90,11 +90,21 @@ async def chat_ws(websocket: WebSocket) -> None:
 
     await websocket.accept()
     session_id = uuid.uuid4().hex
-    _sessions[session_id] = {"active_tts": []}
+    # `voice_mode` is sticky session state (PRD 0004): the client sends a
+    # `voice_mode` frame on every toggle (and on connect/reconnect for
+    # re-sync). When true, proactive pushes are also voiced via TTS, not
+    # only direct replies to `user_msg` carrying their own `voice: true`.
+    _sessions[session_id] = {"active_tts": [], "voice_mode": False}
     orchestrator = _orchestrator_provider()
 
     async def _session_emit(event: dict[str, Any]) -> None:
-        """Forward a task event from the orchestrator / sub-agent to this WS."""
+        """Forward a task event from the orchestrator / sub-agent to this WS.
+
+        PRD 0004: when the event is a proactive ``assistant_msg`` and the
+        session has voice mode enabled, also kick off TTS synthesis for the
+        spoken line so the user hears the sub-task done synthesis (and other
+        proactive pushes) without having to re-prompt.
+        """
 
         try:
             await websocket.send_json(event)
@@ -104,6 +114,37 @@ async def chat_ws(websocket: WebSocket) -> None:
                 session_id=session_id,
                 event_type=event.get("type"),
             )
+            return
+
+        if event.get("type") != "assistant_msg":
+            return
+        if not event.get("proactive"):
+            return
+        session = _sessions.get(session_id)
+        if session is None or not session.get("voice_mode"):
+            return
+        speech = event.get("speech")
+        msg_id = event.get("msg_id")
+        if not isinstance(speech, str) or not speech.strip():
+            return
+        if not isinstance(msg_id, str) or not msg_id:
+            return
+        task: asyncio.Task[None] = asyncio.create_task(
+            _synthesize_and_stream(websocket, session_id, msg_id, speech)
+        )
+        session.setdefault("active_tts", []).append((msg_id, task))
+
+        def _remove_when_done(t: asyncio.Task[None], _msg_id: str = msg_id) -> None:
+            sess = _sessions.get(session_id)
+            if not sess:
+                return
+            active = sess.get("active_tts", [])
+            for i, (mid, tt) in enumerate(active):
+                if mid == _msg_id and tt is t:
+                    active.pop(i)
+                    break
+
+        task.add_done_callback(_remove_when_done)
 
     ws_events.set_emitter(_session_emit)
 
@@ -344,6 +385,35 @@ async def _handle_client_typing(
     orchestrator.set_user_typing(typing)
 
 
+async def _handle_voice_mode(
+    websocket: WebSocket, payload: dict[str, Any], session_id: str
+) -> None:
+    """Client → ``voice_mode`` toggle (PRD 0004).
+
+    Frontend sends ``{"type": "voice_mode", "enabled": true/false}`` on every
+    mute toggle AND on connect/reconnect (re-sync). We persist the flag in
+    the session dict so ``_session_emit`` can synthesise TTS for proactive
+    pushes (sub-task done synthesis, paraphrased ``ask_user``) when voice is
+    on — not only direct replies to a ``user_msg`` carrying ``voice: true``.
+
+    Returns a ``bad_voice_mode`` error code when ``enabled`` is not a bool.
+    """
+
+    enabled = payload.get("enabled")
+    if not isinstance(enabled, bool):
+        await websocket.send_json(
+            {
+                "type": "error",
+                "code": "bad_voice_mode",
+                "message": "voice_mode.enabled must be a boolean",
+            }
+        )
+        return
+    session = _sessions.get(session_id)
+    if session is not None:
+        session["voice_mode"] = enabled
+
+
 async def _handle_request_task_messages(websocket: WebSocket, payload: dict[str, Any]) -> None:
     """Client → return the full ``task_messages`` log for a task.
 
@@ -431,6 +501,10 @@ async def _handle_client_message(
 
     if msg_type == "client_typing":
         await _handle_client_typing(websocket, payload, orchestrator)
+        return
+
+    if msg_type == "voice_mode":
+        await _handle_voice_mode(websocket, payload, session_id)
         return
 
     if msg_type != "user_msg":

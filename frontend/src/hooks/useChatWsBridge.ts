@@ -7,6 +7,7 @@ import {
 import { WS_URL } from "../config";
 import { useChatStore } from "../store/chatStore";
 import type { ClientMessage, ConnectionStatus, ServerMessage } from "../types/ws";
+import { useVoiceMode } from "./useVoiceMode";
 import { useWebSocket } from "./useWebSocket";
 
 type UseChatWsBridgeResult = {
@@ -170,6 +171,16 @@ export function useChatWsBridge(): UseChatWsBridgeResult {
   useEffect(() => {
     setStatus(status);
   }, [status, setStatus]);
+
+  // Mirror voice mode to the backend as sticky session state so proactive
+  // pushes (sub-task done synthesis, paraphrased ask_user) get TTS too.
+  // Sends on every toggle AND every time the WS reaches `open` (covers
+  // initial connect + reconnect re-sync).
+  const { voiceEnabled } = useVoiceMode();
+  useEffect(() => {
+    if (status !== "open") return;
+    send({ type: "voice_mode", enabled: voiceEnabled });
+  }, [status, voiceEnabled, send]);
 
   return { status, send };
 }

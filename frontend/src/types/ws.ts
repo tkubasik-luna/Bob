@@ -53,12 +53,23 @@ export type ClientTypingMsg = {
   typing: boolean;
 };
 
+/** PRD 0004 — sticky voice mode for the session. Sent on toggle (and on
+ * connect/reconnect for re-sync). The backend stores the flag per session
+ * so subsequent proactive assistant pushes (sub-task done synthesis,
+ * paraphrased ask_user) are voiced too — not only direct replies to a
+ * `user_msg` carrying its own `voice: true`. */
+export type VoiceModeMsg = {
+  type: "voice_mode";
+  enabled: boolean;
+};
+
 export type ClientMessage =
   | UserMsg
   | DismissTaskMsg
   | RequestTaskMessagesMsg
   | CancelTaskMsg
-  | ClientTypingMsg;
+  | ClientTypingMsg
+  | VoiceModeMsg;
 
 // Server → client
 export type SessionMsg = {
