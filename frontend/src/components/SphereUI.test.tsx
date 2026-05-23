@@ -55,7 +55,7 @@ class MockSocket {
 }
 
 import { useChatStore } from "../store/chatStore";
-import type { ChatMessage } from "../types/ws";
+import type { ChatMessage, Task } from "../types/ws";
 import { SphereUI } from "./SphereUI";
 
 const initialState = useChatStore.getState();
@@ -132,6 +132,18 @@ function installGlStub(): void {
 
 function makeAssistantMessage(id: string, content: string): ChatMessage {
   return { id, role: "assistant", content };
+}
+
+function makeDoneTask(id: string, result: string, updatedAt = "2026-05-23T13:00:00Z"): Task {
+  return {
+    id,
+    title: `Task ${id}`,
+    goal: "test",
+    state: "done",
+    result,
+    createdAt: "2026-05-23T12:58:00Z",
+    updatedAt,
+  };
 }
 
 describe("SphereUI — overlay auto-trigger integration", () => {
@@ -247,6 +259,52 @@ describe("SphereUI — overlay auto-trigger integration", () => {
       });
     });
     expect(container.querySelector(".overlay-card")).not.toBeNull();
+  });
+
+  test("subtask done with markdown result opens the overlay (#0004 follow-up)", () => {
+    // The orchestrator stores long sub-task results on tasks[id].result, not on
+    // the main `messages` stream. Without the task-side trigger, the overlay
+    // never opens because the synth follow-up assistant message is short.
+    const { container } = render(<SphereUI />);
+
+    act(() => {
+      useChatStore.setState({
+        tasks: {
+          t1: makeDoneTask(
+            "t1",
+            "# UK News\n\n- politics\n- economy\n- society\n\n| col | val |\n|---|---|\n| a | 1 |",
+          ),
+        },
+      });
+    });
+
+    expect(container.querySelector(".overlay-card")).not.toBeNull();
+  });
+
+  test("dismissed task-result overlay does not reopen on same task", () => {
+    const { container } = render(<SphereUI />);
+
+    act(() => {
+      useChatStore.setState({
+        tasks: {
+          t1: makeDoneTask("t1", "# Long\n\n- one\n- two\n- three\n- four"),
+        },
+      });
+    });
+    expect(container.querySelector(".overlay-card")).not.toBeNull();
+
+    act(() => {
+      fireEvent.keyDown(window, { key: "Escape" });
+    });
+    expect(container.querySelector(".overlay-card")).toBeNull();
+
+    // Same task object update — must NOT reopen.
+    act(() => {
+      useChatStore.setState({
+        tasks: { ...useChatStore.getState().tasks },
+      });
+    });
+    expect(container.querySelector(".overlay-card")).toBeNull();
   });
 
   test("renders the Tauri drag region as the first child of the .app wrapper (#0036)", () => {

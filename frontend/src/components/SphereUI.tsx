@@ -55,13 +55,15 @@ export function SphereUI() {
   // Closing it stays a user gesture: a `false` heuristic on a later message
   // never auto-dismisses the open card — only Esc / X / backdrop / DISMISS do.
   const messages = useChatStore((s) => s.messages);
+  const tasks = useChatStore((s) => s.tasks);
   const [overlayContent, setOverlayContent] = useState<string | null>(null);
-  // Track the id of the last assistant message we evaluated against the
-  // overlay heuristic. Keying on id (not content) means: once the user
-  // dismisses the overlay via Esc / X / backdrop / DISMISS, the effect won't
-  // reopen the same message even though `overlayContent` flips back to null.
-  // A *new* assistant message (different id) re-triggers evaluation.
+  // Dedup keys for already-evaluated sources. Keying by id (not content) means:
+  // once the user dismisses the overlay via Esc / X / backdrop / DISMISS, the
+  // effect won't reopen the same source even though `overlayContent` flips
+  // back to null. A *new* assistant message id, or a *new* task result, is
+  // re-evaluated.
   const lastEvaluatedMsgIdRef = useRef<string | null>(null);
+  const evaluatedTaskIdsRef = useRef<Set<string>>(new Set());
   useEffect(() => {
     // Walk back to the most recent non-empty assistant message; older entries
     // are uninteresting because the heuristic is evaluated per *latest* turn.
@@ -79,6 +81,24 @@ export function SphereUI() {
     if (!shouldOverlayResponse(lastAssistant.content)) return;
     setOverlayContent(lastAssistant.content);
   }, [messages]);
+  useEffect(() => {
+    // Sub-task results land on `tasks[id].result` (not on the main `messages`
+    // stream). The orchestrator follows up with a short synth assistant_msg
+    // ("Résultat de la veille UK revenu…") which is too short to trigger the
+    // overlay on its own — the long markdown lives only on the task. Surface
+    // it here when a task transitions to done with a non-empty result.
+    const candidates = Object.values(tasks)
+      .filter((t) => t.state === "done" && typeof t.result === "string" && t.result.length > 0)
+      .sort((a, b) => (a.updatedAt ?? a.createdAt).localeCompare(b.updatedAt ?? b.createdAt));
+    const latest = candidates[candidates.length - 1];
+    if (!latest) return;
+    if (evaluatedTaskIdsRef.current.has(latest.id)) return;
+    evaluatedTaskIdsRef.current.add(latest.id);
+    const result = latest.result;
+    if (typeof result !== "string") return;
+    if (!shouldOverlayResponse(result)) return;
+    setOverlayContent(result);
+  }, [tasks]);
 
   const overlayOpen = overlayContent !== null;
   return (
