@@ -1,22 +1,26 @@
 export function SphereUI() {
   return (
-    <div
-      style={{
-        position: "fixed",
-        inset: 0,
-        display: "flex",
-        flexDirection: "column",
-        alignItems: "center",
-        justifyContent: "center",
-        gap: "12px",
-        background: "#0A0606",
-        color: "#FFE7DD",
-        fontFamily: "'JetBrains Mono', ui-monospace, monospace",
-      }}
-    >
-      <div style={{ fontSize: "11px", letterSpacing: "0.28em", opacity: 0.55 }}>SPHERE UI</div>
-      <div style={{ fontSize: "10px", letterSpacing: "0.18em", opacity: 0.32 }}>
-        UNDER CONSTRUCTION
+    <div className="app theme-warm mood-calm state-idle surface-none">
+      <div
+        className="hud-zone"
+        style={{
+          inset: 0,
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "center",
+          justifyContent: "center",
+          gap: "12px",
+        }}
+      >
+        <span className="text-accent font-mono" style={{ letterSpacing: "0.28em" }}>
+          SPHERE UI
+        </span>
+        <span
+          className="font-mono"
+          style={{ color: "var(--ink-faint)", fontSize: "10px", letterSpacing: "0.18em" }}
+        >
+          UNDER CONSTRUCTION
+        </span>
       </div>
     </div>
   );

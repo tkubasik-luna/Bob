@@ -1,5 +1,23 @@
 @import "tailwindcss";
 
+@theme {
+  --color-bg: var(--bg);
+  --color-bg-2: var(--bg-2);
+  --color-ink: var(--ink);
+  --color-ink-dim: var(--ink-dim);
+  --color-ink-faint: var(--ink-faint);
+  --color-accent: var(--accent);
+  --color-accent-2: var(--accent-2);
+  --color-accent-3: var(--accent-3);
+  --color-warn: var(--warn);
+  --color-err: var(--err);
+  --color-hud-rule: var(--hud-rule);
+  --color-hud-rule-dim: var(--hud-rule-dim);
+  --color-hud-fill: var(--hud-fill);
+  --font-sans: var(--font-sans);
+  --font-mono: var(--font-mono);
+}
+
 html,
 body,
 #root {
