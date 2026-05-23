@@ -185,4 +185,22 @@ describe("SphereUI — overlay auto-trigger integration", () => {
     // belongs there per the PRD.
     expect(container.querySelector(".hud-transcript")).not.toBeNull();
   });
+
+  test("renders the Tauri drag region as the first child of the .app wrapper (#0036)", () => {
+    // The borderless `?ui=new` Tauri window has `decorations: false`, so the
+    // user needs a 28px transparent strip up top to move it. The styling
+    // (`-webkit-app-region: drag`) lives in `hud.css`; jsdom doesn't surface
+    // webkit-only CSS properties via `getComputedStyle`, so we assert the
+    // structural contract (the element exists, has the expected class, and
+    // is the FIRST child of `.app` so it sits in the right stacking order).
+    const { container } = render(<SphereUI />);
+    const appRoot = container.querySelector(".app");
+    expect(appRoot).not.toBeNull();
+    const dragRegion = appRoot?.querySelector(".drag-region");
+    expect(dragRegion).not.toBeNull();
+    expect(dragRegion).toBeInstanceOf(HTMLDivElement);
+    // FIRST-child contract: must come before SphereCanvas so the drag layer
+    // sits above the canvas in the stacking order (z-index: 100 in hud.css).
+    expect(appRoot?.firstElementChild).toBe(dragRegion);
+  });
 });

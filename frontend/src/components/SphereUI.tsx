@@ -79,6 +79,13 @@ export function SphereUI() {
       <div
         className={`app theme-${theme} mood-${mood} state-${effectiveState} ${overlayOpen ? "has-surface surface-notes" : "surface-none"}`}
       >
+        {/* Tauri v2 borderless drag region (#0036). The `?ui=new` window has
+         * `decorations: false` so the OS chrome is gone; this transparent
+         * 28px top strip carries `-webkit-app-region: drag` so the user can
+         * still move the window. Inputs/buttons opt back out via no-drag in
+         * hud.css. Rendered FIRST so it sits above the canvas but underneath
+         * pointer-events:auto HUD zones in the stacking order. */}
+        <div className="drag-region" />
         <SphereCanvas
           state={effectiveState}
           variant={variant}

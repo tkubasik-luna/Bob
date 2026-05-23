@@ -2799,3 +2799,30 @@ body {
   font-size: 14px;
   color: var(--ink-dim);
 }
+
+/* ════════════════════════════════════════════════════════════════════
+   TAURI BORDERLESS DRAG REGION (issue #0036)
+   Top 28px transparent strip on the `?ui=new` window picks up native
+   `-webkit-app-region: drag` so the user can move the borderless Tauri
+   window. Inputs/buttons opt back out via no-drag so clicks land on the
+   actual control instead of being swallowed by the drag region.
+   ════════════════════════════════════════════════════════════════════ */
+.app .drag-region {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 28px;
+  z-index: 100;
+  -webkit-app-region: drag;
+  -webkit-user-select: none;
+  user-select: none;
+}
+.app .drag-region * {
+  -webkit-app-region: no-drag;
+}
+.app input,
+.app textarea,
+.app button {
+  -webkit-app-region: no-drag;
+}
