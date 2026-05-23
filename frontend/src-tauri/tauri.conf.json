@@ -12,9 +12,20 @@
   "app": {
     "windows": [
       {
-        "title": "Bob",
-        "width": 800,
-        "height": 600,
+        "label": "legacy",
+        "title": "Bob · Legacy",
+        "url": "/?ui=legacy",
+        "width": 900,
+        "height": 700,
+        "resizable": true,
+        "fullscreen": false
+      },
+      {
+        "label": "new",
+        "title": "Bob · Sphere",
+        "url": "/?ui=new",
+        "width": 1280,
+        "height": 800,
         "resizable": true,
         "fullscreen": false
       }

@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Bob · debug split</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        height: 100%;
+        background: #000;
+        color: #ccc;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+      .wrap {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        height: 100vh;
+        gap: 2px;
+        background: #1a1a1a;
+      }
+      .pane {
+        display: flex;
+        flex-direction: column;
+        min-height: 0;
+        background: #000;
+      }
+      .head {
+        padding: 6px 12px;
+        font-size: 10px;
+        letter-spacing: 0.22em;
+        text-transform: uppercase;
+        background: #0a0a0a;
+        color: #888;
+        border-bottom: 1px solid #1a1a1a;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+      }
+      .head .tag {
+        opacity: 0.5;
+        font-size: 9px;
+      }
+      iframe {
+        flex: 1;
+        border: 0;
+        width: 100%;
+        background: #000;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="pane">
+        <div class="head">
+          <span>Legacy · ChatView</span>
+          <span class="tag">?ui=legacy</span>
+        </div>
+        <iframe src="/?ui=legacy" title="legacy"></iframe>
+      </div>
+      <div class="pane">
+        <div class="head">
+          <span>New · SphereUI</span>
+          <span class="tag">?ui=new</span>
+        </div>
+        <iframe src="/?ui=new" title="new"></iframe>
+      </div>
+    </div>
+  </body>
+</html>
