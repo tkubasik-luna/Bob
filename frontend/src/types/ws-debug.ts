@@ -74,6 +74,13 @@ export type DebugEvent = {
   turn_id: string | null;
   /** Pairs `*_start` / `*_end` events for long ops (LLM, sub-task). */
   correlation_id: string | null;
+  /**
+   * Slice 0043: id of the enclosing sub-task when the event was emitted from
+   * within a `SubAgentRunner.run` scope. `null` (or absent on legacy
+   * snapshots) means "no enclosing sub-task". Optional in the TS type so a
+   * pre-0043 buffer replay still decodes cleanly.
+   */
+  parent_task_id?: string | null;
   /** `true` when the event was streamed from the ring-buffer snapshot at
    * subscribe time; `false` for live events. */
   replayed: boolean;

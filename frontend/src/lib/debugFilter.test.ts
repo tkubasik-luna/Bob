@@ -6,7 +6,8 @@ import {
   type DebugFilters,
   type DebugSeverity,
 } from "../types/ws-debug";
-import { filterEvents, passesFilters } from "./debugFilter";
+import { filterEvents, passesFilters, pruneEmptyNodes } from "./debugFilter";
+import { groupEvents, type TaskNode, type TurnNode } from "./groupEvents";
 
 function makeEvent(category: DebugCategory, severity: DebugSeverity, summary = "evt"): DebugEvent {
   return {
@@ -126,5 +127,121 @@ describe("filterEvents", () => {
       severityThreshold: "trace",
     };
     expect(filterEvents(sample, filters)).toEqual([]);
+  });
+});
+
+describe("pruneEmptyNodes", () => {
+  function withTurn(category: DebugCategory, severity: DebugSeverity, turn_id: string): DebugEvent {
+    return {
+      ts: "2026-05-25T14:23:01.123Z",
+      category,
+      severity,
+      source: "test",
+      summary: `${category}/${severity}`,
+      payload: {},
+      turn_id,
+      correlation_id: null,
+      parent_task_id: null,
+      replayed: false,
+    };
+  }
+
+  test("drops turn whose descendants don't match the filter", () => {
+    const tree = groupEvents([
+      withTurn("voice", "trace", "T1"),
+      withTurn("voice", "debug", "T1"),
+    ]);
+    const filters: DebugFilters = { categoriesOn: allCategoriesOn(), severityThreshold: "info" };
+    const pruned = pruneEmptyNodes(tree, filters);
+    expect(pruned).toHaveLength(0);
+  });
+
+  test("keeps turn whose at least one descendant matches", () => {
+    const tree = groupEvents([
+      withTurn("voice", "trace", "T1"),
+      withTurn("voice", "warn", "T1"),
+    ]);
+    const filters: DebugFilters = { categoriesOn: allCategoriesOn(), severityThreshold: "info" };
+    const pruned = pruneEmptyNodes(tree, filters);
+    expect(pruned).toHaveLength(1);
+    const turn = pruned[0] as TurnNode;
+    expect(turn.eventCount).toBe(1);
+  });
+
+  test("recomputes counts post-filter", () => {
+    const tree = groupEvents([
+      withTurn("system", "info", "T1"),
+      withTurn("system", "trace", "T1"),
+      withTurn("system", "warn", "T1"),
+    ]);
+    const filters: DebugFilters = { categoriesOn: allCategoriesOn(), severityThreshold: "info" };
+    const pruned = pruneEmptyNodes(tree, filters);
+    const turn = pruned[0] as TurnNode;
+    expect(turn.eventCount).toBe(2); // info + warn (trace dropped)
+    expect(turn.maxSeverity).toBe("warn");
+  });
+
+  test("drops empty task within otherwise-surviving turn", () => {
+    const events: DebugEvent[] = [
+      {
+        ts: "2026-05-25T14:23:00.000Z",
+        category: "task",
+        severity: "info",
+        source: "test",
+        summary: "spawn A",
+        payload: { task_id: "A", title: "A" },
+        turn_id: "T1",
+        correlation_id: null,
+        parent_task_id: null,
+        replayed: false,
+      },
+      // Only an event the filter will drop lives in A
+      {
+        ts: "2026-05-25T14:23:01.000Z",
+        category: "voice",
+        severity: "trace",
+        source: "test",
+        summary: "deep",
+        payload: {},
+        turn_id: "T1",
+        correlation_id: null,
+        parent_task_id: "A",
+        replayed: false,
+      },
+      // A direct-to-turn event that DOES pass
+      {
+        ts: "2026-05-25T14:23:02.000Z",
+        category: "system",
+        severity: "warn",
+        source: "test",
+        summary: "ok",
+        payload: {},
+        turn_id: "T1",
+        correlation_id: null,
+        parent_task_id: null,
+        replayed: false,
+      },
+    ];
+    const tree = groupEvents(events);
+    const filters: DebugFilters = { categoriesOn: allCategoriesOn(), severityThreshold: "info" };
+    const pruned = pruneEmptyNodes(tree, filters);
+    const turn = pruned[0] as TurnNode;
+    expect(turn.children.find((c) => c.kind === "task")).toBeUndefined();
+    expect(turn.taskCount).toBe(0);
+  });
+
+  test("does not mutate the input tree", () => {
+    const tree = groupEvents([
+      withTurn("system", "info", "T1"),
+      withTurn("system", "trace", "T1"),
+    ]);
+    const originalChildrenRef = (tree[0] as TurnNode).children;
+    const originalCount = (tree[0] as TurnNode).eventCount;
+    pruneEmptyNodes(tree, {
+      categoriesOn: allCategoriesOn(),
+      severityThreshold: "info",
+    });
+    expect((tree[0] as TurnNode).children).toBe(originalChildrenRef);
+    expect((tree[0] as TurnNode).eventCount).toBe(originalCount);
   });
 });

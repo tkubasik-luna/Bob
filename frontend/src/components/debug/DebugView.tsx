@@ -8,15 +8,16 @@ import {
   useState,
 } from "react";
 import { useDebugWs } from "../../hooks/useDebugWs";
-import { filterEvents } from "../../lib/debugFilter";
+import { useGroupedEvents } from "../../hooks/useGroupedEvents";
+import { pruneEmptyNodes } from "../../lib/debugFilter";
 import {
   DEBUG_CATEGORIES,
   type DebugCategory,
   type DebugFilters,
   type DebugSeverity,
 } from "../../types/ws-debug";
-import { DebugRow } from "./DebugRow";
 import { DebugToolbar } from "./DebugToolbar";
+import { DebugTree } from "./DebugTree";
 
 /** Auto-clear delay for the per-`turn_id` highlight, in milliseconds. */
 const TURN_HIGHLIGHT_TTL_MS = 5000;
@@ -112,8 +113,31 @@ export function DebugView() {
     };
   }, [highlightedTurnId]);
 
-  const filteredEvents = useMemo(() => filterEvents(events, filters), [events, filters]);
-  const filteredCount = filteredEvents.length;
+  // Slice 0044: grouped tree replaces the linear render. We memoize the raw
+  // tree on `events` identity (`useGroupedEvents`) and apply the filter as a
+  // pruning pass on the tree so empty turn/task subtrees vanish but the
+  // surrounding structure is preserved.
+  const tree = useGroupedEvents(events);
+  const prunedTree = useMemo(() => pruneEmptyNodes(tree, filters), [tree, filters]);
+  // Visible event count — sum of `eventCount` across root nodes (turns/tasks
+  // already aggregate their descendants; lone EventNodes count as 1 each;
+  // LlmCallNodes count as 1).
+  const filteredCount = useMemo(() => {
+    let n = 0;
+    for (const node of prunedTree) {
+      switch (node.kind) {
+        case "turn":
+        case "task":
+          n += node.eventCount;
+          break;
+        case "llm":
+        case "event":
+          n += 1;
+          break;
+      }
+    }
+    return n;
+  }, [prunedTree]);
 
   // Scroll handler. Recomputes `isAtBottom` on every scroll tick. When the
   // user transitions back to the bottom manually (without clicking the
@@ -210,21 +234,18 @@ export function DebugView() {
       />
       <div style={feedWrapperStyle}>
         <div ref={containerRef} onScroll={onScroll} style={feedScrollStyle}>
-          {filteredEvents.length === 0 ? (
+          {prunedTree.length === 0 ? (
             <div style={{ opacity: 0.45 }}>
               {events.length === 0
                 ? "En attente d'événements…"
                 : "Aucun événement ne correspond aux filtres actifs."}
             </div>
           ) : (
-            filteredEvents.map((event, idx) => (
-              <DebugRow
-                key={`${event.ts}-${idx}`}
-                event={event}
-                highlightedTurnId={highlightedTurnId}
-                onTurnClick={onTurnClick}
-              />
-            ))
+            <DebugTree
+              nodes={prunedTree}
+              highlightedTurnId={highlightedTurnId}
+              onTurnClick={onTurnClick}
+            />
           )}
         </div>
         {!isAtBottom && newEventsSinceScroll > 0 ? (
