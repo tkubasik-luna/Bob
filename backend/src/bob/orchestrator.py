@@ -61,6 +61,9 @@ from bob import response_parser, task_scheduler, ws_events
 from bob import task_store as task_store_module
 from bob import ui_registry as ui_registry_module
 from bob.config import get_settings
+from bob.context.assembler import ContextAssembler
+from bob.context.policy import ContextPolicy, legacy_full_history_policy
+from bob.context.providers.legacy_full_history import LegacyFullHistoryProvider
 from bob.debug_log import emit_debug, start_turn
 from bob.jarvis_store import JarvisStore
 from bob.llm.types import ToolDefinition
@@ -279,6 +282,7 @@ class Orchestrator:
         jarvis_prompt: str,
         prompts: _PromptsLike = prompts_module,
         ui_registry: ModuleType = ui_registry_module,
+        context_policy: ContextPolicy | None = None,
     ) -> None:
         self._jarvis_client = jarvis_client
         self._jarvis_store = jarvis_store
@@ -287,6 +291,12 @@ class Orchestrator:
         self._jarvis_prompt = jarvis_prompt
         self._prompts = prompts
         self._ui_registry = ui_registry
+        # PRD 0006 / issue 0043 — every prompt the orchestrator sends is now
+        # composed by ``ContextAssembler``. The default policy
+        # ``legacy_full_history`` reproduces today's "send the whole thread
+        # every turn" behavior; later slices swap the provider mix without
+        # touching the orchestrator.
+        self._context_policy = context_policy or legacy_full_history_policy()
 
         # Slice #0025 — proactive buffering layer. The queue + flusher live
         # on the instance so tests can build an Orchestrator without auto-
@@ -334,12 +344,11 @@ class Orchestrator:
 
             system_content = self._build_system_prompt()
             waiting_context = self._build_waiting_input_addendum()
-            history = self._jarvis_store.history()
             complete_system = system_content + _TOOLS_SYSTEM_ADDENDUM + waiting_context
-            messages: list[dict[str, Any]] = [
-                {"role": "system", "content": complete_system},
-                *({"role": m["role"], "content": m["content"]} for m in history),
-            ]
+            messages = self._assemble_chat_messages(
+                system_content=complete_system,
+                user_message=user_content,
+            )
 
             decision = await self._jarvis_client.complete(
                 messages,
@@ -713,13 +722,37 @@ class Orchestrator:
         included the tools-system addendum. The structured-output path takes
         a fresh system prompt + the persisted history (which now includes the
         user turn appended at the top of :meth:`process_user_message`).
+
+        The actual composition is delegated to
+        :class:`bob.context.assembler.ContextAssembler` (issue 0043). The
+        orchestrator no longer reads ``jarvis_store`` directly — the
+        ``LegacyFullHistoryProvider`` does that on its behalf.
         """
 
-        history = self._jarvis_store.history()
-        return [
-            {"role": "system", "content": system_content},
-            *({"role": m["role"], "content": m["content"]} for m in history),
-        ]
+        return self._assemble_chat_messages(system_content=system_content)
+
+    def _assemble_chat_messages(
+        self,
+        *,
+        system_content: str,
+        user_message: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Build a chat-messages list via :class:`ContextAssembler`.
+
+        ``system_content`` is the system prompt for this LLM call (may include
+        tools / waiting addendums for the ``complete()`` path or be the bare
+        Jarvis system prompt for the structured ``chat()`` path). The
+        assembler concatenates the system entry with the persisted Jarvis
+        thread emitted by :class:`LegacyFullHistoryProvider` — preserving
+        today's byte-equal output.
+        """
+
+        provider = LegacyFullHistoryProvider(
+            jarvis_store=self._jarvis_store,
+            system_content=system_content,
+        )
+        assembler = ContextAssembler(providers=[provider], policy=self._context_policy)
+        return assembler.assemble(user_message=user_message)
 
     async def _dispatch_tool_calls(
         self, tool_calls: list[Any]
