@@ -1,27 +1,40 @@
 """Jarvis orchestrator — user-turn entry point and sub-task dispatcher.
 
 ``Orchestrator.process_user_message`` is the single user-message entry point
-used by the WebSocket layer and the smoke CLI. The orchestrator:
+used by the WebSocket layer and the smoke CLI. PRD 0006 / issue 0047
+unified every Jarvis emission as a tool call — there is no longer a
+free-form text path. The orchestrator:
 
 1. Records the user message in the persistent Jarvis thread.
-2. Asks Jarvis (LLM) whether to spawn a sub-task or forward an answer to a
-   sub-task waiting for input, via the ``spawn_subtask`` /
-   ``forward_to_subtask`` tool definitions.
-3. On ``spawn_subtask`` it creates the task in :class:`TaskStore`, emits
-   ``task_created`` then hands it to :class:`TaskScheduler` which decides
-   whether to promote it to ``running`` immediately or queue it.
-4. On ``forward_to_subtask`` it appends the user's answer as a ``user``
-   message on the target task, then asks the scheduler to resume the
-   sub-agent. The orchestrator emits a short confirmation back to the user.
-5. Otherwise (no tool call → plain text reply), it falls through to the
-   structured-output path (JSON schema + ``response_parser``) so the
-   server-driven UI contract from slice #0016 still applies.
+2. Builds the system prompt from versioned :mod:`prompt_fragments` and
+   assembles the chat-messages list via :class:`ContextAssembler`.
+3. Invokes :meth:`LLMClient.complete` in tool-call mode with the
+   versioned tool registry (``say`` + ``spawn_subtask`` +
+   ``forward_to_subtask`` + ``cancel_subtask``).
+4. Dispatches every tool call through :class:`ToolDispatcher`:
+   - ``say`` — the unified direct-reply path. The handler persists the
+     assistant turn and threads ``speech`` + optional ``ui`` back into
+     the :class:`OrchestratorResponse` so the WS router emits a single
+     ``assistant_msg`` frame, unchanged from the legacy contract.
+   - ``spawn_subtask`` / ``forward_to_subtask`` / ``cancel_subtask`` —
+     side-effect tools. The orchestrator emits the matching versioned
+     confirmation phrase and persists it in the Jarvis thread.
+
+The structured-output ``chat()`` + ``response_parser`` path was removed
+in 0047. When the LLM violates the tool-call contract (no tool call
+returned, or every dispatch errored) the orchestrator raises
+:class:`OrchestratorContractError`. The WS router surfaces this as an
+``INTERNAL`` error frame today; the per-tool retry/degrade policy that
+ships in 0048 will catch it earlier and emit a hardcoded fallback
+``say("Désolé, peux-tu reformuler ?")``.
 
 Slice #0021 added :meth:`generate_proactive_message`: when a sub-agent
 emits ``ask_user`` the :class:`ProactivityHandler` invokes this method.
 Jarvis paraphrases the raw question in his own tone and the orchestrator
 pushes a single ``assistant_msg`` with ``proactive: true`` back through the
-WS emitter — no user turn triggered it.
+WS emitter — no user turn triggered it. The proactivity path still uses
+``LLMClient.chat()`` directly because it is a templated single-turn
+synthesis, not a user-driven turn.
 
 Slice #0025 extends proactivity to ``done`` events (sub-task synthesis) and
 introduces a per-instance buffering layer so proactive pushes do not race
@@ -57,16 +70,17 @@ import structlog
 
 from bob import jarvis_store as jarvis_store_module
 from bob import prompts as prompts_module
-from bob import response_parser, task_scheduler, ws_events
+from bob import task_scheduler, ws_events
 from bob import task_store as task_store_module
 from bob import ui_registry as ui_registry_module
 from bob.config import get_settings
 from bob.context.assembler import ContextAssembler
 from bob.context.policy import (
     BOUNDED_V1_POLICY_ID,
+    BOUNDED_V2_POLICY_ID,
     LEGACY_FULL_HISTORY_POLICY_ID,
     ContextPolicy,
-    bounded_v1_policy,
+    bounded_v2_policy,
 )
 from bob.context.prompt_fragments import (
     ASK_USER_PARAPHRASE_TEMPLATE,
@@ -76,6 +90,7 @@ from bob.context.prompt_fragments import (
     SPAWN_CONFIRMATION,
     TOOLS_SYSTEM_ADDENDUM,
 )
+from bob.context.providers.cross_epoch_digest import CrossEpochDigestProvider
 from bob.context.providers.legacy_full_history import LegacyFullHistoryProvider
 from bob.context.providers.recent_turns import RecentTurnsProvider
 from bob.context.providers.rolling_summary import RollingSummaryProvider
@@ -84,6 +99,12 @@ from bob.context.providers.user_message import UserMessageProvider
 from bob.context.summariser import LLMSummariser, Summariser
 from bob.context.summary_pipeline import maybe_regenerate_rolling_summary
 from bob.debug_log import emit_debug, start_turn
+from bob.epoch import (
+    CrossEpochDigestStore,
+    EpochManager,
+    EpochPolicy,
+    RetrievalAPI,
+)
 from bob.jarvis_store import JarvisStore
 from bob.llm.types import ToolCall
 from bob.llm_client import LLMClient
@@ -145,6 +166,22 @@ ProactiveEventKind = Literal["ask_user", "done"]
 JarvisState = Literal["idle", "thinking"]
 
 
+class OrchestratorContractError(RuntimeError):
+    """Raised when a Jarvis turn violates the "exactly one tool call" contract.
+
+    PRD 0006 / issue 0047 unified every Jarvis emission as a tool call.
+    When the LLM returns plain text (no tool call) or every dispatched
+    tool errors, the orchestrator raises this exception so the WS router
+    surfaces it as an ``INTERNAL`` error frame today.
+
+    Issue 0048 wires the retry/degrade policy: the dispatcher path will
+    catch validation failures earlier and emit a hardcoded fallback
+    ``say("Désolé, peux-tu reformuler ?")`` before this exception fires.
+    Keeping a distinct exception type now means call sites can pattern
+    match on contract violations rather than catching every ``Exception``.
+    """
+
+
 class _PromptsLike(Protocol):
     def render(self, name: str, **kwargs: object) -> str: ...
 
@@ -198,6 +235,10 @@ class Orchestrator:
         tool_registry: ToolRegistry | None = None,
         rolling_summary_store: RollingSummaryStore | None = None,
         summariser: Summariser | None = None,
+        epoch_policy: EpochPolicy | None = None,
+        cross_epoch_digest_store: CrossEpochDigestStore | None = None,
+        epoch_manager: EpochManager | None = None,
+        retrieval_api: RetrievalAPI | None = None,
     ) -> None:
         self._jarvis_client = jarvis_client
         self._jarvis_store = jarvis_store
@@ -208,12 +249,12 @@ class Orchestrator:
         self._ui_registry = ui_registry
         # PRD 0006 — every prompt the orchestrator sends is composed by
         # :class:`ContextAssembler`. Issue 0043 introduced the foundation
-        # with a legacy policy; issue 0046 switches the production default
-        # to :func:`bounded_v1_policy` (system + rolling summary + recent
-        # turns + live user message). The legacy policy stays available so
-        # tests and the byte-for-byte regression snapshot can still target
-        # it explicitly.
-        self._context_policy = context_policy or bounded_v1_policy()
+        # with a legacy policy; issue 0046 added the bounded v1 mix;
+        # issue 0051 introduces :func:`bounded_v2_policy` (same mix plus
+        # the cross-epoch digest) and switches the production default to
+        # v2. The legacy policy stays available so tests and the byte-
+        # for-byte regression snapshot can still target it explicitly.
+        self._context_policy = context_policy or bounded_v2_policy()
 
         # PRD 0006 / issue 0046 — bounded policy needs a persistent rolling
         # summary. The orchestrator owns the store + the summariser so the
@@ -221,11 +262,26 @@ class Orchestrator:
         self._rolling_summary_store = rolling_summary_store
         self._summariser = summariser or LLMSummariser(chat=self._jarvis_chat_for_summary)
 
+        # PRD 0006 / issue 0051 — sealed-epoch plumbing. The orchestrator
+        # owns the digest store, the :class:`EpochManager` (token-threshold
+        # sealer) and the :class:`RetrievalAPI` stub. Lazy-init mirrors
+        # the rolling-summary store pattern so legacy tests that bypass
+        # ``main.lifespan`` still construct a functional orchestrator.
+        self._epoch_policy = epoch_policy or EpochPolicy()
+        self._cross_epoch_digest_store = cross_epoch_digest_store
+        self._epoch_manager_cached = epoch_manager
+        self._retrieval_api = retrieval_api or RetrievalAPI()
+
         # PRD 0006 / issue 0044 — Jarvis-side tools are now dispatched
         # through a versioned :class:`ToolRegistry`. The default registry
-        # registers ``spawn_subtask`` / ``forward_to_subtask`` /
-        # ``cancel_subtask``. Tests can inject a narrower registry to
-        # exercise the dispatcher in isolation.
+        # registers ``say`` (issue 0047) + ``spawn_subtask`` /
+        # ``forward_to_subtask`` / ``cancel_subtask``. Tests can inject a
+        # narrower registry to exercise the dispatcher in isolation.
+        #
+        # Issue 0047 threads the orchestrator's :class:`JarvisStore` into
+        # the :class:`ToolHandlerContext` so the ``say`` handler can
+        # persist the assistant turn through the same DI bag as every
+        # other handler.
         self._tool_registry = tool_registry or build_default_registry()
         self._tool_dispatcher = ToolDispatcher(
             registry=self._tool_registry,
@@ -233,6 +289,7 @@ class Orchestrator:
                 task_store=self._task_store,
                 task_scheduler=self._task_scheduler,
                 ws_emit=ws_events.emit,
+                jarvis_store=self._jarvis_store,
             ),
         )
 
@@ -291,6 +348,14 @@ class Orchestrator:
             # the persisted store. Legacy policy paths skip this entirely.
             await self._maybe_regenerate_summary()
 
+            # PRD 0006 / issue 0051 — observable retrieval read path.
+            # ``recall`` returns ``[]`` at v1 but logs the call so the
+            # sealed-epoch logic cannot rot silently. The result is
+            # currently unused; the v2 RAG implementation will inject
+            # retrieved entries into the bounded prompt as a new
+            # provider.
+            self._trigger_retrieval(user_content)
+
             messages = self._assemble_chat_messages(
                 system_content=complete_system,
                 user_message=user_content,
@@ -314,57 +379,38 @@ class Orchestrator:
                 },
             )
 
-            if decision.is_tool_call:
-                (
-                    spawned_task_ids,
-                    forwarded_task_ids,
-                    cancelled_task_ids,
-                ) = await self._dispatch_tool_calls(decision.tool_calls)
-                if spawned_task_ids or forwarded_task_ids or cancelled_task_ids:
-                    # Pick the speech to match the dominant action. We instruct
-                    # Jarvis to pick one path so coexistence is rare; if multiple
-                    # happen we prioritise the most user-visible signal: cancel
-                    # → forward → spawn.
-                    if cancelled_task_ids:
-                        speech = _CANCEL_CONFIRMATION
-                    elif forwarded_task_ids:
-                        speech = _FORWARD_CONFIRMATION
-                    else:
-                        speech = _SPAWN_CONFIRMATION
-                    self._jarvis_store.append("assistant", speech)
-                    emit_debug(
-                        category="output",
-                        severity="info",
-                        source="orchestrator.process_user_message",
-                        summary=f'Bob répond: "{speech[:80]}"',
-                        payload={
-                            "speech": speech,
-                            "ui": [],
-                            "proactive": False,
-                            "spawned_task_ids": spawned_task_ids,
-                            "forwarded_task_ids": forwarded_task_ids,
-                            "cancelled_task_ids": cancelled_task_ids,
-                        },
-                    )
-                    return OrchestratorResponse(
-                        speech=speech,
-                        ui=[],
-                        spawned_task_ids=spawned_task_ids,
-                        forwarded_task_ids=forwarded_task_ids,
-                        cancelled_task_ids=cancelled_task_ids,
-                    )
-                # All tool calls were rejected (bad args, unknown tool). Fall
-                # through to the plain-text path so the user still gets a reply.
+            # PRD 0006 / issue 0047: every Jarvis turn ends in exactly
+            # one dispatched tool call. ``decision.is_tool_call`` must be
+            # true; the free-form text path was removed in 0047 and the
+            # LLM-side system prompt explicitly forbids it. The retry /
+            # degrade policy in 0048 will catch this earlier and emit a
+            # hardcoded ``say("Désolé, peux-tu reformuler ?")`` fallback.
+            if not decision.is_tool_call:
                 _logger.warning(
-                    "orchestrator.tool_call_dropped_all",
+                    "orchestrator.contract_violation_no_tool_call",
+                    session_id=session_id,
+                    text_preview=(decision.text or "")[:120],
+                )
+                raise OrchestratorContractError(
+                    "Jarvis returned a free-form reply instead of a tool call. "
+                    "Issue 0048 will degrade this to a hardcoded say() fallback."
+                )
+
+            response = await self._dispatch_tool_calls(decision.tool_calls)
+            if response is None:
+                # Every tool call errored. Same shape as the no-tool-call
+                # path — 0048 will degrade this to the hardcoded ``say()``
+                # fallback through the same dispatcher.
+                _logger.warning(
+                    "orchestrator.contract_violation_all_dispatches_errored",
                     session_id=session_id,
                     tool_call_count=len(decision.tool_calls),
                 )
+                raise OrchestratorContractError(
+                    "Every Jarvis tool call failed dispatch. "
+                    "Issue 0048 will degrade this to a hardcoded say() fallback."
+                )
 
-            response = await self._reply_with_structured_response(
-                session_id=session_id,
-                base_messages=self._rebuild_chat_messages(system_content),
-            )
             emit_debug(
                 category="output",
                 severity="info",
@@ -374,6 +420,9 @@ class Orchestrator:
                     "speech": response.speech,
                     "ui": [component.model_dump() for component in response.ui],
                     "proactive": False,
+                    "spawned_task_ids": response.spawned_task_ids,
+                    "forwarded_task_ids": response.forwarded_task_ids,
+                    "cancelled_task_ids": response.cancelled_task_ids,
                 },
             )
             return response
@@ -661,22 +710,6 @@ class Orchestrator:
                 return msg.content
         return None
 
-    def _rebuild_chat_messages(self, system_content: str) -> list[dict[str, Any]]:
-        """Recompute the message list for the structured chat call.
-
-        We do *not* reuse the message list passed to ``complete()`` because it
-        included the tools-system addendum. The structured-output path takes
-        a fresh system prompt + the persisted history (which now includes the
-        user turn appended at the top of :meth:`process_user_message`).
-
-        The actual composition is delegated to
-        :class:`bob.context.assembler.ContextAssembler` (issue 0043). The
-        orchestrator no longer reads ``jarvis_store`` directly — the
-        ``LegacyFullHistoryProvider`` does that on its behalf.
-        """
-
-        return self._assemble_chat_messages(system_content=system_content)
-
     def _assemble_chat_messages(
         self,
         *,
@@ -711,13 +744,27 @@ class Orchestrator:
             assembler = ContextAssembler(providers=[provider], policy=self._context_policy)
             return assembler.assemble(user_message=user_message)
 
-        # Bounded providers (default policy).
+        # Bounded providers. Both ``bounded_v1`` (no cross-epoch digest)
+        # and ``bounded_v2`` (with digest) wire the same store-bound
+        # providers; the assembler picks via the policy's
+        # ``provider_ids`` so unused providers are simply not invoked.
+        current_epoch_id = self._current_epoch_id_for_assembly()
         system_provider = SystemBlockProvider(system_content=system_content)
-        rolling_provider = RollingSummaryProvider(store=self._ensure_summary_store())
+        digest_provider = CrossEpochDigestProvider(store=self._ensure_digest_store())
+        rolling_provider = RollingSummaryProvider(
+            store=self._ensure_summary_store(),
+            current_epoch_id=current_epoch_id,
+        )
         recent_provider = RecentTurnsProvider(jarvis_store=self._jarvis_store)
         user_provider = UserMessageProvider()
         assembler = ContextAssembler(
-            providers=[system_provider, rolling_provider, recent_provider, user_provider],
+            providers=[
+                system_provider,
+                digest_provider,
+                rolling_provider,
+                recent_provider,
+                user_provider,
+            ],
             policy=self._context_policy,
         )
         return assembler.assemble(user_message=user_message)
@@ -741,30 +788,107 @@ class Orchestrator:
             self._rolling_summary_store = RollingSummaryStore(conn)
         return self._rolling_summary_store
 
+    def _ensure_digest_store(self) -> CrossEpochDigestStore:
+        """Lazy-init the cross-epoch digest store (issue 0051)."""
+
+        if self._cross_epoch_digest_store is None:
+            conn = self._jarvis_store._conn
+            self._cross_epoch_digest_store = CrossEpochDigestStore(conn)
+        return self._cross_epoch_digest_store
+
+    def _current_epoch_id_for_assembly(self) -> int:
+        """Read the live ``current_epoch_id`` for provider construction.
+
+        Under ``bounded_v2`` the orchestrator's :class:`EpochManager`
+        owns the live epoch id. Under any other policy we default to
+        ``0`` so the rolling-summary provider keeps its pre-0051
+        behavior (read the latest row regardless of epoch).
+        """
+
+        if self._context_policy.policy_id != BOUNDED_V2_POLICY_ID:
+            return 0
+        return self._ensure_epoch_manager().current_epoch_id
+
+    def _ensure_epoch_manager(self) -> EpochManager:
+        """Lazy-init the :class:`EpochManager` (issue 0051).
+
+        The manager is bound to the rolling-summary store + the digest
+        store + the live SQLite connection so :meth:`apply_seal` can
+        read RAW sealed turns directly. Tests inject a pre-built
+        manager via the constructor when they need a low-threshold
+        policy.
+        """
+
+        if self._epoch_manager_cached is None:
+            conn = self._jarvis_store._conn
+            self._epoch_manager_cached = EpochManager(
+                policy=self._epoch_policy,
+                rolling_summary_store=self._ensure_summary_store(),
+                digest_store=self._ensure_digest_store(),
+                conn=conn,
+            )
+        return self._epoch_manager_cached
+
     async def _maybe_regenerate_summary(self) -> None:
         """Regenerate the rolling summary if the older slice has grown enough.
 
         No-op when:
 
-        * The active policy is not the bounded policy (``bounded_v1``).
+        * The active policy is not a bounded policy (``bounded_v1`` /
+          ``bounded_v2``).
         * The persisted history is too short — :func:`maybe_regenerate_rolling_summary`
           returns ``None`` and the rolling-summary block stays empty.
         * The summariser raises — the failure is logged and swallowed so a
           single bad summarisation never breaks the live turn.
+
+        Under ``bounded_v2`` (PRD 0006 / issue 0051) we also evaluate the
+        :class:`EpochManager` token-threshold trigger immediately after
+        the regeneration: if the freshly persisted summary's token count
+        crossed the threshold, the manager seals the epoch and rebuilds
+        the cross-epoch digest from RAW sealed turns. Both calls live
+        on the same code path so the seal lifecycle stays observable
+        from one orchestrator hook.
         """
 
-        if self._context_policy.policy_id != BOUNDED_V1_POLICY_ID:
+        if self._context_policy.policy_id not in (BOUNDED_V1_POLICY_ID, BOUNDED_V2_POLICY_ID):
             return
         recent_window = self._context_policy.recent_turns_window or 3
+        current_epoch_id = self._current_epoch_id_for_assembly()
         try:
             await maybe_regenerate_rolling_summary(
                 jarvis_store=self._jarvis_store,
                 summary_store=self._ensure_summary_store(),
                 summariser=self._summariser,
                 recent_window=recent_window,
+                current_epoch_id=current_epoch_id,
             )
         except Exception:
             _logger.exception("orchestrator.rolling_summary_failed")
+
+        if self._context_policy.policy_id == BOUNDED_V2_POLICY_ID:
+            try:
+                self._ensure_epoch_manager().apply_seal()
+            except Exception:
+                _logger.exception("orchestrator.epoch_seal_failed")
+
+    def _trigger_retrieval(self, user_content: str) -> None:
+        """Observable call site for the retrieval read path (PRD 0006 / issue 0051).
+
+        The result is currently unused — :meth:`RetrievalAPI.recall` is
+        a v1 stub returning ``[]`` — but the call MUST happen so the
+        ``retrieval.recall_called`` structured-log event flows on every
+        turn. Without an active read path the sealed-epoch logic rots
+        silently; see PRD "Further Notes". When real RAG ships the
+        body changes; the call site stays.
+        """
+
+        try:
+            self._retrieval_api.recall(user_content)
+        except Exception:
+            # Never let the read-path stub take down a live turn. Real
+            # retrieval will have its own retry/degrade policy under
+            # 0048; for now we swallow and log.
+            _logger.exception("orchestrator.retrieval_recall_failed")
 
     async def _jarvis_chat_for_summary(self, messages: list[dict[str, str]]) -> str:
         """Bridge between :class:`LLMSummariser` and the bound Jarvis client.
@@ -779,27 +903,75 @@ class Orchestrator:
             session_id="rolling_summary",
         )
 
-    async def _dispatch_tool_calls(
-        self, tool_calls: list[ToolCall]
-    ) -> tuple[list[str], list[str], list[str]]:
+    async def _dispatch_tool_calls(self, tool_calls: list[ToolCall]) -> OrchestratorResponse | None:
         """Dispatch every tool call through the :class:`ToolDispatcher`.
 
-        Returns ``(spawned, forwarded, cancelled)``. Each call is routed
-        through the registry: unknown names and invalid argument shapes
-        surface as :class:`DispatchResult(outcome="error", ...)`. The
-        orchestrator currently mirrors the pre-0044 behavior — error
-        outcomes simply do not contribute to any of the three lists, so
-        the caller falls through to the chat path when every call failed
-        (issue 0044 explicitly defers retry/degrade to 0048).
+        Returns the assembled :class:`OrchestratorResponse` describing
+        the turn, or ``None`` when every dispatch errored — the caller
+        then routes through the contract-violation path.
+
+        PRD 0006 / issue 0047 unified Jarvis emission: direct replies
+        become a ``say`` tool call (the handler persists the assistant
+        turn and threads the spoken text + optional UI back through the
+        :class:`DispatchResult`); task operations remain
+        ``spawn_subtask`` / ``forward_to_subtask`` / ``cancel_subtask``
+        (each surfaces its versioned confirmation fragment as the
+        spoken reply). The prompt forbids multiple tool calls in a
+        single turn, but if the LLM violates that constraint we keep
+        the *first* ``say`` and apply the legacy dominant-action
+        priority for task tools (cancel → forward → spawn).
         """
 
         spawned: list[str] = []
         forwarded: list[str] = []
         cancelled: list[str] = []
+        say_speech: str | None = None
+        say_ui: Any = None
+        any_ok = False
         for call in tool_calls:
             result = await self._tool_dispatcher.dispatch(call)
+            if not result.ok:
+                continue
+            any_ok = True
             self._collect_dispatch_result(result, spawned, forwarded, cancelled)
-        return spawned, forwarded, cancelled
+            if result.tool_name == "say" and say_speech is None:
+                say_speech = result.speech
+                say_ui = result.ui
+
+        if not any_ok:
+            return None
+
+        # Task confirmations take precedence over a coexisting ``say``
+        # call (the prompt forbids both — the priority matches the
+        # pre-0047 dominant-action heuristic so observed behavior on
+        # spawn / forward / cancel turns is unchanged).
+        if cancelled or forwarded or spawned:
+            if cancelled:
+                speech = _CANCEL_CONFIRMATION
+            elif forwarded:
+                speech = _FORWARD_CONFIRMATION
+            else:
+                speech = _SPAWN_CONFIRMATION
+            self._jarvis_store.append("assistant", speech)
+            return OrchestratorResponse(
+                speech=speech,
+                ui=[],
+                spawned_task_ids=spawned,
+                forwarded_task_ids=forwarded,
+                cancelled_task_ids=cancelled,
+            )
+
+        # Pure ``say`` turn. The handler already persisted the assistant
+        # row in :class:`JarvisStore`; here we only lift speech + ui
+        # into the response shape the WS router consumes.
+        assert say_speech is not None
+        return OrchestratorResponse(
+            speech=say_speech,
+            ui=_coerce_say_ui(say_ui),
+            spawned_task_ids=[],
+            forwarded_task_ids=[],
+            cancelled_task_ids=[],
+        )
 
     def _collect_dispatch_result(
         self,
@@ -810,9 +982,12 @@ class Orchestrator:
     ) -> None:
         """Append ``result.task_id`` to the right bucket on a successful dispatch.
 
-        Each tool maps to exactly one of the three response lists. The
-        dispatcher already emitted the ``jarvis.route`` event so this
-        helper stays narrowly focused on the legacy response shape.
+        Each task tool maps to exactly one of the three response lists.
+        The dispatcher already emitted the ``jarvis.route`` event so
+        this helper stays narrowly focused on the legacy response
+        shape. ``say`` carries no ``task_id``; the caller collects its
+        speech + ui side payload directly off the
+        :class:`DispatchResult`.
         """
 
         if not result.ok or result.task_id is None:
@@ -829,32 +1004,38 @@ class Orchestrator:
         # silently ignored at this layer — the dispatcher still recorded
         # the route event.
 
-    async def _reply_with_structured_response(
-        self,
-        *,
-        session_id: str,
-        base_messages: list[dict[str, Any]],
-    ) -> OrchestratorResponse:
-        """Run the structured (JSON schema + retry/fallback) reply path."""
 
-        raw = await self._jarvis_client.chat(
-            base_messages,
-            schema=self._ui_registry.get_response_schema(),
-            session_id=session_id,
-        )
-        parsed = await response_parser.parse(
-            raw,
-            self._jarvis_client,
-            base_messages,
-            session_id=session_id,
-        )
-        self._jarvis_store.append("assistant", parsed.speech)
-        return OrchestratorResponse(
-            speech=parsed.speech,
-            ui=list(parsed.ui),
-            spawned_task_ids=[],
-            forwarded_task_ids=[],
-        )
+def _coerce_say_ui(ui: Any) -> list[ComponentDescriptor]:
+    """Normalise the ``say.ui`` argument into the orchestrator's UI shape.
+
+    Pre-0047 the structured-output path validated ``ui`` against the
+    full :mod:`bob.ui_registry` JSON schema. Issue 0047 keeps the
+    contract permissive at the tool boundary (the LLM may emit ``null``
+    most of the time and an opaque ``{component, props}`` object when
+    a Markdown overlay is warranted); validation against the registry's
+    versioned schema lands with 0048's per-tool retry/degrade. Until
+    then we coerce best-effort:
+
+    * ``None`` → empty list (the common case).
+    * A dict with ``component`` and ``props`` → wrap into a single
+      :class:`ComponentDescriptor` (legacy structured-output shape).
+    * Any other shape → empty list + a warning log so misuse is loud
+      without breaking the live turn.
+    """
+
+    if ui is None:
+        return []
+    if isinstance(ui, dict):
+        component = ui.get("component")
+        props = ui.get("props", {})
+        if isinstance(component, str) and isinstance(props, dict):
+            try:
+                return [ComponentDescriptor(component=component, props=props)]
+            except Exception:
+                _logger.warning("orchestrator.say_ui_invalid_component", ui=ui)
+                return []
+    _logger.warning("orchestrator.say_ui_unexpected_shape", ui=ui)
+    return []
 
 
 # Process-wide singleton. Slice #0025 turns the per-call factory into a true

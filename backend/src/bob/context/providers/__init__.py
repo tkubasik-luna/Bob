@@ -18,6 +18,7 @@ target. The orchestrator default policy now wires the bounded providers.
 
 from __future__ import annotations
 
+from bob.context.providers.cross_epoch_digest import CrossEpochDigestProvider
 from bob.context.providers.legacy_full_history import LegacyFullHistoryProvider
 from bob.context.providers.recent_turns import RecentTurnsProvider
 from bob.context.providers.rolling_summary import RollingSummaryProvider
@@ -25,6 +26,7 @@ from bob.context.providers.system_block import SystemBlockProvider
 from bob.context.providers.user_message import UserMessageProvider
 
 __all__ = [
+    "CrossEpochDigestProvider",
     "LegacyFullHistoryProvider",
     "RecentTurnsProvider",
     "RollingSummaryProvider",

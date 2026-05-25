@@ -163,12 +163,14 @@ class ToolRegistry:
 def build_default_registry() -> ToolRegistry:
     """Construct the default Jarvis-side tool registry.
 
-    The default set mirrors today's behavior (PRD 0006 issue 0044): the
-    three existing tools (``spawn_subtask``, ``forward_to_subtask``,
-    ``cancel_subtask``) wired to their handler implementations under
-    :mod:`bob.tools.definitions`. The unified ``say`` tool (issue 0047)
-    and the ``addendum_task`` / ``replan_task`` family (issue 0050) will
-    register themselves here in their respective slices.
+    Issue 0047 added the unified ``say`` tool: after this slice every
+    Jarvis turn — direct reply or task operation — ends in exactly one
+    dispatched tool call. ``say`` is registered first so its position in
+    the LLM-facing tool list matches the order it appears in the
+    ``TOOLS_SYSTEM_ADDENDUM`` prompt fragment (PRD 0006 user story #19
+    "every turn is auditable via ``jarvis.route``"). The
+    ``addendum_task`` / ``replan_task`` family (issue 0050) will
+    register itself here in its respective slice.
     """
 
     # Imported lazily so ``bob.tools`` does not eagerly drag the
@@ -176,10 +178,12 @@ def build_default_registry() -> ToolRegistry:
     # tests that target the registry in isolation.
     from bob.tools.definitions.cancel import build_cancel_subtask_tool
     from bob.tools.definitions.forward import build_forward_to_subtask_tool
+    from bob.tools.definitions.say import build_say_tool
     from bob.tools.definitions.spawn import build_spawn_subtask_tool
 
     return ToolRegistry(
         [
+            build_say_tool(),
             build_spawn_subtask_tool(),
             build_forward_to_subtask_tool(),
             build_cancel_subtask_tool(),

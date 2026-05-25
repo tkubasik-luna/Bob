@@ -98,11 +98,18 @@ def test_iter_and_len_match_registration() -> None:
     assert [d.name for d in registry] == ["a", "b"]
 
 
-def test_default_registry_contains_three_v1_tools() -> None:
-    """Behavior preservation: the registry ships exactly the legacy tool surface."""
+def test_default_registry_contains_say_spawn_forward_cancel_v1_tools() -> None:
+    """Issue 0047: ``say`` joins the registered tool surface as the first entry.
+
+    The registration order pins the LLM-facing tool list (``say`` first
+    so the bounded prompt addendum can describe it before the task
+    tools); changing it requires a deliberate update here and to the
+    matching prompt fragment.
+    """
 
     registry = build_default_registry()
     assert registry.names() == [
+        "say",
         "spawn_subtask",
         "forward_to_subtask",
         "cancel_subtask",

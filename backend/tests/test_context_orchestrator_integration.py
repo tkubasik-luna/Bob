@@ -6,13 +6,17 @@ it goes through the assembler and the legacy provider. The test asserts
 that the messages list reaching :meth:`FakeLLMClient.complete` matches the
 pre-0043 inline construction byte-for-byte.
 
-Later slices (0044-0052) will reuse this same harness to assert the
+Issue 0047 unified Jarvis emission as tool calls: the orchestrator
+always invokes ``complete()`` with the versioned tool registry, and the
+free-form ``chat()`` reply path was removed. The assembler contract is
+unchanged; only the round-trip shape simplifies.
+
+Later slices (0048-0052) will reuse this same harness to assert the
 streaming + tool-dispatch contracts evolve correctly.
 """
 
 from __future__ import annotations
 
-import json
 import sqlite3
 
 import pytest
@@ -20,11 +24,23 @@ import pytest
 from bob.context.policy import legacy_full_history_policy
 from bob.db.migrations_runner import apply_migrations, default_migrations_dir
 from bob.jarvis_store import JarvisStore
-from bob.llm.types import LLMResponse
+from bob.llm.types import LLMResponse, ToolCall
 from bob.orchestrator import _TOOLS_SYSTEM_ADDENDUM, Orchestrator
 from bob.task_store import TaskStore
 
 from ._harness.fake_llm import FakeLLMClient
+
+
+def _say_response(speech: str = "ok") -> LLMResponse:
+    """Build a minimal ``say`` tool-call response (issue 0047)."""
+
+    return LLMResponse(
+        text=None,
+        tool_calls=[
+            ToolCall(id="call_say", name="say", arguments={"speech": speech}),
+        ],
+    )
+
 
 _TEST_JARVIS_PROMPT = "Tu es Jarvis-de-test."
 
@@ -75,13 +91,11 @@ async def test_orchestrator_uses_assembler_for_complete_call() -> None:
 
     The messages list must contain a single system message and the full
     persisted history including the user turn just appended — exactly what
-    the pre-0043 orchestrator did inline.
+    the pre-0043 orchestrator did inline. Issue 0047 unified emission as
+    a single ``say`` tool call; the assembler contract is unchanged.
     """
 
-    fake = FakeLLMClient(
-        complete_responses=[LLMResponse(text="ok", tool_calls=[])],
-        chat_responses=[json.dumps({"speech": "Bonjour", "ui": []})],
-    )
+    fake = FakeLLMClient(complete_responses=[_say_response(speech="Bonjour")])
     orchestrator, jarvis_store, _ = _make_orchestrator(fake)
 
     # Seed two prior turns so we can prove the assembler returns the full
@@ -91,8 +105,10 @@ async def test_orchestrator_uses_assembler_for_complete_call() -> None:
 
     await orchestrator.process_user_message("s1", "deuxième question")
 
-    # ``complete()`` was called once with the full assembled messages list.
+    # ``complete()`` was called once with the full assembled messages list;
+    # the structured ``chat()`` path is gone (issue 0047).
     assert len(fake.complete_calls) == 1
+    assert fake.chat_calls == []
     messages = fake.complete_calls[0]["messages"]
 
     # First message is the system prompt with the tools addendum baked in.
@@ -107,40 +123,6 @@ async def test_orchestrator_uses_assembler_for_complete_call() -> None:
         ("user", "première question"),
         ("assistant", "première réponse"),
         ("user", "deuxième question"),
-    ]
-
-
-@pytest.mark.asyncio
-async def test_structured_chat_path_uses_assembler_without_tools_addendum() -> None:
-    """The structured ``chat()`` call drops the tools addendum but keeps history."""
-
-    fake = FakeLLMClient(
-        complete_responses=[LLMResponse(text="just chatting", tool_calls=[])],
-        chat_responses=[json.dumps({"speech": "ok", "ui": []})],
-    )
-    orchestrator, jarvis_store, _ = _make_orchestrator(fake)
-
-    jarvis_store.append("user", "prior")
-    jarvis_store.append("assistant", "ack")
-
-    await orchestrator.process_user_message("s1", "new turn")
-
-    assert len(fake.chat_calls) == 1
-    chat_msgs = fake.chat_calls[0]["messages"]
-
-    # System message must NOT include the tools-system addendum on the
-    # structured path.
-    assert chat_msgs[0]["role"] == "system"
-    assert _TEST_JARVIS_PROMPT in chat_msgs[0]["content"]
-    assert _TOOLS_SYSTEM_ADDENDUM not in chat_msgs[0]["content"]
-    assert "spawn_subtask" not in chat_msgs[0]["content"]
-
-    # History flows through unchanged.
-    bodies = [(m["role"], m["content"]) for m in chat_msgs[1:]]
-    assert bodies == [
-        ("user", "prior"),
-        ("assistant", "ack"),
-        ("user", "new turn"),
     ]
 
 

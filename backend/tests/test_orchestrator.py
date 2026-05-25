@@ -16,7 +16,11 @@ from bob.db.migrations_runner import apply_migrations, default_migrations_dir
 from bob.jarvis_store import JarvisStore
 from bob.llm.types import LLMResponse, ToolCall, ToolDefinition
 from bob.llm_client import LLMClient
-from bob.orchestrator import _SPAWN_CONFIRMATION, Orchestrator
+from bob.orchestrator import (
+    _SPAWN_CONFIRMATION,
+    Orchestrator,
+    OrchestratorContractError,
+)
 from bob.sub_agent_runner import SubAgentRunner
 from bob.task_scheduler import TaskScheduler
 from bob.task_store import TaskStore
@@ -127,6 +131,29 @@ def _spawn_tool_call(*, title: str = "Buy milk", goal: str = "Acheter du lait") 
     )
 
 
+def _say_tool_call(
+    *,
+    speech: str = "Bonjour Tom",
+    ui: dict[str, Any] | None = None,
+) -> ToolCall:
+    """Build a ``say(speech, ui)`` :class:`ToolCall` (issue 0047)."""
+
+    args: dict[str, Any] = {"speech": speech}
+    if ui is not None:
+        args["ui"] = ui
+    return ToolCall(
+        id=f"call_{uuid4().hex[:6]}",
+        name="say",
+        arguments=args,
+    )
+
+
+def _say_response(speech: str = "Bonjour Tom", ui: dict[str, Any] | None = None) -> LLMResponse:
+    """Build a Jarvis :class:`LLMResponse` wrapping a single ``say`` call."""
+
+    return LLMResponse(text=None, tool_calls=[_say_tool_call(speech=speech, ui=ui)])
+
+
 def _valid_payload(speech: str = "Bonjour Tom") -> str:
     return json.dumps({"speech": speech, "ui": []})
 
@@ -173,8 +200,17 @@ async def test_process_user_message_spawns_subtask_when_tool_call() -> None:
 
 
 @pytest.mark.asyncio
-async def test_spawn_with_invalid_args_falls_back_to_text() -> None:
-    # Tool call with missing 'goal' → orchestrator drops it and re-routes to chat().
+async def test_spawn_with_invalid_args_raises_contract_error() -> None:
+    """Issue 0047: a turn with no successful dispatch is a contract violation.
+
+    Pre-0047 the orchestrator fell through to the structured-output
+    ``chat()`` path when every tool call errored. After 0047 the
+    free-form path is gone and the turn raises
+    :class:`OrchestratorContractError` — the per-tool retry/degrade
+    policy in 0048 will catch this earlier with a hardcoded ``say()``
+    fallback.
+    """
+
     bad_call = ToolCall(
         id="call_bad",
         name="spawn_subtask",
@@ -183,40 +219,33 @@ async def test_spawn_with_invalid_args_falls_back_to_text() -> None:
     orchestrator, jarvis_client, _sub_client, _jarvis_store, task_store, scheduler = (
         _make_orchestrator(
             complete_responses=[LLMResponse(text=None, tool_calls=[bad_call])],
-            chat_responses=[_valid_payload("Fallback reply")],
         )
     )
 
-    response = await orchestrator.process_user_message("s1", "anything")
+    with pytest.raises(OrchestratorContractError):
+        await orchestrator.process_user_message("s1", "anything")
 
-    assert response.speech == "Fallback reply"
-    assert response.spawned_task_ids == []
     assert task_store.list_tasks() == []
     assert scheduler.enqueued == []
     assert len(jarvis_client.complete_calls) == 1
-    assert len(jarvis_client.chat_calls) == 1
+    # Issue 0047: the free-form ``chat()`` reply path was removed.
+    assert jarvis_client.chat_calls == []
 
 
 # ---------------------------------------------------------------------------
-# Plain text path (no spawn)
+# Unified ``say`` tool — direct-reply path (issue 0047)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_no_tool_call_routes_to_structured_chat() -> None:
+async def test_say_tool_call_produces_direct_reply() -> None:
+    """A ``say`` tool call surfaces as the assistant turn (no ``chat()`` round-trip)."""
+
     orchestrator, jarvis_client, _sub, jarvis_store, task_store, _scheduler = _make_orchestrator(
-        complete_responses=[LLMResponse(text="just chatting", tool_calls=[])],
-        chat_responses=[
-            json.dumps(
-                {
-                    "speech": "Salut Tom",
-                    "ui": [
-                        {
-                            "component": "Markdown",
-                            "props": {"content": "**hi**"},
-                        }
-                    ],
-                }
+        complete_responses=[
+            _say_response(
+                speech="Salut Tom",
+                ui={"component": "Markdown", "props": {"content": "**hi**"}},
             )
         ],
     )
@@ -227,81 +256,82 @@ async def test_no_tool_call_routes_to_structured_chat() -> None:
     assert response.spawned_task_ids == []
     assert len(response.ui) == 1
     assert response.ui[0].component == "Markdown"
+    assert response.ui[0].props == {"content": "**hi**"}
 
     assert task_store.list_tasks() == []
     assert jarvis_store.history() == [
         {"role": "user", "content": "Coucou"},
         {"role": "assistant", "content": "Salut Tom"},
     ]
-    assert len(jarvis_client.chat_calls) == 1
-    assert jarvis_client.chat_calls[0]["schema"] is not None
+    # Issue 0047: every turn dispatches through ``complete()``. The
+    # structured ``chat()`` reply path is gone.
+    assert jarvis_client.chat_calls == []
+    assert len(jarvis_client.complete_calls) == 1
 
 
 @pytest.mark.asyncio
-async def test_no_tool_call_uses_jarvis_prompt_in_system_message() -> None:
-    orchestrator, jarvis_client, _sub, _store, _ts, _scheduler = _make_orchestrator(
+async def test_say_with_null_ui_omits_components() -> None:
+    """``say(speech, ui=null)`` produces an empty ``OrchestratorResponse.ui``."""
+
+    orchestrator, _jc, _sub, jarvis_store, _ts, _scheduler = _make_orchestrator(
+        complete_responses=[_say_response(speech="ok", ui=None)],
+    )
+
+    response = await orchestrator.process_user_message("s1", "ping")
+
+    assert response.speech == "ok"
+    assert response.ui == []
+    assert jarvis_store.history()[-1] == {"role": "assistant", "content": "ok"}
+
+
+@pytest.mark.asyncio
+async def test_no_tool_call_raises_contract_error() -> None:
+    """Free-form text from the LLM is a contract violation post-0047."""
+
+    orchestrator, jarvis_client, _sub, jarvis_store, _ts, _scheduler = _make_orchestrator(
         complete_responses=[LLMResponse(text="just chatting", tool_calls=[])],
-        chat_responses=[_valid_payload("ok")],
+    )
+
+    with pytest.raises(OrchestratorContractError):
+        await orchestrator.process_user_message("s1", "Coucou")
+
+    # The user turn was still persisted (it lands before the LLM call).
+    assert jarvis_store.history() == [{"role": "user", "content": "Coucou"}]
+    # The structured ``chat()`` fallback path no longer fires.
+    assert jarvis_client.chat_calls == []
+
+
+@pytest.mark.asyncio
+async def test_say_tool_call_uses_jarvis_prompt_in_system_message() -> None:
+    """The single ``complete()`` call carries the personality + tools addendum."""
+
+    orchestrator, jarvis_client, _sub, _store, _ts, _scheduler = _make_orchestrator(
+        complete_responses=[_say_response(speech="ok")],
     )
 
     await orchestrator.process_user_message("s1", "hi")
 
-    # The complete() call carries the tools addendum; the chat() call should NOT.
     complete_system = jarvis_client.complete_calls[0]["messages"][0]
-    chat_system = jarvis_client.chat_calls[0]["messages"][0]
     assert complete_system["role"] == "system"
-    assert chat_system["role"] == "system"
     assert _TEST_JARVIS_PROMPT in complete_system["content"]
-    assert _TEST_JARVIS_PROMPT in chat_system["content"]
     assert "spawn_subtask" in complete_system["content"]
-    assert "spawn_subtask" not in chat_system["content"]
-
-
-@pytest.mark.asyncio
-async def test_parser_retry_does_not_pollute_jarvis_history() -> None:
-    orchestrator, jarvis_client, _sub, jarvis_store, _ts, _scheduler = _make_orchestrator(
-        complete_responses=[LLMResponse(text="just chatting", tool_calls=[])],
-        chat_responses=["not json at all", _valid_payload("retry-ok")],
-    )
-
-    response = await orchestrator.process_user_message("s1", "Ping")
-
-    assert response.speech == "retry-ok"
-    assert jarvis_store.history() == [
-        {"role": "user", "content": "Ping"},
-        {"role": "assistant", "content": "retry-ok"},
-    ]
-    assert len(jarvis_client.chat_calls) == 2
-
-
-@pytest.mark.asyncio
-async def test_fallback_when_both_chat_attempts_invalid() -> None:
-    orchestrator, jarvis_client, _sub, jarvis_store, _ts, _scheduler = _make_orchestrator(
-        complete_responses=[LLMResponse(text="just chatting", tool_calls=[])],
-        chat_responses=["garbage first", "garbage retry"],
-    )
-
-    response = await orchestrator.process_user_message("s1", "Question")
-
-    assert response.speech == "garbage first"
-    assert response.ui == []
-    assert jarvis_store.history() == [
-        {"role": "user", "content": "Question"},
-        {"role": "assistant", "content": "garbage first"},
-    ]
-    assert len(jarvis_client.chat_calls) == 2
+    # Issue 0047 (v2) closes the tool-call instruction loop.
+    assert "say" in complete_system["content"]
+    # No ``chat()`` round-trip.
+    assert jarvis_client.chat_calls == []
 
 
 # ---------------------------------------------------------------------------
-# spawn_subtask tool definition is what gets sent down to complete()
+# Tool registry surface delivered to ``complete()`` (issue 0044 + 0047)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_complete_call_sends_spawn_forward_and_cancel_tools() -> None:
+async def test_complete_call_sends_say_spawn_forward_and_cancel_tools() -> None:
+    """Issue 0047: ``say`` joins the LLM-facing tool list (registered first)."""
+
     orchestrator, jarvis_client, _sub, _store, _ts, _scheduler = _make_orchestrator(
-        complete_responses=[LLMResponse(text="hello", tool_calls=[])],
-        chat_responses=[_valid_payload("ok")],
+        complete_responses=[_say_response(speech="ok")],
     )
 
     await orchestrator.process_user_message("s1", "hi")
@@ -309,10 +339,12 @@ async def test_complete_call_sends_spawn_forward_and_cancel_tools() -> None:
     tools = jarvis_client.complete_calls[0]["tools"]
     assert tools is not None
     names = [t.name for t in tools]
-    assert names == ["spawn_subtask", "forward_to_subtask", "cancel_subtask"]
-    spawn_tool = tools[0]
-    forward_tool = tools[1]
-    cancel_tool = tools[2]
+    assert names == ["say", "spawn_subtask", "forward_to_subtask", "cancel_subtask"]
+    say_tool = tools[0]
+    spawn_tool = tools[1]
+    forward_tool = tools[2]
+    cancel_tool = tools[3]
+    assert say_tool.parameters["required"] == ["speech"]
     assert spawn_tool.parameters["required"] == ["title", "goal"]
     assert forward_tool.parameters["required"] == ["task_id", "response"]
     assert cancel_tool.parameters["required"] == ["task_id"]
@@ -377,7 +409,12 @@ async def test_spawn_emits_task_created_via_orchestrator() -> None:
 
 @pytest.mark.asyncio
 async def test_spawn_with_invalid_args_does_not_emit_events() -> None:
-    """When all tool calls are dropped, no task events are emitted."""
+    """When all tool calls are dropped, no task events are emitted.
+
+    Issue 0047 raises :class:`OrchestratorContractError` on the empty
+    dispatch outcome (0048 will degrade earlier); the no-event contract
+    still holds — the handler never ran.
+    """
 
     received: list[dict[str, Any]] = []
 
@@ -393,14 +430,17 @@ async def test_spawn_with_invalid_args_does_not_emit_events() -> None:
         )
         orchestrator, _jc, _sc, _js, _ts, _scheduler = _make_orchestrator(
             complete_responses=[LLMResponse(text=None, tool_calls=[bad])],
-            chat_responses=[_valid_payload("fallback")],
         )
-        response = await orchestrator.process_user_message("s1", "x")
-        assert response.spawned_task_ids == []
+        with pytest.raises(OrchestratorContractError):
+            await orchestrator.process_user_message("s1", "x")
     finally:
         ws_events.set_emitter(None)
 
-    assert received == []
+    # No ``task_created`` event landed (the dispatch errored before the
+    # handler ran). Note: a ``jarvis.route`` debug event still fires
+    # via the dispatcher; those are not delivered through ws_events.
+    task_events = [e for e in received if e.get("type") == "task_created"]
+    assert task_events == []
 
 
 @pytest.mark.asyncio
@@ -556,8 +596,8 @@ async def test_forward_to_subtask_emits_task_message_event() -> None:
 
 
 @pytest.mark.asyncio
-async def test_forward_to_unknown_task_falls_back_to_text() -> None:
-    """A forward to a missing task is dropped — orchestrator replies in text."""
+async def test_forward_to_unknown_task_raises_contract_error() -> None:
+    """A forward to a missing task errors; the turn is a contract violation post-0047."""
 
     bad_call = ToolCall(
         id="call_bad",
@@ -566,24 +606,24 @@ async def test_forward_to_unknown_task_falls_back_to_text() -> None:
     )
     orchestrator, _jarvis_client, _sub, _js, task_store, scheduler = _make_orchestrator(
         complete_responses=[LLMResponse(text=None, tool_calls=[bad_call])],
-        chat_responses=[_valid_payload("fallback")],
     )
 
-    response = await orchestrator.process_user_message("s1", "Amical.")
+    with pytest.raises(OrchestratorContractError):
+        await orchestrator.process_user_message("s1", "Amical.")
 
-    assert response.speech == "fallback"
-    assert response.forwarded_task_ids == []
     assert scheduler.resumed == []
     assert task_store.list_tasks() == []
 
 
 @pytest.mark.asyncio
 async def test_forward_to_task_not_in_waiting_input_is_dropped() -> None:
-    """Forward must target a task in ``waiting_input``; running rejects it."""
+    """Forward must target a task in ``waiting_input``; running rejects it.
 
-    orchestrator, jarvis_client, _sub, _js, task_store, scheduler = _make_orchestrator(
-        chat_responses=[_valid_payload("fallback")],
-    )
+    Issue 0047: rejection now surfaces as :class:`OrchestratorContractError`
+    rather than a structured-chat fallback (0048 will degrade earlier).
+    """
+
+    orchestrator, jarvis_client, _sub, _js, task_store, scheduler = _make_orchestrator()
     target_id = task_store.create_task(title="t", goal="g")
     task_store.update_state(target_id, "running")  # Not waiting_input!
 
@@ -594,10 +634,9 @@ async def test_forward_to_task_not_in_waiting_input_is_dropped() -> None:
         )
     )
 
-    response = await orchestrator.process_user_message("s1", "x")
+    with pytest.raises(OrchestratorContractError):
+        await orchestrator.process_user_message("s1", "x")
 
-    assert response.forwarded_task_ids == []
-    assert response.speech == "fallback"
     assert scheduler.resumed == []
     # Original task untouched.
     assert task_store.get_task(target_id).state == "running"
@@ -983,8 +1022,7 @@ async def test_process_user_message_sets_thinking_then_idle() -> None:
     """The user-turn entry point flips state to ``thinking`` and back to ``idle``."""
 
     orchestrator, _jc, _sub, _js, _ts, _scheduler = _make_orchestrator(
-        complete_responses=[LLMResponse(text="just chatting", tool_calls=[])],
-        chat_responses=[_valid_payload("ok")],
+        complete_responses=[_say_response(speech="ok")],
     )
     assert orchestrator._jarvis_state == "idle"
     await orchestrator.process_user_message("s1", "hi")
@@ -1074,8 +1112,12 @@ async def test_cancel_subtask_forwards_custom_reason() -> None:
 
 
 @pytest.mark.asyncio
-async def test_cancel_subtask_with_bad_task_id_falls_back_to_text() -> None:
-    """A malformed tool call (missing task_id) is dropped; text reply wins."""
+async def test_cancel_subtask_with_bad_task_id_raises_contract_error() -> None:
+    """A malformed tool call (missing task_id) is dropped.
+
+    Issue 0047: drop now surfaces as :class:`OrchestratorContractError`
+    rather than a structured-chat fallback (0048 will degrade earlier).
+    """
 
     bad_call = ToolCall(
         id="call_bad",
@@ -1084,13 +1126,11 @@ async def test_cancel_subtask_with_bad_task_id_falls_back_to_text() -> None:
     )
     orchestrator, _jc, _sub, _js, _ts, scheduler = _make_orchestrator(
         complete_responses=[LLMResponse(text=None, tool_calls=[bad_call])],
-        chat_responses=[_valid_payload("fallback")],
     )
 
-    response = await orchestrator.process_user_message("s1", "anything")
+    with pytest.raises(OrchestratorContractError):
+        await orchestrator.process_user_message("s1", "anything")
 
-    assert response.speech == "fallback"
-    assert response.cancelled_task_ids == []
     assert scheduler.cancelled == []
 
 
@@ -1129,8 +1169,7 @@ async def test_process_user_message_emits_orchestrator_debug_milestones() -> Non
     debug_log.current_turn_id.set(None)
 
     orchestrator, _jc, _sub, _js, _ts, _scheduler = _make_orchestrator(
-        complete_responses=[LLMResponse(text="just chatting", tool_calls=[])],
-        chat_responses=[_valid_payload("Salut Tom")],
+        complete_responses=[_say_response(speech="Salut Tom")],
     )
 
     await orchestrator.process_user_message("sess-A", "Coucou")
@@ -1166,8 +1205,7 @@ async def test_process_user_message_shares_turn_id_across_all_events() -> None:
     debug_log.current_turn_id.set(None)
 
     orchestrator, _jc, _sub, _js, _ts, _scheduler = _make_orchestrator(
-        complete_responses=[LLMResponse(text="just chatting", tool_calls=[])],
-        chat_responses=[_valid_payload("Salut")],
+        complete_responses=[_say_response(speech="Salut")],
     )
 
     await orchestrator.process_user_message("sess-shared", "Hi")
@@ -1191,10 +1229,9 @@ async def test_two_consecutive_messages_produce_distinct_turn_ids() -> None:
 
     orchestrator, _jc, _sub, _js, _ts, _scheduler = _make_orchestrator(
         complete_responses=[
-            LLMResponse(text="t1", tool_calls=[]),
-            LLMResponse(text="t2", tool_calls=[]),
+            _say_response(speech="a"),
+            _say_response(speech="b"),
         ],
-        chat_responses=[_valid_payload("a"), _valid_payload("b")],
     )
 
     await orchestrator.process_user_message("sess-X", "first")

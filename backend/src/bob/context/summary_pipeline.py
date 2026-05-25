@@ -109,6 +109,7 @@ async def maybe_regenerate_rolling_summary(
     recent_window: int,
     trigger_delta: int = DEFAULT_TRIGGER_DELTA,
     include_live_user_message: bool = False,
+    current_epoch_id: int = 0,
 ) -> StoredRollingSummary | None:
     """Regenerate the rolling summary if the older slice has grown enough.
 
@@ -116,6 +117,11 @@ async def maybe_regenerate_rolling_summary(
     previously latest row when no regeneration was needed (still
     non-``None`` so callers can introspect), or ``None`` when there is
     nothing to summarise yet (early session, older slice empty).
+
+    ``current_epoch_id`` (PRD 0006 / issue 0051) is stamped on the
+    persisted row so the :class:`bob.epoch.manager.EpochManager` can
+    distinguish "current epoch's rolling summary" from earlier sealed
+    summaries. Defaults to ``0`` to preserve pre-0051 behavior.
 
     See module docstring for the trigger rule.
     """
@@ -128,10 +134,10 @@ async def maybe_regenerate_rolling_summary(
     )
     older = _older_slice(history, recent_window=recent_window)
     if not older:
-        return summary_store.latest()
+        return summary_store.latest_for_epoch(current_epoch_id) or summary_store.latest()
 
     older_to_turn = len(older)  # 1-indexed inclusive bound (count of older rows)
-    latest = summary_store.latest()
+    latest = summary_store.latest_for_epoch(current_epoch_id)
     if latest is not None and (older_to_turn - latest.to_turn) < trigger_delta:
         return latest
 
@@ -150,5 +156,6 @@ async def maybe_regenerate_rolling_summary(
         summariser_version=result.summariser_version,
         text=result.text,
         token_estimate=len(result.text) // 4,
+        epoch_id=current_epoch_id,
     )
-    return summary_store.latest()
+    return summary_store.latest_for_epoch(current_epoch_id)

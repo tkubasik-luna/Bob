@@ -28,9 +28,15 @@ from dataclasses import dataclass, field
 #: retained in 0046 as a regression / safety-net policy.
 LEGACY_FULL_HISTORY_POLICY_ID = "legacy_full_history"
 
-#: Bounded policy id introduced by issue 0046. The orchestrator wires this
-#: as the default; see :func:`bounded_v1_policy`.
+#: Bounded policy id introduced by issue 0046. Kept as a regression
+#: target; the orchestrator default is now :func:`bounded_v2_policy`.
 BOUNDED_V1_POLICY_ID = "bounded_v1"
+
+#: Bounded policy id introduced by issue 0051. Same provider mix as v1
+#: plus the cross-epoch digest slotted right after the system block.
+#: PRD 0006's "Sealed epochs are NEVER auto-injected — only the cross-
+#: epoch digest is" lives in this policy.
+BOUNDED_V2_POLICY_ID = "bounded_v2"
 
 #: Default recent-turns window (K) for the bounded policy. K user↔Jarvis
 #: pairs are visible verbatim — i.e. up to 2*K rows in the persisted
@@ -101,6 +107,40 @@ def bounded_v1_policy() -> ContextPolicy:
     return ContextPolicy(
         policy_id=BOUNDED_V1_POLICY_ID,
         provider_ids=("system_block", "rolling_summary", "recent_turns", "user_message"),
+        token_budget=DEFAULT_TOKEN_BUDGET,
+        recent_turns_window=DEFAULT_RECENT_TURNS_WINDOW,
+    )
+
+
+def bounded_v2_policy() -> ContextPolicy:
+    """Return the bounded v2 policy — adds the cross-epoch digest block.
+
+    Provider order:
+
+    1. ``system_block`` — personality + tool-schema reminder + (optional)
+       waiting-input addendum.
+    2. ``cross_epoch_digest`` — synthesis of sealed epochs, regenerated
+       from RAW sealed turns at every seal (issue 0051). Skipped when no
+       epoch has sealed yet.
+    3. ``rolling_summary`` — current-epoch rolling summary of older
+       turns (skipped when empty).
+    4. ``recent_turns`` — verbatim window of the last K user↔Jarvis pairs.
+    5. ``user_message`` — the live in-progress user turn.
+
+    PRD 0006 STATE block (issue 0050) will slot in between
+    ``system_block`` and ``cross_epoch_digest``. The ordering is
+    deliberate: STATE > sealed epochs > current epoch > live user.
+    """
+
+    return ContextPolicy(
+        policy_id=BOUNDED_V2_POLICY_ID,
+        provider_ids=(
+            "system_block",
+            "cross_epoch_digest",
+            "rolling_summary",
+            "recent_turns",
+            "user_message",
+        ),
         token_budget=DEFAULT_TOKEN_BUDGET,
         recent_turns_window=DEFAULT_RECENT_TURNS_WINDOW,
     )

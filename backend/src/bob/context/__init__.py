@@ -26,11 +26,13 @@ from bob.context.entry import (
 )
 from bob.context.policy import (
     BOUNDED_V1_POLICY_ID,
+    BOUNDED_V2_POLICY_ID,
     DEFAULT_RECENT_TURNS_WINDOW,
     DEFAULT_TOKEN_BUDGET,
     LEGACY_FULL_HISTORY_POLICY_ID,
     ContextPolicy,
     bounded_v1_policy,
+    bounded_v2_policy,
     legacy_full_history_policy,
     parse_policy_overrides,
 )
@@ -39,6 +41,7 @@ from bob.context.tokenizer import Tokenizer, WordCountTokenizer, default_tokeniz
 
 __all__ = [
     "BOUNDED_V1_POLICY_ID",
+    "BOUNDED_V2_POLICY_ID",
     "CONTEXT_ENTRY_SCHEMA_VERSION",
     "DEFAULT_RECENT_TURNS_WINDOW",
     "DEFAULT_TOKEN_BUDGET",
@@ -53,6 +56,7 @@ __all__ = [
     "Tokenizer",
     "WordCountTokenizer",
     "bounded_v1_policy",
+    "bounded_v2_policy",
     "default_tokenizer",
     "legacy_full_history_policy",
     "parse_policy_overrides",

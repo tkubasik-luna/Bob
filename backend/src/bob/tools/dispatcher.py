@@ -96,6 +96,20 @@ class _TaskStoreLike(Protocol):
     def get_task_messages(self, task_id: str) -> Any: ...
 
 
+class _JarvisStoreLike(Protocol):
+    """Narrow protocol used by the ``say`` tool handler.
+
+    Issue 0047 routes Jarvis direct replies through the unified ``say``
+    tool. The handler persists the assistant turn so subsequent context
+    assembly sees the reply in history — owning the persistence in the
+    handler (rather than the orchestrator) keeps the dispatcher path
+    fully self-contained: every successful turn ends with exactly one
+    handler call that performs both the side effect and the persistence.
+    """
+
+    def append(self, role: Any, content: str, action: Any = ...) -> None: ...
+
+
 @dataclass(frozen=True)
 class ToolHandlerContext:
     """Dependencies handed to every tool handler.
@@ -106,11 +120,18 @@ class ToolHandlerContext:
     nothing else from the orchestrator. Adding a new dependency (e.g.
     the event bus when 0052 lands) is a one-line change here and a
     no-op for handlers that don't need it.
+
+    Issue 0047 adds the optional ``jarvis_store`` so the unified ``say``
+    tool can persist its assistant turn through the same DI bag as every
+    other handler. The field defaults to ``None`` so legacy registry /
+    dispatcher contract tests that never touched persistence keep
+    compiling without a stub.
     """
 
     task_store: _TaskStoreLike
     task_scheduler: _SchedulerLike
     ws_emit: _WsEmitterLike
+    jarvis_store: _JarvisStoreLike | None = None
 
 
 @dataclass(frozen=True)
@@ -127,12 +148,16 @@ class DispatchResult:
       registry could resolve the call (so even validation errors carry
       provenance). ``tool_version`` is ``None`` for unknown tools.
     - ``task_id`` — the task id touched by a successful call (created,
-      resumed, cancelled). ``None`` for the unified ``say`` tool when it
-      ships in 0047, and ``None`` for every error branch.
+      resumed, cancelled). ``None`` for the unified ``say`` tool (issue
+      0047), and ``None`` for every error branch.
     - ``error_code`` / ``error_message`` — populated on ``outcome="error"``.
       ``error_code`` follows the ``reason_code`` shape used elsewhere in
       PRD 0006 (``"unknown_tool"``, ``"invalid_args"``, ``"unknown_task"``,
       ``"task_not_waiting_input"``, ``"handler_failed"``).
+    - ``speech`` / ``ui`` — populated by the unified ``say`` tool (issue
+      0047) so the orchestrator can lift the spoken text + optional UI
+      payload into the :class:`OrchestratorResponse`. ``None`` for every
+      other tool and for every error branch.
     """
 
     outcome: DispatchOutcome
@@ -141,6 +166,8 @@ class DispatchResult:
     task_id: str | None = None
     error_code: str | None = None
     error_message: str | None = None
+    speech: str | None = None
+    ui: Any | None = None
 
     @property
     def ok(self) -> bool:
@@ -275,6 +302,8 @@ class ToolDispatcher:
                 tool_name=definition.name,
                 tool_version=definition.version,
                 task_id=outcome.task_id,
+                speech=outcome.speech,
+                ui=outcome.ui,
             )
         return DispatchResult(
             outcome="error",

@@ -28,17 +28,24 @@ ROLLING_SUMMARY_PROVIDER_ID = "rolling_summary"
 
 
 class RollingSummaryProvider:
-    """Emit the freshest persisted :class:`StoredRollingSummary` as a system entry."""
+    """Emit the freshest persisted :class:`StoredRollingSummary` as a system entry.
 
-    def __init__(self, *, store: RollingSummaryStore) -> None:
+    ``current_epoch_id`` (PRD 0006 / issue 0051) filters the latest row
+    to the active epoch so a sealed previous-epoch summary does not
+    leak back into the active prompt. Defaults to ``0`` to preserve
+    pre-0051 behavior.
+    """
+
+    def __init__(self, *, store: RollingSummaryStore, current_epoch_id: int = 0) -> None:
         self._store = store
+        self._current_epoch_id = current_epoch_id
 
     @property
     def provider_id(self) -> str:
         return ROLLING_SUMMARY_PROVIDER_ID
 
     def entries(self, ctx: AssemblyContext) -> Sequence[ContextEntry]:
-        latest = self._store.latest()
+        latest = self._store.latest_for_epoch(self._current_epoch_id)
         if latest is None:
             return []
         wrapped = SUMMARY_BLOCK_HEADER.render(
