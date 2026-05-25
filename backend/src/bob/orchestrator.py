@@ -113,10 +113,16 @@ _ASK_USER_PARAPHRASE_TEMPLATE = (
 # announce a sub-task's completion in Jarvis' tone. Same pinning rationale as
 # the ask_user paraphrase — no jarvis.md tuning, ships deterministically.
 _DONE_SYNTHESIS_TEMPLATE = (
-    "La sous-tâche '{task_title}' vient de terminer. "
-    "Résultat brut : '{result}'. "
-    "Annonce-le à l'utilisateur dans ton ton, en 2-3 lignes max. "
-    "Résume les points clés, propose une suite si pertinent."
+    "La sous-tâche '{task_title}' vient de terminer.\n"
+    "Résultat brut : '{result}'.\n"
+    "Étape 1 — Vérifie le contenu : si le résultat est vide, incohérent ou "
+    "manifestement raté, dis-le franchement à l'utilisateur en une phrase "
+    "et arrête-toi là.\n"
+    "Étape 2 — Sinon, ouvre impérativement par "
+    "« Voilà ce que j'ai trouvé à propos de <sujet> … » (remplace <sujet> "
+    "par le thème exact de la sous-tâche, pas son titre brut) puis résume "
+    "les points clés en 2-3 lignes max dans ton ton. "
+    "Propose une suite si pertinent."
 )
 
 

@@ -750,13 +750,16 @@ async def test_do_generate_done_synthesis_emits_assistant_msg_with_flag() -> Non
     assert event["ui"] == []
     assert isinstance(event["msg_id"], str) and len(event["msg_id"]) == 32
 
-    # Prompt referenced the task title + raw result text.
+    # Prompt referenced the task title + raw result text + the announcement
+    # framing the orchestrator now mandates ("Voilà ce que j'ai trouvé …").
     chat_messages = jarvis_client.chat_calls[0]["messages"]
     user_msg = chat_messages[-1]
     assert user_msg["role"] == "user"
     assert "Recherche papier RAG" in user_msg["content"]
     assert "3 résultats trouvés" in user_msg["content"]
     assert "2-3 lignes" in user_msg["content"]
+    assert "Vérifie le contenu" in user_msg["content"]
+    assert "Voilà ce que j'ai trouvé" in user_msg["content"]
 
     # Persisted in history so the user's next turn sees it.
     history = jarvis_store.history()
