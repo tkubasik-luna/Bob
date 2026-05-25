@@ -31,6 +31,48 @@ Threading model: a single :class:`asyncio.Lock` serialises promotion and
 counter updates so two simultaneous ``on_task_terminated`` callbacks (or an
 ``on_task_terminated`` racing with an ``enqueue``) cannot both grab the same
 pending row.
+
+Structured concurrency (PRD 0006 / issue 0045)
+----------------------------------------------
+
+When the scheduler is started via :meth:`start`, every runner coroutine is
+spawned inside ONE shared :class:`asyncio.TaskGroup`. The group is hosted
+by a long-lived background coroutine that waits on a stop-event; on
+:meth:`stop` we set the stop-event, the host coroutine cancels every
+in-flight child via the group, and the ``async with`` exits cleanly. This
+guarantees that an orchestrator crash propagating up to the FastAPI
+lifespan cannot leak background sub-agent coroutines (PRD 0006 user story
+#24).
+
+Schedulers that do not call :meth:`start` (legacy tests, scripts that
+exercise the scheduler in isolation) fall back to bare
+``asyncio.create_task`` for each runner. The two paths are otherwise
+behaviourally identical from the perspective of ``enqueue`` /
+``on_task_terminated`` / ``cancel``.
+
+Cancellation contract (PRD 0006 / issue 0045)
+---------------------------------------------
+
+:meth:`cancel` cooperates with the new :class:`SubAgentRunner` when one
+is registered for the target task:
+
+1. Mark the task as cancelling.
+2. If a cooperative-cancel hook was registered for the task (via the
+   ``coop_cancel_factory`` ctor arg, populated by the boot path with
+   :meth:`SubAgentRunner.request_cancel`), invoke it. The runner will
+   reach its next checkpoint (iteration boundary or pre-tool-call) and
+   emit a forced ``done(cancelled, user_cancelled)`` cleanly.
+3. Wait up to :data:`SubAgentPolicy.cancel_grace_seconds` (default
+   ``2 s``) for the runner asyncio task to terminate of its own accord.
+4. If the grace elapses without termination, escalate to
+   :meth:`asyncio.Task.cancel`. The runner converts the resulting
+   :class:`asyncio.CancelledError` into ``done(cancelled, hard_killed)``
+   so the task row still ends with a structured terminal action.
+
+When no cooperative hook is registered (legacy paths, tests using bare
+runner factories) step 2 is skipped: we hard-cancel immediately. This
+preserves the slice #0023 behaviour exactly for callers that have not
+opted into the new runner.
 """
 
 from __future__ import annotations
@@ -60,6 +102,24 @@ task to its terminal state as before.
 """
 
 
+CooperativeCancelFactory = Callable[[str], Callable[[], None] | None]
+"""Factory looking up the cooperative-cancel callback for ``task_id``.
+
+Returns ``None`` when no cooperative cancel is registered for the task —
+the scheduler then falls back to immediate hard cancel. Populated by the
+boot path with :meth:`SubAgentRunner.request_cancel` so the cooperative
+path is the default in production while legacy tests keep the slice #0023
+behaviour.
+"""
+
+
+#: Default cooperative-cancel grace window. Mirrors
+#: ``SubAgentPolicy.cancel_grace_seconds`` so the two layers can be tuned
+#: together. Kept here as a module-level constant so legacy tests (which
+#: don't construct a :class:`SubAgentPolicy`) can reference it.
+DEFAULT_COOP_CANCEL_GRACE_SECONDS = 2.0
+
+
 class TaskScheduler:
     """Cap + queue for concurrent sub-task runners."""
 
@@ -69,12 +129,16 @@ class TaskScheduler:
         task_store: TaskStore,
         cap: int,
         runner_factory: RunnerFactory,
+        coop_cancel_factory: CooperativeCancelFactory | None = None,
+        cancel_grace_seconds: float = DEFAULT_COOP_CANCEL_GRACE_SECONDS,
     ) -> None:
         if cap < 1:
             raise ValueError(f"TaskScheduler cap must be >= 1, got {cap}")
         self._task_store = task_store
         self._cap = cap
         self._runner_factory = runner_factory
+        self._coop_cancel_factory = coop_cancel_factory
+        self._cancel_grace_seconds = cancel_grace_seconds
         # Running set is the in-memory mirror of "tasks currently driven by an
         # asyncio runner task we own". Counter is ``len(self._running)``.
         self._running: set[str] = set()
@@ -93,6 +157,13 @@ class TaskScheduler:
         # task to ``failed`` and persisted the reason; the callback must
         # only free the slot + promote a pending row, NOT touch state again.
         self._cancelling: set[str] = set()
+        # Issue 0045 — single shared ``asyncio.TaskGroup`` hosting every
+        # runner spawned while the scheduler is started. ``_task_group`` is
+        # populated by :meth:`start` and torn down by :meth:`stop`; when
+        # ``None`` the legacy ``asyncio.create_task`` path is used.
+        self._task_group: asyncio.TaskGroup | None = None
+        self._host_task: asyncio.Task[None] | None = None
+        self._stop_event: asyncio.Event | None = None
 
     @property
     def cap(self) -> int:
@@ -102,6 +173,70 @@ class TaskScheduler:
         """Snapshot of the in-memory running set — for tests + observability."""
 
         return set(self._running)
+
+    async def start(self) -> None:
+        """Spin up the shared :class:`asyncio.TaskGroup` host (PRD 0006 / 0045).
+
+        Runners spawned after this call land inside the group; an
+        orchestrator crash propagating up the lifespan cancels every
+        in-flight runner deterministically when the host coroutine
+        eventually exits the ``async with``.
+
+        Idempotent — calling :meth:`start` twice is a no-op.
+        """
+
+        if self._task_group is not None:
+            return
+        self._stop_event = asyncio.Event()
+        ready: asyncio.Event = asyncio.Event()
+
+        async def _host() -> None:
+            assert self._stop_event is not None
+            try:
+                async with asyncio.TaskGroup() as tg:
+                    self._task_group = tg
+                    ready.set()
+                    # Block until ``stop`` is called. ``TaskGroup``'s
+                    # ``__aexit__`` then waits for every spawned child to
+                    # finish before returning, which is the structured-
+                    # concurrency guarantee we need.
+                    await self._stop_event.wait()
+            finally:
+                self._task_group = None
+
+        # Run the host as a top-level task so it survives the caller
+        # returning. We don't strong-ref it here; ``_host_task`` is the
+        # caller's handle for :meth:`stop`.
+        self._host_task = asyncio.create_task(_host())
+        # Wait for the TaskGroup to be live before returning — otherwise
+        # the first enqueue could lose the group reference race.
+        await ready.wait()
+
+    async def stop(self) -> None:
+        """Tear down the shared :class:`asyncio.TaskGroup` host.
+
+        Cancels every in-flight runner asyncio task (cooperative path
+        not attempted at shutdown — the orchestrator is going down so a
+        forced terminal ``done`` is acceptable) then awaits the host
+        coroutine.
+
+        Idempotent.
+        """
+
+        if self._host_task is None:
+            return
+        # Cancel every in-flight runner so the TaskGroup can drain
+        # cleanly. Without this the host coroutine would block in
+        # ``__aexit__`` until every runner returned naturally.
+        for runner_task in list(self._runners.values()):
+            if not runner_task.done():
+                runner_task.cancel()
+        if self._stop_event is not None:
+            self._stop_event.set()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await self._host_task
+        self._host_task = None
+        self._stop_event = None
 
     async def enqueue(self, task_id: str) -> None:
         """Take ownership of a ``pending`` task, promote it if a slot is free.
@@ -316,9 +451,35 @@ class TaskScheduler:
             return
 
         if not runner_task.done():
-            runner_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await runner_task
+            # Issue 0045 — cooperative cancel before hard kill. If the boot
+            # wired a cooperative-cancel callback for this task (which
+            # :meth:`SubAgentRunner.request_cancel` populates), invoke it
+            # and wait up to ``cancel_grace_seconds`` for the runner to
+            # reach its next checkpoint and terminate cleanly. Past the
+            # grace we escalate via :meth:`asyncio.Task.cancel`. The
+            # runner converts the resulting :class:`asyncio.CancelledError`
+            # into a forced ``done(cancelled, hard_killed)`` — see
+            # :mod:`bob.sub_agent.runner` docstring.
+            coop_cancel: Callable[[], None] | None = None
+            if self._coop_cancel_factory is not None:
+                coop_cancel = self._coop_cancel_factory(task_id)
+            if coop_cancel is not None:
+                coop_cancel()
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(self._await_runner(runner_task)),
+                        timeout=self._cancel_grace_seconds,
+                    )
+                except TimeoutError:
+                    _logger.warning(
+                        "task_scheduler.coop_cancel_grace_elapsed",
+                        task_id=task_id,
+                        grace_seconds=self._cancel_grace_seconds,
+                    )
+            if not runner_task.done():
+                runner_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await runner_task
 
         # The done-callback fires when ``runner_task`` resolves. It checks
         # ``self._cancelling`` and only frees the slot + promotes a pending
@@ -326,6 +487,18 @@ class TaskScheduler:
         # state + reason here so the caller (WS handler or Jarvis tool) can
         # rely on the state being settled by the time ``cancel`` returns.
         await self._finalize_cancelled(task_id, reason=reason)
+
+    @staticmethod
+    async def _await_runner(runner_task: asyncio.Task[None]) -> None:
+        """Await ``runner_task`` swallowing any exception.
+
+        Used by the cooperative-cancel path so :func:`asyncio.wait_for`
+        sees a clean completion (or its own ``TimeoutError``) instead of
+        a leaked ``CancelledError`` from the runner.
+        """
+
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await runner_task
 
     # --- Internals -----------------------------------------------------------
 
@@ -388,8 +561,15 @@ class TaskScheduler:
         # 0039 wires. The follow-up promotion path (``on_task_terminated``)
         # runs outside the original turn and gets a fresh None ``turn_id``,
         # which is the correct behaviour for a tail-of-queue runner.
+        #
+        # Issue 0045: route the coroutine through the shared TaskGroup when
+        # the scheduler has been ``start``-ed. Fall back to
+        # :func:`asyncio.create_task` for legacy callers (existing tests).
         runner_coro = self._runner_factory(task_id)
-        runner_task = asyncio.create_task(runner_coro)
+        if self._task_group is not None:
+            runner_task = self._task_group.create_task(runner_coro)
+        else:
+            runner_task = asyncio.create_task(runner_coro)
         # Slice #0023 — track the asyncio handle so :meth:`cancel` can call
         # ``task.cancel()`` on it. Cleared in the done-callback.
         self._runners[task_id] = runner_task
@@ -523,18 +703,29 @@ def build_default_scheduler(
     settings: Settings,
     task_store: TaskStore,
     runner_factory: RunnerFactory,
+    *,
+    coop_cancel_factory: CooperativeCancelFactory | None = None,
+    cancel_grace_seconds: float = DEFAULT_COOP_CANCEL_GRACE_SECONDS,
 ) -> TaskScheduler:
     """Build a :class:`TaskScheduler` using settings + provided dependencies.
 
     The ``runner_factory`` is injected because the scheduler does not depend
     on the LLM layer — the orchestrator wires its concrete
     :class:`SubAgentRunner` here at boot.
+
+    Issue 0045: optional ``coop_cancel_factory`` lets the boot path plug a
+    cooperative-cancel hook (typically :meth:`SubAgentRunner.request_cancel`)
+    so :meth:`TaskScheduler.cancel` honours the 2 s grace window before
+    escalating to a hard kill. Legacy callers leave it at ``None`` to keep
+    slice #0023 behaviour.
     """
 
     return TaskScheduler(
         task_store=task_store,
         cap=settings.MAX_RUNNING_TASKS,
         runner_factory=runner_factory,
+        coop_cancel_factory=coop_cancel_factory,
+        cancel_grace_seconds=cancel_grace_seconds,
     )
 
 

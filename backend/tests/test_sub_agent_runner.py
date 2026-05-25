@@ -443,8 +443,14 @@ async def test_progress_sequence_then_done_persists_messages_and_emits_events() 
 
 
 @pytest.mark.asyncio
-async def test_progress_cap_exceeded_fails_with_max_iterations_reason() -> None:
-    """11 consecutive progress emits → state ``failed`` with the cap reason."""
+async def test_progress_cap_exceeded_emits_done_degraded() -> None:
+    """11 consecutive progress emits trip the iteration cap.
+
+    Issue 0045 (PRD 0006): the runner exits with a forced
+    ``done(status=degraded, reason_code=iteration_cap)`` rather than
+    the legacy ``failed`` state. The task row therefore lands in
+    ``done``; the cap is recorded on the structured event payload.
+    """
 
     store = _make_store()
     task_id = _make_running_task(store)
@@ -465,24 +471,21 @@ async def test_progress_cap_exceeded_fails_with_max_iterations_reason() -> None:
         ws_events.set_emitter(None)
 
     task = store.get_task(task_id)
-    assert task.state == "failed"
-    # ``_fail`` only writes the reason on a system message + ``task_result``
-    # event; ``task.result`` is reserved for ``done`` payloads.
-    assert task.result is None
+    # ``done(degraded, iteration_cap)`` lands as state ``done`` with an
+    # empty ``result`` (no payload at the cap).
+    assert task.state == "done"
+    assert task.result == ""
 
-    # Only the first 10 progress emits made it through; the 11th tripped
-    # the cap before persisting.
+    # Exactly 10 progress messages persisted (the 11th tripped the cap
+    # at the iteration boundary *before* a new LLM call).
     messages = store.get_task_messages(task_id)
     progress_msgs = [m for m in messages if m.action == "progress"]
     assert len(progress_msgs) == 10
-    # The system row carrying the failure reason is also present.
-    system_msgs = [m for m in messages if m.role == "system"]
-    assert any("max_iterations_exceeded" in m.content for m in system_msgs)
 
-    # The final task_result event surfaces the cap reason verbatim.
+    # The task_result event still surfaces (empty string for cap paths).
     results = [e for e in received_ws if e["type"] == "task_result"]
     assert len(results) == 1
-    assert results[0]["result"] == "max_iterations_exceeded"
+    assert results[0]["result"] == ""
 
 
 @pytest.mark.asyncio

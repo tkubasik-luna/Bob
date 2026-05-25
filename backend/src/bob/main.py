@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
-from collections.abc import AsyncIterator, Coroutine
+from collections.abc import AsyncIterator, Callable, Coroutine
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -40,7 +40,11 @@ from bob.llm.factory import build_subagent_client
 from bob.logging_setup import configure_logging
 from bob.orchestrator import get_default_orchestrator
 from bob.proactivity_handler import ProactivityHandler
-from bob.sub_agent_runner import SubAgentRunner
+from bob.sub_agent import (
+    SubAgentRunner,
+    build_default_subagent_registry,
+    default_policy,
+)
 from bob.task_scheduler import build_default_scheduler
 from bob.task_store import TaskStore
 from bob.tts_service import get_default_tts_service
@@ -90,17 +94,48 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     # once and reuse it across every runner invocation — the underlying
     # client is stateless and the orchestrator's previous wiring did the
     # same (one client instance, many calls).
+    #
+    # Issue 0045: the runner is wrapped in a shared TaskGroup managed by the
+    # scheduler. The boot path keeps a per-task index of live runners so the
+    # cooperative-cancel hook resolves to :meth:`SubAgentRunner.request_cancel`
+    # before the scheduler escalates to the hard-kill path.
     subagent_client = build_subagent_client(settings)
+    subagent_policy = default_policy()
+    subagent_registry = build_default_subagent_registry()
+    live_runners: dict[str, SubAgentRunner] = {}
 
     def _runner_factory(task_id: str) -> Coroutine[Any, Any, None]:
         runner = SubAgentRunner(
             subagent_client=subagent_client,
             task_store=task_store,
+            policy=subagent_policy,
+            tool_registry=subagent_registry,
         )
-        return runner.run(task_id)
+        live_runners[task_id] = runner
 
-    scheduler = build_default_scheduler(settings, task_store, _runner_factory)
+        async def _run_and_cleanup() -> None:
+            try:
+                await runner.run(task_id)
+            finally:
+                live_runners.pop(task_id, None)
+
+        return _run_and_cleanup()
+
+    def _coop_cancel_factory(task_id: str) -> Callable[[], None] | None:
+        runner = live_runners.get(task_id)
+        if runner is None:
+            return None
+        return runner.request_cancel
+
+    scheduler = build_default_scheduler(
+        settings,
+        task_store,
+        _runner_factory,
+        coop_cancel_factory=_coop_cancel_factory,
+        cancel_grace_seconds=subagent_policy.cancel_grace_seconds,
+    )
     task_scheduler_module.set_default_scheduler(scheduler)
+    await scheduler.start()
     await scheduler.recover_after_restart()
 
     # EventBus + proactivity wiring (slice #0021, #0025). The bus is
@@ -138,6 +173,9 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         await orchestrator.stop_proactive_loop()
+        # Issue 0045 — drain the scheduler's TaskGroup deterministically so
+        # in-flight sub-agents don't leak past the lifespan teardown.
+        await scheduler.stop()
         orchestrator_module.set_default_orchestrator(None)
         set_event_bus(None)
         task_scheduler_module.set_default_scheduler(None)

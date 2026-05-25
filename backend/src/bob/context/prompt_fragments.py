@@ -98,9 +98,14 @@ CANCEL_CONFIRMATION = PromptFragment(
 
 TOOLS_SYSTEM_ADDENDUM = PromptFragment(
     id="tools_system_addendum",
-    version=1,
+    version=2,
     template=(
-        "\n\nTu disposes de trois outils :\n"
+        "\n\nTu disposes de quatre outils :\n"
+        "- ``say`` : pour répondre directement à l'utilisateur. C'est ton "
+        "outil par défaut pour toute interaction qui ne demande ni "
+        "délégation ni transmission. ``speech`` (obligatoire) est le texte "
+        "à dire ; ``ui`` (optionnel) est un objet ``{component, props}`` "
+        "ou ``null`` quand la réponse est purement vocale.\n"
         "- ``spawn_subtask`` : pour déléguer une tâche longue ou autonome à un "
         "sub-agent en arrière-plan.\n"
         "- ``forward_to_subtask`` : pour transmettre la réponse de l'utilisateur "
@@ -109,20 +114,25 @@ TOOLS_SYSTEM_ADDENDUM = PromptFragment(
         "- ``cancel_subtask`` : pour annuler une sous-tâche en cours quand "
         "l'utilisateur demande explicitement de l'arrêter (\"annule X\", "
         '"laisse tomber").\n'
-        "Pour CE message, tu dois EXCLUSIVEMENT :\n"
-        "- soit appeler ``spawn_subtask`` (un seul appel) si la demande mérite "
-        "d'être déléguée ;\n"
-        "- soit appeler ``forward_to_subtask`` si l'utilisateur répond à une "
+        "RÈGLE ABSOLUE : chaque tour DOIT être exactement UN appel d'outil. "
+        "Tu n'écris JAMAIS de texte libre — toute réponse passe par "
+        "``say``. Pour CE message :\n"
+        "- appelle ``spawn_subtask`` si la demande mérite d'être déléguée ;\n"
+        "- appelle ``forward_to_subtask`` si l'utilisateur répond à une "
         "question préalablement transmise par toi pour le compte d'une tâche en "
         "cours ;\n"
-        "- soit appeler ``cancel_subtask`` si l'utilisateur demande explicitement "
+        "- appelle ``cancel_subtask`` si l'utilisateur demande explicitement "
         "d'annuler / arrêter une tâche listée dans le résumé ;\n"
-        "- soit répondre directement en texte si aucune action n'est requise.\n"
-        "Ne fais jamais deux appels en parallèle."
+        "- sinon, appelle ``say`` avec ton texte de réponse dans ``speech``.\n"
+        "Ne fais jamais deux appels en parallèle. Ne renvoie jamais de "
+        "texte hors d'un appel d'outil."
     ),
     description=(
         "Appended to the live system prompt for every ``complete()`` call so "
-        "Jarvis knows the available Jarvis-side tools."
+        "Jarvis knows the available Jarvis-side tools. Issue 0047 (v2) "
+        "closes the instruction: every turn is exactly one tool call. "
+        "Free-form text replies route through ``say``; the legacy "
+        "``response_parser`` raw-text fallback is gone."
     ),
 )
 
@@ -229,5 +239,57 @@ SYSTEM_BLOCK_PERSONALITY_REMINDER = PromptFragment(
     description=(
         "Tail added to the system prompt under the bounded policy so the "
         "model is reminded the rolling summary already carries older context."
+    ),
+)
+
+
+# --- Sub-agent v2 fragments (PRD 0006 / issue 0045). ---
+#
+# The sub-agent v2 contract surfaces three structured actions. The system
+# prompt below describes the action surface to the LLM so the runner can
+# parse a versioned :class:`bob.sub_agent.actions.SubAgentAction`. Tools
+# are listed dynamically by the runner — keep the prompt fragment focused
+# on the action contract itself.
+
+SUB_AGENT_V2_SYSTEM_PROMPT = PromptFragment(
+    id="sub_agent_v2_system",
+    version=1,
+    template=(
+        "Tu es un sub-agent autonome. Ton but : {goal}.\n"
+        "À chaque tour tu émets UNE seule action JSON parmi :\n"
+        '  - {{"action": "progress", "thought": "<réflexion>"}} pour '
+        "exposer une réflexion intermédiaire (la boucle continue).\n"
+        '  - {{"action": "tool_call", "name": "<nom>", "args": {{...}}}} '
+        "pour invoquer un outil disponible ci-dessous (la boucle continue "
+        "après l'exécution).\n"
+        '  - {{"action": "done", "result_summary": "<résumé>", '
+        '"ui_payload": null, "status": "complete", '
+        '"reason_code": "ok", "cost": {{}}}} pour terminer.\n'
+        "Statuts ``done`` : ``complete`` (but atteint), ``degraded`` "
+        "(résultat partiel sous contrainte), ``failed`` (erreur non "
+        "récupérable). ``cancelled`` et ``timeout`` sont émis par le "
+        "runner lui-même, ne les renvoie pas.\n"
+        "Réponds avec l'objet JSON UNIQUEMENT, sans markdown ni prose "
+        "autour."
+    ),
+    description=(
+        "System prompt for sub-agents under the v2 contract (PRD 0006 / "
+        "issue 0045). Describes the three-action surface and the closed "
+        "set of done statuses the LLM is allowed to emit."
+    ),
+)
+
+
+SUB_AGENT_V2_ADDENDUM_TEMPLATE = PromptFragment(
+    id="sub_agent_v2_addendum",
+    version=1,
+    template=(
+        "L'utilisateur a ajouté la note suivante en cours de route "
+        "(prise en compte pour la suite de la tâche) : « {text} »"
+    ),
+    description=(
+        "Per-addendum wrapper injected into the next sub-agent LLM "
+        "iteration when :class:`AddendumQueue.drain` returns entries. "
+        "0050 (addendum_task tool) is the producer side."
     ),
 )
