@@ -217,3 +217,36 @@ describe("groupEvents - maxSeverity aggregation", () => {
     expect(task.maxSeverity).toBe("error");
   });
 });
+
+describe("groupEvents - self-cycle guard (regression)", () => {
+  // SubAgentRunner emits progress/done/fail/ask_user from INSIDE start_task(T)
+  // scope. Those events carry both `parent_task_id == T` (from the ContextVar)
+  // AND `payload.task_id == T` (for client identification). Without the guard,
+  // Pass 1 would set T's parentTaskId to T itself → Pass 4 pushes T into its
+  // own children → infinite recursion in `computeTaskAggregates` (stack
+  // overflow crashing the debug window).
+  test("event with parent_task_id == payload.task_id does not create a self-cycle", () => {
+    const events: DebugEvent[] = [
+      makeEvent({
+        category: "task",
+        summary: "spawn A",
+        payload: { task_id: "A", title: "A" },
+        turn_id: "T1",
+      }),
+      makeEvent({
+        category: "task",
+        summary: "A done",
+        payload: { task_id: "A", title: "A", result: "ok" },
+        parent_task_id: "A",
+        turn_id: "T1",
+      }),
+    ];
+    // The two assertions matter: (1) the call returns at all (no overflow),
+    // (2) task A appears as a child of the turn — NOT as a child of itself.
+    const tree = groupEvents(events);
+    const turn = tree[0] as TurnNode;
+    const task = turn.children.find((c) => c.kind === "task") as TaskNode;
+    expect(task.taskId).toBe("A");
+    expect(task.children.some((c) => c.kind === "task" && c.taskId === "A")).toBe(false);
+  });
+});

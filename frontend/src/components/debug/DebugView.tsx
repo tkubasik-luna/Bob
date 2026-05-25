@@ -16,6 +16,7 @@ import {
   type DebugFilters,
   type DebugSeverity,
 } from "../../types/ws-debug";
+import { DebugErrorBoundary } from "./DebugErrorBoundary";
 import { DebugToolbar } from "./DebugToolbar";
 import { DebugTree } from "./DebugTree";
 
@@ -375,14 +376,16 @@ export function DebugView() {
                 : "Aucun événement ne correspond aux filtres actifs."}
             </div>
           ) : (
-            <DebugTree
-              nodes={prunedTree}
-              highlightedTurnId={highlightedTurnId}
-              onTurnClick={onTurnClick}
-              expanded={expandedMap}
-              onToggle={onToggleExpand}
-              lastInnerRef={lastInnerRef}
-            />
+            <DebugErrorBoundary>
+              <DebugTree
+                nodes={prunedTree}
+                highlightedTurnId={highlightedTurnId}
+                onTurnClick={onTurnClick}
+                expanded={expandedMap}
+                onToggle={onToggleExpand}
+                lastInnerRef={lastInnerRef}
+              />
+            </DebugErrorBoundary>
           )}
         </div>
         {!isAtBottom && newEventsSinceScroll > 0 ? (

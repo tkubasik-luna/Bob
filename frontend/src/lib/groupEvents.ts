@@ -198,10 +198,18 @@ export function groupEvents(events: readonly DebugEvent[]): TreeNode[] {
     const payloadTaskId = typeof p.task_id === "string" ? p.task_id : null;
     if (payloadTaskId !== null) {
       const meta = readTaskMeta(p);
+      // Self-reference guard: an event emitted *inside* task T whose payload
+      // also carries `task_id == T` (progress/done/fail/ask_user emits from
+      // `sub_agent_runner` running in `start_task(T)` scope) is NOT a spawn
+      // from T's parent — it's T describing itself. Treat parentTaskId as
+      // null in that case so we don't introduce a self-cycle in the task
+      // graph (which would explode `computeTaskAggregates` into infinite
+      // recursion).
+      const parentTaskId = eventParent === payloadTaskId ? null : eventParent;
       touchTask(payloadTaskId, {
         title: meta.title,
         goal: meta.goal,
-        parentTaskId: eventParent,
+        parentTaskId,
         turnId: e.turn_id,
       });
     }
@@ -335,7 +343,7 @@ export function groupEvents(events: readonly DebugEvent[]): TreeNode[] {
   for (const [taskId, meta] of taskMeta) {
     const task = taskNodes.get(taskId);
     if (task === undefined) continue;
-    if (meta.parentTaskId !== null) {
+    if (meta.parentTaskId !== null && meta.parentTaskId !== taskId) {
       const parent = taskNodes.get(meta.parentTaskId);
       if (parent !== undefined) {
         parent.children.push(task);
@@ -437,10 +445,15 @@ function aggregateSubtree(children: TreeNode[]): {
   return { eventCount, taskCount, maxSeverity: maxSev, startTs, endTs };
 }
 
-function computeTaskAggregates(task: TaskNode): void {
+function computeTaskAggregates(task: TaskNode, visited: Set<string> = new Set()): void {
+  // Cycle guard — should be unreachable thanks to the self-cycle filter in
+  // Pass 1 + Pass 4, but a stray cycle here would lock the UI in an infinite
+  // recursion. Bail early if we re-enter the same task.
+  if (visited.has(task.taskId)) return;
+  visited.add(task.taskId);
   // Recurse into children that are tasks first so their aggregates are ready.
   for (const c of task.children) {
-    if (c.kind === "task") computeTaskAggregates(c);
+    if (c.kind === "task") computeTaskAggregates(c, visited);
   }
   const agg = aggregateSubtree(task.children);
   task.eventCount = agg.eventCount;
