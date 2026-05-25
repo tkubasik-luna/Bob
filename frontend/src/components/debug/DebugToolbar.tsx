@@ -1,4 +1,4 @@
-import type { ChangeEvent } from "react";
+import type { CSSProperties, ChangeEvent } from "react";
 import {
   DEBUG_CATEGORIES,
   DEBUG_SEVERITIES,
@@ -11,19 +11,42 @@ type DebugToolbarProps = {
   filters: DebugFilters;
   onToggleCategory: (category: DebugCategory) => void;
   onChangeSeverity: (severity: DebugSeverity) => void;
+  /** Current pause state — drives the Pause/Resume button label + active styling. */
+  paused: boolean;
+  /** Toggle pause/resume; also exposed via the Space keybind on the window. */
+  onTogglePause: () => void;
+  /** Clear the visible feed locally — backend ring buffer is untouched. */
+  onClear: () => void;
+  /** Visible event count, shown as `Clear (N)` for quick at-a-glance feedback. */
+  visibleCount: number;
+  /**
+   * Events buffered while paused. Shown as a chip next to the Pause label so
+   * the operator can tell how much will flush on resume without clicking.
+   */
+  pendingCount: number;
 };
 
 /**
  * Top-of-window filter strip for the debug view. Renders one chip per
- * category (toggleable) and one `<select>` for the severity threshold.
+ * category (toggleable), a `<select>` for the severity threshold, and (since
+ * slice 0042) two action buttons: Pause/Resume and Clear.
  *
  * Defaults and behaviour are owned by the parent (`DebugView`); the toolbar
  * is a controlled component that only emits change intents. No persistence
  * in v1 — each app session resets to "all categories ON, threshold `info`".
  *
- * PRD: prd/0005-debug-view.md — slice: issues/0040-debug-view-toolbar.md
+ * PRD: prd/0005-debug-view.md — slice: issues/0042-debug-view-tail-scroll.md
  */
-export function DebugToolbar({ filters, onToggleCategory, onChangeSeverity }: DebugToolbarProps) {
+export function DebugToolbar({
+  filters,
+  onToggleCategory,
+  onChangeSeverity,
+  paused,
+  onTogglePause,
+  onClear,
+  visibleCount,
+  pendingCount,
+}: DebugToolbarProps) {
   const onSeverityChange = (e: ChangeEvent<HTMLSelectElement>) => {
     onChangeSeverity(e.target.value as DebugSeverity);
   };
@@ -75,7 +98,29 @@ export function DebugToolbar({ filters, onToggleCategory, onChangeSeverity }: De
           );
         })}
       </div>
-      <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: "6px" }}>
+      <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: "8px" }}>
+        <button
+          type="button"
+          onClick={onTogglePause}
+          aria-pressed={paused}
+          aria-label={paused ? "Resume feed" : "Pause feed"}
+          title="Toggle pause (Space)"
+          style={actionButtonStyle(paused)}
+        >
+          {paused ? "▶ Resume" : "⏸ Pause"}
+          {paused && pendingCount > 0 ? (
+            <span style={pendingBadgeStyle}>+{pendingCount}</span>
+          ) : null}
+        </button>
+        <button
+          type="button"
+          onClick={onClear}
+          aria-label="Clear visible feed"
+          title="Clear visible feed (backend buffer kept)"
+          style={actionButtonStyle(false)}
+        >
+          {visibleCount > 0 ? `Clear (${visibleCount})` : "Clear"}
+        </button>
         <label
           htmlFor="debug-severity"
           style={{
@@ -111,6 +156,43 @@ export function DebugToolbar({ filters, onToggleCategory, onChangeSeverity }: De
     </div>
   );
 }
+
+/**
+ * Shared style for Pause and Clear. Same dimensions as a category chip so the
+ * toolbar reads as a single horizontal band. `active = true` renders the
+ * "currently engaged" variant used by Pause when the feed is frozen.
+ */
+function actionButtonStyle(active: boolean): CSSProperties {
+  return {
+    cursor: "pointer",
+    fontFamily: "inherit",
+    fontSize: "11px",
+    fontWeight: 600,
+    letterSpacing: "0.04em",
+    textTransform: "uppercase",
+    padding: "3px 10px",
+    borderRadius: "999px",
+    border: `1px solid ${active ? "rgba(125, 211, 252, 0.65)" : "rgba(255, 255, 255, 0.18)"}`,
+    background: active ? "rgba(125, 211, 252, 0.22)" : "transparent",
+    color: active ? "#dbeafe" : "rgba(223, 239, 255, 0.78)",
+    display: "inline-flex",
+    alignItems: "center",
+    gap: "6px",
+    transition: "background 120ms ease, border-color 120ms ease, color 120ms ease",
+  };
+}
+
+/** Inline pending counter rendered on the Pause button while frozen. */
+const pendingBadgeStyle: CSSProperties = {
+  display: "inline-block",
+  padding: "0 6px",
+  borderRadius: "999px",
+  background: "rgba(2, 6, 14, 0.55)",
+  color: "#dbeafe",
+  fontSize: "10px",
+  fontWeight: 700,
+  letterSpacing: "0.02em",
+};
 
 /**
  * Visual palette for the 7 categories. PRD-defined mapping (input=blue,
