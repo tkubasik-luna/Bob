@@ -12,7 +12,7 @@
  */
 
 import { useMemo } from "react";
-import { groupEvents, type TreeNode } from "../lib/groupEvents";
+import { type TreeNode, groupEvents } from "../lib/groupEvents";
 import type { DebugEvent } from "../types/ws-debug";
 
 export function useGroupedEvents(events: readonly DebugEvent[]): TreeNode[] {

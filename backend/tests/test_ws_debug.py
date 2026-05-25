@@ -34,6 +34,7 @@ def test_ws_debug_replays_buffered_events_on_connect() -> None:
         # Replayed snapshot pass must mark the flag.
         assert frame["replayed"] is True
         # Envelope key set is the PRD `Schema sur le fil` shape.
+        # Issue 0052 adds the ``task_id`` field alongside ``parent_task_id``.
         assert set(frame.keys()) == {
             "ts",
             "category",
@@ -44,6 +45,7 @@ def test_ws_debug_replays_buffered_events_on_connect() -> None:
             "turn_id",
             "correlation_id",
             "parent_task_id",
+            "task_id",
             "replayed",
         }
 

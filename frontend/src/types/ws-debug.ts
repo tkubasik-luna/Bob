@@ -81,7 +81,38 @@ export type DebugEvent = {
    * pre-0043 buffer replay still decodes cleanly.
    */
   parent_task_id?: string | null;
+  /**
+   * Issue 0052: the task this event belongs to. Aliased to the same
+   * ContextVar as `parent_task_id` today; the `/ws/task/{task_id}` filter
+   * uses this field. Optional so pre-0052 snapshots still decode cleanly.
+   */
+  task_id?: string | null;
   /** `true` when the event was streamed from the ring-buffer snapshot at
    * subscribe time; `false` for live events. */
   replayed: boolean;
 };
+
+/**
+ * Issue 0052 — wire frame on `/ws/task/{task_id}`. The session uses a
+ * snapshot-then-tail protocol in ONE WS:
+ *
+ * - First frame: `type: "snapshot"` with the full list of currently
+ *   buffered events tagged with the requested `task_id`.
+ * - Subsequent frames: `type: "tail"`, one per live event.
+ *
+ * The wire is intentionally simple — no negotiation, no client → server
+ * frames. Clients pop the snapshot envelope, render, then append every
+ * tail frame to the timeline.
+ */
+export type TaskWsSnapshotFrame = {
+  type: "snapshot";
+  task_id: string;
+  events: DebugEvent[];
+};
+
+export type TaskWsTailFrame = {
+  type: "tail";
+  event: DebugEvent;
+};
+
+export type TaskWsFrame = TaskWsSnapshotFrame | TaskWsTailFrame;

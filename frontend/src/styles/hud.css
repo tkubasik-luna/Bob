@@ -494,9 +494,7 @@ body {
 /* ── CLICKABLE ── rows with a result payload re-open the overlay on click */
 .hud-task.is-clickable {
   cursor: pointer;
-  transition:
-    opacity 600ms ease,
-    background-color 160ms ease;
+  transition: opacity 600ms ease, background-color 160ms ease;
 }
 .hud-task.is-clickable:hover,
 .hud-task.is-clickable:focus-visible {

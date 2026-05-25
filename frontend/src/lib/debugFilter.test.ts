@@ -7,7 +7,7 @@ import {
   type DebugSeverity,
 } from "../types/ws-debug";
 import { filterEvents, passesFilters, pruneEmptyNodes } from "./debugFilter";
-import { groupEvents, type TaskNode, type TurnNode } from "./groupEvents";
+import { type TaskNode, type TurnNode, groupEvents } from "./groupEvents";
 
 function makeEvent(category: DebugCategory, severity: DebugSeverity, summary = "evt"): DebugEvent {
   return {
@@ -147,20 +147,14 @@ describe("pruneEmptyNodes", () => {
   }
 
   test("drops turn whose descendants don't match the filter", () => {
-    const tree = groupEvents([
-      withTurn("voice", "trace", "T1"),
-      withTurn("voice", "debug", "T1"),
-    ]);
+    const tree = groupEvents([withTurn("voice", "trace", "T1"), withTurn("voice", "debug", "T1")]);
     const filters: DebugFilters = { categoriesOn: allCategoriesOn(), severityThreshold: "info" };
     const pruned = pruneEmptyNodes(tree, filters);
     expect(pruned).toHaveLength(0);
   });
 
   test("keeps turn whose at least one descendant matches", () => {
-    const tree = groupEvents([
-      withTurn("voice", "trace", "T1"),
-      withTurn("voice", "warn", "T1"),
-    ]);
+    const tree = groupEvents([withTurn("voice", "trace", "T1"), withTurn("voice", "warn", "T1")]);
     const filters: DebugFilters = { categoriesOn: allCategoriesOn(), severityThreshold: "info" };
     const pruned = pruneEmptyNodes(tree, filters);
     expect(pruned).toHaveLength(1);
@@ -231,10 +225,7 @@ describe("pruneEmptyNodes", () => {
   });
 
   test("does not mutate the input tree", () => {
-    const tree = groupEvents([
-      withTurn("system", "info", "T1"),
-      withTurn("system", "trace", "T1"),
-    ]);
+    const tree = groupEvents([withTurn("system", "info", "T1"), withTurn("system", "trace", "T1")]);
     const originalChildrenRef = (tree[0] as TurnNode).children;
     const originalCount = (tree[0] as TurnNode).eventCount;
     pruneEmptyNodes(tree, {

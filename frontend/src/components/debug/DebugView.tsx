@@ -88,7 +88,7 @@ export function DebugView() {
       // open, LLM closed. We bake that into the new value so a manual toggle
       // always produces a deterministic explicit entry the user can flip back.
       const prevValue = next.get(nodeId);
-      const wasOpen = prevValue ?? (nodeId.startsWith("llm:") ? false : true);
+      const wasOpen = prevValue ?? !nodeId.startsWith("llm:");
       next.set(nodeId, !wasOpen);
       return next;
     });

@@ -112,7 +112,7 @@ def test_event_to_dict_matches_wire_envelope() -> None:
 
     [event] = snapshot()
     wire = event.to_dict()
-    # PRD `Schema sur le fil` field set.
+    # PRD `Schema sur le fil` field set — issue 0052 adds ``task_id``.
     assert set(wire.keys()) == {
         "ts",
         "category",
@@ -123,6 +123,7 @@ def test_event_to_dict_matches_wire_envelope() -> None:
         "turn_id",
         "correlation_id",
         "parent_task_id",
+        "task_id",
         "replayed",
     }
     assert wire["turn_id"] == "t1"

@@ -1,5 +1,5 @@
-import type { TreeNode } from "./groupEvents";
 import { type DebugEvent, type DebugFilters, SEVERITY_ORDER } from "../types/ws-debug";
+import type { TreeNode } from "./groupEvents";
 
 /**
  * Pure, allocation-light predicate that decides whether a single event passes
@@ -37,10 +37,7 @@ export function filterEvents(events: readonly DebugEvent[], filters: DebugFilter
  *
  * PRD: prd/0006-debug-view-grouped-tree.md — slice: issues/0044-debug-view-grouped-tree.md
  */
-export function pruneEmptyNodes(
-  tree: readonly TreeNode[],
-  filters: DebugFilters,
-): TreeNode[] {
+export function pruneEmptyNodes(tree: readonly TreeNode[], filters: DebugFilters): TreeNode[] {
   const out: TreeNode[] = [];
   for (const node of tree) {
     const pruned = pruneNode(node, filters);
@@ -81,8 +78,8 @@ function pruneNode(node: TreeNode, filters: DebugFilters): TreeNode | null {
 
 // --- aggregate recomputation (mirrors groupEvents' bottom-up pass) --------
 
-import type { TaskNode, TurnNode } from "./groupEvents";
 import type { DebugSeverity } from "../types/ws-debug";
+import type { TaskNode, TurnNode } from "./groupEvents";
 
 function tsMs(iso: string): number {
   const t = Date.parse(iso);

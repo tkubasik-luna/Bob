@@ -304,10 +304,7 @@ const TaskNodeView = memo(function TaskNodeView({
   return (
     <div style={taskContainerStyle}>
       {/* biome-ignore lint/a11y/useKeyWithClickEvents: dev-only debug view */}
-      <div
-        style={{ ...headerRowStyle, cursor: "pointer" }}
-        onClick={() => onToggle(node.id)}
-      >
+      <div style={{ ...headerRowStyle, cursor: "pointer" }} onClick={() => onToggle(node.id)}>
         <span style={caretStyle}>{caret(open)}</span>
         <span style={taskChipStyle}>📋 {node.taskId.slice(0, 6)}</span>
         {label !== "" ? <span style={taskLabelStyle}>{label}</span> : null}

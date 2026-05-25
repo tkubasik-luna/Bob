@@ -6,11 +6,13 @@ import { useAudioLevel } from "../sphere/useAudioLevel";
 import { type SphereDerivedState, useSphereState } from "../sphere/useSphereState";
 import { useDevTweaksStore } from "../state/devTweaksStore";
 import { useChatStore } from "../store/chatStore";
+import type { Task } from "../types/ws";
 import { DevControls } from "./sphere/DevControls";
 import { HudTasks } from "./sphere/HudTasks";
 import { InputField } from "./sphere/InputField";
 import { MarkdownOverlay } from "./sphere/MarkdownOverlay";
 import { MuteToggle } from "./sphere/MuteToggle";
+import { TaskOverlay } from "./sphere/TaskOverlay";
 import { TranscriptLine } from "./sphere/TranscriptLine";
 import { SphereWsContext } from "./sphere/sphereWsContext";
 
@@ -83,6 +85,11 @@ export function SphereUI() {
   const messages = useChatStore((s) => s.messages);
   const tasks = useChatStore((s) => s.tasks);
   const [overlayContent, setOverlayContent] = useState<string | null>(null);
+  // Issue 0052 — per-task overlay state. Clicking a task in `HudTasks`
+  // sets this; the overlay subscribes to the task's live reflections
+  // (running) or renders its markdown / empty state (finished).
+  const [openTaskId, setOpenTaskId] = useState<string | null>(null);
+  const openTask: Task | null = openTaskId !== null ? (tasks[openTaskId] ?? null) : null;
   // PRD 0005 — Cmd+Shift+D toggles the dedicated debug window. The listener
   // attaches at mount and unattaches on unmount; the guard rejects key
   // events whose target is a text input so the user can still type `D`
@@ -165,13 +172,18 @@ export function SphereUI() {
           audioLevelRef={audioLevelRef}
         />
         <div className="hud-zone tr">
-          <HudTasks onOpenResult={setOverlayContent} />
+          <HudTasks onOpenResult={setOverlayContent} onOpenTask={(t) => setOpenTaskId(t.id)} />
         </div>
         <div className="hud-zone b">
           <TranscriptLine state={transcriptState} hidden={overlayOpen} />
           <InputField />
         </div>
         <MarkdownOverlay content={overlayContent} onClose={() => setOverlayContent(null)} />
+        {/* Per-task overlay (issue 0052) — opens on row click in HudTasks.
+         * The two overlays are mutually exclusive in practice (HudTasks
+         * triggers exactly one); rendering both unconditionally keeps the
+         * Esc/backdrop dismiss paths independent. */}
+        <TaskOverlay task={openTask} onClose={() => setOpenTaskId(null)} />
         <MuteToggle />
         <DevControls />
       </div>

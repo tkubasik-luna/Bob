@@ -8,6 +8,12 @@ type HudTasksProps = {
    * to do with the markdown — usually re-opening the `MarkdownOverlay`. When
    * omitted, rows stay non-interactive. */
   onOpenResult?: (content: string) => void;
+  /** Issue 0052 — called when the user clicks a task row to open the
+   * per-task overlay. Running tasks → live reflection timeline; finished
+   * tasks → markdown synthesis or empty-state. When omitted, only the
+   * legacy `onOpenResult` callback is wired so the panel stays
+   * backwards-compatible. */
+  onOpenTask?: (task: Task) => void;
 };
 
 /**
@@ -26,7 +32,7 @@ type HudTasksProps = {
  * fall off the FIFO window so the user can click one to re-open its result
  * in the markdown overlay (`onOpenResult` callback).
  */
-export function HudTasks({ onOpenResult }: HudTasksProps) {
+export function HudTasks({ onOpenResult, onOpenTask }: HudTasksProps) {
   const tasksMap = useChatStore((s) => s.tasks);
 
   const ordered = useMemo<Task[]>(
@@ -56,7 +62,12 @@ export function HudTasks({ onOpenResult }: HudTasksProps) {
       </div>
       <div className="hud-tasks-list">
         {visible.map((task) => (
-          <HudTaskRow key={task.id} task={task} onOpenResult={onOpenResult} />
+          <HudTaskRow
+            key={task.id}
+            task={task}
+            onOpenResult={onOpenResult}
+            onOpenTask={onOpenTask}
+          />
         ))}
       </div>
     </div>
@@ -66,9 +77,11 @@ export function HudTasks({ onOpenResult }: HudTasksProps) {
 function HudTaskRow({
   task,
   onOpenResult,
+  onOpenTask,
 }: {
   task: Task;
   onOpenResult?: (content: string) => void;
+  onOpenTask?: (task: Task) => void;
 }) {
   const variant = stateToVariant(task.state);
   const sub = formatTaskSub(task);
@@ -78,13 +91,23 @@ function HudTaskRow({
   // accent border so the user notices Jarvis is blocked on them.
   const needsAccent = task.needsAttention === true && task.state === "waiting_input";
 
-  // Interactive once a result payload is attached — typically state=done with
-  // a non-empty result. The auto-trigger in `SphereUI` only fires once per
-  // task id; this manual path lets the user re-open after dismissing.
+  // Issue 0052: when an `onOpenTask` is provided the row is interactive for
+  // EVERY state — clicking a running task opens the in-progress overlay
+  // (live reflection timeline), clicking a finished task opens the
+  // markdown synthesis or empty-state.
+  // Legacy path (`onOpenResult`): only finished tasks with a non-empty
+  // result are interactive — kept for backwards compat with the existing
+  // `SphereUI` wiring.
   const result = typeof task.result === "string" && task.result.length > 0 ? task.result : null;
-  const interactive = result !== null && onOpenResult !== undefined;
+  const interactive = onOpenTask !== undefined || (result !== null && onOpenResult !== undefined);
   const handleOpen = () => {
-    if (interactive && result !== null) onOpenResult(result);
+    if (onOpenTask !== undefined) {
+      onOpenTask(task);
+      return;
+    }
+    if (result !== null && onOpenResult !== undefined) {
+      onOpenResult(result);
+    }
   };
 
   return (

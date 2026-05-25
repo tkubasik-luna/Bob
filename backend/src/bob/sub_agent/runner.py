@@ -122,24 +122,36 @@ from bob.sub_agent.tool_registry import (
     build_default_subagent_registry,
 )
 from bob.task_store import Task, TaskStore, TaskStoreError
+from bob.validation import (
+    SUB_AGENT_DEFAULT_POLICY,
+    CallEnvelope,
+    ExhaustedContext,
+    OnValidationExhausted,
+    SubAgentOnValidationExhausted,
+    build_validator_message,
+    render_feedback,
+)
+from bob.validation.reason_codes import (
+    REASON_HARD_KILLED,
+    REASON_INVALID_OUTPUT,
+    REASON_ITERATION_CAP,
+    REASON_LLM_FAILED,
+    REASON_OK,
+    REASON_TOKEN_CAP,
+    REASON_TOOL_FAILED,
+    REASON_USER_CANCELLED,
+    REASON_WALL_CLOCK_CAP,
+)
 
 _logger = structlog.get_logger(__name__)
 
 
-# --- Reason codes used by this slice -----------------------------------------
+# --- Reason codes ------------------------------------------------------------
 #
-# These are the codes the runner emits today. 0048 ships the full
-# :class:`ReasonCodeRegistry`; for now we centralise the literals here so
-# greps stay friendly and 0048 can adopt them wholesale.
-REASON_OK = "ok"
-REASON_ITERATION_CAP = "iteration_cap"
-REASON_WALL_CLOCK_CAP = "wall_clock_cap"
-REASON_TOKEN_CAP = "token_cap"
-REASON_USER_CANCELLED = "user_cancelled"
-REASON_HARD_KILLED = "hard_killed"
-REASON_INVALID_OUTPUT = "invalid_output"
-REASON_LLM_FAILED = "llm_failed"
-REASON_TOOL_FAILED = "tool_failed"
+# Issue 0048 moves the reason-code literals into
+# :mod:`bob.validation.reason_codes` so the registry is the single source
+# of truth. We re-export the names from this module so existing call sites
+# importing them from :mod:`bob.sub_agent.runner` keep working.
 
 
 #: Clock callable used to read wall-clock time. Defaults to
@@ -281,6 +293,7 @@ class SubAgentRunner:
         tool_registry: SubAgentToolRegistry | None = None,
         addendum_queue: AddendumQueue | None = None,
         clock: Clock | None = None,
+        on_validation_exhausted: OnValidationExhausted | None = None,
     ) -> None:
         self._client = subagent_client
         self._task_store = task_store
@@ -299,6 +312,13 @@ class SubAgentRunner:
         # so the terminal done can report ``hard_killed`` vs
         # ``user_cancelled``. Tests assert on this through the task row.
         self._hard_killed = False
+        # PRD 0006 / issue 0048 — validation degrade contract. The
+        # default handler delegates to ``force_failed_invalid_output``
+        # so the forced ``done(failed, invalid_output)`` keeps the
+        # existing finalisation path (lineage preservation + bus event).
+        self._on_validation_exhausted: OnValidationExhausted = (
+            on_validation_exhausted or SubAgentOnValidationExhausted(runner=self)
+        )
 
     @property
     def addendum_queue(self) -> AddendumQueue:
@@ -358,6 +378,12 @@ class SubAgentRunner:
         iteration = 0
         tokens_used = 0
         pending_addenda: list[AddendumEntry] = []
+        # PRD 0006 / issue 0048 — validation feedback messages re-injected
+        # on the next LLM call under the ``system_validator`` role. Reset
+        # on every successful parse so a stale retry buffer cannot leak
+        # across iteration boundaries.
+        validator_feedback: list[dict[str, Any]] = []
+        validator_envelope = CallEnvelope(tool_name=None, actor="sub_agent")
 
         while True:
             # ---- Checkpoint 1: iteration boundary -----------------------
@@ -421,7 +447,24 @@ class SubAgentRunner:
             # Drain the addendum queue exactly here — at the iteration
             # boundary, before building the next LLM prompt. 0050 fills
             # the queue; today the drain is a no-op for production use.
-            pending_addenda.extend(self._addendum_queue.drain())
+            drained = self._addendum_queue.drain()
+            pending_addenda.extend(drained)
+            # Issue 0052: each drained addendum surfaces in the per-task
+            # overlay as an ``addendum_received`` reflection event so
+            # the dev can see exactly when a user enrichment landed in
+            # the sub-agent's prompt.
+            for entry in drained:
+                emit_debug(
+                    category="task",
+                    severity="info",
+                    source="bob.sub_agent_runner.run",
+                    summary=f"Addendum reçu: {entry.text[:80]}",
+                    payload={
+                        "task_id": task_id,
+                        "kind": "addendum_received",
+                        "text": entry.text,
+                    },
+                )
 
             try:
                 task = self._task_store.get_task(task_id)
@@ -433,6 +476,13 @@ class SubAgentRunner:
             # Consume the addenda once they have been folded into the
             # prompt — they should not appear on the next iteration too.
             pending_addenda = []
+
+            # Re-inject any pending validator feedback under the dedicated
+            # ``system_validator`` role (issue 0048). Empty list on the
+            # happy path — only populated after a parse failure inside
+            # the retry budget.
+            if validator_feedback:
+                messages = [*messages, *validator_feedback]
 
             try:
                 raw = await self._client.chat(messages, session_id=task_id)
@@ -486,19 +536,46 @@ class SubAgentRunner:
                     task_id=task_id,
                     reason=str(exc),
                     raw_preview=raw[:200],
+                    attempt=validator_envelope.attempts,
                 )
-                await self._emit_terminal_done(
-                    task_id,
-                    status="failed",
-                    reason_code=REASON_INVALID_OUTPUT,
-                    result_summary=f"sub-agent response invalid: {exc}",
-                    cost=self._build_cost(
-                        started_at=started_at,
-                        iterations=iteration,
-                        tokens_used=tokens_used,
-                    ),
+                # Issue 0048 — instead of immediately failing the task
+                # on the first invalid output we feed escaped validator
+                # feedback back to the LLM under the
+                # ``system_validator`` role and retry. The retry counter
+                # rides on the transient :class:`CallEnvelope` (never
+                # persisted). Budget exhaustion routes through the
+                # shared ``on_validation_exhausted`` handler which calls
+                # back into ``force_failed_invalid_output``.
+                policy = SUB_AGENT_DEFAULT_POLICY
+                if validator_envelope.retries_used >= policy.max_retries:
+                    await self._on_validation_exhausted.on_validation_exhausted(
+                        ExhaustedContext(
+                            envelope=validator_envelope,
+                            last_error_message=f"sub-agent response invalid: {exc}",
+                            task_id=task_id,
+                        )
+                    )
+                    return
+                validator_feedback.append(
+                    build_validator_message(
+                        render_feedback(
+                            error_message=(
+                                "Ta dernière sortie est invalide: "
+                                f"{exc}. Ré-essaye en émettant exactement "
+                                "UN objet JSON conforme au schéma."
+                            ),
+                            offending_raw=raw,
+                        )
+                    )
                 )
-                return
+                validator_envelope.record_feedback(validator_feedback[-1]["content"])
+                validator_envelope.increment(error_code=REASON_INVALID_OUTPUT)
+                continue
+
+            # Successful parse — drop any pending validator feedback so
+            # it doesn't bleed into the next iteration's prompt.
+            validator_feedback = []
+            validator_envelope = CallEnvelope(tool_name=None, actor="sub_agent")
 
             if normalised.ask_user_question is not None:
                 # Legacy ask_user path — preserved until 0050 replaces it
@@ -635,6 +712,10 @@ class SubAgentRunner:
                 "task_id": task_id,
                 "title": task.title,
                 "thought": thought,
+                # Issue 0052: explicit reflection kind so the per-task
+                # overlay can render a coloured pill / icon per category
+                # without payload sniffing.
+                "kind": "thought",
                 "schema_version": SUB_AGENT_SCHEMA_VERSION,
             },
         )
@@ -682,6 +763,22 @@ class SubAgentRunner:
             _logger.exception("sub_agent_runner.persist_tool_call_failed", task_id=task_id)
             return
 
+        # Issue 0052: emit a ``tool_invoke`` reflection BEFORE the
+        # dispatch so the overlay can show "calling X..." while the
+        # tool is still running.
+        emit_debug(
+            category="task",
+            severity="debug",
+            source="bob.sub_agent_runner._handle_tool_call",
+            summary=f"Sub-task appelle outil {action.name}",
+            payload={
+                "task_id": task_id,
+                "tool": action.name,
+                "args": action.args,
+                "kind": "tool_invoke",
+            },
+        )
+
         result = await self._tool_dispatcher.dispatch(
             name=action.name,
             arguments=action.args,
@@ -717,6 +814,8 @@ class SubAgentRunner:
                 "tool": action.name,
                 "outcome": result.outcome,
                 "error_code": result.error_code,
+                # Issue 0052 — paired with the preceding ``tool_invoke``.
+                "kind": "tool_result",
             },
         )
 
@@ -747,6 +846,11 @@ class SubAgentRunner:
                 "task_id": task_id,
                 "title": task.title,
                 "question": question,
+                # Issue 0052: ask_user is a status transition into
+                # ``waiting_input`` — surface it as the same reflection
+                # kind the overlay handles.
+                "kind": "status_change",
+                "new_state": "waiting_input",
             },
         )
         await _emit_task_message(self._task_store, task_id, message_id=message_id)
@@ -767,6 +871,29 @@ class SubAgentRunner:
                 "new_state": "waiting_input",
                 "action": "ask_user",
             },
+        )
+
+    async def force_failed_invalid_output(
+        self,
+        *,
+        task_id: str,
+        error_message: str,
+    ) -> None:
+        """Forced terminal ``done(failed, invalid_output)`` (PRD 0006 / issue 0048).
+
+        Entry point used by :class:`SubAgentOnValidationExhausted` when
+        the validator runs out of retries on a malformed LLM payload.
+        Goes through :meth:`_finalize_done` so the lineage / bus event /
+        task_result WS frame remain identical to a regular failure.
+        """
+
+        await self._finalize_done(
+            task_id,
+            status="failed",
+            reason_code=REASON_INVALID_OUTPUT,
+            result_summary=f"sub-agent response invalid: {error_message}",
+            ui_payload=None,
+            cost={},
         )
 
     async def _finalize_done(
@@ -866,6 +993,10 @@ class SubAgentRunner:
                 "reason_code": reason_code,
                 "ui_payload": ui_payload,
                 "cost": cost,
+                # Issue 0052: status_change reflection so the overlay
+                # can render a terminal pill in the timeline.
+                "kind": "status_change",
+                "new_state": store_state,
                 "schema_version": SUB_AGENT_SCHEMA_VERSION,
             },
         )

@@ -60,7 +60,7 @@ import contextlib
 import logging
 import uuid
 from collections import deque
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -128,7 +128,14 @@ class DebugEvent:
       event was emitted from inside a :class:`SubAgentRunner.run` scope —
       slice 0043 auto-fills this from the ``current_task_id`` ContextVar.
       ``None`` for events emitted at the orchestrator level or outside any
-      sub-task context.
+      sub-task context. Kept for backward compat with the debug grouped
+      tree (frontend ``groupEvents.ts``) which still keys on
+      ``parent_task_id``.
+    - ``task_id``: issue 0052 — the task this event belongs to. Auto-filled
+      from the same ``current_task_id`` ContextVar as ``parent_task_id``
+      (they alias the same value today; field exists so the per-task
+      overlay subscription has a stable name to filter on regardless of
+      whether the parent_task_id semantics ever diverge).
     - ``replayed``: ``True`` when the event was yielded from the ring
       buffer snapshot at subscribe time, ``False`` for live emits.
     """
@@ -142,6 +149,7 @@ class DebugEvent:
     turn_id: str | None = None
     correlation_id: str | None = None
     parent_task_id: str | None = None
+    task_id: str | None = None
     replayed: bool = False
 
     def to_dict(self) -> dict[str, Any]:
@@ -157,6 +165,7 @@ class DebugEvent:
             "turn_id": self.turn_id,
             "correlation_id": self.correlation_id,
             "parent_task_id": self.parent_task_id,
+            "task_id": self.task_id,
             "replayed": self.replayed,
         }
 
@@ -177,6 +186,7 @@ class DebugEvent:
             turn_id=self.turn_id,
             correlation_id=self.correlation_id,
             parent_task_id=self.parent_task_id,
+            task_id=self.task_id,
             replayed=replayed,
         )
 
@@ -270,7 +280,11 @@ def emit_debug(
     # there is no explicit override at the call site today (no producer
     # wants to forge a fake parent). Orphan events outside any
     # ``start_task`` scope keep the default ``None``.
-    effective_parent_task_id = current_task_id.get()
+    # Issue 0052: ``task_id`` aliases the same ContextVar so the per-task
+    # overlay filter can key on a stable name. The two fields carry
+    # identical values today; ``parent_task_id`` is preserved for the
+    # debug grouped tree's existing grouping logic.
+    effective_task_id = current_task_id.get()
 
     event = DebugEvent(
         ts=_now_iso(),
@@ -281,10 +295,15 @@ def emit_debug(
         payload=payload if payload is not None else {},
         turn_id=effective_turn_id,
         correlation_id=correlation_id,
-        parent_task_id=effective_parent_task_id,
+        parent_task_id=effective_task_id,
+        task_id=effective_task_id,
         replayed=False,
     )
     _buffer.append(event)
+    # Issue 0052: enforce byte + age retention bounds. The deque maxlen
+    # still protects against the worst-case pathological producer; the
+    # policy adds dimensions the deque cannot express on its own.
+    _enforce_retention()
 
     # Drop strategy: drop the oldest queued event for the slow subscriber,
     # then place the new one. We iterate over a snapshot of the subscriber
@@ -313,6 +332,18 @@ def snapshot() -> list[DebugEvent]:
     return list(_buffer)
 
 
+def snapshot_for_task(task_id: str) -> list[DebugEvent]:
+    """Return the ring-buffer events tagged with ``task_id`` (issue 0052).
+
+    Used by the ``/ws/task/{task_id}`` route to build the initial snapshot
+    frame before tailing live events filtered by the same id. Matches
+    against ``event.task_id`` (the issue 0052 field) — events emitted
+    before the field existed simply do not match.
+    """
+
+    return [event for event in _buffer if event.task_id == task_id]
+
+
 def clear() -> None:
     """Wipe the ring buffer. Intended for tests only.
 
@@ -321,6 +352,66 @@ def clear() -> None:
     """
 
     _buffer.clear()
+
+
+# --- Retention policy hook (issue 0052) --------------------------------------
+#
+# The ring buffer is bounded by ``_RING_BUFFER_MAXLEN`` already — that's a
+# count cap. Issue 0052 adds two extra dimensions enforced on every emit:
+#
+# - ``max_bytes``: total estimated bytes of the buffered events. Estimated
+#   via :func:`len(json.dumps(event.to_dict()))` so the size accounts for
+#   wire-shape (which is what an overlay client actually streams).
+# - ``max_age_seconds``: events older than this are dropped before the
+#   buffer is consulted. Wall-clock based; we re-parse the ``ts`` field
+#   via :func:`datetime.fromisoformat` (the ``Z`` suffix is normalised to
+#   ``+00:00`` first).
+#
+# The policy module owns the configuration object so tests can install a
+# tight policy and assert eviction. We never enforce a count cap here —
+# the deque ``maxlen`` already does that.
+
+
+# Imported lazily inside the hook to avoid a top-level cycle: the policy
+# module exports a function but the policy itself is a tiny dataclass that
+# imports nothing from debug_log.
+def _enforce_retention() -> None:
+    from bob.event_retention_policy import get_retention_policy
+
+    policy = get_retention_policy()
+    if policy is None:
+        return
+
+    # Age-based eviction first — cheaper than measuring bytes.
+    now = datetime.now(UTC)
+    if policy.max_age_seconds is not None:
+        threshold = policy.max_age_seconds
+        # popleft until the oldest event is within the threshold. We do
+        # not iterate to avoid mutating the deque during iteration.
+        while _buffer:
+            oldest = _buffer[0]
+            try:
+                ts = oldest.ts.replace("Z", "+00:00")
+                age = (now - datetime.fromisoformat(ts)).total_seconds()
+            except ValueError:
+                # Malformed timestamp — drop, can't reason about its age.
+                _buffer.popleft()
+                continue
+            if age <= threshold:
+                break
+            _buffer.popleft()
+
+    # Bytes-based eviction. Recompute total each loop pass; the deque is
+    # bounded by ``_RING_BUFFER_MAXLEN`` so the iteration is short.
+    if policy.max_bytes is not None:
+
+        def total_bytes() -> int:
+            import json
+
+            return sum(len(json.dumps(event.to_dict())) for event in _buffer)
+
+        while _buffer and total_bytes() > policy.max_bytes:
+            _buffer.popleft()
 
 
 async def subscribe() -> AsyncGenerator[DebugEvent, None]:
@@ -358,6 +449,40 @@ async def subscribe() -> AsyncGenerator[DebugEvent, None]:
     finally:
         # ``ValueError`` here means a concurrent path already removed the
         # subscriber — swallowing it is safe; the queue is dropped anyway.
+        with contextlib.suppress(ValueError):
+            _subscribers.remove(queue)
+
+
+async def subscribe_filtered(
+    predicate: Callable[[DebugEvent], bool],
+) -> AsyncGenerator[DebugEvent, None]:
+    """Async-generator over the producer with a per-event filter (issue 0052).
+
+    Behaves like :func:`subscribe` but only yields events for which
+    ``predicate(event)`` returns ``True``. The snapshot pass and the live
+    tail share the same predicate so the consumer sees a single coherent
+    stream — no need to wire a filter twice.
+
+    The producer side is untouched: every emitted event still lands on
+    every subscriber queue (the broadcast cost is per-event, not per-id),
+    we just drop non-matching events at yield time. This is the right
+    trade-off for the small number of concurrent overlay subscribers Bob
+    will see (single-user desktop app) and keeps the producer fully
+    independent of subscriber filter shapes.
+    """
+
+    queue: asyncio.Queue[DebugEvent] = asyncio.Queue(maxsize=_SUBSCRIBER_QUEUE_MAXSIZE)
+    _subscribers.append(queue)
+    try:
+        for event in snapshot():
+            if predicate(event):
+                yield event.with_replayed(True)
+
+        while True:
+            event = await queue.get()
+            if predicate(event):
+                yield event
+    finally:
         with contextlib.suppress(ValueError):
             _subscribers.remove(queue)
 

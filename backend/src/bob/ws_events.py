@@ -1,25 +1,27 @@
-"""Module-level WS event broadcaster for orchestrator / sub-agent → frontend.
+"""Thin shim — routes through :mod:`bob.event_bus_v2` (issue 0052).
 
-Background sub-agent runs do not own a WebSocket — but they need to push state
-transitions to the frontend (slice #0019). Threading a websocket reference all
-the way down through ``Orchestrator`` and ``SubAgentRunner`` would couple
-domain layers to the transport.
+Pre-0052 this module owned a module-level emitter callable + an
+``emit()`` no-op fallback. Sub-agent runners, the scheduler and the
+orchestrator all called ``ws_events.emit(payload)`` to push lifecycle
+events to the connected chat WS. The debug feed lived in parallel via
+:func:`bob.debug_log.emit_debug`.
 
-Instead, the WS handler in :mod:`bob.ws_router` registers a session-scoped
-emitter callable for the duration of the connection, and the orchestrator
-plus sub-agent runner simply call :func:`emit` whenever a task event must be
-pushed. When no emitter is installed (e.g. unit tests for the orchestrator
-in isolation), :func:`emit` is a no-op.
+Issue 0052 collapses the two producers into one. The :mod:`event_bus_v2`
+module is the single source of truth: every emit lands in the ring
+buffer (so the debug feed AND the per-task overlay see it) and is
+forwarded to the registered WS emitter (so the chat client's sidebar
+handlers keep working unchanged).
 
-Design constraints:
+This file is kept as a one-call shim so:
 
-- Single emitter at a time — Bob is a single-user desktop app, exactly one
-  WebSocket is connected at any moment. Connecting a second WS implicitly
-  replaces the previous emitter via :func:`set_emitter`.
-- Async-only: the emitter is awaited so it composes naturally with
-  ``websocket.send_json`` on the FastAPI side.
-- The payload shape is the responsibility of the caller — this module only
-  forwards the dict verbatim.
+- existing call sites (sub-agent runner, scheduler, orchestrator) don't
+  need a global rename in a single commit;
+- the test fixtures (``ws_events.set_emitter(...)``) keep working — they
+  now register the emitter on the unified bus;
+- the public surface ``ws_events.emit(payload)`` stays the same.
+
+Both :func:`set_emitter` and :func:`emit` are thin wrappers that delegate
+to :mod:`bob.event_bus_v2`.
 """
 
 from __future__ import annotations
@@ -27,25 +29,30 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-TaskEvent = dict[str, Any]
+from bob.event_bus_v2 import emit_event, set_ws_emitter
 
-_emitter: Callable[[TaskEvent], Awaitable[None]] | None = None
+TaskEvent = dict[str, Any]
 
 
 def set_emitter(fn: Callable[[TaskEvent], Awaitable[None]] | None) -> None:
     """Install (or clear) the process-wide async emitter.
 
-    Passing ``None`` clears the emitter — :func:`emit` becomes a no-op until a
-    new emitter is registered.
+    Delegates to :func:`bob.event_bus_v2.set_ws_emitter`. The bus
+    forwards every :func:`emit_event` payload to ``fn`` so the chat
+    client receives task lifecycle events as before.
     """
 
-    global _emitter
-    _emitter = fn
+    set_ws_emitter(fn)
 
 
 async def emit(event: TaskEvent) -> None:
-    """Forward ``event`` to the registered emitter; no-op when none is set."""
+    """Route ``event`` through the unified bus (issue 0052).
 
-    if _emitter is None:
-        return
-    await _emitter(event)
+    Every emit now lands in the debug ring buffer AND is forwarded to
+    the WS chat emitter (when registered). The per-task overlay
+    subscribes to the same ring buffer via
+    :func:`bob.event_bus_v2.subscribe_for_task` so no parallel path is
+    required.
+    """
+
+    await emit_event(event)

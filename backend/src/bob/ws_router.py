@@ -44,8 +44,10 @@ from bob import task_scheduler as task_scheduler_module
 from bob import task_store as task_store_module
 from bob import text_segmenter, ws_events
 from bob.debug_log import emit_debug
+from bob.event_bus_v2 import get_snapshot_for_task, subscribe_for_task
 from bob.orchestrator import Orchestrator, get_default_orchestrator
 from bob.spoken_text_cleaner import clean_for_speech
+from bob.task_store import TaskStoreError
 from bob.tts_service import KokoroTtsService, get_default_tts_service
 
 router = APIRouter()
@@ -773,3 +775,111 @@ async def _synthesize_and_stream(
     except asyncio.CancelledError:
         # The cancelling path emits the final audio_end. Bubble out.
         raise
+
+
+# --- Per-task overlay WS (issue 0052) ---------------------------------------
+#
+# Single-session "snapshot then tail" subscription scoped to a single
+# ``task_id``. The frontend overlay opens this when the user clicks a
+# running task; the first frame carries every currently-buffered event
+# that matched the id (``replayed=true``), subsequent frames carry live
+# events as the sub-agent runs. No HTTP-then-WS race — both phases are
+# served from the same socket.
+#
+# The producer side is :mod:`bob.event_bus_v2`: every emit lands in the
+# debug ring buffer with a ``task_id`` field (populated by the
+# ``current_task_id`` ContextVar inside :class:`SubAgentRunner.run`).
+# :func:`subscribe_for_task` walks that buffer for the snapshot and tails
+# the live producer with a per-event filter — no new topic, no new
+# persistent store.
+#
+# Finished tasks: the route still works for a task that has already
+# completed. The snapshot replays whatever ring-buffer events are still
+# in retention (sub-agent reflections may have aged out — that's
+# expected; the ``task_completed`` row survives in SQLite and the
+# frontend uses ``task.result`` + ``ui_payload`` for the dead-task
+# overlay). The frame format is identical so the same client hook can
+# render both phases.
+
+
+@router.websocket("/ws/task/{task_id}")
+async def task_ws(websocket: WebSocket, task_id: str) -> None:
+    """Snapshot-then-tail per-task event subscription (issue 0052).
+
+    Wire protocol (frame types):
+
+    - ``snapshot``: first frame, carries a list of every currently
+      buffered :class:`bob.debug_log.DebugEvent` whose ``task_id``
+      matches. Each item is the event's ``to_dict()`` shape so the
+      frontend can reuse the same renderer as the debug feed.
+    - ``tail``: every subsequent frame, one event per frame, same shape.
+
+    Wrapping each phase in its own envelope lets the consumer treat the
+    snapshot as a single transactional render and stream tail events
+    one-by-one without re-reading the snapshot wrapper. The two phases
+    share the same WS session — no HTTP-then-WS upgrade race.
+
+    Implementation: phase 1 reads the ring-buffer snapshot via
+    :func:`bob.event_bus_v2.get_snapshot_for_task`; phase 2 subscribes
+    via :func:`bob.event_bus_v2.subscribe_for_task` and forwards only
+    NON-replayed events (the replayed ones from the producer's snapshot
+    pass overlap with what we just sent; we drop them to avoid double
+    delivery). A tiny duplicate window exists between the snapshot copy
+    and the subscription start — events emitted in that microsecond gap
+    will appear in both phase 1 and phase 2's snapshot pass. We
+    deduplicate by ``(ts, source, summary)`` tuple.
+    """
+
+    await websocket.accept()
+    emit_debug(
+        category="system",
+        severity="info",
+        source="bob.ws_router.task_ws",
+        summary=f"Overlay WS connecté (task={task_id})",
+        payload={"task_id": task_id},
+    )
+
+    # Verify the task exists when the store is primed. We don't reject
+    # the connection on unknown ids — the frontend may open the overlay
+    # on a task whose row is not yet in the store snapshot we read here
+    # (race). An unknown id simply yields an empty snapshot + a tail
+    # that never matches; the client renders the empty-state.
+    with contextlib.suppress(RuntimeError, TaskStoreError):
+        task_store_module.get_default_store().get_task(task_id)
+
+    snapshot_events = get_snapshot_for_task(task_id)
+    sent_keys: set[tuple[str, str, str]] = {
+        (event.ts, event.source, event.summary) for event in snapshot_events
+    }
+    try:
+        await websocket.send_json(
+            {
+                "type": "snapshot",
+                "task_id": task_id,
+                "events": [event.to_dict() for event in snapshot_events],
+            }
+        )
+
+        async for event in subscribe_for_task(task_id):
+            key = (event.ts, event.source, event.summary)
+            # Producer-side snapshot pass overlaps with our phase 1
+            # snapshot — skip events we already sent (whether replayed
+            # or not). Anything not already in ``sent_keys`` is a fresh
+            # event and goes out as a ``tail`` frame.
+            if key in sent_keys:
+                continue
+            sent_keys.add(key)
+            await websocket.send_json({"type": "tail", "event": event.to_dict()})
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        _logger.exception("ws_task.stream_failed", task_id=task_id)
+        return
+    finally:
+        emit_debug(
+            category="system",
+            severity="info",
+            source="bob.ws_router.task_ws",
+            summary=f"Overlay WS déconnecté (task={task_id})",
+            payload={"task_id": task_id},
+        )

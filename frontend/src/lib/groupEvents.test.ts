@@ -1,11 +1,6 @@
 import { describe, expect, test } from "vitest";
 import type { DebugCategory, DebugEvent, DebugSeverity } from "../types/ws-debug";
-import {
-  groupEvents,
-  type LlmCallNode,
-  type TaskNode,
-  type TurnNode,
-} from "./groupEvents";
+import { type LlmCallNode, type TaskNode, type TurnNode, groupEvents } from "./groupEvents";
 
 let _tsCounter = 0;
 function makeEvent(opts: Partial<DebugEvent> & { category?: DebugCategory } = {}): DebugEvent {
@@ -117,9 +112,7 @@ describe("groupEvents - task nesting", () => {
     expect(taskA).toBeDefined();
     expect(taskA.title).toBe("A title");
     expect(taskA.goal).toBe("A goal");
-    const taskB = taskA.children.find(
-      (c) => c.kind === "task" && c.taskId === "B",
-    ) as TaskNode;
+    const taskB = taskA.children.find((c) => c.kind === "task" && c.taskId === "B") as TaskNode;
     expect(taskB).toBeDefined();
     expect(taskB.title).toBe("B title");
     expect(turn.taskCount).toBe(2);
