@@ -62,72 +62,67 @@ from bob import task_store as task_store_module
 from bob import ui_registry as ui_registry_module
 from bob.config import get_settings
 from bob.context.assembler import ContextAssembler
-from bob.context.policy import ContextPolicy, legacy_full_history_policy
+from bob.context.policy import (
+    BOUNDED_V1_POLICY_ID,
+    LEGACY_FULL_HISTORY_POLICY_ID,
+    ContextPolicy,
+    bounded_v1_policy,
+)
+from bob.context.prompt_fragments import (
+    ASK_USER_PARAPHRASE_TEMPLATE,
+    CANCEL_CONFIRMATION,
+    DONE_SYNTHESIS_TEMPLATE,
+    FORWARD_CONFIRMATION,
+    SPAWN_CONFIRMATION,
+    TOOLS_SYSTEM_ADDENDUM,
+)
 from bob.context.providers.legacy_full_history import LegacyFullHistoryProvider
+from bob.context.providers.recent_turns import RecentTurnsProvider
+from bob.context.providers.rolling_summary import RollingSummaryProvider
+from bob.context.providers.system_block import SystemBlockProvider
+from bob.context.providers.user_message import UserMessageProvider
+from bob.context.summariser import LLMSummariser, Summariser
+from bob.context.summary_pipeline import maybe_regenerate_rolling_summary
 from bob.debug_log import emit_debug, start_turn
 from bob.jarvis_store import JarvisStore
-from bob.llm.types import ToolDefinition
+from bob.llm.types import ToolCall
 from bob.llm_client import LLMClient
+from bob.rolling_summary_store import RollingSummaryStore
 from bob.task_store import TaskStore, TaskStoreError
+from bob.tools import (
+    DispatchResult,
+    ToolDispatcher,
+    ToolHandlerContext,
+    ToolRegistry,
+    build_default_registry,
+)
 from bob.ui_registry import ComponentDescriptor
 
 _logger = structlog.get_logger(__name__)
 
 
-_SPAWN_CONFIRMATION = "D'accord, je m'en occupe. Je te dis dès que c'est prêt."
-_FORWARD_CONFIRMATION = "Compris, je transmets à la tâche."
-_CANCEL_CONFIRMATION = "Compris, j'annule."
+# Legacy module-level constants kept as thin aliases over the versioned
+# prompt fragments. Existing tests import some of these names; wording
+# now lives in :mod:`bob.context.prompt_fragments` and is bumped via the
+# ``version`` field on each :class:`PromptFragment`.
+_SPAWN_CONFIRMATION = SPAWN_CONFIRMATION.template
+_FORWARD_CONFIRMATION = FORWARD_CONFIRMATION.template
+_CANCEL_CONFIRMATION = CANCEL_CONFIRMATION.template
 
 
-_TOOLS_SYSTEM_ADDENDUM = (
-    "\n\nTu disposes de trois outils :\n"
-    "- ``spawn_subtask`` : pour déléguer une tâche longue ou autonome à un "
-    "sub-agent en arrière-plan.\n"
-    "- ``forward_to_subtask`` : pour transmettre la réponse de l'utilisateur "
-    "à une sous-tâche en attente d'input. Tu connais l'``id`` de chaque "
-    "sous-tâche concernée via le résumé des tâches actives ci-dessous.\n"
-    "- ``cancel_subtask`` : pour annuler une sous-tâche en cours quand "
-    "l'utilisateur demande explicitement de l'arrêter (\"annule X\", "
-    '"laisse tomber").\n'
-    "Pour CE message, tu dois EXCLUSIVEMENT :\n"
-    "- soit appeler ``spawn_subtask`` (un seul appel) si la demande mérite "
-    "d'être déléguée ;\n"
-    "- soit appeler ``forward_to_subtask`` si l'utilisateur répond à une "
-    "question préalablement transmise par toi pour le compte d'une tâche en "
-    "cours ;\n"
-    "- soit appeler ``cancel_subtask`` si l'utilisateur demande explicitement "
-    "d'annuler / arrêter une tâche listée dans le résumé ;\n"
-    "- soit répondre directement en texte si aucune action n'est requise.\n"
-    "Ne fais jamais deux appels en parallèle."
-)
+_TOOLS_SYSTEM_ADDENDUM = TOOLS_SYSTEM_ADDENDUM.template
 
 
 # Hard-coded template used by ``generate_proactive_message`` to paraphrase a
-# sub-agent's ``ask_user`` question in Jarvis' tone. Slice #0021 pins this
-# in code (no `jarvis.md`-driven tuning) so it ships deterministically.
-_ASK_USER_PARAPHRASE_TEMPLATE = (
-    "Une de tes sous-tâches ({task_title}) a besoin d'une info : "
-    "'{raw_question}'. Reformule cette question pour l'utilisateur dans "
-    "ton ton, en 1-2 phrases max. Ne mentionne pas le mot 'sub-agent', "
-    "dis 'la tâche'."
-)
+# sub-agent's ``ask_user`` question. Pinned in code (no `jarvis.md`-driven
+# tuning). Issue 0046 lifted the literal into
+# :data:`prompt_fragments.ASK_USER_PARAPHRASE_TEMPLATE`.
+_ASK_USER_PARAPHRASE_TEMPLATE = ASK_USER_PARAPHRASE_TEMPLATE.template
 
 
-# Slice #0025: hard-coded template used by ``generate_done_synthesis`` to
-# announce a sub-task's completion in Jarvis' tone. Same pinning rationale as
-# the ask_user paraphrase — no jarvis.md tuning, ships deterministically.
-_DONE_SYNTHESIS_TEMPLATE = (
-    "La sous-tâche '{task_title}' vient de terminer.\n"
-    "Résultat brut : '{result}'.\n"
-    "Étape 1 — Vérifie le contenu : si le résultat est vide, incohérent ou "
-    "manifestement raté, dis-le franchement à l'utilisateur en une phrase "
-    "et arrête-toi là.\n"
-    "Étape 2 — Sinon, ouvre impérativement par "
-    "« Voilà ce que j'ai trouvé à propos de <sujet> … » (remplace <sujet> "
-    "par le thème exact de la sous-tâche, pas son titre brut) puis résume "
-    "les points clés en 2-3 lignes max dans ton ton. "
-    "Propose une suite si pertinent."
-)
+# Slice #0025 + issue 0046: hard-coded template for ``generate_done_synthesis``.
+# Now sourced from :data:`prompt_fragments.DONE_SYNTHESIS_TEMPLATE`.
+_DONE_SYNTHESIS_TEMPLATE = DONE_SYNTHESIS_TEMPLATE.template
 
 
 # Debounce window before ``_user_typing`` falls back to false on its own. The
@@ -148,89 +143,6 @@ ProactiveEventKind = Literal["ask_user", "done"]
 
 
 JarvisState = Literal["idle", "thinking"]
-
-
-_SPAWN_SUBTASK_TOOL = ToolDefinition(
-    name="spawn_subtask",
-    description=(
-        "Délègue une tâche longue ou autonome à un sub-agent en arrière-plan. "
-        "Utilise ceci quand l'utilisateur demande quelque chose qui prend du "
-        "temps (recherche, draft d'email, analyse) ou qui peut tourner sans "
-        "ton intervention. Pour les questions simples, réponds directement "
-        "en texte sans appeler cet outil."
-    ),
-    parameters={
-        "type": "object",
-        "properties": {
-            "title": {
-                "type": "string",
-                "description": "Titre court (1-5 mots) pour la sidebar.",
-            },
-            "goal": {
-                "type": "string",
-                "description": "Goal précis et complet pour le sub-agent.",
-            },
-        },
-        "required": ["title", "goal"],
-    },
-)
-
-
-_FORWARD_TO_SUBTASK_TOOL = ToolDefinition(
-    name="forward_to_subtask",
-    description=(
-        "Transmet la réponse de l'utilisateur à une sous-tâche en attente "
-        "d'input. À appeler uniquement quand l'utilisateur répond à une "
-        "question préalablement transmise par toi pour le compte d'une "
-        "tâche en cours."
-    ),
-    parameters={
-        "type": "object",
-        "properties": {
-            "task_id": {
-                "type": "string",
-                "description": (
-                    "ID de la sous-tâche concernée. Le résumé des tâches "
-                    "actives en tête de prompt liste l'``id`` exact de chaque "
-                    "tâche qui attend une réponse."
-                ),
-            },
-            "response": {
-                "type": "string",
-                "description": ("La réponse de l'utilisateur à transmettre, telle quelle."),
-            },
-        },
-        "required": ["task_id", "response"],
-    },
-)
-
-
-_CANCEL_SUBTASK_TOOL = ToolDefinition(
-    name="cancel_subtask",
-    description=(
-        "Annule une sous-tâche en cours. À appeler quand l'utilisateur "
-        'demande explicitement d\'arrêter une tâche ("annule X", "laisse '
-        'tomber"). Tu peux fournir une raison concise (sinon "user_cancelled" '
-        "est utilisé)."
-    ),
-    parameters={
-        "type": "object",
-        "properties": {
-            "task_id": {
-                "type": "string",
-                "description": (
-                    "ID de la sous-tâche à annuler. Le résumé des tâches "
-                    "actives en tête de prompt liste l'``id`` exact."
-                ),
-            },
-            "reason": {
-                "type": "string",
-                "description": "Raison brève. Default 'user_cancelled'.",
-            },
-        },
-        "required": ["task_id"],
-    },
-)
 
 
 class _PromptsLike(Protocol):
@@ -283,6 +195,9 @@ class Orchestrator:
         prompts: _PromptsLike = prompts_module,
         ui_registry: ModuleType = ui_registry_module,
         context_policy: ContextPolicy | None = None,
+        tool_registry: ToolRegistry | None = None,
+        rolling_summary_store: RollingSummaryStore | None = None,
+        summariser: Summariser | None = None,
     ) -> None:
         self._jarvis_client = jarvis_client
         self._jarvis_store = jarvis_store
@@ -291,12 +206,35 @@ class Orchestrator:
         self._jarvis_prompt = jarvis_prompt
         self._prompts = prompts
         self._ui_registry = ui_registry
-        # PRD 0006 / issue 0043 — every prompt the orchestrator sends is now
-        # composed by ``ContextAssembler``. The default policy
-        # ``legacy_full_history`` reproduces today's "send the whole thread
-        # every turn" behavior; later slices swap the provider mix without
-        # touching the orchestrator.
-        self._context_policy = context_policy or legacy_full_history_policy()
+        # PRD 0006 — every prompt the orchestrator sends is composed by
+        # :class:`ContextAssembler`. Issue 0043 introduced the foundation
+        # with a legacy policy; issue 0046 switches the production default
+        # to :func:`bounded_v1_policy` (system + rolling summary + recent
+        # turns + live user message). The legacy policy stays available so
+        # tests and the byte-for-byte regression snapshot can still target
+        # it explicitly.
+        self._context_policy = context_policy or bounded_v1_policy()
+
+        # PRD 0006 / issue 0046 — bounded policy needs a persistent rolling
+        # summary. The orchestrator owns the store + the summariser so the
+        # WS layer never has to think about it.
+        self._rolling_summary_store = rolling_summary_store
+        self._summariser = summariser or LLMSummariser(chat=self._jarvis_chat_for_summary)
+
+        # PRD 0006 / issue 0044 — Jarvis-side tools are now dispatched
+        # through a versioned :class:`ToolRegistry`. The default registry
+        # registers ``spawn_subtask`` / ``forward_to_subtask`` /
+        # ``cancel_subtask``. Tests can inject a narrower registry to
+        # exercise the dispatcher in isolation.
+        self._tool_registry = tool_registry or build_default_registry()
+        self._tool_dispatcher = ToolDispatcher(
+            registry=self._tool_registry,
+            context=ToolHandlerContext(
+                task_store=self._task_store,
+                task_scheduler=self._task_scheduler,
+                ws_emit=ws_events.emit,
+            ),
+        )
 
         # Slice #0025 — proactive buffering layer. The queue + flusher live
         # on the instance so tests can build an Orchestrator without auto-
@@ -345,6 +283,14 @@ class Orchestrator:
             system_content = self._build_system_prompt()
             waiting_context = self._build_waiting_input_addendum()
             complete_system = system_content + _TOOLS_SYSTEM_ADDENDUM + waiting_context
+
+            # PRD 0006 / issue 0046 — bounded policy needs the rolling
+            # summary to reflect the latest persisted older turns. The
+            # pipeline only triggers an LLM call when the older slice has
+            # grown past the threshold; otherwise it is a cheap read of
+            # the persisted store. Legacy policy paths skip this entirely.
+            await self._maybe_regenerate_summary()
+
             messages = self._assemble_chat_messages(
                 system_content=complete_system,
                 user_message=user_content,
@@ -352,7 +298,7 @@ class Orchestrator:
 
             decision = await self._jarvis_client.complete(
                 messages,
-                tools=[_SPAWN_SUBTASK_TOOL, _FORWARD_TO_SUBTASK_TOOL, _CANCEL_SUBTASK_TOOL],
+                tools=self._tool_registry.as_llm_definitions(),
                 session_id=session_id,
             )
 
@@ -741,195 +687,147 @@ class Orchestrator:
 
         ``system_content`` is the system prompt for this LLM call (may include
         tools / waiting addendums for the ``complete()`` path or be the bare
-        Jarvis system prompt for the structured ``chat()`` path). The
-        assembler concatenates the system entry with the persisted Jarvis
-        thread emitted by :class:`LegacyFullHistoryProvider` — preserving
-        today's byte-equal output.
+        Jarvis system prompt for the structured ``chat()`` path).
+
+        Provider mix depends on the active :class:`ContextPolicy`:
+
+        * ``legacy_full_history`` — wires the legacy provider so the
+          assembled prompt is byte-equal with pre-0046 output. Used by the
+          regression snapshot and by integration tests that pin the legacy
+          policy explicitly.
+        * ``bounded_v1`` (PRD 0006 / issue 0046, production default) —
+          wires the bounded mix: system block + rolling summary + recent
+          turns + live user message. The orchestrator persists the user
+          turn before assembly, so ``RecentTurnsProvider`` trims the live
+          row from its window and ``UserMessageProvider`` re-emits it as
+          the trailing entry.
         """
 
-        provider = LegacyFullHistoryProvider(
-            jarvis_store=self._jarvis_store,
-            system_content=system_content,
+        if self._context_policy.policy_id == LEGACY_FULL_HISTORY_POLICY_ID:
+            provider = LegacyFullHistoryProvider(
+                jarvis_store=self._jarvis_store,
+                system_content=system_content,
+            )
+            assembler = ContextAssembler(providers=[provider], policy=self._context_policy)
+            return assembler.assemble(user_message=user_message)
+
+        # Bounded providers (default policy).
+        system_provider = SystemBlockProvider(system_content=system_content)
+        rolling_provider = RollingSummaryProvider(store=self._ensure_summary_store())
+        recent_provider = RecentTurnsProvider(jarvis_store=self._jarvis_store)
+        user_provider = UserMessageProvider()
+        assembler = ContextAssembler(
+            providers=[system_provider, rolling_provider, recent_provider, user_provider],
+            policy=self._context_policy,
         )
-        assembler = ContextAssembler(providers=[provider], policy=self._context_policy)
         return assembler.assemble(user_message=user_message)
 
-    async def _dispatch_tool_calls(
-        self, tool_calls: list[Any]
-    ) -> tuple[list[str], list[str], list[str]]:
-        """Dispatch every valid spawn / forward / cancel call.
+    def _ensure_summary_store(self) -> RollingSummaryStore:
+        """Lazy-init the rolling-summary store on first use.
 
-        Returns ``(spawned, forwarded, cancelled)``. Invalid calls (wrong
-        name, missing args, bad arg types) are skipped with a warning so the
-        orchestrator can still proceed.
+        The store is normally injected at construction (production wires
+        it from the boot path); when callers omit it (legacy tests) we
+        create an in-memory placeholder so the bounded provider mix stays
+        functional. The placeholder reuses the Jarvis store's connection
+        — migrations have already created the ``rolling_summaries`` table
+        on every connection.
+        """
+
+        if self._rolling_summary_store is None:
+            # Reach into JarvisStore for the connection — it is the same
+            # connection migrations were applied against (see bob.main
+            # lifespan + the integration test harness).
+            conn = self._jarvis_store._conn
+            self._rolling_summary_store = RollingSummaryStore(conn)
+        return self._rolling_summary_store
+
+    async def _maybe_regenerate_summary(self) -> None:
+        """Regenerate the rolling summary if the older slice has grown enough.
+
+        No-op when:
+
+        * The active policy is not the bounded policy (``bounded_v1``).
+        * The persisted history is too short — :func:`maybe_regenerate_rolling_summary`
+          returns ``None`` and the rolling-summary block stays empty.
+        * The summariser raises — the failure is logged and swallowed so a
+          single bad summarisation never breaks the live turn.
+        """
+
+        if self._context_policy.policy_id != BOUNDED_V1_POLICY_ID:
+            return
+        recent_window = self._context_policy.recent_turns_window or 3
+        try:
+            await maybe_regenerate_rolling_summary(
+                jarvis_store=self._jarvis_store,
+                summary_store=self._ensure_summary_store(),
+                summariser=self._summariser,
+                recent_window=recent_window,
+            )
+        except Exception:
+            _logger.exception("orchestrator.rolling_summary_failed")
+
+    async def _jarvis_chat_for_summary(self, messages: list[dict[str, str]]) -> str:
+        """Bridge between :class:`LLMSummariser` and the bound Jarvis client.
+
+        The summariser only needs a "chat with messages, give me text"
+        callable. Going through this method (rather than ``chat`` directly)
+        keeps the summary path narrow + grep-friendly.
+        """
+
+        return await self._jarvis_client.chat(
+            [dict(msg) for msg in messages],
+            session_id="rolling_summary",
+        )
+
+    async def _dispatch_tool_calls(
+        self, tool_calls: list[ToolCall]
+    ) -> tuple[list[str], list[str], list[str]]:
+        """Dispatch every tool call through the :class:`ToolDispatcher`.
+
+        Returns ``(spawned, forwarded, cancelled)``. Each call is routed
+        through the registry: unknown names and invalid argument shapes
+        surface as :class:`DispatchResult(outcome="error", ...)`. The
+        orchestrator currently mirrors the pre-0044 behavior — error
+        outcomes simply do not contribute to any of the three lists, so
+        the caller falls through to the chat path when every call failed
+        (issue 0044 explicitly defers retry/degrade to 0048).
         """
 
         spawned: list[str] = []
         forwarded: list[str] = []
         cancelled: list[str] = []
         for call in tool_calls:
-            if call.name == _SPAWN_SUBTASK_TOOL.name:
-                task_id = await self._dispatch_spawn(call)
-                if task_id is not None:
-                    spawned.append(task_id)
-            elif call.name == _FORWARD_TO_SUBTASK_TOOL.name:
-                task_id = await self._dispatch_forward(call)
-                if task_id is not None:
-                    forwarded.append(task_id)
-            elif call.name == _CANCEL_SUBTASK_TOOL.name:
-                task_id = await self._dispatch_cancel(call)
-                if task_id is not None:
-                    cancelled.append(task_id)
-            else:
-                _logger.warning(
-                    "orchestrator.unknown_tool",
-                    tool_name=call.name,
-                )
+            result = await self._tool_dispatcher.dispatch(call)
+            self._collect_dispatch_result(result, spawned, forwarded, cancelled)
         return spawned, forwarded, cancelled
 
-    async def _dispatch_spawn(self, call: Any) -> str | None:
-        """Persist a single ``spawn_subtask`` call and hand it to the scheduler.
+    def _collect_dispatch_result(
+        self,
+        result: DispatchResult,
+        spawned: list[str],
+        forwarded: list[str],
+        cancelled: list[str],
+    ) -> None:
+        """Append ``result.task_id`` to the right bucket on a successful dispatch.
 
-        Returns the new task id on success, ``None`` when the call is
-        malformed and was dropped. Emits ``task_created`` (state=pending)
-        immediately after creation. The scheduler is responsible for the
-        ``pending → running`` transition + the matching ``task_updated``
-        event, since promotion can be deferred when the running cap is
-        saturated.
+        Each tool maps to exactly one of the three response lists. The
+        dispatcher already emitted the ``jarvis.route`` event so this
+        helper stays narrowly focused on the legacy response shape.
         """
 
-        title = call.arguments.get("title")
-        goal = call.arguments.get("goal")
-        if not isinstance(title, str) or not title.strip():
-            _logger.warning("orchestrator.spawn_bad_title", arguments=call.arguments)
-            return None
-        if not isinstance(goal, str) or not goal.strip():
-            _logger.warning("orchestrator.spawn_bad_goal", arguments=call.arguments)
-            return None
-
-        task_id = self._task_store.create_task(title=title, goal=goal)
-        created = self._task_store.get_task(task_id)
-        emit_debug(
-            category="decision",
-            severity="info",
-            source="orchestrator._dispatch_spawn",
-            summary=f"Jarvis lance sub-task '{title}'",
-            payload={
-                "task_id": task_id,
-                "title": created.title,
-                "goal": created.goal,
-            },
-        )
-        await ws_events.emit(
-            {
-                "type": "task_created",
-                "task_id": task_id,
-                "title": created.title,
-                "goal": created.goal,
-                "state": created.state,
-                "created_at": created.created_at,
-            }
-        )
-        await self._task_scheduler.enqueue(task_id)
-        _logger.info("orchestrator.spawned_subtask", task_id=task_id, title=title)
-        return task_id
-
-    async def _dispatch_forward(self, call: Any) -> str | None:
-        """Forward the user's answer to a sub-agent in ``waiting_input``.
-
-        Appends a ``user`` message to the task's log and asks the scheduler to
-        resume the runner. Drops the call (with a warning) when the target id
-        is unknown or the task is not in ``waiting_input``.
-        """
-
-        target_id = call.arguments.get("task_id")
-        response_text = call.arguments.get("response")
-        if not isinstance(target_id, str) or not target_id.strip():
-            _logger.warning("orchestrator.forward_bad_task_id", arguments=call.arguments)
-            return None
-        if not isinstance(response_text, str) or not response_text.strip():
-            _logger.warning("orchestrator.forward_bad_response", arguments=call.arguments)
-            return None
-
-        try:
-            task = self._task_store.get_task(target_id)
-        except TaskStoreError:
-            _logger.warning("orchestrator.forward_unknown_task", task_id=target_id)
-            return None
-
-        if task.state != "waiting_input":
-            _logger.warning(
-                "orchestrator.forward_wrong_state",
-                task_id=target_id,
-                state=task.state,
-            )
-            return None
-
-        try:
-            message_id = self._task_store.append_message(
-                target_id, role="user", content=response_text
-            )
-        except TaskStoreError:
-            _logger.exception("orchestrator.forward_append_failed", task_id=target_id)
-            return None
-
-        # Surface the forwarded user reply on any open drawer for this task
-        # so the transcript reflects the live multi-turn flow.
-        try:
-            for msg in self._task_store.get_task_messages(target_id):
-                if msg.id != message_id:
-                    continue
-                await ws_events.emit(
-                    {
-                        "type": "task_message",
-                        "task_id": target_id,
-                        "message_id": msg.id,
-                        "role": msg.role,
-                        "content": msg.content,
-                        "action": msg.action,
-                        "created_at": msg.created_at,
-                    }
-                )
-                break
-        except TaskStoreError:
-            _logger.exception("orchestrator.forward_emit_message_failed", task_id=target_id)
-
-        await self._task_scheduler.resume(target_id)
-        _logger.info("orchestrator.forwarded_to_subtask", task_id=target_id)
-        return target_id
-
-    async def _dispatch_cancel(self, call: Any) -> str | None:
-        """Route a ``cancel_subtask`` tool call to the scheduler.
-
-        The scheduler is permissive: cancelling an unknown / terminal task
-        is a no-op, so we don't pre-validate the task_id here. We only
-        validate the argument shape so a malformed call doesn't crash the
-        orchestrator turn.
-
-        The reason — when omitted by Jarvis — defaults to ``user_cancelled``
-        to match the WS sidebar path; Jarvis may override with a brief
-        contextual reason ("trop long", "plus utile", …).
-        """
-
-        target_id = call.arguments.get("task_id")
-        if not isinstance(target_id, str) or not target_id.strip():
-            _logger.warning("orchestrator.cancel_bad_task_id", arguments=call.arguments)
-            return None
-
-        raw_reason = call.arguments.get("reason")
-        reason = (
-            raw_reason.strip()
-            if isinstance(raw_reason, str) and raw_reason.strip()
-            else "user_cancelled"
-        )
-
-        await self._task_scheduler.cancel(target_id, reason=reason)
-        _logger.info(
-            "orchestrator.cancelled_subtask",
-            task_id=target_id,
-            reason=reason,
-        )
-        return target_id
+        if not result.ok or result.task_id is None:
+            return
+        if result.tool_name == "spawn_subtask":
+            spawned.append(result.task_id)
+        elif result.tool_name == "forward_to_subtask":
+            forwarded.append(result.task_id)
+        elif result.tool_name == "cancel_subtask":
+            cancelled.append(result.task_id)
+        # Unknown-tool-on-success is structurally impossible (the
+        # registry would have rejected the call upstream), but if a
+        # future tool ships without an orchestrator branch the result is
+        # silently ignored at this layer — the dispatcher still recorded
+        # the route event.
 
     async def _reply_with_structured_response(
         self,

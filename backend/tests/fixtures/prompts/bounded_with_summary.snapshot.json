@@ -1,0 +1,38 @@
+[
+  {
+    "role": "system",
+    "content": "Tu es Jarvis-de-test, ton calme et concis."
+  },
+  {
+    "role": "system",
+    "content": "Résumé des échanges plus anciens (tours 1 à 6, version 1) :\nÉchanges précédents : Python, Rust, Go, Kotlin évoqués."
+  },
+  {
+    "role": "user",
+    "content": "T3: et de Go ?"
+  },
+  {
+    "role": "assistant",
+    "content": "Go est simple."
+  },
+  {
+    "role": "user",
+    "content": "T4: et de Kotlin ?"
+  },
+  {
+    "role": "assistant",
+    "content": "Kotlin est moderne."
+  },
+  {
+    "role": "user",
+    "content": "T5: et de Swift ?"
+  },
+  {
+    "role": "assistant",
+    "content": "Swift est élégant."
+  },
+  {
+    "role": "user",
+    "content": "T6: et de Zig ?"
+  }
+]

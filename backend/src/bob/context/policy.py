@@ -1,21 +1,22 @@
 """Configuration object passed to :class:`bob.context.assembler.ContextAssembler`.
 
-Issue 0043 only needs a way to identify the active provider set; later
-slices wire in token budgets, recency windows, eviction strategy id and
-state-block caps. Keeping :class:`ContextPolicy` minimal here means the
-data structure for the foundation is stable from day one — future fields
-are added as defaulted Optionals so existing call sites stay valid.
+Issue 0043 introduced the foundation with the legacy "send the whole
+thread every turn" default. Issue 0046 adds the bounded providers
+(:class:`SystemBlockProvider`, :class:`RollingSummaryProvider`,
+:class:`RecentTurnsProvider`, :class:`UserMessageProvider`) and exposes
+:func:`bounded_v1_policy` as the new default. The legacy policy stays
+available for regression tests + the byte-for-byte snapshot.
 
-The PRD pins (see ``## Implementation Decisions / Modules / context/``) the
-following fields for the full v2 surface; we mirror them here as ``None``
-defaults so type-checkers do not complain when callers omit them:
+Recap of the v2 surface (PRD `## Implementation Decisions / Modules /
+context/`):
 
-* ``token_budget`` — overall prompt token cap (used in 0046+).
+* ``token_budget`` — overall prompt token cap (enforced by 0046+ tests).
 * ``recent_turns_window`` — K user/assistant pairs visible verbatim
-  (``RecentTurnsProvider``).
-* ``state_cap`` — max STATE-block entries (``StateBlockProvider``).
+  (:class:`RecentTurnsProvider`).
+* ``state_cap`` — max STATE-block entries (:class:`StateBlockProvider`,
+  shipped in 0050).
 * ``eviction_policy_id`` — id of the :class:`bob.context.eviction.EvictionStrategy`
-  to apply (``"recency"`` by default, ``"least_referenced"`` etc.).
+  to apply (``"recency"`` by default).
 """
 
 from __future__ import annotations
@@ -23,9 +24,22 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
-#: Default policy id used by the orchestrator in issue 0043. The matching
-#: provider list is :class:`bob.context.providers.legacy_full_history.LegacyFullHistoryProvider`.
+#: Legacy "send the whole thread every turn" policy id. Issue 0043 default;
+#: retained in 0046 as a regression / safety-net policy.
 LEGACY_FULL_HISTORY_POLICY_ID = "legacy_full_history"
+
+#: Bounded policy id introduced by issue 0046. The orchestrator wires this
+#: as the default; see :func:`bounded_v1_policy`.
+BOUNDED_V1_POLICY_ID = "bounded_v1"
+
+#: Default recent-turns window (K) for the bounded policy. K user↔Jarvis
+#: pairs are visible verbatim — i.e. up to 2*K rows in the persisted
+#: history.
+DEFAULT_RECENT_TURNS_WINDOW = 3
+
+#: Default overall prompt token budget for the bounded policy. Picked so
+#: the long-session smoke test plateaus around turn 30 with K=3.
+DEFAULT_TOKEN_BUDGET = 2048
 
 
 @dataclass(frozen=True)
@@ -35,17 +49,13 @@ class ContextPolicy:
     Fields:
 
     - ``policy_id`` — short string used in logs/tests to identify which
-      policy was active for a turn. ``"legacy_full_history"`` is the
-      default that reproduces today's behavior.
+      policy was active for a turn.
     - ``provider_ids`` — ordered list of provider identifiers that the
       :class:`ContextAssembler` will look up in its provider registry. The
       assembler emits entries in this exact order; entries are never
       reordered within a provider.
     - ``token_budget`` / ``recent_turns_window`` / ``state_cap`` /
-      ``eviction_policy_id`` — placeholders for later slices. They have
-      sensible defaults so issue 0043 code does not need to thread real
-      values, but the field is reserved so tests can assert the dataclass
-      shape upfront.
+      ``eviction_policy_id`` — see the module docstring.
     """
 
     policy_id: str = LEGACY_FULL_HISTORY_POLICY_ID
@@ -57,15 +67,42 @@ class ContextPolicy:
 
 
 def legacy_full_history_policy() -> ContextPolicy:
-    """Convenience constructor for the default policy used by orchestrator v1.
+    """Convenience constructor for the legacy "whole thread" policy.
 
-    Equivalent to :class:`ContextPolicy()` but explicit at call sites so the
-    intent ("reproduce the pre-0043 behavior") is obvious in code review.
+    Retained as a regression target; production orchestrator wires
+    :func:`bounded_v1_policy`.
     """
 
     return ContextPolicy(
         policy_id=LEGACY_FULL_HISTORY_POLICY_ID,
         provider_ids=("legacy_full_history",),
+    )
+
+
+def bounded_v1_policy() -> ContextPolicy:
+    """Return the bounded policy: system + rolling summary + recent turns + live user.
+
+    The provider order is significant — entries are emitted in this exact
+    order:
+
+    1. ``system_block`` — personality + tool-schema reminder + (optional)
+       waiting-input addendum.
+    2. ``rolling_summary`` — system-role block carrying the latest
+       persisted summary of older turns (skipped when the store is empty).
+    3. ``recent_turns`` — verbatim window of the last K user↔Jarvis pairs.
+    4. ``user_message`` — the live in-progress user turn passed via
+       :class:`AssemblyContext`.
+
+    PRD 0006 STATE block (issue 0050) will slot in between
+    ``system_block`` and ``rolling_summary``; this slice operates without
+    it.
+    """
+
+    return ContextPolicy(
+        policy_id=BOUNDED_V1_POLICY_ID,
+        provider_ids=("system_block", "rolling_summary", "recent_turns", "user_message"),
+        token_budget=DEFAULT_TOKEN_BUDGET,
+        recent_turns_window=DEFAULT_RECENT_TURNS_WINDOW,
     )
 
 
@@ -77,16 +114,18 @@ def parse_policy_overrides(
     recent_turns_window: int | None = None,
     state_cap: int | None = None,
     eviction_policy_id: str | None = None,
+    base: ContextPolicy | None = None,
 ) -> ContextPolicy:
-    """Build a :class:`ContextPolicy` from optional overrides on top of defaults.
+    """Build a :class:`ContextPolicy` from optional overrides on top of a base.
 
-    Any field left as ``None`` falls back to the default from
-    :func:`legacy_full_history_policy`. This is the canonical entry point
+    Any field left as ``None`` falls back to the corresponding field on
+    ``base`` (defaults to :func:`legacy_full_history_policy` for backwards
+    compatibility with 0043 call sites). This is the canonical entry point
     for tests and future config-driven wiring — call sites pass only what
     they want to change.
     """
 
-    default = legacy_full_history_policy()
+    default = base if base is not None else legacy_full_history_policy()
     return ContextPolicy(
         policy_id=policy_id if policy_id is not None else default.policy_id,
         provider_ids=tuple(provider_ids) if provider_ids is not None else default.provider_ids,

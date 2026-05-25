@@ -1,0 +1,16 @@
+{
+  "system_content": "Tu es Jarvis-de-test, ton calme et concis.",
+  "history": [
+    { "role": "user", "content": "T1: parle-moi de Python." },
+    { "role": "assistant", "content": "Python est un langage." },
+    { "role": "user", "content": "T2: et de Rust ?" },
+    { "role": "assistant", "content": "Rust est rapide." },
+    { "role": "user", "content": "T3: et de Go ?" },
+    { "role": "assistant", "content": "Go est simple." },
+    { "role": "user", "content": "T4: et de Kotlin ?" },
+    { "role": "assistant", "content": "Kotlin est moderne." },
+    { "role": "user", "content": "T5: et de Swift ?" },
+    { "role": "assistant", "content": "Swift est élégant." }
+  ],
+  "pending_user_message": "T6: et de Zig ?"
+}

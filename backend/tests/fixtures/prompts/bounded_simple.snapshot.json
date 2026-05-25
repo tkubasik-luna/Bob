@@ -1,0 +1,26 @@
+[
+  {
+    "role": "system",
+    "content": "Tu es Jarvis-de-test, ton calme et concis."
+  },
+  {
+    "role": "user",
+    "content": "Salut Bob !"
+  },
+  {
+    "role": "assistant",
+    "content": "Salut Tom, ravi de te revoir."
+  },
+  {
+    "role": "user",
+    "content": "Quelle heure est-il ?"
+  },
+  {
+    "role": "assistant",
+    "content": "Il est 10h47."
+  },
+  {
+    "role": "user",
+    "content": "Merci, peux-tu me rappeler de boire de l'eau ?"
+  }
+]

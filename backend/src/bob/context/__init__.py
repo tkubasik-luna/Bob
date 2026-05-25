@@ -1,4 +1,4 @@
-"""Context-assembly module (Jarvis v2 foundation, issue 0043).
+"""Context-assembly module (Jarvis v2 — PRD 0006).
 
 Public surface:
 
@@ -9,8 +9,11 @@ Public surface:
 - :class:`ContextAssembler` — pure composition of providers into chat
   messages.
 
-Concrete providers live under :mod:`bob.context.providers`. Issue 0043 only
-ships :class:`bob.context.providers.legacy_full_history.LegacyFullHistoryProvider`.
+Concrete providers live under :mod:`bob.context.providers`. Issue 0046
+extends the foundation with the bounded providers
+(:class:`SystemBlockProvider`, :class:`RollingSummaryProvider`,
+:class:`RecentTurnsProvider`, :class:`UserMessageProvider`) plus the
+:class:`Summariser` module and prompt-fragment registry.
 """
 
 from __future__ import annotations
@@ -22,15 +25,23 @@ from bob.context.entry import (
     ContextEntryKind,
 )
 from bob.context.policy import (
+    BOUNDED_V1_POLICY_ID,
+    DEFAULT_RECENT_TURNS_WINDOW,
+    DEFAULT_TOKEN_BUDGET,
     LEGACY_FULL_HISTORY_POLICY_ID,
     ContextPolicy,
+    bounded_v1_policy,
     legacy_full_history_policy,
     parse_policy_overrides,
 )
 from bob.context.provider import AssemblyContext, ContextProvider
+from bob.context.tokenizer import Tokenizer, WordCountTokenizer, default_tokenizer
 
 __all__ = [
+    "BOUNDED_V1_POLICY_ID",
     "CONTEXT_ENTRY_SCHEMA_VERSION",
+    "DEFAULT_RECENT_TURNS_WINDOW",
+    "DEFAULT_TOKEN_BUDGET",
     "LEGACY_FULL_HISTORY_POLICY_ID",
     "AssemblyContext",
     "ContextAssembler",
@@ -39,6 +50,10 @@ __all__ = [
     "ContextEntryKind",
     "ContextPolicy",
     "ContextProvider",
+    "Tokenizer",
+    "WordCountTokenizer",
+    "bounded_v1_policy",
+    "default_tokenizer",
     "legacy_full_history_policy",
     "parse_policy_overrides",
 ]
