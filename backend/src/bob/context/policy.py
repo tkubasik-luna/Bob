@@ -113,29 +113,35 @@ def bounded_v1_policy() -> ContextPolicy:
 
 
 def bounded_v2_policy() -> ContextPolicy:
-    """Return the bounded v2 policy — adds the cross-epoch digest block.
+    """Return the bounded v2 policy — STATE + sealed epochs + bounded turns.
 
-    Provider order:
+    Provider order (PRD 0006 / issue 0050 slots ``state_block`` between
+    ``system_block`` and ``cross_epoch_digest``):
 
     1. ``system_block`` — personality + tool-schema reminder + (optional)
        waiting-input addendum.
-    2. ``cross_epoch_digest`` — synthesis of sealed epochs, regenerated
+    2. ``state_block`` — STATE summary of active sub-tasks with the
+       recency signal Jarvis uses to pick delivery phrasing
+       (PRD 0006 / issue 0050). Skipped when no task is active.
+    3. ``cross_epoch_digest`` — synthesis of sealed epochs, regenerated
        from RAW sealed turns at every seal (issue 0051). Skipped when no
        epoch has sealed yet.
-    3. ``rolling_summary`` — current-epoch rolling summary of older
+    4. ``rolling_summary`` — current-epoch rolling summary of older
        turns (skipped when empty).
-    4. ``recent_turns`` — verbatim window of the last K user↔Jarvis pairs.
-    5. ``user_message`` — the live in-progress user turn.
+    5. ``recent_turns`` — verbatim window of the last K user↔Jarvis pairs.
+    6. ``user_message`` — the live in-progress user turn.
 
-    PRD 0006 STATE block (issue 0050) will slot in between
-    ``system_block`` and ``cross_epoch_digest``. The ordering is
-    deliberate: STATE > sealed epochs > current epoch > live user.
+    The ordering is deliberate: STATE > sealed epochs > current epoch >
+    recent turns > live user. STATE leads so the LLM sees the active
+    task ids before any free-text context that might mention them
+    ambiguously.
     """
 
     return ContextPolicy(
         policy_id=BOUNDED_V2_POLICY_ID,
         provider_ids=(
             "system_block",
+            "state_block",
             "cross_epoch_digest",
             "rolling_summary",
             "recent_turns",

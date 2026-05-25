@@ -25,8 +25,9 @@ Jarvis tool call. It serves three goals (PRD 0006, issue 0044):
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 import structlog
 from pydantic import BaseModel, ValidationError
@@ -39,6 +40,10 @@ from bob.tools.registry import (
     ToolRegistry,
 )
 from bob.tools.types import ToolHandlerOutcome
+from bob.validation.policy import RetryPolicy, get_policy
+
+if TYPE_CHECKING:  # pragma: no cover — typing-only.
+    from bob.sub_agent.addendum_queue import AddendumQueue
 
 _logger = structlog.get_logger(__name__)
 
@@ -71,6 +76,12 @@ class _TaskStoreLike(Protocol):
     Kept here (rather than imported from :mod:`bob.task_store`) so the
     test harness can plug a recording double without dragging the SQLite
     plumbing into the import graph of registry-only tests.
+
+    Issue 0050 extends the surface with ``update_state``,
+    ``set_result``, ``list_tasks``, ``set_delivered_at_turn`` and
+    ``mark_superseded`` so the v2 task tools (and the orchestrator's
+    completion debouncer) can transition rows without reaching past
+    the protocol into the concrete :class:`TaskStore`.
     """
 
     def create_task(
@@ -84,6 +95,8 @@ class _TaskStoreLike(Protocol):
 
     def get_task(self, task_id: str) -> Any: ...
 
+    def list_tasks(self, *, state: Any = ..., limit: Any = ...) -> Any: ...
+
     def append_message(
         self,
         task_id: str,
@@ -94,6 +107,14 @@ class _TaskStoreLike(Protocol):
     ) -> int: ...
 
     def get_task_messages(self, task_id: str) -> Any: ...
+
+    def update_state(self, task_id: str, new_state: Any) -> None: ...
+
+    def set_result(self, task_id: str, result: str) -> None: ...
+
+    def set_delivered_at_turn(self, task_id: str, turn_index: int) -> None: ...
+
+    def mark_superseded(self, task_id: str) -> None: ...
 
 
 class _JarvisStoreLike(Protocol):
@@ -123,15 +144,31 @@ class ToolHandlerContext:
 
     Issue 0047 adds the optional ``jarvis_store`` so the unified ``say``
     tool can persist its assistant turn through the same DI bag as every
-    other handler. The field defaults to ``None`` so legacy registry /
-    dispatcher contract tests that never touched persistence keep
-    compiling without a stub.
+    other handler.
+
+    Issue 0050 adds:
+
+    * ``addendum_queue_factory`` — resolves the per-task
+      :class:`bob.sub_agent.addendum_queue.AddendumQueue` for a live
+      runner so the ``addendum_task`` tool can push info into a
+      running sub-agent without restarting it. The factory returns
+      ``None`` when the task is not currently running (the dispatcher
+      then surfaces a structured ``task_not_running`` error).
+    * ``mark_superseded`` — explicit hook the ``replan_task`` tool
+      calls to flip the previous task to the v2 terminal state after
+      the scheduler cancelled it. Threaded through DI so unit tests
+      can pass a no-op when they don't care about the side effect.
+
+    All new fields default to ``None`` so legacy registry / dispatcher
+    contract tests keep compiling without a stub.
     """
 
     task_store: _TaskStoreLike
     task_scheduler: _SchedulerLike
     ws_emit: _WsEmitterLike
     jarvis_store: _JarvisStoreLike | None = None
+    addendum_queue_factory: Callable[[str], AddendumQueue | None] | None = None
+    mark_superseded: Callable[[str], None] | None = None
 
 
 @dataclass(frozen=True)
@@ -200,7 +237,11 @@ class ToolDispatcher:
         1. Look up ``call.name`` in the registry. Miss → ``"unknown_tool"``
            error result + ``jarvis.route`` event.
         2. Validate ``call.arguments`` with ``definition.args_model``.
-           Failure → ``"invalid_args"`` error result + event.
+           Failure → ``"invalid_args"`` error result + event. When the
+           tool's :class:`RetryPolicy` enables ``accept_partial`` we first
+           drop keys unknown to the model and retry validation against
+           the required-only subset; only a missing-or-malformed
+           *required* field still fails.
         3. Invoke ``definition.handler`` with a context + validated args.
            The handler may itself return ``ToolHandlerOutcome(status="error",
            ...)`` for domain-level failures (unknown task id, wrong state).
@@ -279,15 +320,56 @@ class ToolDispatcher:
         the registry's contract, not on Pydantic's version-specific
         error type. The original error message is preserved verbatim so
         debugging stays trivial.
+
+        Issue 0048 adds the per-tool ``accept_partial`` lever: when the
+        first validation fails AND :attr:`RetryPolicy.accept_partial` is
+        true for this tool, we strip keys that are not part of the
+        model's field set and retry validation. If the required-field
+        subset is valid the call succeeds first try, saving a network
+        round-trip on the common "valid required + garbage optional"
+        case (the unified ``say`` tool sees this whenever the LLM emits
+        ``emotion`` / ``tone`` / ``confidence`` under temperature).
         """
 
         try:
             return definition.args_model.model_validate(arguments)
         except ValidationError as exc:
-            raise ToolArgsValidationError(
-                tool_name=definition.name,
-                message=str(exc),
-            ) from exc
+            policy = self._policy_for(definition.name)
+            if not policy.accept_partial:
+                raise ToolArgsValidationError(
+                    tool_name=definition.name,
+                    message=str(exc),
+                ) from exc
+            # Strip keys unknown to the model and retry validation. We
+            # do *not* call :func:`model_construct` here because that
+            # would bypass field-level validators; the goal is "valid
+            # required + dropped optionals", not "skip validation".
+            allowed_keys = set(definition.args_model.model_fields.keys())
+            pruned = {k: v for k, v in arguments.items() if k in allowed_keys}
+            if pruned == arguments:
+                # Nothing was unknown — the validation error is about
+                # required-field shape, not extra keys. Re-raise.
+                raise ToolArgsValidationError(
+                    tool_name=definition.name,
+                    message=str(exc),
+                ) from exc
+            try:
+                return definition.args_model.model_validate(pruned)
+            except ValidationError as inner_exc:
+                raise ToolArgsValidationError(
+                    tool_name=definition.name,
+                    message=str(inner_exc),
+                ) from inner_exc
+
+    @staticmethod
+    def _policy_for(tool_name: str) -> RetryPolicy:
+        """Look up the :class:`RetryPolicy` for ``tool_name``.
+
+        Indirection-as-method so tests can monkeypatch the lookup
+        without reaching into :mod:`bob.validation.policy` globals.
+        """
+
+        return get_policy(tool_name)
 
     def _result_from_handler_outcome(
         self,

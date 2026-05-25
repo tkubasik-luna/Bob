@@ -24,6 +24,11 @@ from bob.context.entry import (
     ContextEntry,
     ContextEntryKind,
 )
+from bob.context.eviction import (
+    DefaultEvictionStrategy,
+    EvictionStrategy,
+    StateBlockCandidate,
+)
 from bob.context.policy import (
     BOUNDED_V1_POLICY_ID,
     BOUNDED_V2_POLICY_ID,
@@ -37,6 +42,14 @@ from bob.context.policy import (
     parse_policy_overrides,
 )
 from bob.context.provider import AssemblyContext, ContextProvider
+from bob.context.recency import (
+    RecencyDecision,
+    RecencyPolicy,
+    RecencySignal,
+    classify_recency,
+    default_recency_policy,
+)
+from bob.context.state_policy import StatePolicy, default_state_policy
 from bob.context.tokenizer import Tokenizer, WordCountTokenizer, default_tokenizer
 
 __all__ = [
@@ -53,10 +66,20 @@ __all__ = [
     "ContextEntryKind",
     "ContextPolicy",
     "ContextProvider",
+    "DefaultEvictionStrategy",
+    "EvictionStrategy",
+    "RecencyDecision",
+    "RecencyPolicy",
+    "RecencySignal",
+    "StateBlockCandidate",
+    "StatePolicy",
     "Tokenizer",
     "WordCountTokenizer",
     "bounded_v1_policy",
     "bounded_v2_policy",
+    "classify_recency",
+    "default_recency_policy",
+    "default_state_policy",
     "default_tokenizer",
     "legacy_full_history_policy",
     "parse_policy_overrides",

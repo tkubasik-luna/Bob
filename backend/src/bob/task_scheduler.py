@@ -87,6 +87,7 @@ import structlog
 from bob import ws_events
 from bob.config import Settings
 from bob.debug_log import emit_debug
+from bob.scheduler_policy import SchedulerPolicy, SchedulerQueueFull
 from bob.task_store import TaskStore, TaskStoreError
 
 _logger = structlog.get_logger(__name__)
@@ -131,6 +132,7 @@ class TaskScheduler:
         runner_factory: RunnerFactory,
         coop_cancel_factory: CooperativeCancelFactory | None = None,
         cancel_grace_seconds: float = DEFAULT_COOP_CANCEL_GRACE_SECONDS,
+        policy: SchedulerPolicy | None = None,
     ) -> None:
         if cap < 1:
             raise ValueError(f"TaskScheduler cap must be >= 1, got {cap}")
@@ -139,6 +141,11 @@ class TaskScheduler:
         self._runner_factory = runner_factory
         self._coop_cancel_factory = coop_cancel_factory
         self._cancel_grace_seconds = cancel_grace_seconds
+        # Issue 0050 — queue cap is owned by :class:`SchedulerPolicy`. When
+        # no policy is injected we synthesise one from ``cap`` so legacy
+        # call sites (tests + the slice-#0020 boot path) keep working
+        # without touching the new ``max_queued`` knob.
+        self._policy = policy or SchedulerPolicy(max_running=cap)
         # Running set is the in-memory mirror of "tasks currently driven by an
         # asyncio runner task we own". Counter is ``len(self._running)``.
         self._running: set[str] = set()
@@ -169,10 +176,30 @@ class TaskScheduler:
     def cap(self) -> int:
         return self._cap
 
+    @property
+    def policy(self) -> SchedulerPolicy:
+        """Return the active :class:`SchedulerPolicy` (PRD 0006 / issue 0050)."""
+
+        return self._policy
+
     def running_task_ids(self) -> set[str]:
         """Snapshot of the in-memory running set — for tests + observability."""
 
         return set(self._running)
+
+    def queued_count(self) -> int:
+        """Count tasks parked in ``spawned`` / ``pending`` (PRD 0006 / issue 0050).
+
+        Used by :meth:`enqueue` to evaluate the queue cap before
+        promoting. Reads through :class:`TaskStore.list_tasks` against
+        both legacy ``pending`` and the new ``spawned`` states so the
+        cap accounts for either flavour while the v1 / v2 lifecycle
+        cohabit.
+        """
+
+        spawned = len(self._task_store.list_tasks(state="spawned"))
+        pending = len(self._task_store.list_tasks(state="pending"))
+        return spawned + pending
 
     async def start(self) -> None:
         """Spin up the shared :class:`asyncio.TaskGroup` host (PRD 0006 / 0045).
@@ -247,15 +274,49 @@ class TaskScheduler:
         emits ``task_updated`` and schedules the runner. Otherwise it leaves
         the task in ``pending`` — a subsequent :meth:`on_task_terminated`
         will pick it up.
+
+        Issue 0050: when the queue cap (:attr:`SchedulerPolicy.max_queued`)
+        is already saturated AND no slot is free we raise
+        :class:`SchedulerQueueFull` so the caller (dispatcher → tool)
+        can surface a clarifying error to Jarvis without persisting the
+        new task in a permanently-stalled state. The caller is expected
+        to clean up the just-created row when it catches the exception
+        (the v2 ``spawn_task`` / ``replan_task`` tools do this; the
+        legacy v1 ``spawn_subtask`` tool keeps slice #0020 behaviour
+        and never trips the cap because the orchestrator caps the
+        sub-task surface there).
         """
 
         async with self._lock:
             if len(self._running) >= self._cap:
+                # No slot free — task stays queued. Evaluate the queue
+                # cap. ``queued_count()`` reads the SQL state and may
+                # already include ``task_id`` (the dispatcher persists
+                # the row in ``spawned`` before calling enqueue). The
+                # ``> max_queued`` comparison therefore tolerates the
+                # caller's own row sitting in the count.
+                queued = self.queued_count()
+                if queued > self._policy.max_queued:
+                    _logger.warning(
+                        "task_scheduler.queue_full",
+                        task_id=task_id,
+                        running=len(self._running),
+                        cap=self._cap,
+                        queued=queued,
+                        max_queued=self._policy.max_queued,
+                    )
+                    raise SchedulerQueueFull(
+                        running=len(self._running),
+                        queued=queued,
+                        max_running=self._cap,
+                        max_queued=self._policy.max_queued,
+                    )
                 _logger.info(
                     "task_scheduler.queued",
                     task_id=task_id,
                     running=len(self._running),
                     cap=self._cap,
+                    queued=queued,
                 )
                 return
             self._running.add(task_id)
@@ -287,9 +348,12 @@ class TaskScheduler:
             if len(self._running) < self._cap:
                 # Cheap enough to re-read on every termination — the queue is
                 # small by design (one user, cap=3, typical bursts <10).
-                pending = self._task_store.list_tasks(state="pending", limit=1)
-                if pending:
-                    next_id = pending[0].id
+                # Issue 0050: walk ``spawned`` first (v2 task tools) then
+                # ``pending`` (legacy slice #0018 entry point) so both
+                # spawn flavours can promote behind a freed slot.
+                next_task = self._next_queued()
+                if next_task is not None:
+                    next_id = next_task
                     self._running.add(next_id)
             if cancelling:
                 self._cancelling.discard(task_id)
@@ -301,18 +365,35 @@ class TaskScheduler:
                 promoted_task_id=next_id,
             )
 
+    def _next_queued(self) -> str | None:
+        """Return the next task id eligible for promotion (oldest queued).
+
+        Walks the v2 ``spawned`` queue first, then the legacy ``pending``
+        queue. Tasks within each bucket are ordered by ``created_at`` /
+        ``rowid`` so FIFO is preserved within a bucket; v2-spawned tasks
+        always promote ahead of v1-pending tasks under the same cap (the
+        v2 tools are the canonical entry point post-0050, so legacy
+        rows are best-effort drains).
+        """
+
+        spawned = self._task_store.list_tasks(state="spawned", limit=1)
+        if spawned:
+            return spawned[0].id
+        pending = self._task_store.list_tasks(state="pending", limit=1)
+        if pending:
+            return pending[0].id
+        return None
+
     async def resume(self, task_id: str) -> None:
-        """Re-enqueue a task that was paused in ``waiting_input``.
+        """Re-enqueue a task that was paused in ``waiting_input`` / ``awaiting_input``.
 
         Called by the orchestrator's ``forward_to_subtask`` path right after
         appending the user's reply to the task's message log. Behaves like
-        :meth:`enqueue` but transitions ``waiting_input → running`` (instead
-        of ``pending → running``). When the running cap is saturated the
-        task is left in ``waiting_input`` and the resume is silently dropped
-        — for the slice scope cap=3 with all running is a deadlock scenario
-        we accept (the user will see no progress until a slot frees, and
-        :meth:`on_task_terminated` will not promote a waiting_input task by
-        itself).
+        :meth:`enqueue` but transitions the parked state back to
+        ``running``. When the running cap is saturated the task is left
+        in its parked state and the resume is silently dropped — for the
+        slice scope cap=3 with all running is a deadlock scenario we
+        accept (the user will see no progress until a slot frees).
         """
 
         try:
@@ -320,7 +401,7 @@ class TaskScheduler:
         except TaskStoreError:
             _logger.warning("task_scheduler.resume_unknown_task", task_id=task_id)
             return
-        if task.state != "waiting_input":
+        if task.state not in ("waiting_input", "awaiting_input"):
             _logger.warning(
                 "task_scheduler.resume_wrong_state",
                 task_id=task_id,
@@ -347,8 +428,9 @@ class TaskScheduler:
         crashed mid-run (the runner can no longer be observing it). Coerce
         such rows back to ``pending`` via raw SQL — bypassing the normal
         ``update_state`` validator because ``running → pending`` is not a
-        legal user transition. Then walk ``pending`` tasks in creation order
-        and re-enqueue them so the cap is honoured exactly as at runtime.
+        legal user transition. Then walk ``spawned`` + ``pending`` tasks
+        in creation order and re-enqueue them so the cap is honoured
+        exactly as at runtime.
         """
 
         # Raw SQL: state-machine validator would refuse running → pending.
@@ -362,9 +444,19 @@ class TaskScheduler:
                 " WHERE state = 'running'"
             )
 
-        pending = self._task_store.list_tasks(state="pending")
-        for task in pending:
-            await self.enqueue(task.id)
+        for task in self._task_store.list_tasks(state="spawned"):
+            try:
+                await self.enqueue(task.id)
+            except SchedulerQueueFull:
+                # Boot-time re-enqueue should not raise — the user has no
+                # tool call to receive the error. Log and leave the row
+                # queued; the next cap-free slot promotes it.
+                _logger.warning("task_scheduler.recover_spawn_queue_full", task_id=task.id)
+        for task in self._task_store.list_tasks(state="pending"):
+            try:
+                await self.enqueue(task.id)
+            except SchedulerQueueFull:
+                _logger.warning("task_scheduler.recover_pending_queue_full", task_id=task.id)
 
     async def cancel(self, task_id: str, *, reason: str = "user_cancelled") -> None:
         """Cancel a task (slice #0023) regardless of its current state.
@@ -400,7 +492,7 @@ class TaskScheduler:
             _logger.warning("task_scheduler.cancel_unknown_task", task_id=task_id)
             return
 
-        if task.state in ("done", "failed"):
+        if task.state in ("done", "failed", "superseded"):
             _logger.info(
                 "task_scheduler.cancel_already_terminal",
                 task_id=task_id,
@@ -423,12 +515,13 @@ class TaskScheduler:
             },
         )
 
-        if task.state in ("pending", "waiting_input"):
+        if task.state in ("pending", "spawned", "waiting_input", "awaiting_input"):
             # No asyncio task to cancel — just persist the failure state.
             await self._finalize_cancelled(task_id, reason=reason)
-            # ``pending`` did not occupy a slot; ``waiting_input`` already
-            # freed it. Either way nothing to promote here — the cap was
-            # not reduced by this cancellation.
+            # ``pending`` / ``spawned`` did not occupy a slot;
+            # ``waiting_input`` / ``awaiting_input`` already freed it.
+            # Either way nothing to promote here — the cap was not
+            # reduced by this cancellation.
             return
 
         # state == "running" — cancel the asyncio task driving the runner.
@@ -605,7 +698,7 @@ class TaskScheduler:
             _logger.warning("task_scheduler.cancel_finalize_unknown_task", task_id=task_id)
             return
 
-        if task.state in ("done", "failed"):
+        if task.state in ("done", "failed", "superseded"):
             _logger.info(
                 "task_scheduler.cancel_finalize_already_terminal",
                 task_id=task_id,
@@ -706,6 +799,7 @@ def build_default_scheduler(
     *,
     coop_cancel_factory: CooperativeCancelFactory | None = None,
     cancel_grace_seconds: float = DEFAULT_COOP_CANCEL_GRACE_SECONDS,
+    policy: SchedulerPolicy | None = None,
 ) -> TaskScheduler:
     """Build a :class:`TaskScheduler` using settings + provided dependencies.
 
@@ -718,14 +812,24 @@ def build_default_scheduler(
     so :meth:`TaskScheduler.cancel` honours the 2 s grace window before
     escalating to a hard kill. Legacy callers leave it at ``None`` to keep
     slice #0023 behaviour.
+
+    Issue 0050: optional ``policy`` (:class:`SchedulerPolicy`) configures
+    the running / queue caps. Defaults to the PRD-prescribed ``3`` /
+    ``5`` so the cap-bursty user-story #33 fires from boot without
+    extra plumbing.
     """
 
+    effective_policy = policy or SchedulerPolicy(
+        max_running=settings.MAX_RUNNING_TASKS,
+        max_queued=5,
+    )
     return TaskScheduler(
         task_store=task_store,
-        cap=settings.MAX_RUNNING_TASKS,
+        cap=effective_policy.max_running,
         runner_factory=runner_factory,
         coop_cancel_factory=coop_cancel_factory,
         cancel_grace_seconds=cancel_grace_seconds,
+        policy=effective_policy,
     )
 
 

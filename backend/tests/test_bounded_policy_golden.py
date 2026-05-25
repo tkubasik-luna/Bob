@@ -31,6 +31,7 @@ from bob.context.policy import bounded_v1_policy, bounded_v2_policy
 from bob.context.providers.cross_epoch_digest import CrossEpochDigestProvider
 from bob.context.providers.recent_turns import RecentTurnsProvider
 from bob.context.providers.rolling_summary import RollingSummaryProvider
+from bob.context.providers.state_block import StateBlockProvider
 from bob.context.providers.system_block import SystemBlockProvider
 from bob.context.providers.user_message import UserMessageProvider
 from bob.context.summariser import SUMMARISER_VERSION, RollingSummary
@@ -39,6 +40,7 @@ from bob.db.migrations_runner import apply_migrations, default_migrations_dir
 from bob.epoch.digest import CrossEpochDigestStore
 from bob.jarvis_store import JarvisStore
 from bob.rolling_summary_store import RollingSummaryStore
+from bob.task_store import TaskStore
 
 from ._harness.golden_prompt import (
     assert_matches_snapshot,
@@ -141,6 +143,7 @@ def _bounded_v2_messages(
     jarvis_store: JarvisStore,
     summary_store: RollingSummaryStore,
     digest_store: CrossEpochDigestStore,
+    task_store: TaskStore,
     system_content: str,
     user_message: str,
 ) -> list[dict[str, str]]:
@@ -148,6 +151,7 @@ def _bounded_v2_messages(
 
     providers: list[ContextProvider] = [
         SystemBlockProvider(system_content=system_content),
+        StateBlockProvider(task_store=task_store),
         CrossEpochDigestProvider(store=digest_store),
         RollingSummaryProvider(store=summary_store),
         RecentTurnsProvider(jarvis_store=jarvis_store),
@@ -172,6 +176,7 @@ async def test_golden_snapshot_bounded_v2_with_digest() -> None:
     jarvis_store = JarvisStore(conn)
     summary_store = RollingSummaryStore(conn)
     digest_store = CrossEpochDigestStore(conn)
+    task_store = TaskStore(conn)
     seed_history(jarvis_store, transcript)
 
     await maybe_regenerate_rolling_summary(
@@ -193,6 +198,7 @@ async def test_golden_snapshot_bounded_v2_with_digest() -> None:
         jarvis_store=jarvis_store,
         summary_store=summary_store,
         digest_store=digest_store,
+        task_store=task_store,
         system_content=transcript["system_content"],
         user_message=transcript["pending_user_message"],
     )

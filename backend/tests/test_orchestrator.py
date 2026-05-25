@@ -19,7 +19,6 @@ from bob.llm_client import LLMClient
 from bob.orchestrator import (
     _SPAWN_CONFIRMATION,
     Orchestrator,
-    OrchestratorContractError,
 )
 from bob.sub_agent_runner import SubAgentRunner
 from bob.task_scheduler import TaskScheduler
@@ -200,15 +199,15 @@ async def test_process_user_message_spawns_subtask_when_tool_call() -> None:
 
 
 @pytest.mark.asyncio
-async def test_spawn_with_invalid_args_raises_contract_error() -> None:
-    """Issue 0047: a turn with no successful dispatch is a contract violation.
+async def test_spawn_with_invalid_args_then_invalid_again_degrades() -> None:
+    """Issue 0048: every dispatch errored across the retry budget → degrade speech.
 
-    Pre-0047 the orchestrator fell through to the structured-output
-    ``chat()`` path when every tool call errored. After 0047 the
-    free-form path is gone and the turn raises
-    :class:`OrchestratorContractError` — the per-tool retry/degrade
-    policy in 0048 will catch this earlier with a hardcoded ``say()``
-    fallback.
+    Pre-0048 (the issue 0047 contract) every-dispatch-errored raised
+    :class:`OrchestratorContractError`. Issue 0048 wraps the dispatcher
+    in a per-tool retry budget: one retry is allowed; if both attempts
+    error the orchestrator emits the hardcoded degrade speech through
+    the live :class:`SayTool` via the dispatcher (so the JarvisStore
+    persistence + the ``jarvis.route`` event still fire).
     """
 
     bad_call = ToolCall(
@@ -216,20 +215,29 @@ async def test_spawn_with_invalid_args_raises_contract_error() -> None:
         name="spawn_subtask",
         arguments={"title": "no goal here"},
     )
-    orchestrator, jarvis_client, _sub_client, _jarvis_store, task_store, scheduler = (
+    orchestrator, jarvis_client, _sub_client, jarvis_store, task_store, scheduler = (
         _make_orchestrator(
-            complete_responses=[LLMResponse(text=None, tool_calls=[bad_call])],
+            complete_responses=[
+                LLMResponse(text=None, tool_calls=[bad_call]),
+                LLMResponse(text=None, tool_calls=[bad_call]),
+            ],
         )
     )
 
-    with pytest.raises(OrchestratorContractError):
-        await orchestrator.process_user_message("s1", "anything")
+    response = await orchestrator.process_user_message("s1", "anything")
 
+    assert response.speech == "Désolé, peux-tu reformuler ?"
     assert task_store.list_tasks() == []
     assert scheduler.enqueued == []
-    assert len(jarvis_client.complete_calls) == 1
+    # Two complete() calls: initial + retry. The validator never asks
+    # for a 3rd round; the degrade speech is dispatched in-process.
+    assert len(jarvis_client.complete_calls) == 2
     # Issue 0047: the free-form ``chat()`` reply path was removed.
     assert jarvis_client.chat_calls == []
+    # The hardcoded speech was dispatched through the SayTool → it
+    # landed in the Jarvis store.
+    history = jarvis_store.history()
+    assert any(row["content"] == "Désolé, peux-tu reformuler ?" for row in history)
 
 
 # ---------------------------------------------------------------------------
@@ -285,18 +293,33 @@ async def test_say_with_null_ui_omits_components() -> None:
 
 
 @pytest.mark.asyncio
-async def test_no_tool_call_raises_contract_error() -> None:
-    """Free-form text from the LLM is a contract violation post-0047."""
+async def test_two_no_tool_call_attempts_degrade_to_hardcoded_say() -> None:
+    """Issue 0048: contract violation across the retry budget → degrade speech.
+
+    Pre-0048 a free-form text reply raised
+    :class:`OrchestratorContractError` after a single attempt. Issue
+    0048 wraps the LLM call in a per-tool retry budget: one retry is
+    allowed; if both attempts still return free-form text the
+    orchestrator emits the hardcoded ``Désolé, peux-tu reformuler ?``
+    via the live :class:`SayTool` through the dispatcher.
+    """
 
     orchestrator, jarvis_client, _sub, jarvis_store, _ts, _scheduler = _make_orchestrator(
-        complete_responses=[LLMResponse(text="just chatting", tool_calls=[])],
+        complete_responses=[
+            LLMResponse(text="first chatting", tool_calls=[]),
+            LLMResponse(text="second chatting", tool_calls=[]),
+        ],
     )
 
-    with pytest.raises(OrchestratorContractError):
-        await orchestrator.process_user_message("s1", "Coucou")
+    response = await orchestrator.process_user_message("s1", "Coucou")
 
-    # The user turn was still persisted (it lands before the LLM call).
-    assert jarvis_store.history() == [{"role": "user", "content": "Coucou"}]
+    assert response.speech == "Désolé, peux-tu reformuler ?"
+    # User turn + degrade reply landed in the Jarvis store; nothing else.
+    history = jarvis_store.history()
+    assert history[0] == {"role": "user", "content": "Coucou"}
+    assert history[-1]["content"] == "Désolé, peux-tu reformuler ?"
+    # Two complete() round-trips: initial + 1 retry.
+    assert len(jarvis_client.complete_calls) == 2
     # The structured ``chat()`` fallback path no longer fires.
     assert jarvis_client.chat_calls == []
 
@@ -314,7 +337,8 @@ async def test_say_tool_call_uses_jarvis_prompt_in_system_message() -> None:
     complete_system = jarvis_client.complete_calls[0]["messages"][0]
     assert complete_system["role"] == "system"
     assert _TEST_JARVIS_PROMPT in complete_system["content"]
-    assert "spawn_subtask" in complete_system["content"]
+    # PRD 0006 / issue 0050: v2 task surface advertised by the addendum.
+    assert "spawn_task" in complete_system["content"]
     # Issue 0047 (v2) closes the tool-call instruction loop.
     assert "say" in complete_system["content"]
     # No ``chat()`` round-trip.
@@ -327,8 +351,8 @@ async def test_say_tool_call_uses_jarvis_prompt_in_system_message() -> None:
 
 
 @pytest.mark.asyncio
-async def test_complete_call_sends_say_spawn_forward_and_cancel_tools() -> None:
-    """Issue 0047: ``say`` joins the LLM-facing tool list (registered first)."""
+async def test_complete_call_sends_v2_task_surface_plus_legacy_aliases() -> None:
+    """PRD 0006 / issue 0050: v2 tools register ahead of legacy aliases."""
 
     orchestrator, jarvis_client, _sub, _store, _ts, _scheduler = _make_orchestrator(
         complete_responses=[_say_response(speech="ok")],
@@ -339,15 +363,32 @@ async def test_complete_call_sends_say_spawn_forward_and_cancel_tools() -> None:
     tools = jarvis_client.complete_calls[0]["tools"]
     assert tools is not None
     names = [t.name for t in tools]
-    assert names == ["say", "spawn_subtask", "forward_to_subtask", "cancel_subtask"]
+    assert names == [
+        "say",
+        "spawn_task",
+        "addendum_task",
+        "replan_task",
+        "cancel_task",
+        "spawn_subtask",
+        "forward_to_subtask",
+        "cancel_subtask",
+    ]
     say_tool = tools[0]
-    spawn_tool = tools[1]
-    forward_tool = tools[2]
-    cancel_tool = tools[3]
+    spawn_task_tool = tools[1]
+    addendum_tool = tools[2]
+    replan_tool = tools[3]
+    cancel_task_tool = tools[4]
+    legacy_spawn_tool = tools[5]
+    legacy_forward_tool = tools[6]
+    legacy_cancel_tool = tools[7]
     assert say_tool.parameters["required"] == ["speech"]
-    assert spawn_tool.parameters["required"] == ["title", "goal"]
-    assert forward_tool.parameters["required"] == ["task_id", "response"]
-    assert cancel_tool.parameters["required"] == ["task_id"]
+    assert spawn_task_tool.parameters["required"] == ["title", "goal"]
+    assert addendum_tool.parameters["required"] == ["task_id", "info"]
+    assert replan_tool.parameters["required"] == ["task_id", "new_goal"]
+    assert cancel_task_tool.parameters["required"] == ["task_id"]
+    assert legacy_spawn_tool.parameters["required"] == ["title", "goal"]
+    assert legacy_forward_tool.parameters["required"] == ["task_id", "response"]
+    assert legacy_cancel_tool.parameters["required"] == ["task_id"]
 
 
 # ---------------------------------------------------------------------------
@@ -411,9 +452,9 @@ async def test_spawn_emits_task_created_via_orchestrator() -> None:
 async def test_spawn_with_invalid_args_does_not_emit_events() -> None:
     """When all tool calls are dropped, no task events are emitted.
 
-    Issue 0047 raises :class:`OrchestratorContractError` on the empty
-    dispatch outcome (0048 will degrade earlier); the no-event contract
-    still holds — the handler never ran.
+    Issue 0048 retries the dispatch once then degrades through the
+    hardcoded say; the spawn handler still never ran so the
+    ``task_created`` WS event is not emitted.
     """
 
     received: list[dict[str, Any]] = []
@@ -429,10 +470,13 @@ async def test_spawn_with_invalid_args_does_not_emit_events() -> None:
             arguments={"title": "no goal"},
         )
         orchestrator, _jc, _sc, _js, _ts, _scheduler = _make_orchestrator(
-            complete_responses=[LLMResponse(text=None, tool_calls=[bad])],
+            complete_responses=[
+                LLMResponse(text=None, tool_calls=[bad]),
+                LLMResponse(text=None, tool_calls=[bad]),
+            ],
         )
-        with pytest.raises(OrchestratorContractError):
-            await orchestrator.process_user_message("s1", "x")
+        response = await orchestrator.process_user_message("s1", "x")
+        assert response.speech == "Désolé, peux-tu reformuler ?"
     finally:
         ws_events.set_emitter(None)
 
@@ -596,8 +640,8 @@ async def test_forward_to_subtask_emits_task_message_event() -> None:
 
 
 @pytest.mark.asyncio
-async def test_forward_to_unknown_task_raises_contract_error() -> None:
-    """A forward to a missing task errors; the turn is a contract violation post-0047."""
+async def test_forward_to_unknown_task_degrades_after_retry() -> None:
+    """Issue 0048: an unknown ``task_id`` retries once then degrades."""
 
     bad_call = ToolCall(
         id="call_bad",
@@ -605,22 +649,25 @@ async def test_forward_to_unknown_task_raises_contract_error() -> None:
         arguments={"task_id": "does-not-exist", "response": "x"},
     )
     orchestrator, _jarvis_client, _sub, _js, task_store, scheduler = _make_orchestrator(
-        complete_responses=[LLMResponse(text=None, tool_calls=[bad_call])],
+        complete_responses=[
+            LLMResponse(text=None, tool_calls=[bad_call]),
+            LLMResponse(text=None, tool_calls=[bad_call]),
+        ],
     )
 
-    with pytest.raises(OrchestratorContractError):
-        await orchestrator.process_user_message("s1", "Amical.")
+    response = await orchestrator.process_user_message("s1", "Amical.")
 
+    assert response.speech == "Désolé, peux-tu reformuler ?"
     assert scheduler.resumed == []
     assert task_store.list_tasks() == []
 
 
 @pytest.mark.asyncio
-async def test_forward_to_task_not_in_waiting_input_is_dropped() -> None:
+async def test_forward_to_task_not_in_waiting_input_degrades_after_retry() -> None:
     """Forward must target a task in ``waiting_input``; running rejects it.
 
-    Issue 0047: rejection now surfaces as :class:`OrchestratorContractError`
-    rather than a structured-chat fallback (0048 will degrade earlier).
+    Issue 0048: rejection retries once then surfaces the degrade speech
+    through the live SayTool dispatcher path.
     """
 
     orchestrator, jarvis_client, _sub, _js, task_store, scheduler = _make_orchestrator()
@@ -633,10 +680,16 @@ async def test_forward_to_task_not_in_waiting_input_is_dropped() -> None:
             tool_calls=[_forward_tool_call(task_id=target_id, response="x")],
         )
     )
+    jarvis_client._complete_responses.append(
+        LLMResponse(
+            text=None,
+            tool_calls=[_forward_tool_call(task_id=target_id, response="x")],
+        )
+    )
 
-    with pytest.raises(OrchestratorContractError):
-        await orchestrator.process_user_message("s1", "x")
+    response = await orchestrator.process_user_message("s1", "x")
 
+    assert response.speech == "Désolé, peux-tu reformuler ?"
     assert scheduler.resumed == []
     # Original task untouched.
     assert task_store.get_task(target_id).state == "running"
@@ -1112,11 +1165,13 @@ async def test_cancel_subtask_forwards_custom_reason() -> None:
 
 
 @pytest.mark.asyncio
-async def test_cancel_subtask_with_bad_task_id_raises_contract_error() -> None:
-    """A malformed tool call (missing task_id) is dropped.
+async def test_cancel_subtask_with_bad_task_id_degrades_after_retry() -> None:
+    """Issue 0048: a malformed cancel retries once then degrades.
 
-    Issue 0047: drop now surfaces as :class:`OrchestratorContractError`
-    rather than a structured-chat fallback (0048 will degrade earlier).
+    The missing ``task_id`` field trips Pydantic validation; the retry
+    budget gives the LLM one chance to recover, and then the
+    orchestrator emits the hardcoded degrade speech through the
+    dispatcher.
     """
 
     bad_call = ToolCall(
@@ -1125,12 +1180,15 @@ async def test_cancel_subtask_with_bad_task_id_raises_contract_error() -> None:
         arguments={"reason": "nope"},
     )
     orchestrator, _jc, _sub, _js, _ts, scheduler = _make_orchestrator(
-        complete_responses=[LLMResponse(text=None, tool_calls=[bad_call])],
+        complete_responses=[
+            LLMResponse(text=None, tool_calls=[bad_call]),
+            LLMResponse(text=None, tool_calls=[bad_call]),
+        ],
     )
 
-    with pytest.raises(OrchestratorContractError):
-        await orchestrator.process_user_message("s1", "anything")
+    response = await orchestrator.process_user_message("s1", "anything")
 
+    assert response.speech == "Désolé, peux-tu reformuler ?"
     assert scheduler.cancelled == []
 
 

@@ -40,7 +40,9 @@ from bob.llm.factory import build_subagent_client
 from bob.logging_setup import configure_logging
 from bob.orchestrator import get_default_orchestrator
 from bob.proactivity_handler import ProactivityHandler
+from bob.scheduler_policy import SchedulerPolicy
 from bob.sub_agent import (
+    AddendumQueue,
     SubAgentRunner,
     build_default_subagent_registry,
     default_policy,
@@ -127,12 +129,33 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             return None
         return runner.request_cancel
 
+    def _addendum_queue_factory(task_id: str) -> AddendumQueue | None:
+        """Resolve the live runner's :class:`AddendumQueue` for ``task_id``.
+
+        PRD 0006 / issue 0050. The v2 ``addendum_task`` tool pushes
+        info into the queue at this address; the runner drains it at
+        the next iteration boundary.
+        """
+
+        runner = live_runners.get(task_id)
+        if runner is None:
+            return None
+        return runner.addendum_queue
+
+    # PRD 0006 / issue 0050 — concurrency caps (3 running, 5 queued)
+    # so Jarvis can degrade with a clarifying speech when the user
+    # bursts more than the scheduler can absorb.
+    scheduler_policy = SchedulerPolicy(
+        max_running=settings.MAX_RUNNING_TASKS,
+        max_queued=5,
+    )
     scheduler = build_default_scheduler(
         settings,
         task_store,
         _runner_factory,
         coop_cancel_factory=_coop_cancel_factory,
         cancel_grace_seconds=subagent_policy.cancel_grace_seconds,
+        policy=scheduler_policy,
     )
     task_scheduler_module.set_default_scheduler(scheduler)
     await scheduler.start()
@@ -147,6 +170,9 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     bus = EventBus()
     set_event_bus(bus)
     orchestrator = get_default_orchestrator()
+    # PRD 0006 / issue 0050 — late-bind the addendum factory now that
+    # the live runner pool exists.
+    orchestrator.set_addendum_queue_factory(_addendum_queue_factory)
     orchestrator.start_proactive_loop()
     proactivity = ProactivityHandler(orchestrator_factory=get_default_orchestrator)
     bus.subscribe("task_state_changed", proactivity.on_task_state_changed)

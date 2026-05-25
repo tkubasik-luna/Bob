@@ -98,18 +98,26 @@ def test_iter_and_len_match_registration() -> None:
     assert [d.name for d in registry] == ["a", "b"]
 
 
-def test_default_registry_contains_say_spawn_forward_cancel_v1_tools() -> None:
-    """Issue 0047: ``say`` joins the registered tool surface as the first entry.
+def test_default_registry_contains_say_v2_tasks_and_legacy_aliases() -> None:
+    """PRD 0006 / issue 0050: the v2 task surface registers ahead of the legacy aliases.
 
-    The registration order pins the LLM-facing tool list (``say`` first
-    so the bounded prompt addendum can describe it before the task
-    tools); changing it requires a deliberate update here and to the
-    matching prompt fragment.
+    Order pinned (matches the ``TOOLS_SYSTEM_ADDENDUM`` prompt
+    fragment):
+
+    1. ``say`` (issue 0047) — direct-reply path.
+    2. ``spawn_task`` / ``addendum_task`` / ``replan_task`` /
+       ``cancel_task`` (issue 0050) — v2 task surface.
+    3. ``spawn_subtask`` / ``forward_to_subtask`` / ``cancel_subtask``
+       (issue 0044) — kept as deprecated aliases for the migration.
     """
 
     registry = build_default_registry()
     assert registry.names() == [
         "say",
+        "spawn_task",
+        "addendum_task",
+        "replan_task",
+        "cancel_task",
         "spawn_subtask",
         "forward_to_subtask",
         "cancel_subtask",

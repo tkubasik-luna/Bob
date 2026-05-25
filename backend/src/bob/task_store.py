@@ -25,7 +25,26 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Literal
 
-TaskState = Literal["pending", "running", "waiting_input", "done", "failed"]
+#: Closed set of task states.
+#:
+#: Pre-PRD-0006 the runtime used ``pending`` / ``running`` / ``waiting_input``
+#: / ``done`` / ``failed``. Issue 0050 (PRD 0006) ships the granular v2
+#: lifecycle: ``spawned`` (replaces ``pending``), ``awaiting_input``
+#: (renames ``waiting_input``) and the new ``superseded`` terminal value
+#: for tasks replaced via ``replan_task``. The legacy literals stay in
+#: the union so existing slice #0018 call sites (scheduler, runner)
+#: keep compiling without a sweeping rename — the v2 tools use the new
+#: names, and a future cleanup slice can collapse the union.
+TaskState = Literal[
+    "spawned",
+    "pending",
+    "running",
+    "awaiting_input",
+    "waiting_input",
+    "done",
+    "failed",
+    "superseded",
+]
 TaskRole = Literal["system", "user", "assistant", "tool"]
 TaskAction = Literal["done", "ask_user", "progress"]
 
@@ -59,6 +78,13 @@ class Task:
     updated_at: str
     dismissed: bool
     lineage: list[str] = field(default_factory=list)
+    #: Turn index at which Jarvis delivered this task's result to the user.
+    #:
+    #: PRD 0006 / issue 0050 — guards against announcing the same
+    #: completion twice. ``None`` while the task is still active or
+    #: queued for delivery; set to the user-turn index by the
+    #: orchestrator once the spoken acknowledgement has been emitted.
+    delivered_at_turn: int | None = None
 
 
 @dataclass(frozen=True)
@@ -73,15 +99,33 @@ class TaskMessage:
     created_at: str
 
 
-# State machine for sub-tasks. ``done`` and ``failed`` are terminal — no
-# outbound transitions. The orchestrator slice (#0018) is the primary caller
-# but the rules live here so they are enforced at the data layer.
+# State machine for sub-tasks. ``done`` / ``failed`` / ``superseded`` are
+# terminal. The orchestrator slice (#0018) is the primary caller but the
+# rules live here so they are enforced at the data layer.
+#
+# PRD 0006 / issue 0050 adds ``spawned`` (alias of pre-existing
+# ``pending``), ``awaiting_input`` (rename of ``waiting_input``) and the
+# new ``superseded`` terminal state. Both legacy aliases remain in the
+# transition table so the scheduler / runner code paths that still emit
+# them keep working — the v2 tools use the new names.
 _VALID_TRANSITIONS: dict[TaskState, frozenset[TaskState]] = {
-    "pending": frozenset({"running", "failed"}),
-    "running": frozenset({"waiting_input", "done", "failed"}),
-    "waiting_input": frozenset({"running", "failed"}),
+    # ``spawned`` and ``pending`` are interchangeable queued states
+    # (slice #0018 legacy vs PRD 0006 v2). They round-trip so the
+    # v2 tools can normalise a freshly-created row to ``spawned``
+    # without being blocked by a tie to the SQL default.
+    "spawned": frozenset({"running", "pending", "failed", "superseded"}),
+    "pending": frozenset({"running", "spawned", "failed", "superseded"}),
+    "running": frozenset({"awaiting_input", "waiting_input", "done", "failed", "superseded"}),
+    "awaiting_input": frozenset({"running", "failed", "superseded"}),
+    "waiting_input": frozenset({"running", "failed", "superseded"}),
     "done": frozenset(),
-    "failed": frozenset(),
+    # ``failed`` rows can be lifted to ``superseded`` by
+    # :meth:`mark_superseded` so the v2 replan flow (cancel via the
+    # scheduler → row flipped to failed → mark superseded) ends with
+    # the audit-correct terminal state without bypassing the
+    # transition validator.
+    "failed": frozenset({"superseded"}),
+    "superseded": frozenset(),
 }
 
 
@@ -135,7 +179,8 @@ class TaskStore:
         with self._lock:
             cursor = self._conn.execute(
                 "SELECT id, title, goal, state, needs_attention, result, parent_task_id,"
-                " created_at, updated_at, dismissed, lineage FROM tasks WHERE id = ?",
+                " created_at, updated_at, dismissed, lineage, delivered_at_turn"
+                " FROM tasks WHERE id = ?",
                 (task_id,),
             )
             row = cursor.fetchone()
@@ -160,7 +205,8 @@ class TaskStore:
 
         query = (
             "SELECT id, title, goal, state, needs_attention, result, parent_task_id,"
-            " created_at, updated_at, dismissed, lineage FROM tasks"
+            " created_at, updated_at, dismissed, lineage, delivered_at_turn"
+            " FROM tasks"
         )
         where: list[str] = []
         params: list[object] = []
@@ -237,6 +283,60 @@ class TaskStore:
             )
             if cursor.rowcount == 0:
                 raise TaskStoreError(f"task not found: {task_id}")
+
+    def set_delivered_at_turn(self, task_id: str, turn_index: int) -> None:
+        """Stamp ``task_id`` as delivered at user-turn index ``turn_index``.
+
+        PRD 0006 / issue 0050. Set once Jarvis has spoken the completion
+        announcement; the :class:`StateBlockProvider` then keeps the task
+        visible for ``recent_turns_for_done_inclusion`` user turns before
+        eviction so the next user reply can still address the result by
+        natural reference.
+
+        Subsequent calls overwrite the value: ``replan_task`` reuses the
+        delivery slot. ``turn_index`` is a non-negative monotonic
+        identifier shared with the orchestrator's turn counter.
+        """
+
+        if turn_index < 0:
+            raise TaskStoreError(f"delivered_at_turn must be >= 0, got {turn_index}")
+        with self._lock, self._conn:
+            cursor = self._conn.execute(
+                "UPDATE tasks SET delivered_at_turn = ?, updated_at = datetime('now') WHERE id = ?",
+                (turn_index, task_id),
+            )
+            if cursor.rowcount == 0:
+                raise TaskStoreError(f"task not found: {task_id}")
+
+    def mark_superseded(self, task_id: str) -> None:
+        """Force-transition ``task_id`` to the ``superseded`` terminal state.
+
+        PRD 0006 / issue 0050. Used by ``replan_task`` after the previous
+        task has been cancelled: the cancel finalises the row in
+        ``failed``, then ``mark_superseded`` flips it to the v2 terminal
+        ``superseded`` so the audit trail distinguishes "the user changed
+        their mind" from "the runner crashed". The transition is
+        validated through :data:`_VALID_TRANSITIONS` so a real terminal
+        (already ``done`` / ``superseded``) raises.
+        """
+
+        with self._lock, self._conn:
+            cursor = self._conn.execute(
+                "SELECT state FROM tasks WHERE id = ?",
+                (task_id,),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                raise TaskStoreError(f"task not found: {task_id}")
+            current: TaskState = row[0]
+            if "superseded" not in _VALID_TRANSITIONS[current]:
+                raise TaskStoreError(
+                    f"invalid transition for task {task_id}: {current} -> superseded"
+                )
+            self._conn.execute(
+                "UPDATE tasks SET state = 'superseded', updated_at = datetime('now') WHERE id = ?",
+                (task_id,),
+            )
 
     def dismiss_task(self, task_id: str) -> None:
         """Flip ``dismissed`` to true so the task hides from sidebar replays.
@@ -317,6 +417,7 @@ def _row_to_task(row: tuple[object, ...]) -> Task:
         updated_at,
         dismissed,
         lineage_raw,
+        delivered_at_turn,
     ) = row
     assert isinstance(id_, str)
     assert isinstance(title, str)
@@ -329,6 +430,7 @@ def _row_to_task(row: tuple[object, ...]) -> Task:
     assert isinstance(updated_at, str)
     assert isinstance(dismissed, int)
     assert isinstance(lineage_raw, str)
+    assert delivered_at_turn is None or isinstance(delivered_at_turn, int)
     lineage = _decode_lineage(lineage_raw)
     # ``state`` is constrained by the SQL CHECK to the TaskState set — the
     # cast to the Literal alias is safe.
@@ -344,6 +446,7 @@ def _row_to_task(row: tuple[object, ...]) -> Task:
         updated_at=updated_at,
         dismissed=bool(dismissed),
         lineage=lineage,
+        delivered_at_turn=delivered_at_turn,
     )
 
 

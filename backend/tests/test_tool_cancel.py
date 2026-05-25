@@ -48,6 +48,9 @@ class _StubTaskStore:
     def get_task(self, task_id: str) -> Any:
         raise AssertionError("not used by cancel tool")
 
+    def list_tasks(self, *, state: Any = None, limit: Any = None) -> Any:
+        return []
+
     def append_message(
         self,
         task_id: str,
@@ -60,6 +63,18 @@ class _StubTaskStore:
 
     def get_task_messages(self, task_id: str) -> Any:
         raise AssertionError("not used by cancel tool")
+
+    def update_state(self, task_id: str, new_state: Any) -> None:
+        return None
+
+    def set_result(self, task_id: str, result: str) -> None:
+        return None
+
+    def set_delivered_at_turn(self, task_id: str, turn_index: int) -> None:
+        return None
+
+    def mark_superseded(self, task_id: str) -> None:
+        return None
 
 
 def _make_dispatcher(scheduler: _RecordingScheduler) -> ToolDispatcher:

@@ -1,9 +1,24 @@
-"""LLM client abstraction and LM Studio implementation.
+"""LLM client abstraction and LM Studio / Claude CLI implementations.
 
-The abstract :class:`LLMClient` is intentionally tiny — a single ``chat``
-method returning the raw string emitted by the model. Higher layers
-(``response_parser``, ``chat_service``) take care of validation, retries
-and structured-output parsing.
+The abstract :class:`LLMClient` is intentionally tiny — a ``chat`` method
+returning the raw string emitted by the model and a ``complete`` method
+exposing the OpenAI-compatible tool-calling surface. Higher layers
+(:mod:`bob.orchestrator`, :mod:`bob.sub_agent.runner`, the validation
+retry path in :mod:`bob.validation`) take care of schema enforcement,
+retry budgets and degrade fallbacks. Pre-0048 the
+``bob.response_parser`` module also lived in that higher layer; it was
+deleted in 0048 because the silent raw-text fallback amounted to assistant-
+history corruption.
+
+Issue 0048 adds the ``system_validator`` role contract. Each client
+normalises ``system_validator`` rows before dispatching:
+
+- :class:`LMStudioClient` passes them through verbatim (OpenAI-compatible
+  endpoints tolerate arbitrary role strings).
+- :class:`ClaudeCliClient` folds them into ``system`` rows prefixed with
+  :data:`bob.validation.system_validator.FALLBACK_VALIDATOR_PREFIX`
+  because the CLI's prompt rendering only understands the four standard
+  roles.
 """
 
 from __future__ import annotations
@@ -23,8 +38,57 @@ from bob.config import Settings
 from bob.debug_log import emit_debug
 from bob.llm.types import LLMResponse, ToolCall, ToolDefinition
 from bob.logging_setup import log_llm_call
+from bob.validation.system_validator import (
+    FALLBACK_VALIDATOR_PREFIX,
+    SYSTEM_VALIDATOR_ROLE,
+)
 
 _logger = structlog.get_logger(__name__)
+
+
+#: Roles known to be accepted by every OpenAI-compatible endpoint Bob
+#: targets (LM Studio, vLLM, llama.cpp's server, Claude CLI in tool
+#: mode). When the validation path hands us a message with a role
+#: outside this set we either pass it through (LM Studio: arbitrary role
+#: strings are accepted) or wrap it into a ``system`` message prefixed
+#: with :data:`FALLBACK_VALIDATOR_PREFIX`. Issue 0048 — the wrap path is
+#: the safety net documented in :mod:`bob.validation.system_validator`.
+_STANDARD_ROLES: frozenset[str] = frozenset({"system", "user", "assistant", "tool"})
+
+
+def _normalise_validator_role(
+    messages: list[dict[str, Any]],
+    *,
+    allow_arbitrary_roles: bool,
+) -> list[dict[str, Any]]:
+    """Return ``messages`` with ``system_validator`` rows handled.
+
+    When ``allow_arbitrary_roles`` is true the messages are returned as
+    is (the upstream provider accepts custom roles). Otherwise each
+    ``system_validator`` row is folded into a ``system`` message
+    prefixed with :data:`FALLBACK_VALIDATOR_PREFIX` so the validator
+    payload stays distinguishable from a real system prompt.
+
+    The function is a no-op when no ``system_validator`` messages are
+    present so production calls pay zero overhead on the happy path.
+    """
+
+    if allow_arbitrary_roles:
+        return messages
+    if not any(msg.get("role") == SYSTEM_VALIDATOR_ROLE for msg in messages):
+        return messages
+    normalised: list[dict[str, Any]] = []
+    for msg in messages:
+        if msg.get("role") != SYSTEM_VALIDATOR_ROLE:
+            normalised.append(msg)
+            continue
+        normalised.append(
+            {
+                "role": "system",
+                "content": FALLBACK_VALIDATOR_PREFIX + str(msg.get("content", "")),
+            }
+        )
+    return normalised
 
 
 def _estimate_tokens(messages: list[dict[str, Any]]) -> int:
@@ -135,6 +199,13 @@ class LMStudioClient(LLMClient):
         schema: dict[str, Any] | None = None,
         session_id: str | None = None,
     ) -> str:
+        # Issue 0048 — pass ``system_validator`` rows straight through.
+        # LM Studio (and every OpenAI-compatible endpoint Bob targets)
+        # tolerates arbitrary role strings on chat messages. The fold
+        # path in :func:`_normalise_validator_role` exists for upstream
+        # providers that reject unknown roles; we opt in to it only on
+        # the Claude CLI client below.
+        messages = _normalise_validator_role(messages, allow_arbitrary_roles=True)
         kwargs: dict[str, Any] = {
             "model": self._settings.LLM_MODEL,
             "messages": messages,
@@ -263,6 +334,10 @@ class LMStudioClient(LLMClient):
         tools: list[ToolDefinition] | None = None,
         session_id: str | None = None,
     ) -> LLMResponse:
+        # Issue 0048 — same passthrough policy as ``chat``: LM Studio
+        # accepts the ``system_validator`` role verbatim. See
+        # :func:`_normalise_validator_role` for the rationale.
+        messages = _normalise_validator_role(messages, allow_arbitrary_roles=True)
         kwargs: dict[str, Any] = {
             "model": self._settings.LLM_MODEL,
             "messages": messages,
@@ -520,6 +595,11 @@ class ClaudeCliClient(LLMClient):
         schema: dict[str, Any] | None = None,
         session_id: str | None = None,
     ) -> str:
+        # Issue 0048 — fold ``system_validator`` messages into ``system``
+        # rows with a ``[VALIDATOR]:`` prefix. The Claude CLI consumes a
+        # single rendered prompt; arbitrary roles don't survive
+        # :meth:`_split_messages` / :meth:`_render_history` cleanly.
+        messages = _normalise_validator_role(messages, allow_arbitrary_roles=False)
         system_prompt, history = self._split_messages(messages)
         prompt = self._render_history(history)
 

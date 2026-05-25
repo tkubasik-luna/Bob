@@ -21,12 +21,17 @@ free-form text path. The orchestrator:
      confirmation phrase and persists it in the Jarvis thread.
 
 The structured-output ``chat()`` + ``response_parser`` path was removed
-in 0047. When the LLM violates the tool-call contract (no tool call
-returned, or every dispatch errored) the orchestrator raises
-:class:`OrchestratorContractError`. The WS router surfaces this as an
-``INTERNAL`` error frame today; the per-tool retry/degrade policy that
-ships in 0048 will catch it earlier and emit a hardcoded fallback
-``say("Désolé, peux-tu reformuler ?")``.
+in 0047 — and ``response_parser`` itself was deleted in 0048 so the
+silent raw-text fallback can never re-surface. When the LLM violates
+the tool-call contract (no tool call returned, or every dispatch
+errored) the per-tool retry/degrade policy
+(:mod:`bob.validation`) injects validator feedback under the dedicated
+``system_validator`` role for one retry; on budget exhaustion the
+orchestrator runs ``on_validation_exhausted`` which dispatches the
+hardcoded ``say("Désolé, peux-tu reformuler ?")`` through the live
+:class:`ToolDispatcher`. The legacy :class:`OrchestratorContractError`
+is kept for narrow cases (e.g. the dispatcher itself raises) so call
+sites can pattern-match on the type rather than catching ``Exception``.
 
 Slice #0021 added :meth:`generate_proactive_message`: when a sub-agent
 emits ``ask_user`` the :class:`ProactivityHandler` invokes this method.
@@ -62,9 +67,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from types import ModuleType
-from typing import Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 import structlog
 
@@ -94,6 +100,7 @@ from bob.context.providers.cross_epoch_digest import CrossEpochDigestProvider
 from bob.context.providers.legacy_full_history import LegacyFullHistoryProvider
 from bob.context.providers.recent_turns import RecentTurnsProvider
 from bob.context.providers.rolling_summary import RollingSummaryProvider
+from bob.context.providers.state_block import StateBlockProvider
 from bob.context.providers.system_block import SystemBlockProvider
 from bob.context.providers.user_message import UserMessageProvider
 from bob.context.summariser import LLMSummariser, Summariser
@@ -109,6 +116,10 @@ from bob.jarvis_store import JarvisStore
 from bob.llm.types import ToolCall
 from bob.llm_client import LLMClient
 from bob.rolling_summary_store import RollingSummaryStore
+from bob.task_completion_debouncer import (
+    DEFAULT_DEBOUNCE_SECONDS,
+    TaskCompletionDebouncer,
+)
 from bob.task_store import TaskStore, TaskStoreError
 from bob.tools import (
     DispatchResult,
@@ -118,6 +129,23 @@ from bob.tools import (
     build_default_registry,
 )
 from bob.ui_registry import ComponentDescriptor
+from bob.validation import (
+    JARVIS_DEGRADE_SPEECH_FRAGMENT,
+    CallEnvelope,
+    ExhaustedContext,
+    JarvisOnValidationExhausted,
+    OnValidationExhausted,
+    build_validator_message,
+    get_policy,
+    render_feedback,
+)
+
+if TYPE_CHECKING:  # pragma: no cover — typing-only.
+    from bob.context.eviction import EvictionStrategy
+    from bob.context.recency import RecencyPolicy
+    from bob.context.state_policy import StatePolicy
+    from bob.sub_agent.addendum_queue import AddendumQueue
+
 
 _logger = structlog.get_logger(__name__)
 
@@ -239,6 +267,12 @@ class Orchestrator:
         cross_epoch_digest_store: CrossEpochDigestStore | None = None,
         epoch_manager: EpochManager | None = None,
         retrieval_api: RetrievalAPI | None = None,
+        on_validation_exhausted: OnValidationExhausted | None = None,
+        state_policy: StatePolicy | None = None,
+        recency_policy: RecencyPolicy | None = None,
+        eviction_strategy: EvictionStrategy | None = None,
+        addendum_queue_factory: Callable[[str], AddendumQueue | None] | None = None,
+        completion_debounce_seconds: float = DEFAULT_DEBOUNCE_SECONDS,
     ) -> None:
         self._jarvis_client = jarvis_client
         self._jarvis_store = jarvis_store
@@ -282,6 +316,16 @@ class Orchestrator:
         # the :class:`ToolHandlerContext` so the ``say`` handler can
         # persist the assistant turn through the same DI bag as every
         # other handler.
+        # PRD 0006 / issue 0050 — wire the live runner registry (set
+        # explicitly via :meth:`set_addendum_queue_factory` at boot) so the
+        # ``addendum_task`` tool can resolve the per-task
+        # :class:`AddendumQueue`. The orchestrator stays neutral to the
+        # actual factory shape — tests inject a dict-backed double.
+        self._addendum_queue_factory = addendum_queue_factory
+        self._state_policy = state_policy
+        self._recency_policy = recency_policy
+        self._eviction_strategy = eviction_strategy
+
         self._tool_registry = tool_registry or build_default_registry()
         self._tool_dispatcher = ToolDispatcher(
             registry=self._tool_registry,
@@ -290,7 +334,35 @@ class Orchestrator:
                 task_scheduler=self._task_scheduler,
                 ws_emit=ws_events.emit,
                 jarvis_store=self._jarvis_store,
+                addendum_queue_factory=self._addendum_queue_factory,
+                mark_superseded=self._task_store.mark_superseded,
             ),
+        )
+
+        # PRD 0006 / issue 0050 — pending-completions debounce. The
+        # orchestrator owns the debouncer so the WS layer never has to
+        # think about batched announcements. Production wires the
+        # ``task_state_changed`` subscriber to invoke
+        # :meth:`enqueue_completion`. The flush callback materialises a
+        # synthetic ``task_completed`` ContextEntry and pushes the
+        # batched announcement via the proactive flusher.
+        self._completion_debouncer = TaskCompletionDebouncer(
+            flush_callback=self._on_completion_batch,
+            window_seconds=completion_debounce_seconds,
+        )
+
+        # PRD 0006 / issue 0050 — monotonic user-turn counter consumed by
+        # the STATE block provider (``age_turns`` + post-delivery
+        # inclusion window) and by ``set_delivered_at_turn``.
+        self._user_turn_index = 0
+
+        # PRD 0006 / issue 0048 — degrade contract. The default handler
+        # routes a hardcoded ``say("Désolé, peux-tu reformuler ?")``
+        # through the live :class:`ToolDispatcher` so the side effects
+        # (route event, JarvisStore persistence) match a regular turn.
+        # Tests inject a recording double via the constructor.
+        self._on_validation_exhausted: OnValidationExhausted = (
+            on_validation_exhausted or JarvisOnValidationExhausted(dispatcher=self._tool_dispatcher)
         )
 
         # Slice #0025 — proactive buffering layer. The queue + flusher live
@@ -326,6 +398,10 @@ class Orchestrator:
         )
 
         self._jarvis_state = "thinking"
+        # PRD 0006 / issue 0050 — bump the monotonic user-turn counter
+        # BEFORE the turn runs so the STATE block sees the new index in
+        # ``age_turns`` and ``delivered_at_turn`` comparisons.
+        self._user_turn_index += 1
         try:
             self._jarvis_store.append("user", user_content)
 
@@ -356,60 +432,15 @@ class Orchestrator:
             # provider.
             self._trigger_retrieval(user_content)
 
-            messages = self._assemble_chat_messages(
+            base_messages = self._assemble_chat_messages(
                 system_content=complete_system,
                 user_message=user_content,
             )
 
-            decision = await self._jarvis_client.complete(
-                messages,
-                tools=self._tool_registry.as_llm_definitions(),
+            response = await self._run_jarvis_turn_with_retry(
+                base_messages=base_messages,
                 session_id=session_id,
             )
-
-            emit_debug(
-                category="decision",
-                severity="info",
-                source="orchestrator.process_user_message",
-                summary="Jarvis a fini de réfléchir",
-                payload={
-                    "session_id": session_id,
-                    "is_tool_call": decision.is_tool_call,
-                    "tool_call_count": len(decision.tool_calls),
-                },
-            )
-
-            # PRD 0006 / issue 0047: every Jarvis turn ends in exactly
-            # one dispatched tool call. ``decision.is_tool_call`` must be
-            # true; the free-form text path was removed in 0047 and the
-            # LLM-side system prompt explicitly forbids it. The retry /
-            # degrade policy in 0048 will catch this earlier and emit a
-            # hardcoded ``say("Désolé, peux-tu reformuler ?")`` fallback.
-            if not decision.is_tool_call:
-                _logger.warning(
-                    "orchestrator.contract_violation_no_tool_call",
-                    session_id=session_id,
-                    text_preview=(decision.text or "")[:120],
-                )
-                raise OrchestratorContractError(
-                    "Jarvis returned a free-form reply instead of a tool call. "
-                    "Issue 0048 will degrade this to a hardcoded say() fallback."
-                )
-
-            response = await self._dispatch_tool_calls(decision.tool_calls)
-            if response is None:
-                # Every tool call errored. Same shape as the no-tool-call
-                # path — 0048 will degrade this to the hardcoded ``say()``
-                # fallback through the same dispatcher.
-                _logger.warning(
-                    "orchestrator.contract_violation_all_dispatches_errored",
-                    session_id=session_id,
-                    tool_call_count=len(decision.tool_calls),
-                )
-                raise OrchestratorContractError(
-                    "Every Jarvis tool call failed dispatch. "
-                    "Issue 0048 will degrade this to a hardcoded say() fallback."
-                )
 
             emit_debug(
                 category="output",
@@ -428,6 +459,184 @@ class Orchestrator:
             return response
         finally:
             self._jarvis_state = "idle"
+
+    async def _run_jarvis_turn_with_retry(
+        self,
+        *,
+        base_messages: list[dict[str, Any]],
+        session_id: str,
+    ) -> OrchestratorResponse:
+        """Drive one Jarvis turn through the per-tool retry policy.
+
+        PRD 0006 / issue 0048. The dispatcher path stays unchanged; the
+        retry loop wraps it:
+
+        1. Run :meth:`LLMClient.complete` with the current message list
+           (initial: ``base_messages``; on retry: ``base_messages`` plus
+           ``system_validator`` feedback messages appended).
+        2. If ``decision.is_tool_call`` is false → record the contract
+           violation as feedback, increment the in-memory
+           :class:`CallEnvelope` retry counter, loop.
+        3. Otherwise dispatch through the existing path. If every
+           dispatch errored → record feedback for the first error,
+           increment the counter, loop.
+        4. When ``envelope.retries_used`` exceeds the active per-tool
+           :class:`RetryPolicy.max_retries` (or the no-tool-call path's
+           default) → call
+           :meth:`OnValidationExhausted.on_validation_exhausted`, then
+           return an :class:`OrchestratorResponse` carrying the hardcoded
+           degrade speech.
+
+        The envelope dies at function exit — the retry counter NEVER
+        lands on a :class:`ContextEntry`.
+        """
+
+        envelope = CallEnvelope(tool_name=None, actor="jarvis")
+        feedback_messages: list[dict[str, Any]] = []
+        last_error_message = "validation failed"
+
+        while True:
+            messages = (
+                base_messages
+                if not feedback_messages
+                else [
+                    *base_messages,
+                    *feedback_messages,
+                ]
+            )
+
+            decision = await self._jarvis_client.complete(
+                messages,
+                tools=self._tool_registry.as_llm_definitions(),
+                session_id=session_id,
+            )
+
+            emit_debug(
+                category="decision",
+                severity="info",
+                source="orchestrator.process_user_message",
+                summary="Jarvis a fini de réfléchir",
+                payload={
+                    "session_id": session_id,
+                    "is_tool_call": decision.is_tool_call,
+                    "tool_call_count": len(decision.tool_calls),
+                    "attempt": envelope.attempts,
+                },
+            )
+
+            # ---- No tool call → contract violation, retry if budget allows.
+            if not decision.is_tool_call:
+                last_error_message = (
+                    "Tu n'as pas appelé d'outil. RÈGLE : chaque tour doit "
+                    "être exactement UN appel d'outil. Pour répondre, appelle "
+                    "``say`` avec ton texte dans ``speech``."
+                )
+                _logger.warning(
+                    "orchestrator.contract_violation_no_tool_call",
+                    session_id=session_id,
+                    attempt=envelope.attempts,
+                    text_preview=(decision.text or "")[:120],
+                )
+                # Default policy (no tool resolved) — the LLM did not
+                # pick a tool yet so the policy table cannot key on a
+                # name. Use the global default budget.
+                policy = get_policy("say")
+                if envelope.retries_used >= policy.max_retries:
+                    return await self._degrade_validation_exhausted(
+                        envelope=envelope,
+                        last_error_message=last_error_message,
+                    )
+                feedback_messages.append(
+                    build_validator_message(
+                        render_feedback(
+                            error_message=last_error_message,
+                            offending_raw=decision.text,
+                        )
+                    )
+                )
+                envelope.record_feedback(feedback_messages[-1]["content"])
+                envelope.increment(error_code="no_tool_call")
+                continue
+
+            # ---- Dispatch tool calls.
+            response, dispatch_error = await self._dispatch_tool_calls_with_diagnostics(
+                decision.tool_calls
+            )
+            if response is not None:
+                return response
+
+            # Every dispatch errored — retry with feedback if budget allows.
+            tool_name = dispatch_error.tool_name if dispatch_error is not None else None
+            error_code = (
+                dispatch_error.error_code if dispatch_error is not None else "dispatch_failed"
+            )
+            error_message = (
+                dispatch_error.error_message
+                if dispatch_error is not None and dispatch_error.error_message
+                else "every tool call failed dispatch"
+            )
+            last_error_message = error_message
+            envelope.tool_name = tool_name
+            policy = get_policy(tool_name) if tool_name else get_policy("say")
+            _logger.warning(
+                "orchestrator.contract_violation_all_dispatches_errored",
+                session_id=session_id,
+                tool_call_count=len(decision.tool_calls),
+                attempt=envelope.attempts,
+                error_code=error_code,
+            )
+            if envelope.retries_used >= policy.max_retries:
+                return await self._degrade_validation_exhausted(
+                    envelope=envelope,
+                    last_error_message=last_error_message,
+                )
+            feedback_messages.append(
+                build_validator_message(
+                    render_feedback(
+                        error_message=(
+                            f"Validation a échoué pour l'outil ``{tool_name}`` "
+                            f"({error_code}): {error_message}. "
+                            "Ré-essaye en respectant le schéma."
+                        ),
+                        offending_raw=None,
+                    )
+                )
+            )
+            envelope.record_feedback(feedback_messages[-1]["content"])
+            envelope.increment(error_code=error_code)
+            continue
+
+    async def _degrade_validation_exhausted(
+        self,
+        *,
+        envelope: CallEnvelope,
+        last_error_message: str,
+    ) -> OrchestratorResponse:
+        """Run the ``on_validation_exhausted`` handler + build the degrade response.
+
+        The handler routes the hardcoded ``say()`` through the live
+        dispatcher (so :class:`JarvisStore` persistence + the
+        ``jarvis.route`` event still fire) and logs the structured
+        ``jarvis.validation_failed`` event. We then return an
+        :class:`OrchestratorResponse` carrying the same speech so the
+        WS router emits exactly one ``assistant_msg`` frame.
+        """
+
+        await self._on_validation_exhausted.on_validation_exhausted(
+            ExhaustedContext(
+                envelope=envelope,
+                last_error_message=last_error_message,
+                task_id=None,
+            )
+        )
+        speech = JARVIS_DEGRADE_SPEECH_FRAGMENT.template
+        return OrchestratorResponse(
+            speech=speech,
+            ui=[],
+            spawned_task_ids=[],
+            forwarded_task_ids=[],
+            cancelled_task_ids=[],
+        )
 
     async def generate_proactive_message(self, task_id: str, event_kind: str) -> None:
         """Enqueue a proactive Jarvis push for ``task_id``.
@@ -468,6 +677,116 @@ class Orchestrator:
         """
 
         await self.generate_proactive_message(task_id, "done")
+
+    # --- PRD 0006 / issue 0050 — completion batching + delivery -----------
+
+    def set_addendum_queue_factory(
+        self,
+        factory: Callable[[str], AddendumQueue | None] | None,
+    ) -> None:
+        """Late-binding hook so the boot path can wire ``addendum_queue_factory``.
+
+        Boot wiring needs the orchestrator instance *before* the scheduler /
+        runner pool exists. The constructor accepts an optional factory for
+        tests; production calls this method once the runner pool is alive.
+        """
+
+        self._addendum_queue_factory = factory
+        # The dispatcher was constructed with the previous (possibly
+        # ``None``) factory. Re-create the dispatcher's
+        # :class:`ToolHandlerContext` so the new factory is visible to
+        # the next dispatch.
+        self._tool_dispatcher = ToolDispatcher(
+            registry=self._tool_registry,
+            context=ToolHandlerContext(
+                task_store=self._task_store,
+                task_scheduler=self._task_scheduler,
+                ws_emit=ws_events.emit,
+                jarvis_store=self._jarvis_store,
+                addendum_queue_factory=self._addendum_queue_factory,
+                mark_superseded=self._task_store.mark_superseded,
+            ),
+        )
+
+    @property
+    def user_turn_index(self) -> int:
+        """Monotonic count of user turns seen by :meth:`process_user_message`."""
+
+        return self._user_turn_index
+
+    @property
+    def completion_debouncer(self) -> TaskCompletionDebouncer:
+        """Expose the per-orchestrator debouncer for tests + bus wiring."""
+
+        return self._completion_debouncer
+
+    async def enqueue_completion(self, task_id: str) -> None:
+        """Register ``task_id`` for the next debounced delivery batch.
+
+        Production wires the ``task_state_changed`` bus subscriber to call
+        this whenever a sub-agent transitions to ``done`` (or
+        ``failed`` / ``superseded``). Within the
+        :attr:`TaskCompletionDebouncer.window_seconds` window every
+        ``enqueue_completion`` call lands in the same batch; the flush
+        callback (:meth:`_on_completion_batch`) materialises the
+        synthetic ``task_completed`` :class:`ContextEntry` set + emits
+        the proactive announcement.
+        """
+
+        await self._completion_debouncer.schedule(task_id)
+
+    async def _on_completion_batch(self, task_ids: list[str]) -> None:
+        """Flush callback: materialise + announce a batch of completed tasks.
+
+        For every ``task_id`` in the batch we:
+
+        1. Stamp ``delivered_at_turn`` so the same result is never
+           announced twice (PRD acceptance criterion).
+        2. Materialise a synthetic ``task_completed`` :class:`ContextEntry`
+           into the Jarvis thread so subsequent turns see the result as
+           part of history. Recency is *not* computed here — the next
+           turn's STATE block recomputes it at assembly time per PRD.
+        3. Push a single proactive announcement for the batch via the
+           existing :meth:`generate_done_synthesis` flusher. With > 1
+           task we let the flusher render each ``task_id`` in turn; a
+           future enhancement can synthesise a single batched utterance.
+
+        The handler swallows all exceptions per task — a single bad task
+        must not block the batch.
+        """
+
+        for task_id in task_ids:
+            try:
+                self._task_store.set_delivered_at_turn(task_id, self._user_turn_index)
+            except TaskStoreError:
+                _logger.exception(
+                    "orchestrator.completion_delivered_at_failed",
+                    task_id=task_id,
+                )
+                continue
+            try:
+                task = self._task_store.get_task(task_id)
+                # Materialise a synthetic ``task_completed`` row in the
+                # Jarvis thread so the bounded recent-turns window can
+                # carry the result forward. Recency is recomputed at the
+                # next assembly per PRD.
+                synthetic = (
+                    f'[task_completed task_id={task_id} title="{task.title}" '
+                    f"delivered_at_turn={self._user_turn_index}]"
+                )
+                self._jarvis_store.append("system", synthetic)
+            except TaskStoreError:
+                _logger.exception(
+                    "orchestrator.completion_materialise_failed",
+                    task_id=task_id,
+                )
+                continue
+            # Schedule the spoken announcement through the same
+            # proactivity flusher slice #0025 already wires. Multiple
+            # task ids in a batch produce one announcement per task;
+            # the user perceives them as back-to-back deliveries within
+            # the same flush window.
+            await self.generate_proactive_message(task_id, "done")
 
     # --- Proactive flusher ---------------------------------------------------
 
@@ -745,11 +1064,19 @@ class Orchestrator:
             return assembler.assemble(user_message=user_message)
 
         # Bounded providers. Both ``bounded_v1`` (no cross-epoch digest)
-        # and ``bounded_v2`` (with digest) wire the same store-bound
-        # providers; the assembler picks via the policy's
-        # ``provider_ids`` so unused providers are simply not invoked.
+        # and ``bounded_v2`` (STATE + cross-epoch digest, issue 0050)
+        # wire the same store-bound providers; the assembler picks via
+        # the policy's ``provider_ids`` so unused providers are simply
+        # not invoked.
         current_epoch_id = self._current_epoch_id_for_assembly()
         system_provider = SystemBlockProvider(system_content=system_content)
+        state_provider = StateBlockProvider(
+            task_store=self._task_store,
+            state_policy=self._state_policy,
+            recency_policy=self._recency_policy,
+            eviction_strategy=self._eviction_strategy,
+            current_user_turn=self._user_turn_index,
+        )
         digest_provider = CrossEpochDigestProvider(store=self._ensure_digest_store())
         rolling_provider = RollingSummaryProvider(
             store=self._ensure_summary_store(),
@@ -760,6 +1087,7 @@ class Orchestrator:
         assembler = ContextAssembler(
             providers=[
                 system_provider,
+                state_provider,
                 digest_provider,
                 rolling_provider,
                 recent_provider,
@@ -904,11 +1232,27 @@ class Orchestrator:
         )
 
     async def _dispatch_tool_calls(self, tool_calls: list[ToolCall]) -> OrchestratorResponse | None:
+        """Dispatch every tool call; return the :class:`OrchestratorResponse` or ``None``.
+
+        Thin wrapper kept for compatibility with the pre-0048 call
+        sites; the retry path under :meth:`_run_jarvis_turn_with_retry`
+        uses :meth:`_dispatch_tool_calls_with_diagnostics` which also
+        exposes the first dispatch error for validator feedback.
+        """
+
+        response, _err = await self._dispatch_tool_calls_with_diagnostics(tool_calls)
+        return response
+
+    async def _dispatch_tool_calls_with_diagnostics(
+        self,
+        tool_calls: list[ToolCall],
+    ) -> tuple[OrchestratorResponse | None, DispatchResult | None]:
         """Dispatch every tool call through the :class:`ToolDispatcher`.
 
-        Returns the assembled :class:`OrchestratorResponse` describing
-        the turn, or ``None`` when every dispatch errored — the caller
-        then routes through the contract-violation path.
+        Returns ``(response, None)`` when at least one dispatch succeeded
+        and ``(None, first_error)`` when every dispatch errored. The
+        first-error :class:`DispatchResult` is what the retry path
+        feeds back to the LLM under the ``system_validator`` role.
 
         PRD 0006 / issue 0047 unified Jarvis emission: direct replies
         become a ``say`` tool call (the handler persists the assistant
@@ -928,9 +1272,12 @@ class Orchestrator:
         say_speech: str | None = None
         say_ui: Any = None
         any_ok = False
+        first_error: DispatchResult | None = None
         for call in tool_calls:
             result = await self._tool_dispatcher.dispatch(call)
             if not result.ok:
+                if first_error is None:
+                    first_error = result
                 continue
             any_ok = True
             self._collect_dispatch_result(result, spawned, forwarded, cancelled)
@@ -939,7 +1286,7 @@ class Orchestrator:
                 say_ui = result.ui
 
         if not any_ok:
-            return None
+            return None, first_error
 
         # Task confirmations take precedence over a coexisting ``say``
         # call (the prompt forbids both — the priority matches the
@@ -953,24 +1300,30 @@ class Orchestrator:
             else:
                 speech = _SPAWN_CONFIRMATION
             self._jarvis_store.append("assistant", speech)
-            return OrchestratorResponse(
-                speech=speech,
-                ui=[],
-                spawned_task_ids=spawned,
-                forwarded_task_ids=forwarded,
-                cancelled_task_ids=cancelled,
+            return (
+                OrchestratorResponse(
+                    speech=speech,
+                    ui=[],
+                    spawned_task_ids=spawned,
+                    forwarded_task_ids=forwarded,
+                    cancelled_task_ids=cancelled,
+                ),
+                None,
             )
 
         # Pure ``say`` turn. The handler already persisted the assistant
         # row in :class:`JarvisStore`; here we only lift speech + ui
         # into the response shape the WS router consumes.
         assert say_speech is not None
-        return OrchestratorResponse(
-            speech=say_speech,
-            ui=_coerce_say_ui(say_ui),
-            spawned_task_ids=[],
-            forwarded_task_ids=[],
-            cancelled_task_ids=[],
+        return (
+            OrchestratorResponse(
+                speech=say_speech,
+                ui=_coerce_say_ui(say_ui),
+                spawned_task_ids=[],
+                forwarded_task_ids=[],
+                cancelled_task_ids=[],
+            ),
+            None,
         )
 
     def _collect_dispatch_result(

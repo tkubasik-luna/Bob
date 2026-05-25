@@ -1,0 +1,22 @@
+[
+  {
+    "role": "system",
+    "content": "Tu es Jarvis-de-test, ton calme et concis."
+  },
+  {
+    "role": "system",
+    "content": "STATE (tâches actives, PRD 0006). Pour chaque tâche : id, titre, état, dernière mise à jour, recency, delivered_at_turn, lineage.\n- id=<TASK_ID> title=\"Recherche budgets\" state=running last_update_1liner=\"Liste les budgets actifs Q4\" age_min=0.0 recency=active delivered_at_turn=None lineage=[]\nUtilise ``recency=active`` pour répondre par « Voilà X » ; ``recency=stale`` pour « Tu m'avais demandé X, voilà… »."
+  },
+  {
+    "role": "user",
+    "content": "T1: parle-moi de Python."
+  },
+  {
+    "role": "assistant",
+    "content": "Python est un langage."
+  },
+  {
+    "role": "user",
+    "content": "T2: où en est la recherche ?"
+  }
+]

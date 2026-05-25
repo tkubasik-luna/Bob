@@ -22,6 +22,7 @@ from bob.context.providers.cross_epoch_digest import CrossEpochDigestProvider
 from bob.context.providers.legacy_full_history import LegacyFullHistoryProvider
 from bob.context.providers.recent_turns import RecentTurnsProvider
 from bob.context.providers.rolling_summary import RollingSummaryProvider
+from bob.context.providers.state_block import StateBlockProvider
 from bob.context.providers.system_block import SystemBlockProvider
 from bob.context.providers.user_message import UserMessageProvider
 
@@ -30,6 +31,7 @@ __all__ = [
     "LegacyFullHistoryProvider",
     "RecentTurnsProvider",
     "RollingSummaryProvider",
+    "StateBlockProvider",
     "SystemBlockProvider",
     "UserMessageProvider",
 ]

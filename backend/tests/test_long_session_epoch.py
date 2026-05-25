@@ -101,9 +101,16 @@ def _assemble(
     """Compose the bounded-v2 prompt for the live user message."""
 
     from bob.context.provider import ContextProvider
+    from bob.context.providers.state_block import StateBlockProvider
+    from bob.task_store import TaskStore
 
+    # The long-session test never spawns tasks; we still register the
+    # ``state_block`` provider so the v2 policy provider list resolves
+    # (PRD 0006 / issue 0050).
+    task_store = TaskStore(jarvis_store._conn)
     providers: list[ContextProvider] = [
         SystemBlockProvider(system_content=_SYSTEM_PROMPT),
+        StateBlockProvider(task_store=task_store),
         CrossEpochDigestProvider(store=digest_store),
         RollingSummaryProvider(store=summary_store),
         RecentTurnsProvider(jarvis_store=jarvis_store),
