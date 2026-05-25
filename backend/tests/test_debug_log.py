@@ -18,10 +18,12 @@ from bob import debug_log
 from bob.debug_log import (
     DebugEvent,
     clear,
+    current_task_id,
     current_turn_id,
     emit_debug,
     install_structlog_bridge,
     snapshot,
+    start_task,
     start_turn,
     subscribe,
     subscriber_count,
@@ -38,10 +40,12 @@ def _clean_state() -> Iterator[None]:
     # Slice 0039: also reset the ``current_turn_id`` ContextVar so a leftover
     # turn from a previous test does not leak into the next one.
     current_turn_id.set(None)
+    current_task_id.set(None)
     yield
     clear()
     debug_log._subscribers.clear()
     current_turn_id.set(None)
+    current_task_id.set(None)
 
 
 def test_emit_debug_appends_to_ring_buffer() -> None:
@@ -64,6 +68,7 @@ def test_emit_debug_appends_to_ring_buffer() -> None:
     assert event.payload == {"content": "hello"}
     assert event.turn_id is None
     assert event.correlation_id is None
+    assert event.parent_task_id is None
     assert event.replayed is False
 
 
@@ -117,6 +122,7 @@ def test_event_to_dict_matches_wire_envelope() -> None:
         "payload",
         "turn_id",
         "correlation_id",
+        "parent_task_id",
         "replayed",
     }
     assert wire["turn_id"] == "t1"
@@ -550,3 +556,130 @@ def test_emit_debug_with_current_turn_set_propagates_through_bridge(
     matching = [e for e in snapshot() if e.summary == "turn-scoped error"]
     assert len(matching) == 1
     assert matching[0].turn_id == turn_id
+
+
+# ---------------------------------------------------------------------------
+# Slice 0043 — current_task_id ContextVar + parent_task_id propagation
+# ---------------------------------------------------------------------------
+
+
+def test_start_task_sets_context_var_and_returns_reset_token() -> None:
+    assert current_task_id.get() is None
+    token = start_task("task-A")
+    assert current_task_id.get() == "task-A"
+    # The returned token restores the previous value (``None``) when reset.
+    current_task_id.reset(token)
+    assert current_task_id.get() is None
+
+
+def test_emit_debug_captures_parent_task_id_from_context_var() -> None:
+    token = start_task("task-A")
+    try:
+        emit_debug(
+            category="task",
+            severity="info",
+            source="t.parent",
+            summary="inside sub-task",
+        )
+    finally:
+        current_task_id.reset(token)
+
+    [event] = snapshot()
+    assert event.parent_task_id == "task-A"
+
+
+def test_emit_debug_orphan_has_no_turn_no_parent_task() -> None:
+    """Outside any turn / task scope the event carries both ids as ``None``."""
+
+    emit_debug(
+        category="system",
+        severity="info",
+        source="t.orphan",
+        summary="lonely",
+    )
+
+    [event] = snapshot()
+    assert event.turn_id is None
+    assert event.parent_task_id is None
+
+
+def test_start_task_reset_token_restores_previous_task_for_nesting() -> None:
+    """Nested start_task / reset round-trips correctly (sub-task spawns sub-task)."""
+
+    outer = start_task("task-A")
+    assert current_task_id.get() == "task-A"
+    inner = start_task("task-B")
+    assert current_task_id.get() == "task-B"
+
+    # Emit while task-B is active: parent_task_id == B.
+    emit_debug(category="task", severity="info", source="t.nest", summary="inner")
+    current_task_id.reset(inner)
+    # After reset we're back to task-A.
+    assert current_task_id.get() == "task-A"
+    emit_debug(category="task", severity="info", source="t.nest", summary="outer")
+    current_task_id.reset(outer)
+    assert current_task_id.get() is None
+
+    events = snapshot()
+    by_summary = {e.summary: e.parent_task_id for e in events}
+    assert by_summary["inner"] == "task-B"
+    assert by_summary["outer"] == "task-A"
+
+
+@pytest.mark.asyncio
+async def test_parent_task_id_inherited_by_spawned_coroutine() -> None:
+    """``asyncio.create_task`` snapshots context — child coroutines inherit task id."""
+
+    token = start_task("task-A")
+    try:
+
+        async def _emit_from_child() -> None:
+            emit_debug(
+                category="task",
+                severity="info",
+                source="t.spawn",
+                summary="from child",
+            )
+
+        child = asyncio.create_task(_emit_from_child())
+        await child
+    finally:
+        current_task_id.reset(token)
+
+    [event] = snapshot()
+    assert event.parent_task_id == "task-A"
+
+
+@pytest.mark.asyncio
+async def test_two_level_nesting_via_spawned_subtasks() -> None:
+    """Sub-task A spawns sub-task B → B's events carry parent_task_id == B.
+
+    The model is that ``start_task`` is called at the entry of each
+    sub-task's runner. The *immediate* enclosing sub-task is what
+    ``parent_task_id`` records — exactly like ``current_turn_id`` records
+    the immediate enclosing turn.
+    """
+
+    async def _sub_b() -> None:
+        token = start_task("task-B")
+        try:
+            emit_debug(category="task", severity="info", source="t.B", summary="B")
+        finally:
+            current_task_id.reset(token)
+
+    async def _sub_a() -> None:
+        token = start_task("task-A")
+        try:
+            emit_debug(category="task", severity="info", source="t.A", summary="A")
+            await asyncio.create_task(_sub_b())
+            # After B finished its scope, we're still in A.
+            emit_debug(category="task", severity="info", source="t.A2", summary="A-after-B")
+        finally:
+            current_task_id.reset(token)
+
+    await _sub_a()
+
+    by_summary = {e.summary: e.parent_task_id for e in snapshot()}
+    assert by_summary["A"] == "task-A"
+    assert by_summary["B"] == "task-B"
+    assert by_summary["A-after-B"] == "task-A"

@@ -61,7 +61,7 @@ import logging
 import uuid
 from collections import deque
 from collections.abc import AsyncGenerator
-from contextvars import ContextVar
+from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Literal
@@ -89,6 +89,17 @@ _SUBSCRIBER_QUEUE_MAXSIZE = 500
 # pass ``turn_id=`` explicitly.
 current_turn_id: ContextVar[str | None] = ContextVar("current_turn_id", default=None)
 
+# Slice 0043: parallel ContextVar for the *currently-executing sub-task id*.
+# Set via :func:`start_task` at the entry of ``SubAgentRunner.run`` so every
+# :func:`emit_debug` triggered within the sub-task (LLM calls, progress / done
+# / ask_user / fail handlers, anything spawned via :func:`asyncio.create_task`)
+# inherits the id as ``parent_task_id``. When a sub-task itself spawns another
+# sub-task, the nested ``start_task`` shadows the parent via reset-token so
+# the inner sub-task's events carry the *immediate* parent. Default ``None``
+# means "no enclosing sub-task" → ``parent_task_id`` on the event stays
+# ``None`` (top-level orchestrator turn or pure system event).
+current_task_id: ContextVar[str | None] = ContextVar("current_task_id", default=None)
+
 
 @dataclass(frozen=True)
 class DebugEvent:
@@ -113,6 +124,11 @@ class DebugEvent:
       it explicitly.
     - ``correlation_id``: optional UUID linking ``*_start`` / ``*_end``
       pairs for long ops (LLM calls, sub-task runs).
+    - ``parent_task_id``: optional id of the *enclosing sub-task* when the
+      event was emitted from inside a :class:`SubAgentRunner.run` scope —
+      slice 0043 auto-fills this from the ``current_task_id`` ContextVar.
+      ``None`` for events emitted at the orchestrator level or outside any
+      sub-task context.
     - ``replayed``: ``True`` when the event was yielded from the ring
       buffer snapshot at subscribe time, ``False`` for live emits.
     """
@@ -125,6 +141,7 @@ class DebugEvent:
     payload: dict[str, Any] = field(default_factory=dict)
     turn_id: str | None = None
     correlation_id: str | None = None
+    parent_task_id: str | None = None
     replayed: bool = False
 
     def to_dict(self) -> dict[str, Any]:
@@ -139,6 +156,7 @@ class DebugEvent:
             "payload": self.payload,
             "turn_id": self.turn_id,
             "correlation_id": self.correlation_id,
+            "parent_task_id": self.parent_task_id,
             "replayed": self.replayed,
         }
 
@@ -158,6 +176,7 @@ class DebugEvent:
             payload=self.payload,
             turn_id=self.turn_id,
             correlation_id=self.correlation_id,
+            parent_task_id=self.parent_task_id,
             replayed=replayed,
         )
 
@@ -198,6 +217,27 @@ def start_turn() -> str:
     return turn_id
 
 
+def start_task(task_id: str) -> Token[str | None]:
+    """Install ``task_id`` in the :data:`current_task_id` ContextVar.
+
+    Symmetric to :func:`start_turn` but the caller already owns the id (the
+    sub-task row was created by the orchestrator before scheduling). Returns
+    the :class:`Token` produced by ``set`` so the caller can restore the
+    previous value via ``current_task_id.reset(token)`` in a ``finally`` —
+    this guarantees correct nesting when a sub-task spawns another sub-task
+    inside the same execution context (e.g. tests).
+
+    Slice 0043: :class:`SubAgentRunner.run` wraps its body in
+    ``token = start_task(task_id); try: ... finally: current_task_id.reset(token)``
+    so every :func:`emit_debug` inside the run inherits the id as
+    ``parent_task_id``. Coroutines spawned via :func:`asyncio.create_task`
+    snapshot the calling context (standard ``contextvars`` semantics) and
+    inherit the value automatically.
+    """
+
+    return current_task_id.set(task_id)
+
+
 def emit_debug(
     *,
     category: DebugCategory,
@@ -226,6 +266,11 @@ def emit_debug(
     """
 
     effective_turn_id = turn_id if turn_id is not None else current_turn_id.get()
+    # Slice 0043: ``parent_task_id`` is always read from the ContextVar —
+    # there is no explicit override at the call site today (no producer
+    # wants to forge a fake parent). Orphan events outside any
+    # ``start_task`` scope keep the default ``None``.
+    effective_parent_task_id = current_task_id.get()
 
     event = DebugEvent(
         ts=_now_iso(),
@@ -236,6 +281,7 @@ def emit_debug(
         payload=payload if payload is not None else {},
         turn_id=effective_turn_id,
         correlation_id=correlation_id,
+        parent_task_id=effective_parent_task_id,
         replayed=False,
     )
     _buffer.append(event)

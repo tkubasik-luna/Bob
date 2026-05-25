@@ -63,7 +63,7 @@ from typing import Any
 import structlog
 
 from bob import ws_events
-from bob.debug_log import emit_debug
+from bob.debug_log import current_task_id, emit_debug, start_task
 from bob.event_bus import EventBus, get_event_bus
 from bob.llm_client import LLMClient
 from bob.task_store import Task, TaskStore, TaskStoreError
@@ -196,6 +196,19 @@ class SubAgentRunner:
         :data:`MAX_PROGRESS_ITERATIONS` guards against infinite loops.
         """
 
+        # Slice 0043: install ``task_id`` in the ``current_task_id`` ContextVar
+        # for the lifetime of this ``run`` so every ``emit_debug`` triggered
+        # inside (this method, the LLM client, the progress/done/ask_user/fail
+        # handlers, anything spawned via ``asyncio.create_task``) inherits the
+        # id as ``parent_task_id``. The reset-token guarantees correct nesting
+        # if a sub-task itself triggers another sub-task in the same context.
+        token = start_task(task_id)
+        try:
+            await self._run(task_id)
+        finally:
+            current_task_id.reset(token)
+
+    async def _run(self, task_id: str) -> None:
         try:
             task = self._task_store.get_task(task_id)
         except TaskStoreError:

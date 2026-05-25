@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from bob import ws_events
+from bob import debug_log, ws_events
 from bob.db.migrations_runner import apply_migrations, default_migrations_dir
 from bob.event_bus import EventBus
 from bob.llm.types import LLMResponse, ToolDefinition
@@ -532,3 +532,58 @@ async def test_progress_does_not_trigger_proactivity_handler() -> None:
     assert len(progress_added) == 2
     assert all(p["role"] == "assistant" for p in progress_added)
     assert all(p["task_id"] == task_id for p in progress_added)
+
+
+# ---------------------------------------------------------------------------
+# Slice 0043 — parent_task_id propagation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_runner_emits_debug_events_with_parent_task_id() -> None:
+    """Every debug event emitted by the runner carries ``parent_task_id == task_id``.
+
+    Covers the happy path: a single ``done`` action emits the ``_handle_done``
+    debug event with the parent id set. The wrapper ``start_task`` /
+    ``current_task_id.reset`` is symmetric so after ``run`` returns the
+    ContextVar is restored to ``None``.
+    """
+
+    # Reset the ring buffer + ContextVar so this test sees only its emits.
+    debug_log.clear()
+    debug_log.current_task_id.set(None)
+
+    store = _make_store()
+    task_id = _make_running_task(store)
+
+    client = _ScriptedClient(chat_value='{"action": "done", "result": "ok"}')
+    runner = SubAgentRunner(subagent_client=client, task_store=store, event_bus=EventBus())
+    await runner.run(task_id)
+
+    # After run returns, the wrapper restored the previous (None) value.
+    assert debug_log.current_task_id.get() is None
+
+    events = [e for e in debug_log.snapshot() if e.source.startswith("bob.sub_agent_runner")]
+    assert len(events) >= 1
+    assert all(e.parent_task_id == task_id for e in events)
+
+
+@pytest.mark.asyncio
+async def test_runner_failure_path_emits_debug_with_parent_task_id() -> None:
+    """The ``_fail`` debug event also carries the parent task id."""
+
+    debug_log.clear()
+    debug_log.current_task_id.set(None)
+
+    store = _make_store()
+    task_id = _make_running_task(store)
+
+    client = _ScriptedClient(chat_exc=RuntimeError("kaboom"))
+    runner = SubAgentRunner(subagent_client=client, task_store=store, event_bus=EventBus())
+    await runner.run(task_id)
+
+    fail_events = [e for e in debug_log.snapshot() if e.source.endswith("._fail")]
+    assert len(fail_events) == 1
+    assert fail_events[0].parent_task_id == task_id
+    # And the ContextVar is restored.
+    assert debug_log.current_task_id.get() is None

@@ -43,6 +43,7 @@ def test_ws_debug_replays_buffered_events_on_connect() -> None:
             "payload",
             "turn_id",
             "correlation_id",
+            "parent_task_id",
             "replayed",
         }
 
