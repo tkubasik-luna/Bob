@@ -1,0 +1,25 @@
+-- 0005 — Add ``lineage`` JSON column on ``tasks`` for PRD 0006 (Jarvis v2).
+--
+-- Issue 0044 introduces the ToolRegistry + ToolDispatcher pattern and lays the
+-- ground for the future ``replan_task`` tool. A replan operation cancels the
+-- current task and respawns a fresh one whose ``lineage`` list carries the
+-- chain of replaced task ids ([old_id, older_id, ...]). Existing tasks have
+-- never been replanned and therefore default to an empty list.
+--
+-- We store the list as a JSON-text column (sqlite ``TEXT``) so callers can
+-- ``json.loads`` it back into a Python list at read time. Defaulting at the
+-- column level keeps existing rows valid without a follow-up UPDATE.
+--
+-- Idempotency: like every other migration in this folder, the runner
+-- (``bob.db.migrations_runner``) tracks applied filenames in ``_migrations``
+-- so re-running at the file level is a no-op. SQLite's ``ALTER TABLE … ADD
+-- COLUMN`` is not natively idempotent but the runner gates this script
+-- entirely.
+--
+-- Down migration (manual, documentation only):
+--   DELETE FROM _migrations WHERE filename = '0005_tasks_lineage.sql';
+--   -- and rebuild ``tasks`` without ``lineage`` via the standard sqlite
+--   -- ``CREATE TABLE tasks_old; INSERT INTO …; DROP TABLE …; ALTER RENAME``
+--   -- dance. Not expected in production — leaving the column around is free.
+
+ALTER TABLE tasks ADD COLUMN lineage TEXT NOT NULL DEFAULT '[]';

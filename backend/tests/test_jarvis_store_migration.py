@@ -72,17 +72,27 @@ def test_migration_backfills_existing_rows() -> None:
     )
     conn.commit()
 
-    # Pretend the runner has applied 0001-0003 — record them in the
-    # bookkeeping table so apply_migrations skips them and runs only 0004.
+    # Pretend the runner has applied 0001-0003 and every newer migration
+    # that targets tables this test does not create (the ``tasks`` table
+    # lives in 0002 and is referenced by 0005+ migrations). Recording
+    # them as already-applied lets ``apply_migrations`` skip them and
+    # focus purely on 0004's backfill behavior.
     conn.execute(
         "CREATE TABLE IF NOT EXISTS _migrations("
         "filename TEXT PRIMARY KEY, applied_at TEXT NOT NULL)"
     )
-    for prior_filename in (
+    pre_recorded = {
         "0001_jarvis_messages.sql",
         "0002_tasks.sql",
         "0003_tasks_dismissed.sql",
-    ):
+    }
+    # Pre-record every migration in the bundle except 0004 so newer
+    # migrations (0005, 0006, …) cannot crash on missing tables.
+    for path in sorted(default_migrations_dir().glob("*.sql")):
+        if path.name == "0004_jarvis_messages_context_entry.sql":
+            continue
+        pre_recorded.add(path.name)
+    for prior_filename in sorted(pre_recorded):
         conn.execute(
             "INSERT OR IGNORE INTO _migrations(filename, applied_at) VALUES (?, datetime('now'))",
             (prior_filename,),

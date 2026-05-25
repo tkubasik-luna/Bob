@@ -17,10 +17,12 @@ workers cannot interleave statements.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 import uuid
-from dataclasses import dataclass
+from collections.abc import Sequence
+from dataclasses import dataclass, field
 from typing import Literal
 
 TaskState = Literal["pending", "running", "waiting_input", "done", "failed"]
@@ -38,6 +40,12 @@ class Task:
     side are surfaced as ``str | None``. ``dismissed`` is the slice #0024
     "user hid this row from the sidebar" flag — preserved in SQLite so
     history stays intact while the live sidebar can be cleaned.
+
+    ``lineage`` (PRD 0006 / issue 0044) is the ordered list of task ids that
+    a future ``replan_task`` tool would chain together: when a task is
+    replanned, the new task is created with the previous chain ([old_id, …])
+    so the audit trail survives across cancel/respawn cycles. Empty list for
+    tasks created by the v1 (today's) flow.
     """
 
     id: str
@@ -50,6 +58,7 @@ class Task:
     created_at: str
     updated_at: str
     dismissed: bool
+    lineage: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -95,15 +104,23 @@ class TaskStore:
         title: str,
         goal: str,
         parent_task_id: str | None = None,
+        lineage: Sequence[str] | None = None,
     ) -> str:
-        """Insert a new task in ``pending`` state and return its id."""
+        """Insert a new task in ``pending`` state and return its id.
+
+        ``lineage`` (PRD 0006 / issue 0044) defaults to an empty list. A
+        future ``replan_task`` tool will pass the previous task chain when
+        spawning the replacement.
+        """
 
         task_id = uuid.uuid4().hex
+        lineage_json = json.dumps(list(lineage) if lineage else [])
         with self._lock, self._conn:
             self._conn.execute(
-                "INSERT INTO tasks(id, title, goal, state, needs_attention, parent_task_id)"
-                " VALUES (?, ?, ?, 'pending', 0, ?)",
-                (task_id, title, goal, parent_task_id),
+                "INSERT INTO tasks"
+                "(id, title, goal, state, needs_attention, parent_task_id, lineage)"
+                " VALUES (?, ?, ?, 'pending', 0, ?, ?)",
+                (task_id, title, goal, parent_task_id, lineage_json),
             )
         return task_id
 
@@ -118,7 +135,7 @@ class TaskStore:
         with self._lock:
             cursor = self._conn.execute(
                 "SELECT id, title, goal, state, needs_attention, result, parent_task_id,"
-                " created_at, updated_at, dismissed FROM tasks WHERE id = ?",
+                " created_at, updated_at, dismissed, lineage FROM tasks WHERE id = ?",
                 (task_id,),
             )
             row = cursor.fetchone()
@@ -143,7 +160,7 @@ class TaskStore:
 
         query = (
             "SELECT id, title, goal, state, needs_attention, result, parent_task_id,"
-            " created_at, updated_at, dismissed FROM tasks"
+            " created_at, updated_at, dismissed, lineage FROM tasks"
         )
         where: list[str] = []
         params: list[object] = []
@@ -299,6 +316,7 @@ def _row_to_task(row: tuple[object, ...]) -> Task:
         created_at,
         updated_at,
         dismissed,
+        lineage_raw,
     ) = row
     assert isinstance(id_, str)
     assert isinstance(title, str)
@@ -310,6 +328,8 @@ def _row_to_task(row: tuple[object, ...]) -> Task:
     assert isinstance(created_at, str)
     assert isinstance(updated_at, str)
     assert isinstance(dismissed, int)
+    assert isinstance(lineage_raw, str)
+    lineage = _decode_lineage(lineage_raw)
     # ``state`` is constrained by the SQL CHECK to the TaskState set — the
     # cast to the Literal alias is safe.
     return Task(
@@ -323,7 +343,26 @@ def _row_to_task(row: tuple[object, ...]) -> Task:
         created_at=created_at,
         updated_at=updated_at,
         dismissed=bool(dismissed),
+        lineage=lineage,
     )
+
+
+def _decode_lineage(raw: str) -> list[str]:
+    """Decode the ``lineage`` JSON-text column into a ``list[str]``.
+
+    The migration in ``0005_tasks_lineage.sql`` defaults the column to
+    ``'[]'`` so any row stored before the migration is consistent. We still
+    guard against legacy / corrupted values by collapsing to ``[]`` —
+    lineage is metadata, never load-bearing for the task-execution path.
+    """
+
+    try:
+        decoded = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(decoded, list):
+        return []
+    return [item for item in decoded if isinstance(item, str)]
 
 
 # --- Singleton plumbing -------------------------------------------------------
