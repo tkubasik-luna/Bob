@@ -75,6 +75,9 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     data_dir.mkdir(parents=True, exist_ok=True)
 
     db_path = data_dir / _DB_FILENAME
+    if settings.BOB_CLEAR_ON_START and db_path.exists():
+        db_path.unlink()
+        _logger.info("bob.cache_cleared", db_path=str(db_path))
     conn = _open_database(str(db_path))
     apply_migrations(conn, default_migrations_dir())
 

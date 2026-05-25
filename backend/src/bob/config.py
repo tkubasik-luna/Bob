@@ -90,6 +90,12 @@ class Settings(BaseSettings):
     # tmp path; the boot path in :mod:`bob.main` ensures the directory exists.
     BOB_DATA_DIR: Path = Path.home() / ".bob"
 
+    # When true, the lifespan wipes ``{BOB_DATA_DIR}/bob.db`` before opening it
+    # so every server start sees a fresh Jarvis thread + empty task list.
+    # ``jarvis.md`` (personality) and ``logs/*.jsonl`` (audit) are preserved.
+    # Tests set this to ``false`` in ``conftest.py`` to keep existing fixtures.
+    BOB_CLEAR_ON_START: bool = True
+
     # Kokoro TTS — local engine via the upstream ``kokoro`` (KPipeline) package.
     # Model weights are downloaded by Hugging Face's cache the first time the
     # pipeline is instantiated (``hexgrad/Kokoro-82M``); no manual artifacts.

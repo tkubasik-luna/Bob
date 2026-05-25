@@ -191,7 +191,30 @@ class LMStudioClient(LLMClient):
             raise
         latency_ms = (time.perf_counter() - started) * 1000.0
 
-        message = completion.choices[0].message
+        choices = getattr(completion, "choices", None)
+        if not choices:
+            emit_debug(
+                category="llm",
+                severity="error",
+                source="bob.llm_client.chat",
+                summary=f"LLM call returned no choices ({latency_ms:.0f}ms)",
+                payload={
+                    "model": self._settings.LLM_MODEL,
+                    "base_url": self._settings.LLM_BASE_URL,
+                    "latency_ms": latency_ms,
+                    "raw_completion": completion.model_dump()
+                    if hasattr(completion, "model_dump")
+                    else repr(completion),
+                    "session_id": session_id,
+                },
+                correlation_id=correlation_id,
+            )
+            raise LLMClientError(
+                "LLM endpoint returned no choices — response is not OpenAI-compatible. "
+                f"Check LLM_BASE_URL={self._settings.LLM_BASE_URL!r} "
+                "(LM Studio expects the '/v1' suffix, e.g. http://host:1234/v1)."
+            )
+        message = choices[0].message
         content = message.content or ""
         if not content:
             content = getattr(message, "reasoning_content", "") or ""
@@ -307,7 +330,30 @@ class LMStudioClient(LLMClient):
             raise
         latency_ms = (time.perf_counter() - started) * 1000.0
 
-        message = completion.choices[0].message
+        choices = getattr(completion, "choices", None)
+        if not choices:
+            emit_debug(
+                category="llm",
+                severity="error",
+                source="bob.llm_client.complete",
+                summary=f"LLM call returned no choices ({latency_ms:.0f}ms)",
+                payload={
+                    "model": self._settings.LLM_MODEL,
+                    "base_url": self._settings.LLM_BASE_URL,
+                    "latency_ms": latency_ms,
+                    "raw_completion": completion.model_dump()
+                    if hasattr(completion, "model_dump")
+                    else repr(completion),
+                    "session_id": session_id,
+                },
+                correlation_id=correlation_id,
+            )
+            raise LLMClientError(
+                "LLM endpoint returned no choices — response is not OpenAI-compatible. "
+                f"Check LLM_BASE_URL={self._settings.LLM_BASE_URL!r} "
+                "(LM Studio expects the '/v1' suffix, e.g. http://host:1234/v1)."
+            )
+        message = choices[0].message
         raw_tool_calls = getattr(message, "tool_calls", None) or []
         tool_calls: list[ToolCall] = []
         for raw_call in raw_tool_calls:

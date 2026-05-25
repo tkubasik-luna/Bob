@@ -26,6 +26,12 @@ os.environ.setdefault("LLM_BASE_URL", "http://localhost:1234/v1")
 os.environ.setdefault("LLM_MODEL", "test-model")
 os.environ.setdefault("LLM_API_KEY", "test-key")
 
+# Tests manage their own DB lifecycle via the ``clear_jarvis_history`` fixture
+# and expect bob.db to persist across lifespan reuse inside a single test
+# (e.g. seeding state outside the TestClient, then starting it). Disable the
+# auto-wipe so existing fixtures stay valid.
+os.environ.setdefault("BOB_CLEAR_ON_START", "false")
+
 
 @pytest.fixture()
 def clear_jarvis_history() -> Iterator[None]:
