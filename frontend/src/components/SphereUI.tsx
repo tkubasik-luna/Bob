@@ -14,6 +14,32 @@ import { MuteToggle } from "./sphere/MuteToggle";
 import { TranscriptLine } from "./sphere/TranscriptLine";
 import { SphereWsContext } from "./sphere/sphereWsContext";
 
+/** Cmd+Shift+D toggles the dedicated debug window (PRD 0005). The listener
+ * is window-scoped (only fires while the Sphere window has focus) and
+ * ignores key events that originated inside text inputs so the user can
+ * type a literal `D` in the InputField without opening the debug view. The
+ * Tauri command lives in `src-tauri/src/lib.rs` and is registered with the
+ * builder. Importing `@tauri-apps/api/core` works fine in browser-only dev
+ * (`pnpm dev`); the dynamic import lets us no-op the invocation if Tauri
+ * isn't available so the web preview doesn't crash. */
+async function invokeToggleDebugWindow(): Promise<void> {
+  try {
+    const tauri = await import("@tauri-apps/api/core");
+    await tauri.invoke("toggle_debug_window");
+  } catch {
+    // Not running inside Tauri (e.g. `pnpm dev` web preview) — silently
+    // swallow. The multi-window plumbing only exists in `pnpm tauri dev`.
+  }
+}
+
+function isEditableTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  const tag = target.tagName;
+  if (tag === "INPUT" || tag === "TEXTAREA") return true;
+  if (target.isContentEditable) return true;
+  return false;
+}
+
 // V1 locked props per PRD 0004: warm + calm + liquid mercury. Those locked
 // defaults now live in `devTweaksStore` so dev mode (`?dev=1`) can flip
 // motion / glow / variant / mood / theme at runtime via `<DevControls />`
@@ -57,6 +83,22 @@ export function SphereUI() {
   const messages = useChatStore((s) => s.messages);
   const tasks = useChatStore((s) => s.tasks);
   const [overlayContent, setOverlayContent] = useState<string | null>(null);
+  // PRD 0005 — Cmd+Shift+D toggles the dedicated debug window. The listener
+  // attaches at mount and unattaches on unmount; the guard rejects key
+  // events whose target is a text input so the user can still type `D`
+  // while composing a message. `event.code === "KeyD"` is keyboard-layout
+  // agnostic (matches the physical key, not the produced character).
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!event.metaKey || !event.shiftKey) return;
+      if (event.code !== "KeyD") return;
+      if (isEditableTarget(event.target)) return;
+      event.preventDefault();
+      void invokeToggleDebugWindow();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
   // Dedup keys for already-evaluated sources. Keying by id (not content) means:
   // once the user dismisses the overlay via Esc / X / backdrop / DISMISS, the
   // effect won't reopen the same source even though `overlayContent` flips

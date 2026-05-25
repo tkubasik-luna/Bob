@@ -61,6 +61,7 @@ from bob import response_parser, task_scheduler, ws_events
 from bob import task_store as task_store_module
 from bob import ui_registry as ui_registry_module
 from bob.config import get_settings
+from bob.debug_log import emit_debug
 from bob.jarvis_store import JarvisStore
 from bob.llm.types import ToolDefinition
 from bob.llm_client import LLMClient
@@ -303,6 +304,18 @@ class Orchestrator:
         user_content: str,
     ) -> OrchestratorResponse:
         """Run one full turn — may spawn 0..N sub-tasks or forward to one before replying."""
+
+        # Debug view (PRD 0005, slice 0038): emit a single input event at the
+        # entry of every user turn so the debug feed shows "user envoie:" lines
+        # in real time. ``turn_id`` propagation via ``contextvars`` arrives in
+        # slice 0039; for now we leave it ``None``.
+        emit_debug(
+            category="input",
+            severity="info",
+            source="orchestrator.process_user_message",
+            summary=f'User envoie: "{user_content[:80]}"',
+            payload={"content": user_content},
+        )
 
         self._jarvis_state = "thinking"
         try:

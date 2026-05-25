@@ -43,6 +43,7 @@ from bob.sub_agent_runner import SubAgentRunner
 from bob.task_scheduler import build_default_scheduler
 from bob.task_store import TaskStore
 from bob.tts_service import get_default_tts_service
+from bob.ws_debug import router as ws_debug_router
 from bob.ws_router import router as ws_router
 
 configure_logging()
@@ -138,6 +139,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(title="Bob backend", lifespan=lifespan)
 app.include_router(ws_router)
+app.include_router(ws_debug_router)
 app.include_router(debug_router)
 
 
