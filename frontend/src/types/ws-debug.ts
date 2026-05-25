@@ -9,6 +9,56 @@ export type DebugCategory = "input" | "llm" | "decision" | "task" | "output" | "
 
 export type DebugSeverity = "trace" | "debug" | "info" | "warn" | "error";
 
+/**
+ * Ordered tuple of all 7 categories. Single source of truth for both the
+ * toolbar chip iteration and the default filter set construction. Frozen
+ * `as const` so callers get the literal-union element type via `[number]`.
+ */
+export const DEBUG_CATEGORIES = [
+  "input",
+  "llm",
+  "decision",
+  "task",
+  "output",
+  "voice",
+  "system",
+] as const satisfies readonly DebugCategory[];
+
+/**
+ * Ordered tuple of severities from lowest (most verbose) to highest. Drives
+ * both the `<select>` dropdown order and the `SEVERITY_ORDER` index map used
+ * for `>=` comparison when filtering.
+ */
+export const DEBUG_SEVERITIES = [
+  "trace",
+  "debug",
+  "info",
+  "warn",
+  "error",
+] as const satisfies readonly DebugSeverity[];
+
+/**
+ * Numeric rank of each severity, lowest-to-highest. An event passes the
+ * threshold when `SEVERITY_ORDER[event.severity] >= SEVERITY_ORDER[threshold]`.
+ */
+export const SEVERITY_ORDER: Record<DebugSeverity, number> = {
+  trace: 0,
+  debug: 1,
+  info: 2,
+  warn: 3,
+  error: 4,
+};
+
+/**
+ * UI-side filter state for the debug feed. Owned by `DebugView` in v1 — see
+ * `issues/0040-debug-view-toolbar.md` for the rationale. Defaults: every
+ * category ON, severity threshold `info` (so `trace`/`debug` are hidden).
+ */
+export type DebugFilters = {
+  categoriesOn: ReadonlySet<DebugCategory>;
+  severityThreshold: DebugSeverity;
+};
+
 export type DebugEvent = {
   /** ISO 8601 UTC instant with millisecond precision, e.g. `2026-05-25T14:23:01.123Z`. */
   ts: string;
