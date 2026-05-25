@@ -44,6 +44,7 @@ import structlog
 
 from bob import ws_events
 from bob.config import Settings
+from bob.debug_log import emit_debug
 from bob.task_store import TaskStore, TaskStoreError
 
 _logger = structlog.get_logger(__name__)
@@ -272,6 +273,21 @@ class TaskScheduler:
             )
             return
 
+        # Slice 0039: surface the cancellation as a task-category debug event
+        # before we proceed with the state-specific cleanup.
+        emit_debug(
+            category="task",
+            severity="info",
+            source="bob.task_scheduler.cancel",
+            summary=f"Sub-task '{task.title}' annulée",
+            payload={
+                "task_id": task_id,
+                "title": task.title,
+                "reason": reason,
+                "previous_state": task.state,
+            },
+        )
+
         if task.state in ("pending", "waiting_input"):
             # No asyncio task to cancel — just persist the failure state.
             await self._finalize_cancelled(task_id, reason=reason)
@@ -341,6 +357,19 @@ class TaskScheduler:
             await self._release_slot(task_id)
             return
 
+        emit_debug(
+            category="task",
+            severity="info",
+            source="bob.task_scheduler._activate",
+            summary=f"Sub-task '{task.title}' démarre",
+            payload={
+                "task_id": task_id,
+                "title": task.title,
+                "running": len(self._running),
+                "cap": self._cap,
+            },
+        )
+
         await ws_events.emit(
             {
                 "type": "task_updated",
@@ -351,6 +380,14 @@ class TaskScheduler:
             }
         )
 
+        # Slice 0039: the runner coroutine inherits the ``current_turn_id``
+        # ContextVar from the calling context. When ``_activate`` is invoked
+        # synchronously from inside ``Orchestrator.process_user_message``, the
+        # sub-task's ``llm`` / ``task`` events stay grouped under the parent
+        # turn — that's the whole point of the ContextVar propagation slice
+        # 0039 wires. The follow-up promotion path (``on_task_terminated``)
+        # runs outside the original turn and gets a fresh None ``turn_id``,
+        # which is the correct behaviour for a tail-of-queue runner.
         runner_coro = self._runner_factory(task_id)
         runner_task = asyncio.create_task(runner_coro)
         # Slice #0023 — track the asyncio handle so :meth:`cancel` can call

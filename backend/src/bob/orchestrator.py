@@ -61,7 +61,7 @@ from bob import response_parser, task_scheduler, ws_events
 from bob import task_store as task_store_module
 from bob import ui_registry as ui_registry_module
 from bob.config import get_settings
-from bob.debug_log import emit_debug
+from bob.debug_log import emit_debug, start_turn
 from bob.jarvis_store import JarvisStore
 from bob.llm.types import ToolDefinition
 from bob.llm_client import LLMClient
@@ -305,21 +305,32 @@ class Orchestrator:
     ) -> OrchestratorResponse:
         """Run one full turn — may spawn 0..N sub-tasks or forward to one before replying."""
 
-        # Debug view (PRD 0005, slice 0038): emit a single input event at the
-        # entry of every user turn so the debug feed shows "user envoie:" lines
-        # in real time. ``turn_id`` propagation via ``contextvars`` arrives in
-        # slice 0039; for now we leave it ``None``.
+        # Debug view (PRD 0005, slice 0039): generate a fresh turn_id and
+        # install it in the ContextVar BEFORE the first ``emit_debug`` call so
+        # every subsequent event in this turn — including those emitted by
+        # sub-tasks spawned via ``asyncio.create_task`` from within the turn —
+        # inherits the same id automatically through ``contextvars``.
+        start_turn()
+
         emit_debug(
             category="input",
             severity="info",
             source="orchestrator.process_user_message",
             summary=f'User envoie: "{user_content[:80]}"',
-            payload={"content": user_content},
+            payload={"content": user_content, "session_id": session_id},
         )
 
         self._jarvis_state = "thinking"
         try:
             self._jarvis_store.append("user", user_content)
+
+            emit_debug(
+                category="decision",
+                severity="info",
+                source="orchestrator.process_user_message",
+                summary="Jarvis réfléchit",
+                payload={"session_id": session_id},
+            )
 
             system_content = self._build_system_prompt()
             waiting_context = self._build_waiting_input_addendum()
@@ -334,6 +345,18 @@ class Orchestrator:
                 messages,
                 tools=[_SPAWN_SUBTASK_TOOL, _FORWARD_TO_SUBTASK_TOOL, _CANCEL_SUBTASK_TOOL],
                 session_id=session_id,
+            )
+
+            emit_debug(
+                category="decision",
+                severity="info",
+                source="orchestrator.process_user_message",
+                summary="Jarvis a fini de réfléchir",
+                payload={
+                    "session_id": session_id,
+                    "is_tool_call": decision.is_tool_call,
+                    "tool_call_count": len(decision.tool_calls),
+                },
             )
 
             if decision.is_tool_call:
@@ -354,6 +377,20 @@ class Orchestrator:
                     else:
                         speech = _SPAWN_CONFIRMATION
                     self._jarvis_store.append("assistant", speech)
+                    emit_debug(
+                        category="output",
+                        severity="info",
+                        source="orchestrator.process_user_message",
+                        summary=f'Bob répond: "{speech[:80]}"',
+                        payload={
+                            "speech": speech,
+                            "ui": [],
+                            "proactive": False,
+                            "spawned_task_ids": spawned_task_ids,
+                            "forwarded_task_ids": forwarded_task_ids,
+                            "cancelled_task_ids": cancelled_task_ids,
+                        },
+                    )
                     return OrchestratorResponse(
                         speech=speech,
                         ui=[],
@@ -369,10 +406,22 @@ class Orchestrator:
                     tool_call_count=len(decision.tool_calls),
                 )
 
-            return await self._reply_with_structured_response(
+            response = await self._reply_with_structured_response(
                 session_id=session_id,
                 base_messages=self._rebuild_chat_messages(system_content),
             )
+            emit_debug(
+                category="output",
+                severity="info",
+                source="orchestrator.process_user_message",
+                summary=f'Bob répond: "{response.speech[:80]}"',
+                payload={
+                    "speech": response.speech,
+                    "ui": [component.model_dump() for component in response.ui],
+                    "proactive": False,
+                },
+            )
+            return response
         finally:
             self._jarvis_state = "idle"
 
@@ -594,6 +643,18 @@ class Orchestrator:
         # part of the conversation history.
         self._jarvis_store.append("assistant", text)
 
+        emit_debug(
+            category="output",
+            severity="info",
+            source="orchestrator._push_proactive_assistant_msg",
+            summary=f'Bob répond: "{text[:80]}"',
+            payload={
+                "speech": text,
+                "ui": [],
+                "proactive": True,
+            },
+        )
+
         await ws_events.emit(
             {
                 "type": "assistant_msg",
@@ -715,6 +776,17 @@ class Orchestrator:
 
         task_id = self._task_store.create_task(title=title, goal=goal)
         created = self._task_store.get_task(task_id)
+        emit_debug(
+            category="decision",
+            severity="info",
+            source="orchestrator._dispatch_spawn",
+            summary=f"Jarvis lance sub-task '{title}'",
+            payload={
+                "task_id": task_id,
+                "title": created.title,
+                "goal": created.goal,
+            },
+        )
         await ws_events.emit(
             {
                 "type": "task_created",

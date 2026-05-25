@@ -63,11 +63,21 @@ from typing import Any
 import structlog
 
 from bob import ws_events
+from bob.debug_log import emit_debug
 from bob.event_bus import EventBus, get_event_bus
 from bob.llm_client import LLMClient
 from bob.task_store import Task, TaskStore, TaskStoreError
 
 _logger = structlog.get_logger(__name__)
+
+
+def _task_title(store: TaskStore, task_id: str) -> str:
+    """Best-effort title lookup for debug summaries — never raises."""
+
+    try:
+        return store.get_task(task_id).title
+    except TaskStoreError:
+        return task_id
 
 
 _SYSTEM_PROMPT_TEMPLATE = (
@@ -321,6 +331,18 @@ class SubAgentRunner:
             _logger.exception("sub_agent_runner.reload_done_failed", task_id=task_id)
             return
 
+        emit_debug(
+            category="task",
+            severity="info",
+            source="bob.sub_agent_runner._handle_done",
+            summary=f"Sub-task '{task.title}' terminée",
+            payload={
+                "task_id": task_id,
+                "title": task.title,
+                "result": result,
+            },
+        )
+
         await _emit_task_message(
             self._task_store,
             task_id,
@@ -379,6 +401,18 @@ class SubAgentRunner:
             _logger.exception("sub_agent_runner.reload_progress_failed", task_id=task_id)
             return
 
+        emit_debug(
+            category="task",
+            severity="debug",
+            source="bob.sub_agent_runner._handle_progress",
+            summary=f"Sub-task '{task.title}' progresse: {status}",
+            payload={
+                "task_id": task_id,
+                "title": task.title,
+                "status": status,
+            },
+        )
+
         await _emit_task_message(
             self._task_store,
             task_id,
@@ -430,6 +464,18 @@ class SubAgentRunner:
             _logger.exception("sub_agent_runner.reload_ask_user_failed", task_id=task_id)
             return
 
+        emit_debug(
+            category="task",
+            severity="info",
+            source="bob.sub_agent_runner._handle_ask_user",
+            summary=f"Sub-task '{task.title}' demande user input",
+            payload={
+                "task_id": task_id,
+                "title": task.title,
+                "question": question,
+            },
+        )
+
         await _emit_task_message(
             self._task_store,
             task_id,
@@ -465,6 +511,10 @@ class SubAgentRunner:
         except TaskStoreError:
             previous = "running"
 
+        # Capture title before we transition: easier to access here than
+        # post-update and the title doesn't change with state.
+        title = _task_title(self._task_store, task_id)
+
         try:
             message_id = self._task_store.append_message(task_id, role="system", content=reason)
             self._task_store.update_state(task_id, "failed")
@@ -477,6 +527,19 @@ class SubAgentRunner:
         except TaskStoreError:
             _logger.exception("sub_agent_runner.reload_failed_failed", task_id=task_id)
             return
+
+        emit_debug(
+            category="task",
+            severity="warn",
+            source="bob.sub_agent_runner._fail",
+            summary=f"Sub-task '{title}' a échoué: {reason}",
+            payload={
+                "task_id": task_id,
+                "title": title,
+                "reason": reason,
+                "previous_state": previous,
+            },
+        )
 
         await _emit_task_message(
             self._task_store,

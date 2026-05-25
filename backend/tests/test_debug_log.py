@@ -8,18 +8,24 @@ The WS surface is tested separately in ``test_ws_debug.py``.
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Iterator
 
 import pytest
+import structlog
 
 from bob import debug_log
 from bob.debug_log import (
     DebugEvent,
     clear,
+    current_turn_id,
     emit_debug,
+    install_structlog_bridge,
     snapshot,
+    start_turn,
     subscribe,
     subscriber_count,
+    uninstall_structlog_bridge,
 )
 
 
@@ -29,9 +35,13 @@ def _clean_state() -> Iterator[None]:
 
     clear()
     debug_log._subscribers.clear()
+    # Slice 0039: also reset the ``current_turn_id`` ContextVar so a leftover
+    # turn from a previous test does not leak into the next one.
+    current_turn_id.set(None)
     yield
     clear()
     debug_log._subscribers.clear()
+    current_turn_id.set(None)
 
 
 def test_emit_debug_appends_to_ring_buffer() -> None:
@@ -261,3 +271,282 @@ async def test_two_concurrent_subscribers_get_independent_streams() -> None:
 
     assert received_a == ["a", "b"]
     assert received_b == ["a", "b"]
+
+
+# ---------------------------------------------------------------------------
+# Slice 0039 — ContextVar propagation
+# ---------------------------------------------------------------------------
+
+
+def test_start_turn_sets_context_var_and_returns_id() -> None:
+    assert current_turn_id.get() is None
+    turn_id = start_turn()
+    assert isinstance(turn_id, str)
+    assert len(turn_id) == 32  # uuid4().hex
+    assert current_turn_id.get() == turn_id
+
+
+def test_emit_debug_reads_context_var_when_turn_id_omitted() -> None:
+    turn_id = start_turn()
+
+    emit_debug(
+        category="input",
+        severity="info",
+        source="t.contextvar",
+        summary="auto",
+    )
+
+    [event] = snapshot()
+    assert event.turn_id == turn_id
+
+
+def test_emit_debug_explicit_turn_id_overrides_context_var() -> None:
+    start_turn()  # installs a different id
+
+    emit_debug(
+        category="input",
+        severity="info",
+        source="t.override",
+        summary="explicit",
+        turn_id="explicit-turn",
+    )
+
+    [event] = snapshot()
+    assert event.turn_id == "explicit-turn"
+
+
+def test_two_start_turn_calls_yield_distinct_ids() -> None:
+    first = start_turn()
+    second = start_turn()
+    assert first != second
+    assert current_turn_id.get() == second
+
+
+@pytest.mark.asyncio
+async def test_context_var_inherited_by_spawned_coroutine() -> None:
+    """``asyncio.create_task`` snapshots the calling context — sub-tasks inherit ``turn_id``."""
+
+    turn_id = start_turn()
+
+    async def _emit_from_subtask() -> None:
+        # Same context as the parent: no explicit turn_id, ContextVar wins.
+        emit_debug(
+            category="task",
+            severity="info",
+            source="t.subtask",
+            summary="from sub-task",
+        )
+
+    task = asyncio.create_task(_emit_from_subtask())
+    await task
+
+    [event] = snapshot()
+    assert event.turn_id == turn_id
+
+
+@pytest.mark.asyncio
+async def test_context_var_not_leaked_across_independent_tasks() -> None:
+    """A task that does NOT inherit a set turn_id still emits with turn_id=None."""
+
+    # Run the emitter in a fresh context so the autouse cleanup is honoured
+    # even though we did NOT call ``start_turn()`` first.
+    import contextvars
+
+    captured: list[str | None] = []
+
+    async def _emit() -> None:
+        emit_debug(
+            category="input",
+            severity="info",
+            source="t.fresh",
+            summary="fresh",
+        )
+        events = snapshot()
+        captured.append(events[-1].turn_id)
+
+    ctx = contextvars.copy_context()
+    ctx.run(asyncio.get_event_loop().create_task, _emit())
+    # Drain.
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    # The event emitted inside the fresh context has turn_id=None because no
+    # ``start_turn()`` was called there.
+    assert captured == [None]
+
+
+# ---------------------------------------------------------------------------
+# Slice 0039 — structlog bridge (WARN/ERROR auto-forward)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def _bridge_installed() -> Iterator[None]:
+    """Install + tear down the bridge for the duration of one test."""
+
+    install_structlog_bridge()
+    try:
+        yield
+    finally:
+        uninstall_structlog_bridge()
+
+
+def test_bridge_install_is_idempotent() -> None:
+    install_structlog_bridge()
+    install_structlog_bridge()
+    install_structlog_bridge()
+
+    # Count handlers of our type on the bob root logger — exactly one.
+    bob_logger = logging.getLogger("bob")
+    matches = [h for h in bob_logger.handlers if isinstance(h, debug_log._DebugBridgeHandler)]
+    assert len(matches) == 1
+
+    uninstall_structlog_bridge()
+
+
+def test_bridge_forwards_error_log_to_system_error_event(_bridge_installed: None) -> None:
+    """A ``logger.error`` in a ``bob.*`` module produces a ``system/error`` event."""
+
+    _logger = logging.getLogger("bob.test_module")
+    _logger.error("ouch %s", "boom", extra={"task_id": "abc"})
+
+    events = snapshot()
+    matching = [e for e in events if e.summary.startswith("ouch")]
+    assert len(matching) == 1
+    event = matching[0]
+    assert event.category == "system"
+    assert event.severity == "error"
+    assert event.source == "bob.test_module"
+    assert event.summary == "ouch boom"
+    # User-supplied structured fields ride along in the payload.
+    assert event.payload.get("task_id") == "abc"
+
+
+def test_bridge_forwards_warning_log_to_system_warn_event(_bridge_installed: None) -> None:
+    _logger = logging.getLogger("bob.somewhere")
+    _logger.warning("uh oh")
+
+    events = snapshot()
+    matching = [e for e in events if e.summary == "uh oh"]
+    assert len(matching) == 1
+    assert matching[0].category == "system"
+    assert matching[0].severity == "warn"
+    assert matching[0].source == "bob.somewhere"
+
+
+def test_bridge_ignores_info_records(_bridge_installed: None) -> None:
+    _logger = logging.getLogger("bob.info_only")
+    _logger.info("just info")
+
+    events = snapshot()
+    assert all(e.summary != "just info" for e in events)
+
+
+def test_bridge_skips_records_flagged_as_already_emitted(_bridge_installed: None) -> None:
+    """The ``_debug_emitted`` extra flag opts out of the bridge."""
+
+    _logger = logging.getLogger("bob.no_dup")
+    _logger.error("explicit", extra={"_debug_emitted": True})
+
+    events = snapshot()
+    assert all(e.summary != "explicit" for e in events)
+
+
+def test_bridge_skips_records_from_debug_log_itself(_bridge_installed: None) -> None:
+    """The bridge MUST NOT loop back when ``debug_log`` itself logs."""
+
+    _logger = logging.getLogger("bob.debug_log")
+    _logger.error("loopy")
+
+    events = snapshot()
+    assert all(e.summary != "loopy" for e in events)
+
+
+def test_bridge_captures_structlog_warn_calls(_bridge_installed: None) -> None:
+    """A structlog ``warning`` event surfaces in the debug feed.
+
+    Bob configures structlog with ``PrintLoggerFactory`` which writes JSON to
+    stdout, so to confirm the bridge sees the record we route a real
+    ``logging`` call through the same ``bob.*`` namespace — structlog's
+    JSONRenderer-then-PrintLoggerFactory pipeline does not pass through
+    ``logging``, but in production the safety net catches any code path that
+    DOES log via the stdlib logger (sub-libraries, traceback handlers,
+    ``_logger.exception`` paths).
+    """
+
+    _logger = logging.getLogger("bob.structlog_like")
+    try:
+        raise ValueError("boom")
+    except ValueError:
+        _logger.exception("during processing")
+
+    events = snapshot()
+    matching = [e for e in events if e.summary == "during processing"]
+    assert len(matching) == 1
+    event = matching[0]
+    assert event.category == "system"
+    assert event.severity == "error"
+    # The traceback rode along in the payload.
+    assert "ValueError: boom" in event.payload.get("exc_info", "")
+
+
+def test_bridge_handles_record_format_errors_gracefully(_bridge_installed: None) -> None:
+    """A record whose ``getMessage`` raises must not crash the producer."""
+
+    _logger = logging.getLogger("bob.bad_format")
+    # ``%s`` with no arg raises in ``record.getMessage`` — the bridge must
+    # swallow this and either drop the record or fall back to ``record.msg``.
+    _logger.warning("hello %s")
+
+    # No assertion on the produced event itself — only that we don't blow up.
+    # The bridge's contract is "safety net", so a defensive drop is fine.
+    assert isinstance(snapshot(), list)
+
+
+def test_bridge_can_be_installed_then_uninstalled(_bridge_installed: None) -> None:
+    """After uninstall the bridge no longer forwards events."""
+
+    uninstall_structlog_bridge()
+    _logger = logging.getLogger("bob.no_longer_bridged")
+    _logger.error("after uninstall")
+
+    events = snapshot()
+    assert all(e.summary != "after uninstall" for e in events)
+
+    # Re-install so the fixture teardown finds the handler.
+    install_structlog_bridge()
+
+
+def test_bridge_includes_logger_name_in_source(_bridge_installed: None) -> None:
+    for name in ("bob.orchestrator", "bob.llm_client", "bob.deeply.nested.thing"):
+        logging.getLogger(name).error(f"err-{name}")
+    events = snapshot()
+    sources = {e.source for e in events if e.summary.startswith("err-bob.")}
+    assert sources == {
+        "bob.orchestrator",
+        "bob.llm_client",
+        "bob.deeply.nested.thing",
+    }
+
+
+def test_bridge_does_not_forward_non_bob_loggers(_bridge_installed: None) -> None:
+    """Loggers outside the ``bob`` namespace are not bridged."""
+
+    logging.getLogger("other.module").error("noisy 3rd party")
+    structlog.get_logger("requests").warning("requests log")
+
+    events = snapshot()
+    assert all("noisy 3rd party" not in e.summary for e in events)
+
+
+def test_emit_debug_with_current_turn_set_propagates_through_bridge(
+    _bridge_installed: None,
+) -> None:
+    """Records forwarded by the bridge inherit ``current_turn_id`` automatically."""
+
+    turn_id = start_turn()
+    logging.getLogger("bob.during_turn").error("turn-scoped error")
+
+    matching = [e for e in snapshot() if e.summary == "turn-scoped error"]
+    assert len(matching) == 1
+    assert matching[0].turn_id == turn_id

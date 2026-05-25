@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+import traceback
 from abc import ABC, abstractmethod
 from typing import Any, cast
 from uuid import uuid4
@@ -19,10 +20,31 @@ import structlog
 from openai import AsyncOpenAI
 
 from bob.config import Settings
+from bob.debug_log import emit_debug
 from bob.llm.types import LLMResponse, ToolCall, ToolDefinition
 from bob.logging_setup import log_llm_call
 
 _logger = structlog.get_logger(__name__)
+
+
+def _estimate_tokens(messages: list[dict[str, Any]]) -> int:
+    """Rough heuristic for the prompt-side token count.
+
+    Used in the ``llm_call_start`` debug summary before the API responds with
+    a real token count. We approximate at ~4 chars per token (the rule of
+    thumb for English; French is in the same ballpark) so the summary line
+    has a number to anchor latency expectations. The real token counts land
+    on the ``llm_call_end`` event from the provider's ``usage`` field.
+    """
+
+    total_chars = 0
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, str):
+            total_chars += len(content)
+        elif content is not None:
+            total_chars += len(str(content))
+    return total_chars // 4
 
 
 class LLMClientError(RuntimeError):
@@ -125,8 +147,48 @@ class LMStudioClient(LLMClient):
                 "json_schema": schema,
             }
 
+        # Slice 0039: pair start / end debug events for this call.
+        correlation_id = uuid4().hex
+        token_estimate = _estimate_tokens(messages)
+        emit_debug(
+            category="llm",
+            severity="info",
+            source="bob.llm_client.chat",
+            summary=(
+                f"LLM call démarré ({token_estimate} tokens prompt, "
+                f"model={self._settings.LLM_MODEL})"
+            ),
+            payload={
+                "messages": messages,
+                "model": self._settings.LLM_MODEL,
+                "tokens_prompt_estimate": token_estimate,
+                "has_schema": schema is not None,
+                "session_id": session_id,
+            },
+            correlation_id=correlation_id,
+        )
+
         started = time.perf_counter()
-        completion = await self._client.chat.completions.create(**kwargs)
+        try:
+            completion = await self._client.chat.completions.create(**kwargs)
+        except Exception as exc:
+            latency_ms = (time.perf_counter() - started) * 1000.0
+            emit_debug(
+                category="llm",
+                severity="error",
+                source="bob.llm_client.chat",
+                summary=f"LLM call échoué en {latency_ms:.0f}ms: {exc}",
+                payload={
+                    "model": self._settings.LLM_MODEL,
+                    "latency_ms": latency_ms,
+                    "exception": str(exc),
+                    "exception_type": exc.__class__.__name__,
+                    "traceback": traceback.format_exc(),
+                    "session_id": session_id,
+                },
+                correlation_id=correlation_id,
+            )
+            raise
         latency_ms = (time.perf_counter() - started) * 1000.0
 
         message = completion.choices[0].message
@@ -149,6 +211,25 @@ class LMStudioClient(LLMClient):
             latency_ms=latency_ms,
             tokens_in=tokens_in,
             tokens_out=tokens_out,
+        )
+
+        emit_debug(
+            category="llm",
+            severity="info",
+            source="bob.llm_client.chat",
+            summary=(
+                f"LLM call terminé en {latency_ms:.0f}ms "
+                f"({tokens_out if tokens_out is not None else '?'} tokens response)"
+            ),
+            payload={
+                "response": raw,
+                "latency_ms": latency_ms,
+                "tokens_in": tokens_in,
+                "tokens_out": tokens_out,
+                "model": self._settings.LLM_MODEL,
+                "session_id": session_id,
+            },
+            correlation_id=correlation_id,
         )
 
         return raw
@@ -179,8 +260,51 @@ class LMStudioClient(LLMClient):
             ]
             kwargs["tool_choice"] = "auto"
 
+        # Slice 0039: pair start / end debug events via a local correlation_id
+        # so the UI can group them. The id is regenerated per call (no cross-
+        # call leakage); ``turn_id`` propagates automatically through the
+        # ``current_turn_id`` ContextVar set by ``Orchestrator.process_user_message``.
+        correlation_id = uuid4().hex
+        token_estimate = _estimate_tokens(messages)
+        emit_debug(
+            category="llm",
+            severity="info",
+            source="bob.llm_client.complete",
+            summary=(
+                f"LLM call démarré ({token_estimate} tokens prompt, "
+                f"model={self._settings.LLM_MODEL})"
+            ),
+            payload={
+                "messages": messages,
+                "model": self._settings.LLM_MODEL,
+                "tokens_prompt_estimate": token_estimate,
+                "has_tools": bool(tools),
+                "session_id": session_id,
+            },
+            correlation_id=correlation_id,
+        )
+
         started = time.perf_counter()
-        completion = await self._client.chat.completions.create(**kwargs)
+        try:
+            completion = await self._client.chat.completions.create(**kwargs)
+        except Exception as exc:
+            latency_ms = (time.perf_counter() - started) * 1000.0
+            emit_debug(
+                category="llm",
+                severity="error",
+                source="bob.llm_client.complete",
+                summary=f"LLM call échoué en {latency_ms:.0f}ms: {exc}",
+                payload={
+                    "model": self._settings.LLM_MODEL,
+                    "latency_ms": latency_ms,
+                    "exception": str(exc),
+                    "exception_type": exc.__class__.__name__,
+                    "traceback": traceback.format_exc(),
+                    "session_id": session_id,
+                },
+                correlation_id=correlation_id,
+            )
+            raise
         latency_ms = (time.perf_counter() - started) * 1000.0
 
         message = completion.choices[0].message
@@ -195,6 +319,20 @@ class LMStudioClient(LLMClient):
             try:
                 arguments = json.loads(arguments_raw) if arguments_raw else {}
             except json.JSONDecodeError as exc:
+                emit_debug(
+                    category="llm",
+                    severity="error",
+                    source="bob.llm_client.complete",
+                    summary=f"LLM call malformed tool args ({latency_ms:.0f}ms)",
+                    payload={
+                        "model": self._settings.LLM_MODEL,
+                        "latency_ms": latency_ms,
+                        "arguments_raw": arguments_raw,
+                        "exception": str(exc),
+                        "session_id": session_id,
+                    },
+                    correlation_id=correlation_id,
+                )
                 raise LLMClientError(
                     f"LM Studio tool call arguments are not valid JSON: {arguments_raw[:200]!r}"
                 ) from exc
@@ -221,6 +359,18 @@ class LMStudioClient(LLMClient):
                 content = getattr(message, "reasoning_content", "") or ""
             text_value = cast(str, content)
             if not text_value:
+                emit_debug(
+                    category="llm",
+                    severity="error",
+                    source="bob.llm_client.complete",
+                    summary=f"LLM call empty response ({latency_ms:.0f}ms)",
+                    payload={
+                        "model": self._settings.LLM_MODEL,
+                        "latency_ms": latency_ms,
+                        "session_id": session_id,
+                    },
+                    correlation_id=correlation_id,
+                )
                 raise LLMClientError("LM Studio returned empty response")
             text = text_value
             raw_for_log = text_value
@@ -239,6 +389,29 @@ class LMStudioClient(LLMClient):
             latency_ms=latency_ms,
             tokens_in=tokens_in,
             tokens_out=tokens_out,
+        )
+
+        emit_debug(
+            category="llm",
+            severity="info",
+            source="bob.llm_client.complete",
+            summary=(
+                f"LLM call terminé en {latency_ms:.0f}ms "
+                f"({tokens_out if tokens_out is not None else '?'} tokens response)"
+            ),
+            payload={
+                "response": raw_for_log,
+                "is_tool_call": bool(tool_calls),
+                "tool_calls": [
+                    {"id": tc.id, "name": tc.name, "arguments": tc.arguments} for tc in tool_calls
+                ],
+                "latency_ms": latency_ms,
+                "tokens_in": tokens_in,
+                "tokens_out": tokens_out,
+                "model": self._settings.LLM_MODEL,
+                "session_id": session_id,
+            },
+            correlation_id=correlation_id,
         )
 
         return LLMResponse(text=text, tool_calls=tool_calls)
@@ -338,6 +511,29 @@ class ClaudeCliClient(LLMClient):
             has_schema=schema is not None,
         )
 
+        # Slice 0039: pair start / end debug events. Same pattern as
+        # :class:`LMStudioClient`; ``turn_id`` is auto-filled from the
+        # ContextVar.
+        correlation_id = uuid4().hex
+        token_estimate = _estimate_tokens(messages)
+        emit_debug(
+            category="llm",
+            severity="info",
+            source="bob.llm_client.chat",
+            summary=(
+                f"LLM call démarré ({token_estimate} tokens prompt, "
+                f"model={self._settings.CLAUDE_CLI_MODEL or 'claude_cli'})"
+            ),
+            payload={
+                "messages": messages,
+                "model": self._settings.CLAUDE_CLI_MODEL,
+                "tokens_prompt_estimate": token_estimate,
+                "has_schema": schema is not None,
+                "session_id": session_id,
+            },
+            correlation_id=correlation_id,
+        )
+
         started = time.perf_counter()
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -351,20 +547,63 @@ class ClaudeCliClient(LLMClient):
                 timeout=self._settings.CLAUDE_CLI_TIMEOUT_SECONDS,
             )
         except TimeoutError as exc:
+            latency_ms = (time.perf_counter() - started) * 1000.0
+            emit_debug(
+                category="llm",
+                severity="error",
+                source="bob.llm_client.chat",
+                summary=f"LLM call timeout après {latency_ms:.0f}ms",
+                payload={
+                    "model": self._settings.CLAUDE_CLI_MODEL,
+                    "latency_ms": latency_ms,
+                    "timeout_seconds": self._settings.CLAUDE_CLI_TIMEOUT_SECONDS,
+                    "exception": str(exc),
+                    "traceback": traceback.format_exc(),
+                    "session_id": session_id,
+                },
+                correlation_id=correlation_id,
+            )
             raise LLMClientError(
                 f"claude CLI timed out after {self._settings.CLAUDE_CLI_TIMEOUT_SECONDS}s"
             ) from exc
         except FileNotFoundError as exc:
+            latency_ms = (time.perf_counter() - started) * 1000.0
+            emit_debug(
+                category="llm",
+                severity="error",
+                source="bob.llm_client.chat",
+                summary=f"LLM call binary missing après {latency_ms:.0f}ms",
+                payload={
+                    "model": self._settings.CLAUDE_CLI_MODEL,
+                    "latency_ms": latency_ms,
+                    "exception": str(exc),
+                    "traceback": traceback.format_exc(),
+                    "session_id": session_id,
+                },
+                correlation_id=correlation_id,
+            )
             raise LLMClientError(
                 f"claude CLI binary not found: {self._settings.CLAUDE_CLI_BIN!r}"
             ) from exc
         latency_ms = (time.perf_counter() - started) * 1000.0
 
         if proc.returncode != 0:
-            raise LLMClientError(
-                f"claude CLI exited with code {proc.returncode}: "
-                f"{stderr_bytes.decode('utf-8', errors='replace')[:500]}"
+            stderr_text = stderr_bytes.decode("utf-8", errors="replace")[:500]
+            emit_debug(
+                category="llm",
+                severity="error",
+                source="bob.llm_client.chat",
+                summary=f"LLM call exit={proc.returncode} en {latency_ms:.0f}ms",
+                payload={
+                    "model": self._settings.CLAUDE_CLI_MODEL,
+                    "latency_ms": latency_ms,
+                    "return_code": proc.returncode,
+                    "stderr": stderr_text,
+                    "session_id": session_id,
+                },
+                correlation_id=correlation_id,
             )
+            raise LLMClientError(f"claude CLI exited with code {proc.returncode}: {stderr_text}")
 
         stdout = stdout_bytes.decode("utf-8", errors="replace")
         stderr = stderr_bytes.decode("utf-8", errors="replace")
@@ -382,6 +621,20 @@ class ClaudeCliClient(LLMClient):
         )
 
         if is_error:
+            emit_debug(
+                category="llm",
+                severity="error",
+                source="bob.llm_client.chat",
+                summary=f"LLM call reported error en {latency_ms:.0f}ms",
+                payload={
+                    "model": self._settings.CLAUDE_CLI_MODEL,
+                    "latency_ms": latency_ms,
+                    "response": raw,
+                    "stderr": stderr if stderr.strip() else None,
+                    "session_id": session_id,
+                },
+                correlation_id=correlation_id,
+            )
             raise LLMClientError(f"claude CLI reported error: {raw[:500]}")
 
         log_llm_call(
@@ -391,6 +644,25 @@ class ClaudeCliClient(LLMClient):
             latency_ms=latency_ms,
             tokens_in=tokens_in,
             tokens_out=tokens_out,
+        )
+
+        emit_debug(
+            category="llm",
+            severity="info",
+            source="bob.llm_client.chat",
+            summary=(
+                f"LLM call terminé en {latency_ms:.0f}ms "
+                f"({tokens_out if tokens_out is not None else '?'} tokens response)"
+            ),
+            payload={
+                "response": raw,
+                "latency_ms": latency_ms,
+                "tokens_in": tokens_in,
+                "tokens_out": tokens_out,
+                "model": self._settings.CLAUDE_CLI_MODEL,
+                "session_id": session_id,
+            },
+            correlation_id=correlation_id,
         )
 
         return raw

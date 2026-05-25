@@ -31,6 +31,7 @@ from bob import task_scheduler as task_scheduler_module
 from bob import task_store as task_store_module
 from bob.config import get_settings
 from bob.db.migrations_runner import apply_migrations, default_migrations_dir
+from bob.debug_log import install_structlog_bridge
 from bob.debug_router import router as debug_router
 from bob.event_bus import EventBus, set_event_bus
 from bob.jarvis_prompt_loader import load_jarvis_prompt
@@ -47,6 +48,11 @@ from bob.ws_debug import router as ws_debug_router
 from bob.ws_router import router as ws_router
 
 configure_logging()
+# Slice 0039: install the structlog → debug_log bridge once at import time so
+# WARN/ERROR records from any ``bob.*`` logger are auto-forwarded to the
+# debug feed as ``system`` events. The handler is idempotent — re-importing
+# this module (test client startup, dev reload) is safe.
+install_structlog_bridge()
 _logger = structlog.get_logger(__name__)
 
 _DB_FILENAME = "bob.db"

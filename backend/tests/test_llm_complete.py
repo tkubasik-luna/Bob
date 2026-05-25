@@ -490,3 +490,97 @@ def test_claude_cli_build_tools_system_addendum_contains_schema() -> None:
     assert "Spawn a background subtask." in addendum
     assert '"required": ["title"]' in addendum
     assert "tool_calls" in addendum
+
+
+# ---------------------------------------------------------------------------
+# Slice 0039 — debug event instrumentation on LMStudioClient.complete
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_lm_studio_complete_emits_start_and_end_debug_events() -> None:
+    from bob import debug_log
+
+    debug_log.clear()
+    debug_log.current_turn_id.set(None)
+
+    client = LMStudioClient(_make_lm_settings())
+    _patch_openai_completion(client, content="hi")
+    await client.complete(messages=[{"role": "user", "content": "ping"}])
+
+    llm_events = [e for e in debug_log.snapshot() if e.category == "llm"]
+    assert len(llm_events) == 2
+    start, end = llm_events
+
+    assert start.summary.startswith("LLM call démarré")
+    assert end.summary.startswith("LLM call terminé")
+    # Same correlation_id pairs the two events.
+    assert start.correlation_id is not None
+    assert start.correlation_id == end.correlation_id
+
+    # Start payload carries messages + model.
+    assert "messages" in start.payload
+    assert start.payload["model"] == "test-model"
+    # End payload carries response + latency + tokens.
+    assert end.payload["response"] == "hi"
+    assert isinstance(end.payload["latency_ms"], float)
+    assert end.payload["tokens_in"] == 5
+    assert end.payload["tokens_out"] == 9
+
+
+@pytest.mark.asyncio
+async def test_lm_studio_complete_emits_error_end_event_on_exception() -> None:
+    from bob import debug_log
+
+    debug_log.clear()
+    debug_log.current_turn_id.set(None)
+
+    client = LMStudioClient(_make_lm_settings())
+
+    boom = RuntimeError("network down")
+
+    async def _explode(**_kw: Any) -> Any:
+        raise boom
+
+    fake_chat = MagicMock()
+    fake_chat.completions.create = _explode
+    client._client = SimpleNamespace(chat=fake_chat)  # type: ignore[assignment]
+
+    with pytest.raises(RuntimeError, match="network down"):
+        await client.complete(messages=[{"role": "user", "content": "x"}])
+
+    llm_events = [e for e in debug_log.snapshot() if e.category == "llm"]
+    assert len(llm_events) == 2
+    start, end = llm_events
+    assert start.summary.startswith("LLM call démarré")
+    assert start.severity == "info"
+    assert start.correlation_id == end.correlation_id
+    assert end.severity == "error"
+    assert end.summary.startswith("LLM call échoué")
+    assert "network down" in end.payload["exception"]
+    assert end.payload["exception_type"] == "RuntimeError"
+    assert "traceback" in end.payload
+    assert isinstance(end.payload["latency_ms"], float)
+
+
+@pytest.mark.asyncio
+async def test_lm_studio_chat_emits_start_and_end_debug_events() -> None:
+    """``LLMClient.chat`` is also instrumented (used by sub-agents + retries)."""
+
+    from bob import debug_log
+
+    debug_log.clear()
+    debug_log.current_turn_id.set(None)
+
+    client = LMStudioClient(_make_lm_settings())
+    _patch_openai_completion(client, content="bonjour")
+    out = await client.chat(messages=[{"role": "user", "content": "salut"}])
+    assert out == "bonjour"
+
+    llm_events = [e for e in debug_log.snapshot() if e.category == "llm"]
+    assert len(llm_events) == 2
+    start, end = llm_events
+    assert start.summary.startswith("LLM call démarré")
+    assert end.summary.startswith("LLM call terminé")
+    assert start.correlation_id == end.correlation_id
+    assert end.payload["response"] == "bonjour"

@@ -1112,3 +1112,204 @@ async def test_cancel_subtask_empty_reason_falls_back_to_default() -> None:
     await orchestrator.process_user_message("s1", "annule")
 
     assert scheduler.cancelled == [(target_id, "user_cancelled")]
+
+
+# ---------------------------------------------------------------------------
+# Slice 0039 — debug event instrumentation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_process_user_message_emits_orchestrator_debug_milestones() -> None:
+    """Acceptance criterion: input → decision → decision → output (milestones)."""
+
+    from bob import debug_log
+
+    debug_log.clear()
+    debug_log.current_turn_id.set(None)
+
+    orchestrator, _jc, _sub, _js, _ts, _scheduler = _make_orchestrator(
+        complete_responses=[LLMResponse(text="just chatting", tool_calls=[])],
+        chat_responses=[_valid_payload("Salut Tom")],
+    )
+
+    await orchestrator.process_user_message("sess-A", "Coucou")
+
+    events = debug_log.snapshot()
+    # FakeLLMClient does not emit llm_call_* events (only the real
+    # LMStudio / Claude clients do). We assert the orchestrator-owned
+    # milestone ordering here; the llm pair is tested via the real client
+    # in :mod:`test_llm_complete`.
+    categories = [(e.category, e.summary) for e in events]
+
+    def _first_index(cat: str, prefix: str) -> int:
+        for i, (c, s) in enumerate(categories):
+            if c == cat and s.startswith(prefix):
+                return i
+        raise AssertionError(f"missing {cat}/{prefix} in {categories}")
+
+    i_input = _first_index("input", "User envoie")
+    i_thinking_start = _first_index("decision", "Jarvis réfléchit")
+    i_thinking_end = _first_index("decision", "Jarvis a fini")
+    i_output = _first_index("output", "Bob répond")
+
+    assert i_input < i_thinking_start < i_thinking_end < i_output
+
+
+@pytest.mark.asyncio
+async def test_process_user_message_shares_turn_id_across_all_events() -> None:
+    """Acceptance criterion: every event in a turn shares the same turn_id."""
+
+    from bob import debug_log
+
+    debug_log.clear()
+    debug_log.current_turn_id.set(None)
+
+    orchestrator, _jc, _sub, _js, _ts, _scheduler = _make_orchestrator(
+        complete_responses=[LLMResponse(text="just chatting", tool_calls=[])],
+        chat_responses=[_valid_payload("Salut")],
+    )
+
+    await orchestrator.process_user_message("sess-shared", "Hi")
+
+    events = debug_log.snapshot()
+    turn_ids = {e.turn_id for e in events if e.source.startswith("orchestrator")}
+    # All orchestrator-source events should share the same turn_id and none
+    # should be None.
+    assert None not in turn_ids
+    assert len(turn_ids) == 1
+
+
+@pytest.mark.asyncio
+async def test_two_consecutive_messages_produce_distinct_turn_ids() -> None:
+    """Acceptance criterion: a new user_msg generates a new turn_id."""
+
+    from bob import debug_log
+
+    debug_log.clear()
+    debug_log.current_turn_id.set(None)
+
+    orchestrator, _jc, _sub, _js, _ts, _scheduler = _make_orchestrator(
+        complete_responses=[
+            LLMResponse(text="t1", tool_calls=[]),
+            LLMResponse(text="t2", tool_calls=[]),
+        ],
+        chat_responses=[_valid_payload("a"), _valid_payload("b")],
+    )
+
+    await orchestrator.process_user_message("sess-X", "first")
+    first_events = debug_log.snapshot()
+    first_turn = next(e.turn_id for e in first_events if e.category == "input")
+
+    await orchestrator.process_user_message("sess-X", "second")
+    all_events = debug_log.snapshot()
+    second_input = [
+        e for e in all_events if e.category == "input" and e.summary.endswith('"second"')
+    ]
+    assert len(second_input) == 1
+    second_turn = second_input[0].turn_id
+
+    assert first_turn is not None
+    assert second_turn is not None
+    assert first_turn != second_turn
+
+
+@pytest.mark.asyncio
+async def test_spawn_subtask_emits_decision_debug_event() -> None:
+    """The decision to spawn a sub-task shows up as a ``decision`` event."""
+
+    from bob import debug_log
+
+    debug_log.clear()
+    debug_log.current_turn_id.set(None)
+
+    orchestrator, _jc, _sub, _js, _ts, _scheduler = _make_orchestrator(
+        complete_responses=[
+            LLMResponse(
+                text=None,
+                tool_calls=[_spawn_tool_call(title="Drafts", goal="Draft emails")],
+            )
+        ],
+    )
+
+    response = await orchestrator.process_user_message("sess-spawn", "draft 3")
+    assert response.spawned_task_ids
+
+    spawn_events = [
+        e
+        for e in debug_log.snapshot()
+        if e.category == "decision" and "lance sub-task" in e.summary
+    ]
+    assert len(spawn_events) == 1
+    assert "Drafts" in spawn_events[0].summary
+    payload = spawn_events[0].payload
+    assert payload["title"] == "Drafts"
+    assert payload["goal"] == "Draft emails"
+    assert payload["task_id"] == response.spawned_task_ids[0]
+    # All sibling events of the turn share the same turn_id.
+    assert spawn_events[0].turn_id is not None
+
+
+@pytest.mark.asyncio
+async def test_subtask_runner_inherits_parent_turn_id() -> None:
+    """Acceptance criterion: a sub-task spawned in a turn inherits its turn_id."""
+
+    from bob import debug_log
+
+    debug_log.clear()
+    debug_log.current_turn_id.set(None)
+
+    jarvis_client = FakeLLMClient(
+        complete_responses=[
+            LLMResponse(
+                text=None,
+                tool_calls=[_spawn_tool_call(title="Echo", goal="reply ok")],
+            )
+        ],
+    )
+    subagent_client = FakeLLMClient(chat_responses=[json.dumps({"action": "done", "result": "ok"})])
+    conn = sqlite3.connect(":memory:")
+    apply_migrations(conn, default_migrations_dir())
+    jarvis_store = JarvisStore(conn)
+    task_store = TaskStore(conn)
+
+    def _runner_factory(tid: str) -> Any:
+        runner = SubAgentRunner(subagent_client=subagent_client, task_store=task_store)
+        return runner.run(tid)
+
+    scheduler = TaskScheduler(task_store=task_store, cap=3, runner_factory=_runner_factory)
+    orchestrator = Orchestrator(
+        jarvis_client=jarvis_client,
+        jarvis_store=jarvis_store,
+        task_store=task_store,
+        task_scheduler=scheduler,
+        jarvis_prompt=_TEST_JARVIS_PROMPT,
+    )
+
+    response = await orchestrator.process_user_message("sess-inherit", "do it")
+    task_id = response.spawned_task_ids[0]
+
+    # Drain the background runner.
+    while True:
+        task = task_store.get_task(task_id)
+        if task.state in ("done", "failed"):
+            break
+        await asyncio.sleep(0)
+
+    parent_turn = next(
+        e.turn_id for e in debug_log.snapshot() if e.category == "input" and "do it" in e.summary
+    )
+    assert parent_turn is not None
+
+    # Every llm / task event emitted while the runner was alive must carry
+    # the parent's turn_id thanks to ContextVar propagation through
+    # asyncio.create_task.
+    runner_events = [
+        e
+        for e in debug_log.snapshot()
+        if e.source.startswith("bob.sub_agent_runner") or e.source.startswith("bob.task_scheduler")
+    ]
+    assert runner_events  # at least the _activate + _handle_done events
+    assert all(e.turn_id == parent_turn for e in runner_events), [
+        (e.source, e.summary, e.turn_id) for e in runner_events
+    ]

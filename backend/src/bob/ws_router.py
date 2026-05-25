@@ -43,6 +43,7 @@ from bob import jarvis_store as jarvis_store_module
 from bob import task_scheduler as task_scheduler_module
 from bob import task_store as task_store_module
 from bob import text_segmenter, ws_events
+from bob.debug_log import emit_debug
 from bob.orchestrator import Orchestrator, get_default_orchestrator
 from bob.spoken_text_cleaner import clean_for_speech
 from bob.tts_service import KokoroTtsService, get_default_tts_service
@@ -96,6 +97,16 @@ async def chat_ws(websocket: WebSocket) -> None:
     # only direct replies to `user_msg` carrying their own `voice: true`.
     _sessions[session_id] = {"active_tts": [], "voice_mode": False}
     orchestrator = _orchestrator_provider()
+
+    # Slice 0039: connect-time debug event. Lives outside any user turn so
+    # ``turn_id`` is intentionally None here.
+    emit_debug(
+        category="system",
+        severity="info",
+        source="bob.ws_router.chat_ws",
+        summary=f"Client WS connecté (session={session_id})",
+        payload={"session_id": session_id},
+    )
 
     async def _session_emit(event: dict[str, Any]) -> None:
         """Forward a task event from the orchestrator / sub-agent to this WS.
@@ -162,6 +173,14 @@ async def chat_ws(websocket: WebSocket) -> None:
         ws_events.set_emitter(None)
         await _cancel_active_tts(session_id, emit_audio_end=False, websocket=None)
         _sessions.pop(session_id, None)
+        # Slice 0039: disconnect-time debug event. Lives outside any user turn.
+        emit_debug(
+            category="system",
+            severity="info",
+            source="bob.ws_router.chat_ws",
+            summary="Client WS déconnecté",
+            payload={"session_id": session_id},
+        )
         # NOTE: Jarvis history is persistent across disconnects (PRD 0003).
 
 
@@ -634,18 +653,44 @@ async def _synthesize_and_stream(
     preparing = not _kokoro_model_files_present(tts)
     if preparing:
         await websocket.send_json({"type": "tts_preparing", "msg_id": msg_id})
+        emit_debug(
+            category="voice",
+            severity="info",
+            source="bob.ws_router._synthesize_and_stream",
+            summary="Kokoro download...",
+            payload={"session_id": session_id, "msg_id": msg_id},
+        )
         try:
             await asyncio.to_thread(tts.preload)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             _logger.exception("ws_chat.tts_download_failed", session_id=session_id, msg_id=msg_id)
+            emit_debug(
+                category="voice",
+                severity="warn",
+                source="bob.ws_router._synthesize_and_stream",
+                summary=f"Audio erreur: téléchargement modèle: {exc}",
+                payload={
+                    "session_id": session_id,
+                    "msg_id": msg_id,
+                    "exception": str(exc),
+                    "exception_type": exc.__class__.__name__,
+                },
+            )
             await websocket.send_json(
                 {"type": "audio_error", "msg_id": msg_id, "reason": f"téléchargement modèle: {exc}"}
             )
             await websocket.send_json({"type": "audio_end", "msg_id": msg_id})
             return
         await websocket.send_json({"type": "tts_ready", "msg_id": msg_id})
+        emit_debug(
+            category="voice",
+            severity="debug",
+            source="bob.ws_router._synthesize_and_stream",
+            summary="Kokoro prêt",
+            payload={"session_id": session_id, "msg_id": msg_id},
+        )
 
     started_at = time.perf_counter()
     started_audio = False
@@ -670,6 +715,18 @@ async def _synthesize_and_stream(
                             msg_id=msg_id,
                             first_audio_ms=round(first_audio_ms, 1),
                         )
+                        emit_debug(
+                            category="voice",
+                            severity="debug",
+                            source="bob.ws_router._synthesize_and_stream",
+                            summary=f"Audio stream démarré (msg={msg_id})",
+                            payload={
+                                "session_id": session_id,
+                                "msg_id": msg_id,
+                                "sample_rate": chunk.sample_rate,
+                                "first_audio_ms": round(first_audio_ms, 1),
+                            },
+                        )
                         started_audio = True
                     await websocket.send_bytes(chunk.pcm16)
             except asyncio.CancelledError:
@@ -682,6 +739,19 @@ async def _synthesize_and_stream(
                     sentence_index=idx,
                 )
                 if not error_emitted:
+                    emit_debug(
+                        category="voice",
+                        severity="warn",
+                        source="bob.ws_router._synthesize_and_stream",
+                        summary=f"Audio erreur: {exc or exc.__class__.__name__}",
+                        payload={
+                            "session_id": session_id,
+                            "msg_id": msg_id,
+                            "sentence_index": idx,
+                            "exception": str(exc),
+                            "exception_type": exc.__class__.__name__,
+                        },
+                    )
                     await websocket.send_json(
                         {
                             "type": "audio_error",
@@ -693,6 +763,13 @@ async def _synthesize_and_stream(
                 continue
 
         await websocket.send_json({"type": "audio_end", "msg_id": msg_id})
+        emit_debug(
+            category="voice",
+            severity="debug",
+            source="bob.ws_router._synthesize_and_stream",
+            summary="Audio stream terminé",
+            payload={"session_id": session_id, "msg_id": msg_id},
+        )
     except asyncio.CancelledError:
         # The cancelling path emits the final audio_end. Bubble out.
         raise
