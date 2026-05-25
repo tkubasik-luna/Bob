@@ -1,14 +1,17 @@
-import { type CSSProperties, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useDebugWs } from "../../hooks/useDebugWs";
 import { filterEvents } from "../../lib/debugFilter";
 import {
   DEBUG_CATEGORIES,
   type DebugCategory,
-  type DebugEvent,
   type DebugFilters,
   type DebugSeverity,
 } from "../../types/ws-debug";
-import { CATEGORY_PALETTE, CATEGORY_SHORT_LABEL, DebugToolbar } from "./DebugToolbar";
+import { DebugRow } from "./DebugRow";
+import { DebugToolbar } from "./DebugToolbar";
+
+/** Auto-clear delay for the per-`turn_id` highlight, in milliseconds. */
+const TURN_HIGHLIGHT_TTL_MS = 5000;
 
 /**
  * Debug window root. Renders a filter toolbar at the top and a scrollable
@@ -18,10 +21,16 @@ import { CATEGORY_PALETTE, CATEGORY_SHORT_LABEL, DebugToolbar } from "./DebugToo
  * of it preserves a focused contract and lets future consumers subscribe to
  * the raw firehose without inheriting toolbar concerns.
  *
+ * Row rendering (click-to-expand + per-`turn_id` color chip) is delegated to
+ * `DebugRow`. The "currently highlighted turn_id" lives here (one source of
+ * truth for the whole feed) and propagates down to every row so they can
+ * render the highlighted variant. Auto-clear is a single shared timeout —
+ * resetting when a new turn is clicked.
+ *
  * Auto-scroll is the slice 0038 naïve "jump to bottom on every append".
  * Slice 0042 will refine it with pause-on-scroll-up + "N new" badge.
  *
- * PRD: prd/0005-debug-view.md — slice: issues/0040-debug-view-toolbar.md
+ * PRD: prd/0005-debug-view.md — slice: issues/0041-debug-view-row-expand.md
  */
 export function DebugView() {
   const { events } = useDebugWs();
@@ -31,6 +40,8 @@ export function DebugView() {
     categoriesOn: new Set<DebugCategory>(DEBUG_CATEGORIES),
     severityThreshold: "info",
   }));
+
+  const [highlightedTurnId, setHighlightedTurnId] = useState<string | null>(null);
 
   const onToggleCategory = useCallback((category: DebugCategory) => {
     setFilters((prev) => {
@@ -47,6 +58,23 @@ export function DebugView() {
   const onChangeSeverity = useCallback((severity: DebugSeverity) => {
     setFilters((prev) => ({ ...prev, severityThreshold: severity }));
   }, []);
+
+  const onTurnClick = useCallback((turnId: string) => {
+    setHighlightedTurnId(turnId);
+  }, []);
+
+  // Single shared 5s auto-clear timer. Re-arms whenever the highlighted
+  // turn_id changes (including from one chip to another mid-flight). Cleared
+  // on unmount or before the next arm fires.
+  useEffect(() => {
+    if (highlightedTurnId === null) return;
+    const handle = window.setTimeout(() => {
+      setHighlightedTurnId(null);
+    }, TURN_HIGHLIGHT_TTL_MS);
+    return () => {
+      window.clearTimeout(handle);
+    };
+  }, [highlightedTurnId]);
 
   const filteredEvents = useMemo(() => filterEvents(events, filters), [events, filters]);
   const filteredCount = filteredEvents.length;
@@ -99,73 +127,16 @@ export function DebugView() {
               : "Aucun événement ne correspond aux filtres actifs."}
           </div>
         ) : (
-          filteredEvents.map((event, idx) => <DebugLine key={`${event.ts}-${idx}`} event={event} />)
+          filteredEvents.map((event, idx) => (
+            <DebugRow
+              key={`${event.ts}-${idx}`}
+              event={event}
+              highlightedTurnId={highlightedTurnId}
+              onTurnClick={onTurnClick}
+            />
+          ))
         )}
       </div>
     </div>
   );
-}
-
-/**
- * Severity-driven text color for a feed row. `warn` reuses the HUD
- * `--warn` token, `error` reuses `--err`; `trace` desaturates to a dim grey
- * so high-frequency rows don't dominate the eye; `debug` / `info` render in
- * the neutral ink color.
- */
-function severityColor(severity: DebugSeverity): string {
-  switch (severity) {
-    case "warn":
-      return "var(--warn, #ffb300)";
-    case "error":
-      return "var(--err, #ff3d3d)";
-    case "trace":
-      return "rgba(223, 239, 255, 0.40)";
-    default:
-      return "var(--ink, #dfefff)";
-  }
-}
-
-function DebugLine({ event }: { event: DebugEvent }) {
-  const palette = CATEGORY_PALETTE[event.category];
-  const lineStyle: CSSProperties = {
-    whiteSpace: "pre-wrap",
-    wordBreak: "break-word",
-    color: severityColor(event.severity),
-  };
-  const chipStyle: CSSProperties = {
-    display: "inline-block",
-    minWidth: "62px",
-    textAlign: "center",
-    padding: "0 6px",
-    marginRight: "8px",
-    borderRadius: "3px",
-    border: `1px solid ${palette.border}`,
-    background: palette.bg,
-    color: palette.fg,
-    fontSize: "10px",
-    fontWeight: 600,
-    letterSpacing: "0.04em",
-    textTransform: "uppercase",
-  };
-  return (
-    <div style={lineStyle}>
-      <span style={{ opacity: 0.55 }}>[{formatTimestamp(event.ts)}]</span>{" "}
-      <span style={chipStyle}>{CATEGORY_SHORT_LABEL[event.category]}</span>
-      {event.summary}
-    </div>
-  );
-}
-
-/**
- * Strip the date prefix from the wire-format timestamp so the feed shows
- * `14:23:01.123` instead of the full `2026-05-25T14:23:01.123Z`. Falls
- * back to the raw string if the format is unexpected — the tracer slice
- * should never crash on a malformed timestamp.
- */
-function formatTimestamp(iso: string): string {
-  const t = iso.indexOf("T");
-  if (t < 0) return iso;
-  const tail = iso.slice(t + 1);
-  // Drop the trailing `Z` so the display stays compact.
-  return tail.endsWith("Z") ? tail.slice(0, -1) : tail;
 }
