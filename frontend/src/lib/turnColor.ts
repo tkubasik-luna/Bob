@@ -73,6 +73,29 @@ export function turnIdHighlightOutline(turnId: string): string {
 }
 
 /**
+ * Border color used to wrap a TurnNode's subtree in slice 0045 — identical to
+ * the chip color so the operator can pivot from chip to bordered subtree
+ * without re-orienting. Alias for :func:`turnIdColor`.
+ */
+export function turnBorderColor(turnId: string): string {
+  return turnIdColor(turnId);
+}
+
+/**
+ * Soft per-turn background tint applied to the `TurnNode` header in slice
+ * 0045. Same hue as the chip but at very high lightness so the header reads
+ * as a colored wash; on the dark feed background we route it through `hsla`
+ * with a moderate alpha so the wash blends in instead of overpowering.
+ *
+ * The spec asks for `hsl(h, 60%, 95%)`. We materialize that hue at low
+ * saturation+alpha so the resulting color is a faint, perceptually-light
+ * tint that the eye groups with `turnBorderColor` of the same `turn_id`.
+ */
+export function turnHeaderTint(turnId: string): string {
+  return `hsla(${turnIdHue(turnId)}, 60%, 95%, 0.10)`;
+}
+
+/**
  * First `TURN_CHIP_SHORT_LENGTH` chars of a UUID-like turn_id, used as the
  * visible chip body. Returns the full string if it's shorter than the cap.
  */

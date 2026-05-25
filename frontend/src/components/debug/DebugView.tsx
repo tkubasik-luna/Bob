@@ -55,6 +55,43 @@ const AT_BOTTOM_TOLERANCE_PX = 6;
 export function DebugView() {
   const { events, paused, setPaused, clear, pendingCount } = useDebugWs();
   const containerRef = useRef<HTMLDivElement | null>(null);
+  // DOM ref attached by `DebugTree` to the very last rendered descendant of
+  // the visible tree. Used to `scrollIntoView()` on a new event landing in
+  // the current (expanded) turn — more precise than scrollHeight when the
+  // tree contains nested expanded LLM JSON dumps.
+  const lastInnerRef = useRef<HTMLDivElement | null>(null);
+
+  // Slice 0045: expand state owned here, keyed by node id
+  // (`turn:${id}` / `task:${id}` / `llm:${corrId}`). Missing entry = let the
+  // child component fall back to its default (turns/tasks open, llm closed).
+  const [expandedMap, setExpandedMap] = useState<Map<string, boolean>>(() => new Map());
+  // Set of node ids the *user* has manually toggled. Once a node id lands
+  // here, the auto-expand logic stops touching it — manual override wins.
+  // This lets auto-flow continue writing entries into `expandedMap` (so the
+  // controlled `expanded` prop is deterministic) without falsely treating
+  // those as user overrides on the next turn switch.
+  const manualOverrideRef = useRef<Set<string>>(new Set());
+  // Track whether we've already initialized expand state from the snapshot
+  // replay batch — fires exactly once on first non-empty `events` array
+  // whose entries are all `replayed: true`.
+  const snapshotInitDoneRef = useRef(false);
+  // Track the previously "current" (= last live, non-replayed) turn id so we
+  // can collapse it when the live current turn shifts.
+  const prevCurrentTurnIdRef = useRef<string | null>(null);
+
+  const onToggleExpand = useCallback((nodeId: string) => {
+    manualOverrideRef.current.add(nodeId);
+    setExpandedMap((prev) => {
+      const next = new Map(prev);
+      // If the entry is missing we read the React-side default — turns/tasks
+      // open, LLM closed. We bake that into the new value so a manual toggle
+      // always produces a deterministic explicit entry the user can flip back.
+      const prevValue = next.get(nodeId);
+      const wasOpen = prevValue ?? (nodeId.startsWith("llm:") ? false : true);
+      next.set(nodeId, !wasOpen);
+      return next;
+    });
+  }, []);
 
   const [filters, setFilters] = useState<DebugFilters>(() => ({
     categoriesOn: new Set<DebugCategory>(DEBUG_CATEGORIES),
@@ -112,6 +149,93 @@ export function DebugView() {
       window.clearTimeout(handle);
     };
   }, [highlightedTurnId]);
+
+  // Auto-expand logic (slice 0045).
+  //  - Snapshot replay: on first non-empty `events` batch where every entry
+  //    is `replayed: true`, collapse every turn EXCEPT the one whose max
+  //    event timestamp is the latest. This is gated by
+  //    `snapshotInitDoneRef` so we initialize exactly once.
+  //  - Live: each new non-replayed event identifies the "current turn". When
+  //    that turn id changes vs the previous current turn, the previous one
+  //    is auto-collapsed and the new one auto-expanded — but only if the
+  //    user hasn't already manually toggled either (we check the Map: any
+  //    explicit entry the user set is treated as an override and respected).
+  //
+  // Both effects mutate `expandedMap` via `setExpandedMap` and never trigger
+  // a scroll on their own — `filteredCount` is the sole scroll trigger
+  // (preserves slice 0042's "manual expand doesn't scroll" invariant).
+  useEffect(() => {
+    if (events.length === 0) return;
+    if (!snapshotInitDoneRef.current) {
+      // First batch — if it's all-replayed treat as snapshot init.
+      const allReplayed = events.every((e) => e.replayed === true);
+      if (allReplayed) {
+        // Find the turn with the max-ts event among replayed events.
+        const lastTsByTurn = new Map<string, number>();
+        for (const e of events) {
+          if (e.turn_id === null) continue;
+          const t = Date.parse(e.ts);
+          if (!Number.isFinite(t)) continue;
+          const prev = lastTsByTurn.get(e.turn_id);
+          if (prev === undefined || t > prev) lastTsByTurn.set(e.turn_id, t);
+        }
+        if (lastTsByTurn.size > 0) {
+          let winner: string | null = null;
+          let winnerTs = Number.NEGATIVE_INFINITY;
+          for (const [turnId, ts] of lastTsByTurn) {
+            if (ts > winnerTs) {
+              winnerTs = ts;
+              winner = turnId;
+            }
+          }
+          setExpandedMap((prev) => {
+            const next = new Map(prev);
+            for (const turnId of lastTsByTurn.keys()) {
+              const key = `turn:${turnId}`;
+              if (manualOverrideRef.current.has(key)) continue;
+              next.set(key, turnId === winner);
+            }
+            return next;
+          });
+          // Seed the "previous current turn" with the snapshot winner so the
+          // first incoming live event for a NEW turn correctly collapses it.
+          prevCurrentTurnIdRef.current = winner;
+        }
+        snapshotInitDoneRef.current = true;
+        return;
+      }
+      // Otherwise — events started arriving live before any snapshot replay
+      // (unlikely but cheap to guard). Mark init done so we don't keep
+      // checking, and fall through to live-current-turn handling below.
+      snapshotInitDoneRef.current = true;
+    }
+
+    // Live current-turn detection: scan from tail for the last non-replayed
+    // event carrying a turn_id. That turn IS the current turn.
+    let currentTurnId: string | null = null;
+    for (let i = events.length - 1; i >= 0; i -= 1) {
+      const e = events[i];
+      if (e.replayed) continue;
+      if (e.turn_id !== null) {
+        currentTurnId = e.turn_id;
+        break;
+      }
+    }
+    if (currentTurnId === null) return;
+    if (currentTurnId === prevCurrentTurnIdRef.current) return;
+    const previousCurrent = prevCurrentTurnIdRef.current;
+    prevCurrentTurnIdRef.current = currentTurnId;
+    setExpandedMap((prev) => {
+      const next = new Map(prev);
+      const newKey = `turn:${currentTurnId}`;
+      if (!manualOverrideRef.current.has(newKey)) next.set(newKey, true);
+      if (previousCurrent !== null) {
+        const oldKey = `turn:${previousCurrent}`;
+        if (!manualOverrideRef.current.has(oldKey)) next.set(oldKey, false);
+      }
+      return next;
+    });
+  }, [events]);
 
   // Slice 0044: grouped tree replaces the linear render. We memoize the raw
   // tree on `events` identity (`useGroupedEvents`) and apply the filter as a
@@ -181,7 +305,17 @@ export function DebugView() {
     const el = containerRef.current;
     if (!el) return;
     if (isAtBottomRef.current) {
-      el.scrollTop = el.scrollHeight;
+      // Slice 0045: prefer scrolling the deepest-last rendered node into
+      // view (set by `DebugTree.lastInnerRef`). When the current turn is
+      // collapsed, that ref points at the turn header itself — also fine,
+      // it stays visible. Fallback to scrollHeight when the ref isn't
+      // populated yet (very first render before the tree mounts).
+      const inner = lastInnerRef.current;
+      if (inner) {
+        inner.scrollIntoView({ block: "end" });
+      } else {
+        el.scrollTop = el.scrollHeight;
+      }
     } else {
       setNewEventsSinceScroll((n) => n + 1);
     }
@@ -245,6 +379,9 @@ export function DebugView() {
               nodes={prunedTree}
               highlightedTurnId={highlightedTurnId}
               onTurnClick={onTurnClick}
+              expanded={expandedMap}
+              onToggle={onToggleExpand}
+              lastInnerRef={lastInnerRef}
             />
           )}
         </div>

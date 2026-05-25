@@ -1,6 +1,8 @@
 import { describe, expect, test } from "vitest";
 import {
   shortTurnId,
+  turnBorderColor,
+  turnHeaderTint,
   turnIdColor,
   turnIdHighlightBg,
   turnIdHighlightOutline,
@@ -67,6 +69,29 @@ describe("turnIdHighlightOutline", () => {
   test("uses the same hue as the chip with brighter alpha", () => {
     const id = "abc123";
     expect(turnIdHighlightOutline(id)).toBe(`hsla(${turnIdHue(id)}, 65%, 55%, 0.65)`);
+  });
+});
+
+describe("turnBorderColor", () => {
+  test("matches turnIdColor (alias)", () => {
+    const id = "deadbeef-cafe-babe-feed-c0ffee123456";
+    expect(turnBorderColor(id)).toBe(turnIdColor(id));
+  });
+  test("deterministic per turn_id", () => {
+    expect(turnBorderColor("abc123")).toBe(turnBorderColor("abc123"));
+  });
+});
+
+describe("turnHeaderTint", () => {
+  test("uses the same hue as the chip", () => {
+    const id = "abc123";
+    expect(turnHeaderTint(id)).toContain(`${turnIdHue(id)}`);
+  });
+  test("deterministic per turn_id", () => {
+    expect(turnHeaderTint("abc123")).toBe(turnHeaderTint("abc123"));
+  });
+  test("two distinct turn_ids yield distinct tints", () => {
+    expect(turnHeaderTint("alpha-turn-id")).not.toBe(turnHeaderTint("beta-turn-id"));
   });
 });
 
