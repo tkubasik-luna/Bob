@@ -1,6 +1,14 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useMemo } from "react";
 import { useChatStore } from "../../store/chatStore";
 import type { Task, TaskState } from "../../types/ws";
+
+type HudTasksProps = {
+  /** Called when the user clicks a task row that carries a result payload
+   * (typically state=done with a non-empty `result`). The parent decides what
+   * to do with the markdown — usually re-opening the `MarkdownOverlay`. When
+   * omitted, rows stay non-interactive. */
+  onOpenResult?: (content: string) => void;
+};
 
 /**
  * Top-right "tâches en cours" panel — port of `Design Mockup/hud.jsx`
@@ -9,15 +17,16 @@ import type { Task, TaskState } from "../../types/ws";
  * Mapping store → mockup format:
  * - `pending` / queued    → `.is-queued`, sub `EN FILE`
  * - `running`             → `.is-running`, spinner, sub `${progressStatus ?? "EN COURS"}`
- * - `done`                → `.is-done`, check icon, sub `OK`, fade-out after ~3s
+ * - `done`                → `.is-done`, check icon, sub `OK`
  * - `failed`              → `.is-error`, cross, sub `ÉCHEC`
  * - `waiting_input`       → `.is-queued`, sub `ATTENTE INPUT`, `needsAttention` border accent
  *
- * Display limit: last 4 tasks (chronological by `createdAt`). Empty store →
- * header alone with `00/00`. Done tasks fade out after 3s and are hidden
- * thereafter, matching the mockup's `fadeAt` behaviour.
+ * Display: most recent 4 tasks (chronological by `createdAt`), FIFO trim —
+ * oldest falls off when a fifth arrives. Done tasks remain visible until they
+ * fall off the FIFO window so the user can click one to re-open its result
+ * in the markdown overlay (`onOpenResult` callback).
  */
-export function HudTasks() {
+export function HudTasks({ onOpenResult }: HudTasksProps) {
   const tasksMap = useChatStore((s) => s.tasks);
 
   const ordered = useMemo<Task[]>(
@@ -25,74 +34,7 @@ export function HudTasks() {
     [tasksMap],
   );
 
-  // Track per-task "done at" timestamps so we can fade out done tasks ~3s
-  // after they enter their terminal state. We keep the ref keyed by task id;
-  // the `hiddenIds` state mirrors which ones have crossed the fade threshold
-  // so React re-renders when the timer fires.
-  const doneAtRef = useRef<Map<string, number>>(new Map());
-  const [hiddenIds, setHiddenIds] = useState<Set<string>>(() => new Set());
-
-  useEffect(() => {
-    const FADE_MS = 3000;
-    const now = performance.now();
-    const orderedIds = new Set(ordered.map((t) => t.id));
-
-    // Record `doneAt` for any newly-done task; clear stale entries.
-    for (const task of ordered) {
-      if (task.state === "done") {
-        if (!doneAtRef.current.has(task.id)) {
-          doneAtRef.current.set(task.id, now);
-        }
-      } else if (doneAtRef.current.has(task.id)) {
-        doneAtRef.current.delete(task.id);
-      }
-    }
-    for (const id of [...doneAtRef.current.keys()]) {
-      if (!orderedIds.has(id)) doneAtRef.current.delete(id);
-    }
-
-    // Compute the set of currently-hidden ids and dedupe against state to
-    // avoid spurious re-renders.
-    const computeHidden = (t: number): Set<string> => {
-      const next = new Set<string>();
-      for (const [id, doneAt] of doneAtRef.current) {
-        if (t - doneAt >= FADE_MS) next.add(id);
-      }
-      return next;
-    };
-    const isSameSet = (a: Set<string>, b: Set<string>) => {
-      if (a.size !== b.size) return false;
-      for (const id of a) if (!b.has(id)) return false;
-      return true;
-    };
-
-    setHiddenIds((prev) => {
-      const next = computeHidden(now);
-      return isSameSet(prev, next) ? prev : next;
-    });
-
-    // Schedule the next re-evaluation for the soonest pending fade-out.
-    let nextHide: number | null = null;
-    for (const [, doneAt] of doneAtRef.current) {
-      const remaining = FADE_MS - (now - doneAt);
-      if (remaining <= 0) continue;
-      nextHide = nextHide === null ? remaining : Math.min(nextHide, remaining);
-    }
-    if (nextHide === null) return;
-    const timer = window.setTimeout(() => {
-      const t = performance.now();
-      setHiddenIds((prev) => {
-        const next = computeHidden(t);
-        return isSameSet(prev, next) ? prev : next;
-      });
-    }, nextHide + 16);
-    return () => window.clearTimeout(timer);
-  }, [ordered]);
-
-  const visible = useMemo(
-    () => ordered.filter((t) => !hiddenIds.has(t.id)).slice(-4),
-    [ordered, hiddenIds],
-  );
+  const visible = useMemo(() => ordered.slice(-4), [ordered]);
 
   const liveCount = ordered.filter(
     (t) => t.state === "running" || t.state === "pending" || t.state === "waiting_input",
@@ -114,14 +56,20 @@ export function HudTasks() {
       </div>
       <div className="hud-tasks-list">
         {visible.map((task) => (
-          <HudTaskRow key={task.id} task={task} />
+          <HudTaskRow key={task.id} task={task} onOpenResult={onOpenResult} />
         ))}
       </div>
     </div>
   );
 }
 
-function HudTaskRow({ task }: { task: Task }) {
+function HudTaskRow({
+  task,
+  onOpenResult,
+}: {
+  task: Task;
+  onOpenResult?: (content: string) => void;
+}) {
   const variant = stateToVariant(task.state);
   const sub = formatTaskSub(task);
   const fillWidth = progressFillWidth(task.state);
@@ -130,10 +78,32 @@ function HudTaskRow({ task }: { task: Task }) {
   // accent border so the user notices Jarvis is blocked on them.
   const needsAccent = task.needsAttention === true && task.state === "waiting_input";
 
+  // Interactive once a result payload is attached — typically state=done with
+  // a non-empty result. The auto-trigger in `SphereUI` only fires once per
+  // task id; this manual path lets the user re-open after dismissing.
+  const result = typeof task.result === "string" && task.result.length > 0 ? task.result : null;
+  const interactive = result !== null && onOpenResult !== undefined;
+  const handleOpen = () => {
+    if (interactive && result !== null) onOpenResult(result);
+  };
+
   return (
     <div
-      className={`hud-task is-${variant}${needsAccent ? " needs-attention" : ""}`}
+      className={`hud-task is-${variant}${needsAccent ? " needs-attention" : ""}${interactive ? " is-clickable" : ""}`}
       data-task-id={task.id}
+      role={interactive ? "button" : undefined}
+      tabIndex={interactive ? 0 : undefined}
+      onClick={interactive ? handleOpen : undefined}
+      onKeyDown={
+        interactive
+          ? (e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                handleOpen();
+              }
+            }
+          : undefined
+      }
     >
       <span className="hud-task-status" aria-hidden="true" />
       <span className="hud-task-name">{task.title}</span>

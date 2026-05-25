@@ -123,7 +123,7 @@ export function SphereUI() {
           audioLevelRef={audioLevelRef}
         />
         <div className="hud-zone tr">
-          <HudTasks />
+          <HudTasks onOpenResult={setOverlayContent} />
         </div>
         <div className="hud-zone b">
           <TranscriptLine state={transcriptState} hidden={overlayOpen} />

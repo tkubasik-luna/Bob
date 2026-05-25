@@ -491,6 +491,20 @@ body {
   box-shadow: none;
 }
 
+/* ── CLICKABLE ── rows with a result payload re-open the overlay on click */
+.hud-task.is-clickable {
+  cursor: pointer;
+  transition:
+    opacity 600ms ease,
+    background-color 160ms ease;
+}
+.hud-task.is-clickable:hover,
+.hud-task.is-clickable:focus-visible {
+  opacity: 1;
+  background: color-mix(in oklab, var(--accent) 8%, transparent);
+  outline: none;
+}
+
 /* ── CALM MOOD overrides ── strip glow, polychrome tint */
 .mood-calm .hud-task.is-running .hud-task-status::before {
   border-top-color: var(--state-tint, var(--accent));

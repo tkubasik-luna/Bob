@@ -1,5 +1,5 @@
-import { act, render } from "@testing-library/react";
-import { beforeEach, describe, expect, test } from "vitest";
+import { act, fireEvent, render } from "@testing-library/react";
+import { beforeEach, describe, expect, test, vi } from "vitest";
 import { useChatStore } from "../../store/chatStore";
 import type { Task } from "../../types/ws";
 import { HudTasks } from "./HudTasks";
@@ -144,6 +144,50 @@ describe("HudTasks", () => {
     const { container } = render(<HudTasks />);
     const card = container.querySelector(".hud-task");
     expect(card?.querySelector(".hud-task-sub")?.textContent).toBe("EN COURS");
+  });
+
+  test("done task with result is clickable and fires `onOpenResult`", () => {
+    setTasks([makeTask({ id: "t1", state: "done", result: "# Long\n\n- a\n- b\n- c" })]);
+    const onOpenResult = vi.fn();
+    const { container } = render(<HudTasks onOpenResult={onOpenResult} />);
+    const card = container.querySelector(".hud-task") as HTMLElement | null;
+    expect(card).not.toBeNull();
+    expect(card?.classList.contains("is-clickable")).toBe(true);
+    expect(card?.getAttribute("role")).toBe("button");
+
+    fireEvent.click(card as HTMLElement);
+    expect(onOpenResult).toHaveBeenCalledTimes(1);
+    expect(onOpenResult).toHaveBeenCalledWith("# Long\n\n- a\n- b\n- c");
+  });
+
+  test("done task without result stays non-interactive", () => {
+    setTasks([makeTask({ id: "t1", state: "done" })]);
+    const onOpenResult = vi.fn();
+    const { container } = render(<HudTasks onOpenResult={onOpenResult} />);
+    const card = container.querySelector(".hud-task");
+    expect(card?.classList.contains("is-clickable")).toBe(false);
+    expect(card?.getAttribute("role")).toBeNull();
+    fireEvent.click(card as HTMLElement);
+    expect(onOpenResult).not.toHaveBeenCalled();
+  });
+
+  test("running task is not clickable even with `onOpenResult` wired", () => {
+    setTasks([makeTask({ id: "t1", state: "running", result: undefined })]);
+    const onOpenResult = vi.fn();
+    const { container } = render(<HudTasks onOpenResult={onOpenResult} />);
+    const card = container.querySelector(".hud-task");
+    expect(card?.classList.contains("is-clickable")).toBe(false);
+    fireEvent.click(card as HTMLElement);
+    expect(onOpenResult).not.toHaveBeenCalled();
+  });
+
+  test("Enter key on a clickable row triggers `onOpenResult`", () => {
+    setTasks([makeTask({ id: "t1", state: "done", result: "payload" })]);
+    const onOpenResult = vi.fn();
+    const { container } = render(<HudTasks onOpenResult={onOpenResult} />);
+    const card = container.querySelector(".hud-task") as HTMLElement | null;
+    fireEvent.keyDown(card as HTMLElement, { key: "Enter" });
+    expect(onOpenResult).toHaveBeenCalledWith("payload");
   });
 
   test("re-renders rows live when the store changes", () => {

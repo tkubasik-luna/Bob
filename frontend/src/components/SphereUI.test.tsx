@@ -307,6 +307,37 @@ describe("SphereUI — overlay auto-trigger integration", () => {
     expect(container.querySelector(".overlay-card")).toBeNull();
   });
 
+  test("clicking a done task in the HUD re-opens its result in the overlay", () => {
+    // After auto-trigger + dismiss, the dedup ref blocks the auto path from
+    // re-opening the same task. The HUD row's onClick bypasses dedup so the
+    // user can re-visit any kept-in-FIFO task result.
+    const { container } = render(<SphereUI />);
+
+    act(() => {
+      useChatStore.setState({
+        tasks: {
+          t1: makeDoneTask("t1", "# Kept\n\n- one\n- two\n- three\n- four"),
+        },
+      });
+    });
+    expect(container.querySelector(".overlay-card")).not.toBeNull();
+
+    act(() => {
+      fireEvent.keyDown(window, { key: "Escape" });
+    });
+    expect(container.querySelector(".overlay-card")).toBeNull();
+
+    // Task still rendered in HUD (no fade-out) and clickable.
+    const row = container.querySelector('.hud-task[data-task-id="t1"]') as HTMLElement | null;
+    expect(row).not.toBeNull();
+    expect(row?.classList.contains("is-clickable")).toBe(true);
+
+    act(() => {
+      fireEvent.click(row as HTMLElement);
+    });
+    expect(container.querySelector(".overlay-card")).not.toBeNull();
+  });
+
   test("renders the Tauri drag region as the first child of the .app wrapper (#0036)", () => {
     // The borderless `?ui=new` Tauri window has `decorations: false`, so the
     // user needs a 28px transparent strip up top to move it. The styling
