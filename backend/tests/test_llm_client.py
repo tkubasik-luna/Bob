@@ -100,19 +100,33 @@ async def test_chat_logs_llm_call(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_chat_returns_empty_string_when_content_is_none() -> None:
+async def test_chat_raises_when_content_is_empty() -> None:
+    """Empty LLM content surfaces as ``LLMClientError`` rather than ``""``.
+
+    Pre-fix the empty string slipped through and the sub-agent runner
+    reported it as ``"sub-agent response invalid: invalid JSON: Expecting
+    value (line 1, column 1)"`` — misleading. The provider-side failure
+    (model unloaded, context overflow, abrupt abort) now surfaces with
+    a clear message and a ``finish_reason`` hint.
+    """
+
     client = LMStudioClient(_make_settings())
     create = AsyncMock(
         return_value=SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content=None))]
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content=None),
+                    finish_reason="length",
+                )
+            ]
         )
     )
     fake_chat = MagicMock()
     fake_chat.completions.create = create
     client._client = SimpleNamespace(chat=fake_chat)  # type: ignore[assignment]
 
-    result = await client.chat(messages=[{"role": "user", "content": "hi"}])
-    assert result == ""
+    with pytest.raises(LLMClientError, match="empty content"):
+        await client.chat(messages=[{"role": "user", "content": "hi"}])
 
 
 # ---------------------------------------------------------------------------

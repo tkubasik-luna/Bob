@@ -551,7 +551,7 @@ class SubAgentRunner:
                     await self._on_validation_exhausted.on_validation_exhausted(
                         ExhaustedContext(
                             envelope=validator_envelope,
-                            last_error_message=f"sub-agent response invalid: {exc}",
+                            last_error_message=str(exc),
                             task_id=task_id,
                         )
                     )

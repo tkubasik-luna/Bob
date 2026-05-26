@@ -358,6 +358,34 @@ class LMStudioClient(LLMClient):
             content = getattr(message, "reasoning_content", "") or ""
         raw = cast(str, content)
 
+        # Empty content slips through as ``""``; sub-agent runner then
+        # tries ``json.loads("")`` and surfaces a misleading
+        # "invalid JSON" error. Detect early + emit a structured event
+        # so the failure mode is greppable (model warmup, context
+        # overflow, abrupt provider abort).
+        if not raw.strip():
+            emit_debug(
+                category="llm",
+                severity="error",
+                source="bob.llm_client.chat",
+                summary=(
+                    f"LLM call returned empty content ({latency_ms:.0f}ms)"
+                ),
+                payload={
+                    "model": self._settings.LLM_MODEL,
+                    "base_url": self._settings.LLM_BASE_URL,
+                    "latency_ms": latency_ms,
+                    "finish_reason": getattr(choices[0], "finish_reason", None),
+                    "session_id": session_id,
+                },
+                correlation_id=correlation_id,
+            )
+            raise LLMClientError(
+                "LLM endpoint returned empty content. "
+                f"finish_reason={getattr(choices[0], 'finish_reason', None)!r}. "
+                "Check the model is loaded and the prompt fits the context window."
+            )
+
         tokens_in: int | None = None
         tokens_out: int | None = None
         usage = getattr(completion, "usage", None)
