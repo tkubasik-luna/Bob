@@ -28,6 +28,7 @@ import json
 import time
 import traceback
 from abc import ABC, abstractmethod
+from collections.abc import AsyncIterator
 from typing import Any, cast
 from uuid import uuid4
 
@@ -36,7 +37,7 @@ from openai import AsyncOpenAI
 
 from bob.config import Settings
 from bob.debug_log import emit_debug
-from bob.llm.types import LLMResponse, ToolCall, ToolDefinition
+from bob.llm.types import LLMResponse, StreamChunk, ToolCall, ToolDefinition
 from bob.logging_setup import log_llm_call
 from bob.validation.system_validator import (
     FALLBACK_VALIDATOR_PREFIX,
@@ -177,6 +178,72 @@ class LLMClient(ABC):
         Raises :class:`LLMClientError` if the backend returns a structurally
         invalid response (e.g. tool-call arguments that are not valid JSON).
         """
+
+    async def stream_complete(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[ToolDefinition] | None = None,
+        session_id: str | None = None,
+    ) -> AsyncIterator[StreamChunk]:
+        """Stream a tool-call (or plain text) response chunk-by-chunk.
+
+        PRD 0006 / issue 0049. The orchestrator uses this to pipe
+        ``delta.tool_calls[0].function.arguments`` bytes into a
+        :class:`bob.streaming.StreamEmitter` while the LLM is still
+        generating — so the user hears Jarvis start speaking almost
+        immediately.
+
+        Default implementation runs the existing :meth:`complete` and
+        replays the final result as a single
+        (``tool_call_start`` + ``tool_call_end``) pair so providers that
+        don't implement native streaming (Claude CLI) still satisfy the
+        contract. Tests can substitute a :class:`FakeLLMClient` that
+        scripts the chunk sequence directly.
+
+        The return type is ``AsyncIterator[StreamChunk]`` — call sites
+        consume with ``async for``. The method itself is ``async def``
+        because some implementations (LM Studio) need to await the
+        underlying HTTP open before yielding the first chunk.
+        """
+
+        response = await self.complete(messages, tools=tools, session_id=session_id)
+        return self._fallback_stream(response)
+
+    @staticmethod
+    async def _fallback_stream(response: LLMResponse) -> AsyncIterator[StreamChunk]:
+        """Synthesise a chunk sequence for providers without native streaming.
+
+        Yields a (``tool_call_start``, ``tool_call_args_delta``,
+        ``tool_call_end``) trio per tool call, in order, so the
+        :class:`bob.streaming.StreamEmitter` sees the same surface as
+        the LM Studio streaming path. The ``args_delta`` carries the
+        FULL argument JSON (not a partial slice) because the upstream
+        client already parsed and re-serialised the call.
+        """
+
+        if response.tool_calls:
+            for call in response.tool_calls:
+                arguments_str = json.dumps(call.arguments, ensure_ascii=False)
+                yield StreamChunk(
+                    kind="tool_call_start",
+                    tool_call_id=call.id,
+                    name=call.name,
+                )
+                if arguments_str:
+                    yield StreamChunk(
+                        kind="tool_call_args_delta",
+                        tool_call_id=call.id,
+                        args_delta=arguments_str,
+                    )
+                yield StreamChunk(
+                    kind="tool_call_end",
+                    tool_call_id=call.id,
+                    final_arguments=call.arguments,
+                )
+            return
+
+        if response.text is not None:
+            yield StreamChunk(kind="text", text_delta=response.text)
 
 
 class LMStudioClient(LLMClient):
@@ -536,6 +603,331 @@ class LMStudioClient(LLMClient):
         )
 
         return LLMResponse(text=text, tool_calls=tool_calls)
+
+    async def stream_complete(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[ToolDefinition] | None = None,
+        session_id: str | None = None,
+    ) -> AsyncIterator[StreamChunk]:
+        """Streaming counterpart to :meth:`complete` (PRD 0006 / issue 0049).
+
+        Drives an OpenAI-compatible streaming chat-completion request
+        (``stream=True``) and yields one :class:`StreamChunk` per
+        provider tick. The chunk lifecycle is:
+
+        1. The first time we see a ``tool_calls`` delta with a
+           non-empty ``function.name``, we emit a ``tool_call_start``
+           with the resolved id + name. Provider-assigned ids carry
+           through verbatim; missing ids get a deterministic
+           ``call_<8-hex>`` placeholder (matches the legacy
+           :meth:`complete` behaviour).
+        2. Every subsequent argument-bytes delta becomes a
+           ``tool_call_args_delta`` with the new suffix. We accumulate
+           the suffix locally so :class:`bob.streaming.StreamEmitter`
+           can re-parse the buffer without owning the underlying byte
+           stream.
+        3. When the provider closes the stream we emit one
+           ``tool_call_end`` per tool call, parsing the accumulated
+           argument JSON in the process. A malformed final JSON raises
+           :class:`LLMClientError` (matches :meth:`complete` — the
+           orchestrator's retry path catches it).
+        4. If the model emitted plain text instead of a tool call, we
+           emit ``text`` chunks instead. Text mode is uncommon under
+           the unified ``say`` tool but supported for robustness.
+
+        Debug events follow the same ``llm_call_start`` /
+        ``llm_call_end`` pairing as :meth:`complete`. ``stream=True``
+        means we don't know the prompt token count up front the same
+        way; the post-stream ``usage`` field (when surfaced by the
+        provider) lands on the end event.
+        """
+
+        # Issue 0048 — same passthrough policy as ``complete``.
+        messages = _normalise_validator_role(messages, allow_arbitrary_roles=True)
+        kwargs: dict[str, Any] = {
+            "model": self._settings.LLM_MODEL,
+            "messages": messages,
+            "timeout": self._settings.LLM_TIMEOUT_SECONDS,
+            "max_tokens": 4096,
+            "stream": True,
+        }
+        if tools:
+            kwargs["tools"] = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.parameters,
+                    },
+                }
+                for tool in tools
+            ]
+            kwargs["tool_choice"] = "auto"
+
+        correlation_id = uuid4().hex
+        token_estimate = _estimate_tokens(messages)
+        emit_debug(
+            category="llm",
+            severity="info",
+            source="bob.llm_client.stream_complete",
+            summary=(
+                f"LLM stream démarré ({token_estimate} tokens prompt, "
+                f"model={self._settings.LLM_MODEL})"
+            ),
+            payload={
+                "messages": messages,
+                "model": self._settings.LLM_MODEL,
+                "tokens_prompt_estimate": token_estimate,
+                "has_tools": bool(tools),
+                "session_id": session_id,
+                "streaming": True,
+            },
+            correlation_id=correlation_id,
+        )
+
+        started = time.perf_counter()
+        # ``self._client.chat.completions.create`` returns either a
+        # full response (stream=False) or an ``AsyncStream`` (stream=True).
+        # We pass ``stream=True`` via kwargs so the SDK returns the
+        # async iterator the SSE machinery is wrapped under.
+        try:
+            stream = await self._client.chat.completions.create(**kwargs)
+        except Exception as exc:
+            latency_ms = (time.perf_counter() - started) * 1000.0
+            emit_debug(
+                category="llm",
+                severity="error",
+                source="bob.llm_client.stream_complete",
+                summary=f"LLM stream échoué en {latency_ms:.0f}ms: {exc}",
+                payload={
+                    "model": self._settings.LLM_MODEL,
+                    "latency_ms": latency_ms,
+                    "exception": str(exc),
+                    "exception_type": exc.__class__.__name__,
+                    "traceback": traceback.format_exc(),
+                    "session_id": session_id,
+                },
+                correlation_id=correlation_id,
+            )
+            raise
+
+        return self._consume_stream(
+            stream,
+            session_id=session_id,
+            correlation_id=correlation_id,
+            messages=messages,
+            started=started,
+        )
+
+    async def _consume_stream(
+        self,
+        stream: Any,
+        *,
+        session_id: str | None,
+        correlation_id: str,
+        messages: list[dict[str, Any]],
+        started: float,
+    ) -> AsyncIterator[StreamChunk]:
+        """Walk the OpenAI ``AsyncStream`` and re-emit it as ``StreamChunk``s.
+
+        Splitting this out of :meth:`stream_complete` keeps the
+        per-tick logic separate from the request-setup code path and
+        gives us a single function the test harness can drive with a
+        scripted iterator.
+        """
+
+        # Track per-index tool-call state. The OpenAI streaming protocol
+        # emits one or more ``choices[0].delta.tool_calls[i]`` entries
+        # per chunk, where ``i`` is stable across the call. We
+        # accumulate name + arguments per ``i`` and emit chunks lazily
+        # as new bytes arrive.
+        tool_call_states: dict[int, dict[str, Any]] = {}
+        text_buffer = ""
+        tokens_in: int | None = None
+        tokens_out: int | None = None
+
+        try:
+            async for raw_chunk in stream:
+                choices = getattr(raw_chunk, "choices", None) or []
+                if not choices:
+                    # OpenAI emits a closing ``usage`` chunk on some
+                    # providers with no ``choices`` payload.
+                    usage = getattr(raw_chunk, "usage", None)
+                    if usage is not None:
+                        tokens_in = getattr(usage, "prompt_tokens", None)
+                        tokens_out = getattr(usage, "completion_tokens", None)
+                    continue
+                choice = choices[0]
+                delta = getattr(choice, "delta", None)
+                if delta is None:
+                    continue
+
+                # Text-mode delta — uncommon under the unified ``say``
+                # tool, supported for robustness.
+                content = getattr(delta, "content", None) or ""
+                if isinstance(content, str) and content:
+                    text_buffer += content
+                    yield StreamChunk(kind="text", text_delta=content)
+
+                # Tool-call deltas. Each entry carries an ``index``,
+                # an optional ``id`` (provider-assigned), and a
+                # ``function`` with optional ``name`` + ``arguments``.
+                raw_tool_calls = getattr(delta, "tool_calls", None) or []
+                for raw_tc in raw_tool_calls:
+                    index = getattr(raw_tc, "index", 0)
+                    function = getattr(raw_tc, "function", None)
+                    state = tool_call_states.setdefault(
+                        index,
+                        {
+                            "id": getattr(raw_tc, "id", None),
+                            "name": None,
+                            "arguments": "",
+                            "started_yielded": False,
+                        },
+                    )
+                    # Provider-assigned id may arrive on the first or
+                    # second tick depending on the upstream.
+                    incoming_id = getattr(raw_tc, "id", None)
+                    if incoming_id and not state["id"]:
+                        state["id"] = incoming_id
+
+                    if function is not None:
+                        incoming_name = getattr(function, "name", None)
+                        if incoming_name and not state["name"]:
+                            state["name"] = incoming_name
+
+                    # Emit the ``tool_call_start`` chunk the first time
+                    # we have BOTH a resolved name and a resolved id.
+                    # Without a name the orchestrator can't dispatch.
+                    if not state["started_yielded"] and state["name"]:
+                        if not state["id"]:
+                            state["id"] = f"call_{uuid4().hex[:8]}"
+                        state["started_yielded"] = True
+                        yield StreamChunk(
+                            kind="tool_call_start",
+                            tool_call_id=cast(str, state["id"]),
+                            name=cast(str, state["name"]),
+                        )
+
+                    if function is not None:
+                        args_delta = getattr(function, "arguments", None) or ""
+                        if isinstance(args_delta, str) and args_delta:
+                            state["arguments"] = cast(str, state["arguments"]) + args_delta
+                            # We can only emit ``tool_call_args_delta``
+                            # once the start chunk has gone out — that
+                            # invariant matches the
+                            # :class:`bob.streaming.StreamEmitter`
+                            # expectation that ``msg_id`` is bound on
+                            # the very first frame of the turn.
+                            if state["started_yielded"]:
+                                yield StreamChunk(
+                                    kind="tool_call_args_delta",
+                                    tool_call_id=cast(str, state["id"]),
+                                    args_delta=args_delta,
+                                )
+
+                # Final usage chunk on some providers.
+                usage = getattr(raw_chunk, "usage", None)
+                if usage is not None:
+                    tokens_in = getattr(usage, "prompt_tokens", None) or tokens_in
+                    tokens_out = getattr(usage, "completion_tokens", None) or tokens_out
+
+            # Stream exhausted — emit ``tool_call_end`` per accumulated
+            # tool call, parsing the final argument JSON.
+            for state in tool_call_states.values():
+                if not state["started_yielded"]:
+                    # Defensive: the stream ended without resolving a
+                    # name. Skip the end chunk — there is no tool to
+                    # dispatch. The orchestrator's retry path will
+                    # surface the contract violation.
+                    continue
+                arguments_raw = cast(str, state["arguments"])
+                try:
+                    final_arguments = json.loads(arguments_raw) if arguments_raw else {}
+                except json.JSONDecodeError as exc:
+                    latency_ms = (time.perf_counter() - started) * 1000.0
+                    emit_debug(
+                        category="llm",
+                        severity="error",
+                        source="bob.llm_client.stream_complete",
+                        summary=(f"LLM stream malformed final args ({latency_ms:.0f}ms)"),
+                        payload={
+                            "model": self._settings.LLM_MODEL,
+                            "latency_ms": latency_ms,
+                            "arguments_raw": arguments_raw,
+                            "exception": str(exc),
+                            "session_id": session_id,
+                        },
+                        correlation_id=correlation_id,
+                    )
+                    raise LLMClientError(
+                        "LM Studio tool call arguments are not valid JSON after "
+                        f"stream close: {arguments_raw[:200]!r}"
+                    ) from exc
+                if not isinstance(final_arguments, dict):
+                    raise LLMClientError(
+                        "LM Studio tool call arguments must decode to an object, "
+                        f"got {type(final_arguments).__name__}"
+                    )
+                yield StreamChunk(
+                    kind="tool_call_end",
+                    tool_call_id=cast(str, state["id"]),
+                    final_arguments=cast(dict[str, Any], final_arguments),
+                )
+        finally:
+            latency_ms = (time.perf_counter() - started) * 1000.0
+            # Reconstruct a raw-for-log shape mirroring :meth:`complete`.
+            log_calls = [
+                {
+                    "id": state["id"],
+                    "name": state["name"],
+                    "arguments": state["arguments"],
+                }
+                for state in tool_call_states.values()
+                if state["started_yielded"]
+            ]
+            raw_for_log = json.dumps(log_calls, ensure_ascii=False) if log_calls else text_buffer
+
+            log_llm_call(
+                session_id=session_id,
+                messages=messages,
+                raw_response=raw_for_log,
+                latency_ms=latency_ms,
+                tokens_in=tokens_in,
+                tokens_out=tokens_out,
+            )
+
+            emit_debug(
+                category="llm",
+                severity="info",
+                source="bob.llm_client.stream_complete",
+                summary=(
+                    f"LLM stream terminé en {latency_ms:.0f}ms "
+                    f"({tokens_out if tokens_out is not None else '?'} tokens response)"
+                ),
+                payload={
+                    "response": raw_for_log,
+                    "is_tool_call": bool(log_calls),
+                    "tool_calls": [
+                        {
+                            "id": state["id"],
+                            "name": state["name"],
+                            "arguments": state["arguments"],
+                        }
+                        for state in tool_call_states.values()
+                        if state["started_yielded"]
+                    ],
+                    "latency_ms": latency_ms,
+                    "tokens_in": tokens_in,
+                    "tokens_out": tokens_out,
+                    "model": self._settings.LLM_MODEL,
+                    "session_id": session_id,
+                    "streaming": True,
+                },
+                correlation_id=correlation_id,
+            )
 
 
 class ClaudeCliClient(LLMClient):

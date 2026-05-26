@@ -84,6 +84,12 @@ export function SphereUI() {
   // never auto-dismisses the open card — only Esc / X / backdrop / DISMISS do.
   const messages = useChatStore((s) => s.messages);
   const tasks = useChatStore((s) => s.tasks);
+  // PRD 0006 / issue 0049 — the streaming pipeline pushes the `ui_payload`
+  // frame as soon as the LLM closes the argument object, well before the
+  // closing `assistant_msg`. We watch the streaming buffer for a non-null
+  // `ui` so the overlay opens "while Jarvis is still talking" rather than
+  // at the very end of the turn.
+  const streamingUi = useChatStore((s) => s.streamingAssistant?.ui ?? null);
   const [overlayContent, setOverlayContent] = useState<string | null>(null);
   // Issue 0052 — per-task overlay state. Clicking a task in `HudTasks`
   // sets this; the overlay subscribes to the task's live reflections
@@ -113,6 +119,35 @@ export function SphereUI() {
   // re-evaluated.
   const lastEvaluatedMsgIdRef = useRef<string | null>(null);
   const evaluatedTaskIdsRef = useRef<Set<string>>(new Set());
+  // Issue 0049 — track which streamed msg_ids have already opened the
+  // overlay so a late-arriving `assistant_msg` (carrying the same `ui`)
+  // doesn't re-open it after the user dismissed it. The ref outlives the
+  // streaming buffer lifecycle (the buffer is cleared when the
+  // `assistant_msg` lands; we still need to remember we already acted).
+  const evaluatedStreamUiRef = useRef<Set<string>>(new Set());
+  // PRD 0006 / issue 0049 — open the overlay as soon as the streamed
+  // `ui_payload` lands. Today the `say` tool only emits a Markdown
+  // descriptor; the heuristic-driven path below still handles
+  // legacy / non-streamed bubbles (proactive pushes, degrade paths) so we
+  // do NOT bypass it.
+  useEffect(() => {
+    if (streamingUi === null) return;
+    const msgId = useChatStore.getState().streamingAssistant?.msgId ?? null;
+    if (msgId === null) return;
+    if (evaluatedStreamUiRef.current.has(msgId)) return;
+    evaluatedStreamUiRef.current.add(msgId);
+    // The unified say tool's `ui` is a Markdown component descriptor:
+    // `{component: "Markdown", props: {content: "..."}}`. Extract the
+    // string so the existing `MarkdownOverlay` (which takes a markdown
+    // string) renders it. Other component types would need the
+    // `Dispatcher` path — out of scope for issue 0049, which only
+    // streams the say tool. Drop the frame silently for those (a
+    // warning would spam the dev console once the registry grows).
+    if (streamingUi.component !== "Markdown") return;
+    const content = streamingUi.props?.content;
+    if (typeof content !== "string" || content.length === 0) return;
+    setOverlayContent(content);
+  }, [streamingUi]);
   useEffect(() => {
     // Walk back to the most recent non-empty assistant message; older entries
     // are uninteresting because the heuristic is evaluated per *latest* turn.

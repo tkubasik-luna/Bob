@@ -3,16 +3,14 @@
 This is the smallest contract test that proves the end-to-end flow defined
 by issue 0043: the orchestrator no longer reads ``jarvis_store`` directly,
 it goes through the assembler and the legacy provider. The test asserts
-that the messages list reaching :meth:`FakeLLMClient.complete` matches the
-pre-0043 inline construction byte-for-byte.
+that the messages list reaching :meth:`FakeLLMClient.stream_complete`
+matches the pre-0043 inline construction byte-for-byte.
 
-Issue 0047 unified Jarvis emission as tool calls: the orchestrator
-always invokes ``complete()`` with the versioned tool registry, and the
-free-form ``chat()`` reply path was removed. The assembler contract is
-unchanged; only the round-trip shape simplifies.
-
-Later slices (0048-0052) will reuse this same harness to assert the
-streaming + tool-dispatch contracts evolve correctly.
+Issue 0047 unified Jarvis emission as tool calls.
+Issue 0049 switched the orchestrator from ``complete()`` to
+``stream_complete()`` so the user hears Jarvis speak while the LLM is
+still generating. The assembler contract is unchanged; we just inspect
+``stream_calls`` instead of ``complete_calls`` here.
 """
 
 from __future__ import annotations
@@ -86,13 +84,15 @@ def _make_orchestrator(
 
 
 @pytest.mark.asyncio
-async def test_orchestrator_uses_assembler_for_complete_call() -> None:
-    """The ``complete()`` call reaches the LLM via the assembler.
+async def test_orchestrator_uses_assembler_for_stream_complete_call() -> None:
+    """The streamed call reaches the LLM via the assembler.
 
     The messages list must contain a single system message and the full
     persisted history including the user turn just appended — exactly what
-    the pre-0043 orchestrator did inline. Issue 0047 unified emission as
-    a single ``say`` tool call; the assembler contract is unchanged.
+    the pre-0043 orchestrator did inline. Issue 0049 swapped ``complete()``
+    for ``stream_complete()`` (with the fallback path replaying the same
+    scripted :class:`LLMResponse` as a synthetic chunk trio), so we
+    inspect ``stream_calls`` here.
     """
 
     fake = FakeLLMClient(complete_responses=[_say_response(speech="Bonjour")])
@@ -105,11 +105,11 @@ async def test_orchestrator_uses_assembler_for_complete_call() -> None:
 
     await orchestrator.process_user_message("s1", "deuxième question")
 
-    # ``complete()`` was called once with the full assembled messages list;
-    # the structured ``chat()`` path is gone (issue 0047).
-    assert len(fake.complete_calls) == 1
+    # ``stream_complete()`` was called once with the full assembled
+    # messages list; the structured ``chat()`` path is gone (issue 0047).
+    assert len(fake.stream_calls) == 1
     assert fake.chat_calls == []
-    messages = fake.complete_calls[0]["messages"]
+    messages = fake.stream_calls[0]["messages"]
 
     # First message is the system prompt with the tools addendum baked in.
     assert messages[0]["role"] == "system"

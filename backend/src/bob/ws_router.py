@@ -3,6 +3,45 @@
 Wires the ``/ws/chat`` endpoint to :class:`bob.chat_service.ChatService` and
 streams Kokoro TTS audio back to the client as **binary** WS frames.
 
+Per-turn streamed text protocol (PRD 0006 / issue 0049)
+-------------------------------------------------------
+
+Before the ``assistant_msg`` final frame, the orchestrator emits zero
+or more ``speech_delta`` JSON frames and at most one ``ui_payload``
+frame via :func:`bob.event_bus_v2.emit_event`. All three frame types
+share the ``msg_id`` field so the frontend can correlate them with the
+eventual bubble:
+
+- ``speech_delta`` — emitted as ``say.speech`` accumulates. Frame shape:
+  ``{type: "speech_delta", msg_id: "<hex>", delta: "<new suffix>"}``.
+  The frontend pipes ``delta`` directly into its TTS engine for
+  progressive synthesis and into the sphere text component for
+  progressive on-screen text.
+- ``ui_payload`` — emitted exactly once on argument-object close, only
+  when ``say.ui`` is a non-null object. Frame shape:
+  ``{type: "ui_payload", msg_id: "<hex>", ui: {...}}``. The frontend
+  opens the markdown overlay with this payload once the corresponding
+  spoken phrase has finished streaming.
+- ``assistant_msg`` — still emitted at the end of every turn (PRD
+  compatibility shim). Carries the full final speech + ui + the same
+  ``msg_id`` the streamed deltas were tagged with. Used by:
+
+  - history replay on reconnect (the streamed deltas do NOT survive a
+    process restart — only the persisted assistant turn does, replayed
+    as a single ``assistant_msg``);
+  - the proactive path (sub-task done synthesis, paraphrased
+    ``ask_user``) which is a single-shot non-streaming chat call —
+    proactive frames carry ``proactive=true`` and bypass the streaming
+    pipeline entirely;
+  - the degrade path (validation budget exhausted → hardcoded "Désolé,
+    peux-tu reformuler ?") which mints a fresh ``msg_id`` because no
+    streaming happened.
+
+  Kept for those three reasons rather than removed; cleaning up after
+  the stabilisation window would require a frontend redesign of the
+  reconnect-replay path and the proactive bubble surface, which is
+  out of scope for issue 0049.
+
 TTS wire protocol (per assistant turn that opts into voice)
 -----------------------------------------------------------
 
@@ -580,7 +619,13 @@ async def _handle_client_message(
         await websocket.send_json({"type": "thinking", "state": "end"})
         return
 
-    msg_id = uuid.uuid4().hex
+    # PRD 0006 / issue 0049 — the orchestrator's streaming pipeline mints
+    # ``msg_id`` and emits ``speech_delta`` frames under it during the
+    # turn. The final ``assistant_msg`` reuses the same id so the frontend
+    # correlates the streamed deltas with the bubble. Degrade paths leave
+    # ``msg_id`` empty — fall back to a generated id so the frame still
+    # carries one (matches the pre-0049 contract).
+    msg_id = response.msg_id or uuid.uuid4().hex
     await websocket.send_json(
         {
             "type": "assistant_msg",

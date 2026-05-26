@@ -32,6 +32,26 @@ export type PushToastOptions = {
 
 const TOAST_AUTO_DISMISS_MS = 5_000;
 
+/** PRD 0006 / issue 0049 — in-flight streamed assistant turn.
+ *
+ *  Populated incrementally by `speech_delta` frames between user submit and
+ *  the closing `assistant_msg`. The `speech` field grows on every delta and
+ *  the optional `ui` is filled by the single `ui_payload` frame. Cleared on
+ *  the closing `assistant_msg` (which spawns the persisted ChatMessage) or
+ *  on a fresh user turn (an interruption resets it before the new stream
+ *  starts).
+ *
+ *  Consumers:
+ *  - `TranscriptLine` renders `speech` progressively so the sphere shows
+ *    each word as it streams from the LLM.
+ *  - `SphereUI` opens the `MarkdownOverlay` immediately when `ui` lands,
+ *    without waiting for the final `assistant_msg`. */
+export type StreamingAssistant = {
+  msgId: string;
+  speech: string;
+  ui: ComponentDescriptor | null;
+};
+
 type ChatState = {
   messages: ChatMessage[];
   connectionStatus: ConnectionStatus;
@@ -41,6 +61,9 @@ type ChatState = {
   /** msg_id of the assistant bubble currently being voiced by audioPlayer,
    * or null when nothing is playing. Driven by `subscribeSpeaking`. */
   speakingMsgId: string | null;
+  /** PRD 0006 / issue 0049 — live state of the streaming Jarvis turn, or
+   * `null` when no turn is in flight. */
+  streamingAssistant: StreamingAssistant | null;
   /** Sub-tasks driven by `task_*` WS events (slice #0019). Keyed by id so
    * each event is an idempotent upsert. */
   tasks: Record<string, Task>;
@@ -89,6 +112,16 @@ type ChatState = {
   /** Slice #0024 — append a live message to a task's cached transcript.
    * Dedupes by `message_id` so re-running the snapshot fetch is safe. */
   appendTaskMessage: (msg: TaskMessageMsg) => void;
+  /** PRD 0006 / issue 0049 — append the latest `speech_delta` suffix into
+   *  the in-flight streaming buffer (creating one when `msgId` changes). */
+  appendSpeechDelta: (msgId: string, delta: string) => void;
+  /** PRD 0006 / issue 0049 — record the `ui_payload` for the in-flight turn.
+   *  No-op when the active stream's `msg_id` doesn't match (stale frame). */
+  setStreamingUi: (msgId: string, ui: ComponentDescriptor) => void;
+  /** PRD 0006 / issue 0049 — drop the in-flight streaming state. Called when
+   *  the closing `assistant_msg` lands (so the persisted bubble takes over)
+   *  AND on user submit (interrupts any leftover stream). */
+  clearStreamingAssistant: () => void;
 };
 
 function randomId(): string {
@@ -106,6 +139,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   sessionId: null,
   toasts: [],
   speakingMsgId: null,
+  streamingAssistant: null,
   tasks: {},
   taskMessages: {},
   openTaskId: null,
@@ -264,4 +298,38 @@ export const useChatStore = create<ChatState>((set, get) => ({
     set((state) => ({
       toasts: state.toasts.filter((t) => t.id !== id),
     })),
+  appendSpeechDelta: (msgId, delta) =>
+    set((state) => {
+      // A new msg_id (or no in-flight stream yet) starts a fresh buffer.
+      // The previous one is implicitly discarded — the closing
+      // `assistant_msg` already turned it into a persisted bubble; if it
+      // hadn't, a retry path on the backend rolled a new id (see
+      // bob.orchestrator._run_jarvis_turn_with_retry) and the previous
+      // attempt's spoken bytes were a false start.
+      const current = state.streamingAssistant;
+      if (current === null || current.msgId !== msgId) {
+        return { streamingAssistant: { msgId, speech: delta, ui: null } };
+      }
+      return {
+        streamingAssistant: { ...current, speech: current.speech + delta },
+      };
+    }),
+  setStreamingUi: (msgId, ui) =>
+    set((state) => {
+      const current = state.streamingAssistant;
+      if (current === null) {
+        // ui_payload before any speech_delta — defensive: open the buffer
+        // with an empty speech string so the overlay still surfaces. In
+        // practice the backend always emits at least one speech_delta
+        // before the ui_payload (StreamEmitter.finalize runs after the
+        // last `feed`).
+        return { streamingAssistant: { msgId, speech: "", ui } };
+      }
+      if (current.msgId !== msgId) {
+        // Stale frame from a previous turn — drop it.
+        return state;
+      }
+      return { streamingAssistant: { ...current, ui } };
+    }),
+  clearStreamingAssistant: () => set({ streamingAssistant: null }),
 }));

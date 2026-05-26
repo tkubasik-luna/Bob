@@ -4,12 +4,15 @@ Used by :meth:`bob.llm_client.LLMClient.complete` so callers can pass tool
 definitions and consume tool calls without caring whether the backend is
 LM Studio (OpenAI-compatible function calling) or the Claude CLI
 (JSON-in-system-prompt protocol).
+
+PRD 0006 / issue 0049 adds :class:`StreamChunk` for the streaming
+tool-call surface :meth:`bob.llm_client.LLMClient.stream_complete`.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 
 @dataclass(frozen=True)
@@ -57,3 +60,55 @@ class LLMResponse:
     @property
     def is_tool_call(self) -> bool:
         return bool(self.tool_calls)
+
+
+#: Kind discriminator for :class:`StreamChunk`. See the class docstring
+#: for the four supported phases.
+StreamChunkKind = Literal["tool_call_start", "tool_call_args_delta", "tool_call_end", "text"]
+
+
+@dataclass(frozen=True)
+class StreamChunk:
+    """A single chunk emitted by :meth:`bob.llm_client.LLMClient.stream_complete`.
+
+    The four kinds together describe the lifecycle of one streamed
+    tool call:
+
+    - ``tool_call_start`` — first chunk for a new tool call. Carries
+      ``tool_call_id`` + ``name`` (resolved as early as the provider
+      surfaces it). ``args_delta`` is empty here.
+    - ``tool_call_args_delta`` — every subsequent chunk for that call
+      whose ``delta.tool_calls[0].function.arguments`` payload is
+      non-empty. ``args_delta`` is the new suffix; the caller is
+      responsible for accumulating it (a :class:`bob.streaming.StreamEmitter`
+      does this on the Bob side).
+    - ``tool_call_end`` — emitted exactly once when the provider closes
+      the stream for that call. ``final_arguments`` carries the parsed
+      JSON object (or ``None`` if the arguments were never closeable —
+      the caller can decide how to handle that).
+    - ``text`` — emitted when the model chose plain text over a tool
+      call. ``text_delta`` carries the latest chunk. Streamed text mode
+      is rare under the unified ``say`` tool but supported for
+      robustness (the orchestrator's retry path treats it as a
+      contract violation and re-prompts).
+
+    The discriminator design avoids a six-field union with mostly-None
+    members. Call sites pattern-match on ``kind`` and read only the
+    fields meaningful for that kind.
+    """
+
+    kind: StreamChunkKind
+    #: Set on ``tool_call_*`` chunks. Stable across the whole call.
+    tool_call_id: str | None = None
+    #: Set on ``tool_call_start``. Empty on subsequent chunks.
+    name: str | None = None
+    #: Set on ``tool_call_args_delta``. The NEW suffix of the
+    #: streaming argument string for this tick, NOT the accumulated
+    #: buffer.
+    args_delta: str = ""
+    #: Set on ``tool_call_end``. The fully-parsed arguments dict, or
+    #: ``None`` when the stream closed before valid JSON was visible.
+    final_arguments: dict[str, Any] | None = None
+    #: Set on ``text``. The latest text suffix, not the accumulated
+    #: buffer.
+    text_delta: str = ""

@@ -39,6 +39,9 @@ export function ChatView() {
   const setTaskResult = useChatStore((s) => s.setTaskResult);
   const setTaskMessagesSnapshot = useChatStore((s) => s.setTaskMessagesSnapshot);
   const appendTaskMessage = useChatStore((s) => s.appendTaskMessage);
+  const appendSpeechDelta = useChatStore((s) => s.appendSpeechDelta);
+  const setStreamingUi = useChatStore((s) => s.setStreamingUi);
+  const clearStreamingAssistant = useChatStore((s) => s.clearStreamingAssistant);
 
   // Bridge audioPlayer → store so `Bubble` can render the wave indicator
   // on the exact bubble currently being voiced. Cleared on natural end
@@ -86,6 +89,13 @@ export function ChatView() {
             }
           }
           addAssistantMessage(msg.speech, msg.ui, msg.msg_id, msg.proactive);
+          clearStreamingAssistant();
+          break;
+        case "speech_delta":
+          appendSpeechDelta(msg.msg_id, msg.delta);
+          break;
+        case "ui_payload":
+          setStreamingUi(msg.msg_id, msg.ui);
           break;
         case "audio_start":
           if (msg.msg_id !== currentMsgIdRef.current) {
@@ -147,6 +157,9 @@ export function ChatView() {
       setTaskResult,
       setTaskMessagesSnapshot,
       appendTaskMessage,
+      appendSpeechDelta,
+      setStreamingUi,
+      clearStreamingAssistant,
     ],
   );
 

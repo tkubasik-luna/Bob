@@ -35,6 +35,11 @@ const ASSISTANT_SNIPPET_MAX = 80;
  */
 export function TranscriptLine({ state, hidden = false }: TranscriptLineProps) {
   const messages = useChatStore((s) => s.messages);
+  // PRD 0006 / issue 0049 — when a streamed Jarvis turn is in flight we
+  // prefer its progressive buffer over the most-recent persisted bubble.
+  // That's how the sphere shows the spoken phrase appearing word-by-word
+  // before the closing `assistant_msg` lands.
+  const streamingSpeech = useChatStore((s) => s.streamingAssistant?.speech ?? null);
 
   const { lastUser, lastAssistant } = useMemo(() => {
     let user: string | null = null;
@@ -51,6 +56,14 @@ export function TranscriptLine({ state, hidden = false }: TranscriptLineProps) {
     return { lastUser: user, lastAssistant: assistant };
   }, [messages]);
 
+  // The streaming buffer is non-null only while a turn is mid-flight; it
+  // wins over the persisted bubble so the user sees a smooth left-to-right
+  // text reveal. A non-empty streamed buffer also flips `slot` from `hint`
+  // → `text` on the very first delta, removing the "Tapez pour parler" line
+  // the moment Jarvis starts talking.
+  const effectiveAssistant =
+    streamingSpeech !== null && streamingSpeech.length > 0 ? streamingSpeech : lastAssistant;
+
   if (hidden) return null;
 
   // Resolve the slot (`hint` | `thinking` | `text`) + raw text payload up
@@ -64,14 +77,14 @@ export function TranscriptLine({ state, hidden = false }: TranscriptLineProps) {
       text = lastUser ?? "";
       break;
     case "speak":
-      slot = lastAssistant ? "text" : "hint";
-      text = lastAssistant ? truncate(lastAssistant, ASSISTANT_SNIPPET_MAX) : "";
+      slot = effectiveAssistant ? "text" : "hint";
+      text = effectiveAssistant ? truncate(effectiveAssistant, ASSISTANT_SNIPPET_MAX) : "";
       break;
     default:
       // idle / error
-      if (lastAssistant) {
+      if (effectiveAssistant) {
         slot = "text";
-        text = truncate(lastAssistant, ASSISTANT_SNIPPET_MAX);
+        text = truncate(effectiveAssistant, ASSISTANT_SNIPPET_MAX);
       } else {
         slot = "hint";
         text = "";

@@ -91,6 +91,36 @@ export type AssistantMsg = {
   proactive?: boolean;
 };
 
+/** PRD 0006 / issue 0049 — incremental chunk of the assistant's speech as it
+ *  streams from the LLM. The frontend accumulates `delta` into a per-msg_id
+ *  buffer so the sphere transcript can render the spoken phrase character-
+ *  by-character before the final `assistant_msg` arrives. TTS itself stays
+ *  server-side (Kokoro on the backend); the wire stays text-only here. */
+export type SpeechDeltaMsg = {
+  type: "speech_delta";
+  /** Turn-stable id, shared with the eventual `assistant_msg` frame. */
+  msg_id: string;
+  /** Newly-visible suffix of the streamed `say.speech` field, NOT the
+   *  accumulated buffer. The consumer is responsible for concatenation. */
+  delta: string;
+};
+
+/** PRD 0006 / issue 0049 — emitted once on argument-object close when the
+ *  `say` tool carried a non-null `ui`. Opens the markdown overlay immediately,
+ *  before the closing `assistant_msg` lands. Omitted entirely when `ui` is
+ *  null / missing — the absence of this frame is the "no overlay" signal. */
+export type UiPayloadMsg = {
+  type: "ui_payload";
+  /** Same `msg_id` as the streamed `speech_delta` frames + the eventual
+   *  `assistant_msg`. */
+  msg_id: string;
+  /** Server-driven component descriptor — same `{ component, props }` shape
+   *  the legacy `assistant_msg.ui` array carries. The frontend hands the
+   *  descriptor to the existing `Dispatcher` / `MarkdownOverlay` plumbing
+   *  without re-parsing the contract. */
+  ui: ComponentDescriptor;
+};
+
 export type ThinkingMsg = {
   type: "thinking";
   state: "start" | "end";
@@ -244,6 +274,8 @@ export type TaskMessageMsg = {
 export type ServerMessage =
   | SessionMsg
   | AssistantMsg
+  | SpeechDeltaMsg
+  | UiPayloadMsg
   | ThinkingMsg
   | ErrorMsg
   | AudioStartMsg

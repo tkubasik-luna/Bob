@@ -66,11 +66,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from types import ModuleType
-from typing import TYPE_CHECKING, Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
 import structlog
 
@@ -113,9 +114,10 @@ from bob.epoch import (
     RetrievalAPI,
 )
 from bob.jarvis_store import JarvisStore
-from bob.llm.types import ToolCall
+from bob.llm.types import LLMResponse, ToolCall
 from bob.llm_client import LLMClient
 from bob.rolling_summary_store import RollingSummaryStore
+from bob.streaming import StreamEmitter
 from bob.task_completion_debouncer import (
     DEFAULT_DEBOUNCE_SECONDS,
     TaskCompletionDebouncer,
@@ -237,6 +239,13 @@ class OrchestratorResponse:
     - ``cancelled_task_ids`` lists every task cancelled by this turn via
       the ``cancel_subtask`` tool. Empty when the turn didn't include a
       cancellation.
+    - ``msg_id`` is the turn-stable id minted at the start of the
+      :class:`bob.streaming.StreamEmitter` lifecycle (PRD 0006 / issue
+      0049). The WS router uses it as the ``assistant_msg.msg_id`` so
+      the streamed ``speech_delta`` frames the frontend already saw
+      correlate with the final assistant bubble. Empty string when the
+      turn was a degrade path that bypassed the streaming pipeline (the
+      router falls back to its own generated id then).
     """
 
     speech: str
@@ -244,6 +253,7 @@ class OrchestratorResponse:
     spawned_task_ids: list[str] = field(default_factory=list)
     forwarded_task_ids: list[str] = field(default_factory=list)
     cancelled_task_ids: list[str] = field(default_factory=list)
+    msg_id: str = ""
 
 
 class Orchestrator:
@@ -468,27 +478,56 @@ class Orchestrator:
     ) -> OrchestratorResponse:
         """Drive one Jarvis turn through the per-tool retry policy.
 
-        PRD 0006 / issue 0048. The dispatcher path stays unchanged; the
-        retry loop wraps it:
+        PRD 0006 / issue 0048 + 0049. The dispatcher path stays
+        unchanged; the retry loop wraps it. Issue 0049 swaps the
+        non-streaming :meth:`LLMClient.complete` for the streaming
+        :meth:`LLMClient.stream_complete` so the user hears Jarvis
+        start speaking while the LLM is still generating:
 
-        1. Run :meth:`LLMClient.complete` with the current message list
-           (initial: ``base_messages``; on retry: ``base_messages`` plus
-           ``system_validator`` feedback messages appended).
-        2. If ``decision.is_tool_call`` is false → record the contract
-           violation as feedback, increment the in-memory
-           :class:`CallEnvelope` retry counter, loop.
-        3. Otherwise dispatch through the existing path. If every
+        1. Mint a turn-stable ``msg_id`` and build a fresh
+           :class:`bob.streaming.StreamEmitter`. The emitter survives
+           ACROSS retries on the same turn (each retry replaces it with
+           a new instance + msg_id because the streamed deltas from a
+           rejected turn have already been spoken — the next attempt
+           must not collide with the previous msg_id).
+        2. Run :meth:`LLMClient.stream_complete` with the current
+           message list (initial: ``base_messages``; on retry:
+           ``base_messages`` plus ``system_validator`` feedback messages
+           appended).
+        3. Pipe argument deltas through the emitter via
+           :meth:`StreamEmitter.feed`. ``speech_delta`` frames flush
+           to the WS bus during the loop. On ``tool_call_end`` we
+           call :meth:`StreamEmitter.finalize` and collect the
+           :class:`ToolCall` for dispatch.
+        4. If no tool call was emitted → record the contract violation
+           as feedback, increment the in-memory :class:`CallEnvelope`
+           retry counter, loop.
+        5. Otherwise dispatch through the existing path. If every
            dispatch errored → record feedback for the first error,
            increment the counter, loop.
-        4. When ``envelope.retries_used`` exceeds the active per-tool
+        6. When ``envelope.retries_used`` exceeds the active per-tool
            :class:`RetryPolicy.max_retries` (or the no-tool-call path's
            default) → call
            :meth:`OnValidationExhausted.on_validation_exhausted`, then
            return an :class:`OrchestratorResponse` carrying the hardcoded
-           degrade speech.
+           degrade speech (and a generated ``msg_id`` so the WS router
+           tags the assistant_msg consistently).
 
         The envelope dies at function exit — the retry counter NEVER
         lands on a :class:`ContextEntry`.
+
+        Streaming + validation interaction: ``speech_delta`` frames are
+        committed to the WS bus during the stream — they cannot be
+        retro-cancelled. If the streamed ``say.speech`` validates but
+        ``say.ui`` malforms, the ``say`` policy's
+        ``accept_partial=True`` setting (see
+        :data:`bob.validation.POLICY_TABLE`) accepts the call without
+        emitting a ``ui_payload`` (overlay stays closed). If the LLM
+        emits garbage that never resolves to a valid ``speech`` field,
+        the retry path replaces the emitter and a fresh ``speech_delta``
+        batch lands under a new msg_id — the user perceives a small
+        false start. Rare in practice; see :mod:`bob.streaming.stream_emitter`
+        for the long-form rationale.
         """
 
         envelope = CallEnvelope(tool_name=None, actor="jarvis")
@@ -505,10 +544,17 @@ class Orchestrator:
                 ]
             )
 
-            decision = await self._jarvis_client.complete(
-                messages,
-                tools=self._tool_registry.as_llm_definitions(),
+            # PRD 0006 / issue 0049 — fresh emitter per attempt. The
+            # msg_id binds the streamed deltas to the eventual
+            # ``assistant_msg`` frame; a retry rolls a new id so the
+            # frontend can distinguish the previous (rejected) speech
+            # from the new attempt.
+            attempt_msg_id = uuid.uuid4().hex
+            emitter = StreamEmitter(msg_id=attempt_msg_id)
+            decision = await self._stream_jarvis_call(
+                messages=messages,
                 session_id=session_id,
+                emitter=emitter,
             )
 
             emit_debug(
@@ -521,6 +567,7 @@ class Orchestrator:
                     "is_tool_call": decision.is_tool_call,
                     "tool_call_count": len(decision.tool_calls),
                     "attempt": envelope.attempts,
+                    "msg_id": attempt_msg_id,
                 },
             )
 
@@ -560,7 +607,8 @@ class Orchestrator:
 
             # ---- Dispatch tool calls.
             response, dispatch_error = await self._dispatch_tool_calls_with_diagnostics(
-                decision.tool_calls
+                decision.tool_calls,
+                msg_id=attempt_msg_id,
             )
             if response is not None:
                 return response
@@ -605,6 +653,159 @@ class Orchestrator:
             envelope.record_feedback(feedback_messages[-1]["content"])
             envelope.increment(error_code=error_code)
             continue
+
+    async def _stream_jarvis_call(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        session_id: str,
+        emitter: StreamEmitter,
+    ) -> LLMResponse:
+        """Drive one streamed Jarvis LLM call through the :class:`StreamEmitter`.
+
+        PRD 0006 / issue 0049. Bridges :meth:`LLMClient.stream_complete`
+        (which yields :class:`StreamChunk`) and the legacy
+        :class:`LLMResponse` shape the dispatcher path consumes.
+
+        Per-chunk behaviour:
+
+        - ``tool_call_start`` — register the call id + name. No emit
+          yet (the emitter's first ``speech_delta`` carries the msg_id
+          and the start phase is provider-internal).
+        - ``tool_call_args_delta`` — feed the argument suffix into the
+          emitter so a ``speech_delta`` can flush mid-stream. Also
+          accumulate the suffix locally so we can fall back to
+          re-parsing when ``final_arguments`` is missing.
+        - ``tool_call_end`` — finalise the emitter (which fires
+          ``ui_payload`` when applicable) and stash the call in the
+          collected :class:`ToolCall` list.
+        - ``text`` — accumulate into a local text buffer; the dispatcher
+          path will surface it as a contract violation if no tool call
+          followed.
+
+        We only feed argument deltas into the emitter for the FIRST
+        ``say`` call: ``ui_payload`` + ``speech_delta`` are exclusively
+        ``say`` concerns. Calls to other tools (``spawn_subtask``,
+        ``forward_to_subtask``, ``cancel_subtask``) still stream
+        through but their argument bytes are ignored by the emitter.
+        """
+
+        stream = await self._jarvis_client.stream_complete(
+            messages,
+            tools=self._tool_registry.as_llm_definitions(),
+            session_id=session_id,
+        )
+
+        # Per-call accumulators keyed by ``tool_call_id``.
+        in_flight: dict[str, dict[str, Any]] = {}
+        # Order in which calls were started, so the final
+        # :class:`LLMResponse` preserves provider order.
+        call_order: list[str] = []
+        # Local accumulator for plain-text path (text mode is rare under
+        # the unified ``say`` tool).
+        text_buffer = ""
+        # Track which call is the active ``say`` — only one ``say`` may
+        # stream per turn (PRD constraint). Subsequent ``say`` calls
+        # would bypass the emitter; the dispatcher path enforces the
+        # uniqueness.
+        active_say_id: str | None = None
+        emitter_finalised = False
+
+        async for chunk in stream:
+            if chunk.kind == "tool_call_start":
+                assert chunk.tool_call_id is not None
+                assert chunk.name is not None
+                in_flight[chunk.tool_call_id] = {
+                    "name": chunk.name,
+                    "arguments_buffer": "",
+                    "final_arguments": None,
+                }
+                call_order.append(chunk.tool_call_id)
+                if chunk.name == "say" and active_say_id is None:
+                    active_say_id = chunk.tool_call_id
+            elif chunk.kind == "tool_call_args_delta":
+                assert chunk.tool_call_id is not None
+                state = in_flight.get(chunk.tool_call_id)
+                if state is None:
+                    # Defensive: provider streamed args before start —
+                    # synthesise a stub state so we don't drop bytes.
+                    state = {
+                        "name": "",
+                        "arguments_buffer": "",
+                        "final_arguments": None,
+                    }
+                    in_flight[chunk.tool_call_id] = state
+                    call_order.append(chunk.tool_call_id)
+                state["arguments_buffer"] = cast(str, state["arguments_buffer"]) + chunk.args_delta
+                if chunk.tool_call_id == active_say_id:
+                    await emitter.feed(chunk.args_delta)
+            elif chunk.kind == "tool_call_end":
+                assert chunk.tool_call_id is not None
+                state = in_flight.get(chunk.tool_call_id)
+                if state is None:
+                    # End without start — synthesise the slot.
+                    state = {
+                        "name": "",
+                        "arguments_buffer": "",
+                        "final_arguments": chunk.final_arguments,
+                    }
+                    in_flight[chunk.tool_call_id] = state
+                    call_order.append(chunk.tool_call_id)
+                else:
+                    state["final_arguments"] = chunk.final_arguments
+                if chunk.tool_call_id == active_say_id and not emitter_finalised:
+                    emitter_finalised = True
+                    await emitter.finalize(chunk.final_arguments)
+            elif chunk.kind == "text":
+                text_buffer += chunk.text_delta
+
+        # Defensive: a stream that ends WITHOUT an explicit
+        # ``tool_call_end`` for the active say leaves the emitter
+        # un-finalised. Force a finalize so any pending ``ui_payload``
+        # still fires from the accumulated buffer.
+        if active_say_id is not None and not emitter_finalised:
+            emitter_finalised = True
+            buffered_state = in_flight.get(active_say_id, {})
+            final_arguments = buffered_state.get("final_arguments")
+            await emitter.finalize(final_arguments if isinstance(final_arguments, dict) else None)
+
+        # Materialise the :class:`LLMResponse`. Tool calls take
+        # precedence over plain-text content — the unified ``say`` tool
+        # is the only legitimate spoken path, so even if the provider
+        # surfaced both, the orchestrator routes through the tool
+        # surface and the dispatcher persists the assistant turn.
+        tool_calls: list[ToolCall] = []
+        for call_id in call_order:
+            state = in_flight[call_id]
+            arguments: dict[str, Any]
+            final = state.get("final_arguments")
+            if isinstance(final, dict):
+                arguments = cast(dict[str, Any], final)
+            else:
+                arguments_raw = cast(str, state.get("arguments_buffer", ""))
+                if not arguments_raw.strip():
+                    arguments = {}
+                else:
+                    try:
+                        parsed = json.loads(arguments_raw)
+                    except json.JSONDecodeError:
+                        # Malformed final args — the validation retry
+                        # loop will surface a contract violation.
+                        continue
+                    if not isinstance(parsed, dict):
+                        continue
+                    arguments = cast(dict[str, Any], parsed)
+            tool_calls.append(
+                ToolCall(
+                    id=call_id,
+                    name=cast(str, state.get("name", "") or ""),
+                    arguments=arguments,
+                )
+            )
+
+        if tool_calls:
+            return LLMResponse(text=None, tool_calls=tool_calls)
+        return LLMResponse(text=text_buffer or None, tool_calls=[])
 
     async def _degrade_validation_exhausted(
         self,
@@ -1246,6 +1447,8 @@ class Orchestrator:
     async def _dispatch_tool_calls_with_diagnostics(
         self,
         tool_calls: list[ToolCall],
+        *,
+        msg_id: str = "",
     ) -> tuple[OrchestratorResponse | None, DispatchResult | None]:
         """Dispatch every tool call through the :class:`ToolDispatcher`.
 
@@ -1307,6 +1510,7 @@ class Orchestrator:
                     spawned_task_ids=spawned,
                     forwarded_task_ids=forwarded,
                     cancelled_task_ids=cancelled,
+                    msg_id=msg_id,
                 ),
                 None,
             )
@@ -1322,6 +1526,7 @@ class Orchestrator:
                 spawned_task_ids=[],
                 forwarded_task_ids=[],
                 cancelled_task_ids=[],
+                msg_id=msg_id,
             ),
             None,
         )

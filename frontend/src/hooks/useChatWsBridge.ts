@@ -43,6 +43,9 @@ export function useChatWsBridge(): UseChatWsBridgeResult {
   const setTaskResult = useChatStore((s) => s.setTaskResult);
   const setTaskMessagesSnapshot = useChatStore((s) => s.setTaskMessagesSnapshot);
   const appendTaskMessage = useChatStore((s) => s.appendTaskMessage);
+  const appendSpeechDelta = useChatStore((s) => s.appendSpeechDelta);
+  const setStreamingUi = useChatStore((s) => s.setStreamingUi);
+  const clearStreamingAssistant = useChatStore((s) => s.clearStreamingAssistant);
 
   // Bridge audioPlayer → store so `Bubble` can render the wave indicator
   // on the exact bubble currently being voiced. Cleared on natural end
@@ -90,6 +93,24 @@ export function useChatWsBridge(): UseChatWsBridgeResult {
             }
           }
           addAssistantMessage(msg.speech, msg.ui, msg.msg_id, msg.proactive);
+          // PRD 0006 / issue 0049 — the persisted bubble takes over from
+          // the in-flight streamed buffer. Clear it so `TranscriptLine`
+          // stops mirroring a duplicate of the same text and `SphereUI`
+          // falls back to the final `messages` array.
+          clearStreamingAssistant();
+          break;
+        case "speech_delta":
+          // PRD 0006 / issue 0049 — accumulate the streamed `say.speech`
+          // suffix. The sphere transcript reads from `streamingAssistant`
+          // to render the partial phrase before the closing `assistant_msg`.
+          appendSpeechDelta(msg.msg_id, msg.delta);
+          break;
+        case "ui_payload":
+          // PRD 0006 / issue 0049 — first (and only) ui frame for the
+          // streamed turn. Opens the markdown overlay immediately; the
+          // closing `assistant_msg` carries the same payload but the
+          // overlay is already up by then.
+          setStreamingUi(msg.msg_id, msg.ui);
           break;
         case "audio_start":
           if (msg.msg_id !== currentMsgIdRef.current) {
@@ -151,6 +172,9 @@ export function useChatWsBridge(): UseChatWsBridgeResult {
       setTaskResult,
       setTaskMessagesSnapshot,
       appendTaskMessage,
+      appendSpeechDelta,
+      setStreamingUi,
+      clearStreamingAssistant,
     ],
   );
 

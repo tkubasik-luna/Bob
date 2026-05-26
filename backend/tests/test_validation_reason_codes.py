@@ -77,8 +77,10 @@ def test_render_frontend_table_contains_schema_version_and_all_codes() -> None:
     rendered = render_frontend_table_ts()
     assert "REASON_CODE_SCHEMA_VERSION = 1" in rendered
     assert "REASON_CODES" in rendered
+    # Biome-style TS object literal: unquoted keys + double-quoted strings
+    # + trailing commas (see ``render_frontend_table_ts`` docstring).
     for entry in DEFAULT_REGISTRY:
-        assert f'"code": "{entry.code}"' in rendered
+        assert f'code: "{entry.code}"' in rendered
 
 
 def test_generated_frontend_table_exists_and_matches_source_of_truth() -> None:

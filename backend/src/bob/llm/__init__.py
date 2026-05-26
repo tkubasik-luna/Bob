@@ -7,6 +7,6 @@ talk to any :class:`bob.llm_client.LLMClient` implementation via the
 
 from __future__ import annotations
 
-from bob.llm.types import LLMResponse, ToolCall, ToolDefinition
+from bob.llm.types import LLMResponse, StreamChunk, StreamChunkKind, ToolCall, ToolDefinition
 
-__all__ = ["LLMResponse", "ToolCall", "ToolDefinition"]
+__all__ = ["LLMResponse", "StreamChunk", "StreamChunkKind", "ToolCall", "ToolDefinition"]
