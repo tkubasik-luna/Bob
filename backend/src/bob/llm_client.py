@@ -139,6 +139,72 @@ def _strip_code_fence(text: str) -> str:
     return "\n".join(lines[1:body_end]).strip()
 
 
+def _repair_json_braces(text: str) -> str | None:
+    """Best-effort repair of structurally-broken JSON closers.
+
+    ``claude -p`` hand-writes tool-call JSON (there is no native tool-calling on
+    the CLI) and miscounts closing braces on deeply-nested payloads — e.g. a
+    ``say`` call carrying a ``ui.props.content`` markdown block nests six
+    containers deep, and the model routinely emits the wrong closer type and/or
+    an extra/missing brace at the tail (observed: ``}}}}}]`` where ``}}}}]}``
+    was needed). The OPENING sequence is reliable, so we rebuild the closers
+    from the open-stack: every ``}``/``]`` seen outside a string is replaced by
+    the closer matching the most-recent unclosed ``{``/``[``, stray closers are
+    dropped, trailing junk after the top-level value is trimmed, and any
+    still-open containers are closed at EOF. String contents (respecting
+    backslash escapes) are copied verbatim so braces inside ``content`` never
+    count toward the structure.
+
+    Returns the repaired string, or ``None`` when there was no structure to
+    balance (no opener seen) — the caller treats ``None`` as unrepairable.
+    """
+
+    out: list[str] = []
+    stack: list[str] = []
+    saw_open = False
+    in_string = False
+    escape = False
+    for ch in text:
+        if in_string:
+            out.append(ch)
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            out.append(ch)
+            continue
+        if ch in "{[":
+            saw_open = True
+            stack.append(ch)
+            out.append(ch)
+            continue
+        if ch in "}]":
+            if not stack:
+                # Stray closer with nothing open — drop it.
+                continue
+            opener = stack.pop()
+            out.append("}" if opener == "{" else "]")
+            if not stack:
+                # Top-level value balanced — stop, ignoring any trailing
+                # extra braces / prose the model appended.
+                break
+            continue
+        out.append(ch)
+
+    if not saw_open:
+        return None
+    # Close anything the model left open (truncated tail).
+    while stack:
+        opener = stack.pop()
+        out.append("}" if opener == "{" else "]")
+    return "".join(out)
+
+
 class LLMClient(ABC):
     """Abstract interface for an OpenAI-compatible chat LLM."""
 
@@ -368,9 +434,7 @@ class LMStudioClient(LLMClient):
                 category="llm",
                 severity="error",
                 source="bob.llm_client.chat",
-                summary=(
-                    f"LLM call returned empty content ({latency_ms:.0f}ms)"
-                ),
+                summary=(f"LLM call returned empty content ({latency_ms:.0f}ms)"),
                 payload={
                     "model": self._settings.LLM_MODEL,
                     "base_url": self._settings.LLM_BASE_URL,
@@ -972,6 +1036,33 @@ class ClaudeCliClient(LLMClient):
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
 
+    def _isolation_args(self) -> list[str]:
+        """Extra argv that quarantine the CLI from the user's ``~/.claude``.
+
+        ``--strict-mcp-config`` drops every inherited MCP server; an empty
+        ``--setting-sources`` skips user/project/local settings so no
+        SessionStart hook (e.g. a "caveman mode" plugin) injects a system
+        prompt that competes with Bob's Jarvis persona. Keychain/OAuth auth
+        survives — unlike ``--bare`` which would force ``ANTHROPIC_API_KEY``.
+        Empty list when :attr:`Settings.CLAUDE_CLI_ISOLATED` is False.
+        """
+
+        if not self._settings.CLAUDE_CLI_ISOLATED:
+            return []
+        return ["--strict-mcp-config", "--setting-sources", ""]
+
+    def _isolation_cwd(self) -> str | None:
+        """Working directory for the subprocess, or ``None`` to inherit.
+
+        Running from :attr:`Settings.BOB_DATA_DIR` (which has no ``CLAUDE.md``)
+        stops the CLI auto-discovering the repo's ``CLAUDE.md`` and folding the
+        project instructions into the prompt.
+        """
+
+        if not self._settings.CLAUDE_CLI_ISOLATED:
+            return None
+        return str(self._settings.BOB_DATA_DIR)
+
     @staticmethod
     def _split_messages(
         messages: list[dict[str, Any]],
@@ -1041,6 +1132,7 @@ class ClaudeCliClient(LLMClient):
             "--no-session-persistence",
             "--tools",
             "",
+            *self._isolation_args(),
         ]
         if system_prompt:
             argv += ["--system-prompt", system_prompt]
@@ -1087,6 +1179,7 @@ class ClaudeCliClient(LLMClient):
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                cwd=self._isolation_cwd(),
             )
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
                 proc.communicate(prompt.encode("utf-8")),
@@ -1323,7 +1416,33 @@ class ClaudeCliClient(LLMClient):
         try:
             payload, _consumed = json.JSONDecoder().raw_decode(stripped)
         except json.JSONDecodeError:
-            return LLMResponse(text=raw, tool_calls=[])
+            # claude -p hand-writes JSON and miscounts braces on deeply-nested
+            # tool calls (notably ``say`` + ``ui.props.content`` markdown).
+            # Try to salvage the call by rebuilding the closers from the
+            # open-stack before giving up — otherwise a valid-intent tool call
+            # is lost and the orchestrator degrades to "Désolé, peux-tu
+            # reformuler ?".
+            repaired = _repair_json_braces(stripped)
+            if repaired is None:
+                return LLMResponse(text=raw, tool_calls=[])
+            try:
+                payload, _consumed = json.JSONDecoder().raw_decode(repaired)
+            except json.JSONDecodeError:
+                emit_debug(
+                    category="llm",
+                    severity="warn",
+                    source="bob.llm_client.complete",
+                    summary="Tool-call JSON irréparable (accolades cassées)",
+                    payload={"raw": raw[:800], "session_id": session_id},
+                )
+                return LLMResponse(text=raw, tool_calls=[])
+            emit_debug(
+                category="llm",
+                severity="warn",
+                source="bob.llm_client.complete",
+                summary="Tool-call JSON réparé (accolades rééquilibrées)",
+                payload={"raw": raw[:800], "session_id": session_id},
+            )
 
         if not isinstance(payload, dict) or "tool_calls" not in payload:
             return LLMResponse(text=raw, tool_calls=[])

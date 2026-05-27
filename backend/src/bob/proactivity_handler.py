@@ -51,13 +51,15 @@ class ProactivityHandler:
         """Subscribe target for the ``task_state_changed`` topic.
 
         Routes ``waiting_input`` + ``action=ask_user`` to a paraphrased
-        question and ``done`` transitions to a result synthesis. Other
-        transitions (``running``, ``failed``, …) are no-ops — the
-        ``task_updated`` WS event already surfaced them in the sidebar.
+        question, ``done`` to a result synthesis and ``failed`` (natural
+        failure, not a user cancel) to a failure synthesis. Other transitions
+        (``running``, ``superseded``, …) are no-ops — the ``task_updated`` WS
+        event already surfaced them in the sidebar.
         """
 
         new_state = payload.get("new_state")
         action = payload.get("action")
+        reason_code = payload.get("reason_code")
         task_id = payload.get("task_id")
         if not isinstance(task_id, str):
             _logger.warning("proactivity.bad_payload", payload=payload)
@@ -73,9 +75,22 @@ class ProactivityHandler:
             await orchestrator.generate_proactive_message(task_id=task_id, event_kind="done")
             return
 
-        # ``failed`` and intermediate transitions are explicitly ignored —
-        # the WS task_updated already surfaced the state change to the
-        # sidebar; Jarvis would have nothing to add in chat.
+        # A sub-task that fails on its own (LLM error, timeout, validation
+        # exhausted, …) must still come back to the user — previously this
+        # branch was a silent no-op so the user was left waiting forever on a
+        # result that never arrived. User-initiated cancels do NOT reach here
+        # (the scheduler's ``_finalize_cancelled`` emits no
+        # ``task_state_changed``); the ``user_cancelled`` reason_code guard is
+        # belt-and-suspenders against the hard-kill path so we never re-announce
+        # a failure on top of the synchronous "Compris, j'annule" confirmation.
+        if new_state == "failed" and reason_code != "user_cancelled":
+            orchestrator = self._orchestrator_factory()
+            await orchestrator.generate_proactive_message(task_id=task_id, event_kind="failed")
+            return
+
+        # Remaining transitions (``running``, ``superseded``, user-cancelled
+        # ``failed``, …) are intentional no-ops — the WS task_updated already
+        # surfaced them in the sidebar and Jarvis has nothing to add in chat.
         _logger.debug(
             "proactivity.no_op",
             task_id=task_id,

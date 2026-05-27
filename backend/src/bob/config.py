@@ -47,7 +47,26 @@ class Settings(BaseSettings):
     # Claude CLI backend (used when LLM_PROVIDER=claude_cli)
     CLAUDE_CLI_BIN: str = "claude"
     CLAUDE_CLI_MODEL: str | None = None
-    CLAUDE_CLI_TIMEOUT_SECONDS: float = 120.0
+    # Per-call wall-clock cap for the ``claude`` CLI subprocess. Bumped
+    # 120 -> 600 because long autonomous sub-agent generations (e.g. a full
+    # written exposé / chronology) routinely exceed several minutes on the
+    # first call and were dying with ``llm_failed`` at iteration 0. Jarvis'
+    # own turns are short so the higher ceiling only ever helps the sub-agent
+    # path. Tune via .env.
+    CLAUDE_CLI_TIMEOUT_SECONDS: float = 600.0
+
+    # Spawn the ``claude`` CLI in an isolated environment so the user's
+    # personal ``~/.claude`` config does not bleed into Bob's backend calls.
+    # When True the client adds ``--strict-mcp-config`` (no inherited MCP
+    # servers) and ``--setting-sources ""`` (no user/project/local settings,
+    # so SessionStart hooks — e.g. a "caveman mode" plugin — cannot inject a
+    # competing system prompt on top of Bob's Jarvis persona) and runs the
+    # subprocess from :attr:`BOB_DATA_DIR` so the repo's ``CLAUDE.md`` is not
+    # auto-discovered. Keychain/OAuth auth is preserved (unlike ``--bare``,
+    # which forces ``ANTHROPIC_API_KEY``). Set False to inherit the full
+    # user environment (e.g. when authenticating via an ``apiKeyHelper`` that
+    # lives in settings.json).
+    CLAUDE_CLI_ISOLATED: bool = True
 
     # Orchestrator backends — slice #0018.
     # When unset they fall back to ``LLM_PROVIDER`` so callers can route the
@@ -84,6 +103,13 @@ class Settings(BaseSettings):
 
     # Logging
     LOG_LEVEL: str = "INFO"
+
+    # When true, the debug event producer (:mod:`bob.debug_log`) also appends
+    # every emitted event as a JSON line to ``logs/orchestration.jsonl`` so the
+    # full orchestration trace survives the process and can be read / grepped
+    # offline. The WS debug feed only lives while a client is connected and the
+    # in-memory ring buffer is bounded; this file is the durable record.
+    ORCHESTRATION_LOG_ENABLED: bool = True
 
     # Persistence — Jarvis thread + future task data live under this directory.
     # Resolved lazily so tests can override via ``BOB_DATA_DIR`` env var with a

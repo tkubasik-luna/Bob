@@ -199,6 +199,40 @@ async def test_process_user_message_spawns_subtask_when_tool_call() -> None:
 
 
 @pytest.mark.asyncio
+async def test_process_user_message_spawns_v2_task_when_tool_call() -> None:
+    """Regression: a v2 ``spawn_task`` call is confirmed, not silently crashed.
+
+    Pre-fix ``_collect_dispatch_result`` only bucketed the v1 ``*_subtask``
+    names, so a v2 ``spawn_task`` (the canonical entry point the prompt now
+    advertises) left ``spawned`` empty and tripped ``assert say_speech is not
+    None``. The AssertionError bubbled up, the spawn was never announced, and
+    the crash was invisible (swallowed by the ws_router catch-all + the
+    structlog bridge bypass).
+    """
+
+    spawn_task_call = ToolCall(
+        id="call_v2",
+        name="spawn_task",
+        arguments={"title": "Exposé", "goal": "Rédige un long exposé"},
+    )
+    orchestrator, _jarvis_client, _sub_client, jarvis_store, _task_store, scheduler = (
+        _make_orchestrator(
+            complete_responses=[LLMResponse(text=None, tool_calls=[spawn_task_call])],
+        )
+    )
+
+    response = await orchestrator.process_user_message("s1", "Fais un long exposé")
+
+    assert response.speech == _SPAWN_CONFIRMATION
+    assert len(response.spawned_task_ids) == 1
+    assert response.spawned_task_ids == scheduler.enqueued
+    assert jarvis_store.history()[-1] == {
+        "role": "assistant",
+        "content": _SPAWN_CONFIRMATION,
+    }
+
+
+@pytest.mark.asyncio
 async def test_spawn_with_invalid_args_then_invalid_again_degrades() -> None:
     """Issue 0048: every dispatch errored across the retry budget → degrade speech.
 
@@ -849,7 +883,9 @@ async def test_do_generate_done_synthesis_emits_assistant_msg_with_flag() -> Non
     assert user_msg["role"] == "user"
     assert "Recherche papier RAG" in user_msg["content"]
     assert "3 résultats trouvés" in user_msg["content"]
-    assert "2-3 lignes" in user_msg["content"]
+    # DONE_SYNTHESIS_TEMPLATE v2 — TTS-aware wording (read aloud, ~40 words,
+    # 2 short sentences) replaced the old "2-3 lignes" phrasing.
+    assert "2 phrases" in user_msg["content"]
     assert "Vérifie le contenu" in user_msg["content"]
     assert "Voilà ce que j'ai trouvé" in user_msg["content"]
 

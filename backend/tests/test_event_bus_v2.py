@@ -70,6 +70,38 @@ async def test_emit_event_lands_in_ring_buffer_and_forwards_to_ws() -> None:
 
 
 @pytest.mark.asyncio
+async def test_emit_event_fans_out_to_every_registered_emitter() -> None:
+    # Multi-window: each ``/ws/chat`` session registers via ``add_ws_emitter``
+    # and a single emit must reach ALL of them. Pre-fix the emitter was a single
+    # slot (last-writer-wins), so opening a second window silently dropped
+    # task events / streamed frames / proactive pushes for every other window.
+    a: list[dict[str, Any]] = []
+    b: list[dict[str, Any]] = []
+
+    async def _emitter_a(event: dict[str, Any]) -> None:
+        a.append(event)
+
+    async def _emitter_b(event: dict[str, Any]) -> None:
+        b.append(event)
+
+    event_bus_v2.add_ws_emitter(_emitter_a)
+    event_bus_v2.add_ws_emitter(_emitter_b)
+
+    payload = {"type": "ui_payload", "task_id": "task-A", "ui": {"component": "Markdown"}}
+    await event_bus_v2.emit_event(payload)
+
+    assert a == [payload]
+    assert b == [payload]
+
+    # A disconnecting window unregisters; the survivor keeps receiving.
+    event_bus_v2.remove_ws_emitter(_emitter_a)
+    await event_bus_v2.emit_event({"type": "task_updated", "task_id": "task-A"})
+
+    assert len(a) == 1  # no new event after removal
+    assert len(b) == 2
+
+
+@pytest.mark.asyncio
 async def test_emit_event_uses_context_var_when_payload_has_no_task_id() -> None:
     payload = {"type": "task_message", "message_id": 42}
     token = start_task("task-X")

@@ -19,7 +19,12 @@ import pytest
 
 from bob.config import Settings
 from bob.llm import LLMResponse, ToolCall, ToolDefinition
-from bob.llm_client import ClaudeCliClient, LLMClientError, LMStudioClient
+from bob.llm_client import (
+    ClaudeCliClient,
+    LLMClientError,
+    LMStudioClient,
+    _repair_json_braces,
+)
 
 
 def _make_lm_settings() -> Settings:
@@ -333,6 +338,73 @@ async def test_claude_cli_complete_parses_tool_call_with_trailing_prose(
     call = response.tool_calls[0]
     assert call.name == "spawn_subtask"
     assert call.arguments == {"title": "Draft email", "goal": "Write three variants."}
+
+
+@pytest.mark.asyncio
+async def test_claude_cli_complete_repairs_malformed_braces(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: ``claude -p`` miscounts braces on deeply-nested ``say`` calls.
+
+    Observed in production — a ``say`` carrying a ``ui.props.content`` markdown
+    block nests six containers deep and the CLI emits a broken closer sequence
+    (``}}}}}]`` instead of ``}}}}]}``), so strict ``raw_decode`` failed, the
+    tool call was dropped, and the orchestrator degraded to "Désolé, peux-tu
+    reformuler ?". The brace-repair pass must salvage the call.
+    """
+
+    client = ClaudeCliClient(_claude_settings())
+    # Valid tail would be ``}}}}]}``; the model emitted ``}}}}}]`` (extra brace,
+    # wrong array closer, missing root close).
+    broken = (
+        '{"tool_calls": [{"id": "call_1", "name": "say", "arguments": '
+        '{"speech": "Bitcoin, en bref", "ui": {"component": "Markdown", '
+        '"props": {"content": "rare et cher"}}}}}]'
+    )
+
+    async def _fake_chat(
+        messages: list[dict[str, Any]],
+        schema: dict[str, Any] | None = None,
+        session_id: str | None = None,
+    ) -> str:
+        return broken
+
+    monkeypatch.setattr(client, "chat", _fake_chat)
+
+    response = await client.complete(
+        messages=[{"role": "user", "content": "parle-moi du bitcoin"}],
+        tools=[_spawn_tool()],
+    )
+
+    assert response.is_tool_call is True
+    assert len(response.tool_calls) == 1
+    call = response.tool_calls[0]
+    assert call.name == "say"
+    assert call.arguments["speech"] == "Bitcoin, en bref"
+    assert call.arguments["ui"]["props"]["content"] == "rare et cher"
+
+
+def test_repair_json_braces_rebuilds_closers() -> None:
+    broken = (
+        '{"tool_calls": [{"name": "say", "arguments": '
+        '{"speech": "x", "ui": {"props": {"content": "y"}}}}}]'
+    )
+    repaired = _repair_json_braces(broken)
+    assert repaired is not None
+    parsed = json.loads(repaired)
+    assert parsed["tool_calls"][0]["arguments"]["ui"]["props"]["content"] == "y"
+
+
+def test_repair_json_braces_ignores_braces_inside_strings() -> None:
+    # A ``}`` inside a string literal must not be counted as a closer, and
+    # trailing extra braces are trimmed once the top-level value balances.
+    repaired = _repair_json_braces('{"a": "x}y{z", "b": 1}}}')
+    assert repaired is not None
+    assert json.loads(repaired) == {"a": "x}y{z", "b": 1}
+
+
+def test_repair_json_braces_returns_none_without_structure() -> None:
+    assert _repair_json_braces("just prose, no json") is None
 
 
 @pytest.mark.asyncio

@@ -6,7 +6,7 @@ strictly disjoint from Jarvis's (no ``spawn_subtask`` / ``say`` on a
 sub-agent — it would let a sub-agent spawn its own children, which is
 explicitly out of scope per PRD 0006 / "Out of scope").
 
-This slice (0045) ships two placeholder tool definitions:
+This slice (0045) defines two placeholder tool definitions:
 
 - ``web_search(query)`` — issues a web search. Real implementation
   intentionally a ``NotImplementedError`` for now; the focus of this
@@ -15,6 +15,11 @@ This slice (0045) ships two placeholder tool definitions:
   later product slice when product priorities decide on a backend.
 - ``web_fetch(url)`` — fetches a URL's content. Same placeholder
   pattern.
+
+Both are intentionally **not** wired into
+:func:`build_default_subagent_registry` (it returns an empty registry):
+advertising a tool whose handler always raises only wastes an LLM
+round-trip per research task. Re-register them once a real backend lands.
 
 The :class:`SubAgentToolHandlerContext` mirrors
 :class:`bob.tools.dispatcher.ToolHandlerContext` but for the sub-agent
@@ -295,17 +300,18 @@ def build_web_fetch_tool() -> SubAgentToolDefinition:
 def build_default_subagent_registry() -> SubAgentToolRegistry:
     """Construct the default sub-agent tool registry.
 
-    Carries ``web_search`` + ``web_fetch`` v1. Other slices may extend
-    via :meth:`SubAgentToolRegistry.register` or by constructing a
-    custom registry directly (tests do this).
+    Currently **empty**. ``web_search`` / ``web_fetch`` exist only as
+    placeholders that raise ``NotImplementedError``; exposing them made every
+    research sub-task burn an LLM round-trip on a ``handler_failed`` tool call
+    before falling back to pure-knowledge generation. The builders stay
+    available (:func:`build_web_search_tool` / :func:`build_web_fetch_tool`) and
+    should be re-registered here once a real HTTP backend lands.
+
+    Other slices may extend via :meth:`SubAgentToolRegistry.register` or by
+    constructing a custom registry directly (tests do this).
     """
 
-    return SubAgentToolRegistry(
-        [
-            build_web_search_tool(),
-            build_web_fetch_tool(),
-        ]
-    )
+    return SubAgentToolRegistry()
 
 
 __all__ = [

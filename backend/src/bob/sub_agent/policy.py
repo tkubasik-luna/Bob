@@ -8,16 +8,16 @@ Three global caps are enforced by the runner:
 
 - ``max_iterations``: the runner exits with ``done(degraded,
   iteration_cap)`` after this many ``progress`` + ``tool_call``
-  iterations. Defaults to ``10`` (mirrors the legacy
-  ``MAX_PROGRESS_ITERATIONS`` constant).
+  iterations. Defaults to ``50``.
 - ``wall_clock_seconds``: total wall-clock budget for a single
   :meth:`SubAgentRunner.run` invocation. Exceeding it triggers a
   cooperative cancel; the runner emits ``done(timeout,
-  wall_clock_cap)``. Defaults to ``120.0``.
+  wall_clock_cap)``. Defaults to ``1800.0`` (30 min) so long autonomous
+  generations (full exposé / chronology) are not cut off.
 - ``token_cap``: aggregate token spend across LLM calls inside a single
   run. The runner adds the prompt + completion token counts from each
   LLM call and exits with ``done(degraded, token_cap)`` once the cap
-  is exceeded. Defaults to ``8000``.
+  is exceeded. Defaults to ``200_000``.
 
 Per-task-type overrides
 -----------------------
@@ -56,9 +56,9 @@ class SubAgentPolicy:
     Default ``2.0`` matches the PRD spec.
     """
 
-    max_iterations: int = 10
-    wall_clock_seconds: float = 120.0
-    token_cap: int = 8000
+    max_iterations: int = 50
+    wall_clock_seconds: float = 1800.0
+    token_cap: int = 200_000
     cancel_grace_seconds: float = 2.0
     per_task_type: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
 

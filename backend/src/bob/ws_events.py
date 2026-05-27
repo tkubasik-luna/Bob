@@ -29,20 +29,37 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from bob.event_bus_v2 import emit_event, set_ws_emitter
+from bob.event_bus_v2 import add_ws_emitter, emit_event, remove_ws_emitter, set_ws_emitter
 
 TaskEvent = dict[str, Any]
 
 
 def set_emitter(fn: Callable[[TaskEvent], Awaitable[None]] | None) -> None:
-    """Install (or clear) the process-wide async emitter.
+    """Replace the emitter set with a single ``fn`` (or clear on ``None``).
 
-    Delegates to :func:`bob.event_bus_v2.set_ws_emitter`. The bus
-    forwards every :func:`emit_event` payload to ``fn`` so the chat
-    client receives task lifecycle events as before.
+    Back-compat convenience for single-emitter call sites + tests. Live
+    multi-window WS handling uses :func:`add_emitter` / :func:`remove_emitter`
+    so every open window receives the fan-out.
     """
 
     set_ws_emitter(fn)
+
+
+def add_emitter(fn: Callable[[TaskEvent], Awaitable[None]]) -> None:
+    """Register a connected session's emitter (fan-out target).
+
+    Each ``/ws/chat`` window registers on connect so task lifecycle events,
+    streamed ``speech_delta`` / ``ui_payload`` frames and proactive pushes
+    reach every open window, not just the last one to connect.
+    """
+
+    add_ws_emitter(fn)
+
+
+def remove_emitter(fn: Callable[[TaskEvent], Awaitable[None]]) -> None:
+    """Unregister a session's emitter on disconnect. Idempotent."""
+
+    remove_ws_emitter(fn)
 
 
 async def emit(event: TaskEvent) -> None:

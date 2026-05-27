@@ -79,7 +79,13 @@ async def test_done_event_without_action_still_dispatches() -> None:
 
 
 @pytest.mark.asyncio
-async def test_failed_event_is_noop() -> None:
+async def test_failed_event_dispatches_to_failed_synthesis() -> None:
+    """A natural sub-task failure now triggers a ``failed`` proactive event.
+
+    The user must hear that the task could not be completed instead of waiting
+    forever on a result that never arrives.
+    """
+
     fake = _FakeOrchestrator()
     handler = ProactivityHandler(orchestrator_factory=lambda: fake)
 
@@ -88,6 +94,32 @@ async def test_failed_event_is_noop() -> None:
             "task_id": "abc",
             "old_state": "running",
             "new_state": "failed",
+            "action": "done",
+            "reason_code": "llm_failed",
+        }
+    )
+
+    assert fake.calls == [("abc", "failed")]
+
+
+@pytest.mark.asyncio
+async def test_user_cancelled_failed_is_noop() -> None:
+    """A user-cancelled task must NOT re-announce a failure.
+
+    The synchronous ``cancel_task`` path already spoke "Compris, j'annule";
+    the ``user_cancelled`` reason_code guards against a duplicate failure
+    announcement on the hard-kill path.
+    """
+
+    fake = _FakeOrchestrator()
+    handler = ProactivityHandler(orchestrator_factory=lambda: fake)
+
+    await handler.on_task_state_changed(
+        {
+            "task_id": "abc",
+            "old_state": "running",
+            "new_state": "failed",
+            "reason_code": "user_cancelled",
         }
     )
 

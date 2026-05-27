@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from typing import Any
 
@@ -12,6 +13,7 @@ from bob.db.migrations_runner import apply_migrations, default_migrations_dir
 from bob.event_bus import EventBus
 from bob.llm.types import LLMResponse, ToolDefinition
 from bob.llm_client import LLMClient
+from bob.sub_agent.policy import SubAgentPolicy
 from bob.sub_agent_runner import SubAgentRunner
 from bob.task_store import TaskStore
 
@@ -111,13 +113,75 @@ async def test_done_action_fenced_json_parses() -> None:
     assert task.result == "X"
 
 
+@pytest.mark.asyncio
+async def test_done_string_ui_payload_persisted_as_deliverable() -> None:
+    """A ``done`` whose ``ui_payload`` is a markdown string surfaces that
+    markdown as ``task.result`` (the overlay renders the full deliverable,
+    not the short ``result_summary``), and parses on the first try."""
+
+    store = _make_store()
+    task_id = _make_running_task(store)
+
+    deliverable = "# Exposé\n\nContenu **complet** en Markdown."
+    payload = json.dumps(
+        {
+            "action": "done",
+            "result_summary": "Court résumé.",
+            "ui_payload": deliverable,
+            "status": "complete",
+            "reason_code": "ok",
+            "cost": {},
+        }
+    )
+    client = _ScriptedClient(chat_value=payload)
+    runner = SubAgentRunner(subagent_client=client, task_store=store, event_bus=EventBus())
+
+    await runner.run(task_id)
+
+    task = store.get_task(task_id)
+    assert task.state == "done"
+    assert task.result == deliverable
+    # String ui_payload is now valid — no validation retries burned.
+    assert len(client.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_salvage_extracts_deliverable_from_malformed_envelope() -> None:
+    """When the envelope still fails validation but is JSON carrying a
+    ``ui_payload`` deliverable, salvage surfaces the clean markdown rather than
+    the raw ``{"action": …}`` blob (the reported bug)."""
+
+    store = _make_store()
+    task_id = _make_running_task(store)
+
+    deliverable = "# Titre\n\nCorps du document."
+    # No ``result_summary`` / ``result`` → the envelope never normalises, even
+    # after retries, so the salvage path runs.
+    malformed = json.dumps({"action": "done", "ui_payload": deliverable})
+    client = _ScriptedClient(chat_value=malformed)
+    runner = SubAgentRunner(subagent_client=client, task_store=store, event_bus=EventBus())
+
+    await runner.run(task_id)
+
+    task = store.get_task(task_id)
+    assert task.state == "done"
+    assert task.result == deliverable
+
+
 # ---------------------------------------------------------------------------
 # error paths
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_invalid_json_marks_failed_no_result() -> None:
+async def test_invalid_json_after_retries_salvaged_as_done() -> None:
+    """Non-empty unparseable output, after retries, is salvaged as a degraded done.
+
+    Deliverable sub-agents often answer with raw prose/markdown that never
+    parses as the JSON envelope; the runner now keeps that output as the task
+    result (state ``done``) so it reaches Jarvis instead of being discarded.
+    """
+
     store = _make_store()
     task_id = _make_running_task(store)
 
@@ -127,10 +191,8 @@ async def test_invalid_json_marks_failed_no_result() -> None:
     await runner.run(task_id)
 
     task = store.get_task(task_id)
-    assert task.state == "failed"
-    assert task.result is None
-    messages = store.get_task_messages(task_id)
-    assert any(m.role == "system" for m in messages)
+    assert task.state == "done"
+    assert task.result == "not json"
 
 
 @pytest.mark.asyncio
@@ -152,7 +214,10 @@ async def test_llm_exception_marks_failed_and_does_not_reraise() -> None:
 
 
 @pytest.mark.asyncio
-async def test_done_action_without_result_marks_failed() -> None:
+async def test_done_action_without_result_salvaged_after_retries() -> None:
+    """A ``done`` missing its result never parses, so after retries the raw
+    payload is salvaged as a degraded done rather than discarded."""
+
     store = _make_store()
     task_id = _make_running_task(store)
 
@@ -162,8 +227,8 @@ async def test_done_action_without_result_marks_failed() -> None:
     await runner.run(task_id)
 
     task = store.get_task(task_id)
-    assert task.state == "failed"
-    assert task.result is None
+    assert task.state == "done"
+    assert task.result == '{"action": "done"}'
 
 
 # ---------------------------------------------------------------------------
@@ -465,7 +530,16 @@ async def test_progress_cap_exceeded_emits_done_degraded() -> None:
         client = _ScriptedClient(
             chat_values=[f'{{"action": "progress", "status": "step {i}"}}' for i in range(1, 12)]
         )
-        runner = SubAgentRunner(subagent_client=client, task_store=store, event_bus=EventBus())
+        # Pin the iteration cap to 10 so the test is independent of the global
+        # default (raised well above 10 for long autonomous tasks).
+        runner = SubAgentRunner(
+            subagent_client=client,
+            task_store=store,
+            event_bus=EventBus(),
+            policy=SubAgentPolicy(
+                max_iterations=10, wall_clock_seconds=999.0, token_cap=999_999
+            ),
+        )
         await runner.run(task_id)
     finally:
         ws_events.set_emitter(None)

@@ -82,24 +82,45 @@ _logger = structlog.get_logger(__name__)
 WsTaskEvent = dict[str, Any]
 
 
-#: Optional async forwarder for the chat WS frame. Registered by the WS
-#: layer for the lifetime of a session; replaced on reconnect. ``None``
-#: when no chat WS is connected — :func:`emit_event` then becomes a pure
-#: debug-only emit. Single-user desktop app, so there's at most one.
+#: Async forwarders for the chat WS frame — ONE per connected window/session.
+#: Each ``/ws/chat`` session registers its emitter via :func:`add_ws_emitter`
+#: for its lifetime and unregisters on disconnect.
+#:
+#: This used to be a single slot (last-writer-wins). With more than one window
+#: open (sphere HUD + legacy chat + debug), each opens its own ``/ws/chat``, so
+#: the last connection silently stole the channel: task lifecycle events,
+#: streamed ``speech_delta`` / ``ui_payload`` frames and proactive pushes only
+#: reached that one window — the others (including the window that asked the
+#: question) got nothing. That is why a Markdown overlay / proactive TTS could
+#: land on the wrong window or vanish. :func:`emit_event` now fans out to every
+#: registered session.
 WsEmitter = Callable[[WsTaskEvent], Awaitable[None]]
-_ws_emitter: WsEmitter | None = None
+_ws_emitters: set[WsEmitter] = set()
+
+
+def add_ws_emitter(fn: WsEmitter) -> None:
+    """Register a connected session's chat WS forwarder (fan-out target)."""
+
+    _ws_emitters.add(fn)
+
+
+def remove_ws_emitter(fn: WsEmitter) -> None:
+    """Unregister a session's forwarder on disconnect. Idempotent."""
+
+    _ws_emitters.discard(fn)
 
 
 def set_ws_emitter(fn: WsEmitter | None) -> None:
-    """Install (or clear) the chat WS forwarder.
+    """Replace the whole emitter set with a single ``fn`` (or clear on ``None``).
 
-    Mirror of the legacy :func:`bob.ws_events.set_emitter` but lives on
-    the unified bus side. The legacy function delegates here so existing
-    call sites (``ws_router`` lifespan) keep working unchanged.
+    Back-compat for single-emitter call sites + tests. The live WS layer uses
+    :func:`add_ws_emitter` / :func:`remove_ws_emitter` so multiple windows each
+    receive the fan-out; this helper keeps the one-emitter test ergonomics.
     """
 
-    global _ws_emitter
-    _ws_emitter = fn
+    _ws_emitters.clear()
+    if fn is not None:
+        _ws_emitters.add(fn)
 
 
 async def emit_event(
@@ -165,15 +186,19 @@ async def emit_event(
         # task id (the ContextVar produced ``None`` for it).
         _patch_last_event_task_id(resolved_task_id)
 
-    if _ws_emitter is None:
+    if not _ws_emitters:
         return
-    try:
-        await _ws_emitter(payload)
-    except Exception:
-        _logger.exception(
-            "event_bus_v2.ws_forward_failed",
-            event_type=payload.get("type"),
-        )
+    # Snapshot the set: a forwarder may disconnect (and remove itself) while we
+    # await a slow sibling. Each forward is isolated so one dead/slow socket
+    # cannot starve the other windows.
+    for emitter in list(_ws_emitters):
+        try:
+            await emitter(payload)
+        except Exception:
+            _logger.exception(
+                "event_bus_v2.ws_forward_failed",
+                event_type=payload.get("type"),
+            )
 
 
 def _default_summary(payload: WsTaskEvent) -> str:
@@ -265,9 +290,11 @@ async def subscribe_for_task(task_id: str) -> AsyncGenerator[DebugEvent, None]:
 __all__ = [
     "WsEmitter",
     "WsTaskEvent",
+    "add_ws_emitter",
     "emit_event",
     "get_snapshot",
     "get_snapshot_for_task",
+    "remove_ws_emitter",
     "set_ws_emitter",
     "subscribe_for_task",
 ]

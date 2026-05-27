@@ -193,6 +193,50 @@ def _strip_code_fence(text: str) -> str:
     return "\n".join(lines[1:body_end]).strip()
 
 
+def _deliverable_text(ui_payload: dict[str, Any] | str | None) -> str | None:
+    """Pull the renderable markdown deliverable out of a ``done`` ui_payload.
+
+    Document-class sub-agents put the finished artefact (exposé, report,
+    chronology) in ``ui_payload`` as a markdown string. Structured payloads
+    may instead carry it under a ``markdown`` / ``content`` / ``text`` key.
+    Returns ``None`` when there is nothing renderable so the caller falls back
+    to ``result_summary``.
+    """
+
+    if isinstance(ui_payload, str):
+        return ui_payload.strip() or None
+    if isinstance(ui_payload, dict):
+        for key in ("markdown", "content", "text"):
+            value = ui_payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
+def _salvage_display(raw: str) -> str:
+    """Best-effort clean text from a sub-agent output that failed validation.
+
+    The model frequently emits the JSON envelope it *meant* to send but with a
+    shape the schema rejects. Rather than surfacing the raw ``{"action": …}``
+    blob in the overlay, decode it and extract the deliverable (``ui_payload``)
+    or summary. Falls back to the stripped raw text when it is not JSON at all.
+    """
+
+    text = _strip_code_fence(raw).strip()
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return raw.strip()
+    if isinstance(payload, dict):
+        deliverable = _deliverable_text(payload.get("ui_payload"))
+        if deliverable:
+            return deliverable
+        summary = payload.get("result_summary") or payload.get("result")
+        if isinstance(summary, str) and summary.strip():
+            return summary.strip()
+    return raw.strip()
+
+
 @dataclass(frozen=True)
 class _NormalisedPayload:
     """Internal: an LLM action payload normalised against the v1 schema.
@@ -548,13 +592,53 @@ class SubAgentRunner:
                 # back into ``force_failed_invalid_output``.
                 policy = SUB_AGENT_DEFAULT_POLICY
                 if validator_envelope.retries_used >= policy.max_retries:
-                    await self._on_validation_exhausted.on_validation_exhausted(
-                        ExhaustedContext(
-                            envelope=validator_envelope,
-                            last_error_message=str(exc),
-                            task_id=task_id,
-                        )
+                    # Retry budget exhausted. The sub-agent never produced a
+                    # parseable action envelope — but for deliverable tasks the
+                    # model frequently just emits the finished content as raw
+                    # prose/markdown (claude -p does this for big outputs, e.g.
+                    # a full chronology) and nagging it to re-wrap as JSON only
+                    # burns another call. Rather than discarding minutes of work
+                    # as done(failed, invalid_output), salvage the raw output as
+                    # a degraded done so it survives to Jarvis' done-synthesis
+                    # for interpretation + display. Truly empty output keeps the
+                    # original forced-failure path (nothing to salvage).
+                    salvaged = _salvage_display(raw)
+                    emit_debug(
+                        category="task",
+                        severity="warn",
+                        source="bob.sub_agent_runner._run",
+                        summary=(
+                            "Sortie sub-agent non conforme après retries — "
+                            f"{'salvage en done(degraded)' if salvaged else 'échec (vide)'}"
+                        ),
+                        payload={
+                            "task_id": task_id,
+                            "last_error": str(exc),
+                            "raw_preview": salvaged[:300],
+                            "attempts": validator_envelope.attempts,
+                        },
                     )
+                    if salvaged:
+                        await self._finalize_done(
+                            task_id,
+                            status="degraded",
+                            reason_code=REASON_INVALID_OUTPUT,
+                            result_summary=salvaged,
+                            ui_payload=None,
+                            cost=self._build_cost(
+                                started_at=started_at,
+                                iterations=iteration,
+                                tokens_used=tokens_used,
+                            ),
+                        )
+                    else:
+                        await self._on_validation_exhausted.on_validation_exhausted(
+                            ExhaustedContext(
+                                envelope=validator_envelope,
+                                last_error_message=str(exc),
+                                task_id=task_id,
+                            )
+                        )
                     return
                 validator_feedback.append(
                     build_validator_message(
@@ -931,7 +1015,11 @@ class SubAgentRunner:
         store_state: str
         if status in ("complete", "degraded"):
             store_state = "done"
-            persisted_result = result_summary
+            # The overlay renders ``task.result`` as markdown. Prefer the
+            # full deliverable from ``ui_payload`` (the exposé / report the
+            # sub-agent produced); fall back to the short ``result_summary``
+            # for tasks with no rendered artefact.
+            persisted_result = _deliverable_text(ui_payload) or result_summary
         else:
             store_state = "failed"
             persisted_result = result_summary or reason_code

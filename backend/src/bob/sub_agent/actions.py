@@ -94,9 +94,13 @@ class DoneAction(BaseModel):
 
     - ``result_summary``: short prose, surfaced to Jarvis in the
       ``task_completed`` ContextEntry (0046 already wires this).
-    - ``ui_payload``: optional dict — the markdown overlay payload
-      0050 / 0052 will render. Free-form for now (no client schema
-      yet).
+    - ``ui_payload``: the deliverable surfaced in the markdown overlay.
+      A markdown string for document-class tasks (exposé, report,
+      chronology) or a free-form dict for structured payloads. ``None``
+      when the task has no rendered deliverable. Accepting a bare string
+      matches what the model naturally emits for a finished document —
+      forcing a dict here caused the envelope to fail validation and the
+      raw JSON to leak into the overlay.
     - ``status``: see :data:`SubAgentDoneStatus`.
     - ``reason_code``: short code drawn from the :mod:`bob.sub_agent.reason_codes`
       registry. Codes used at this slice are intentionally minimal —
@@ -111,7 +115,7 @@ class DoneAction(BaseModel):
 
     action: Literal["done"]
     result_summary: str = Field(default="")
-    ui_payload: dict[str, Any] | None = Field(default=None)
+    ui_payload: dict[str, Any] | str | None = Field(default=None)
     status: SubAgentDoneStatus
     reason_code: str = Field(..., min_length=1)
     cost: dict[str, Any] = Field(default_factory=dict)

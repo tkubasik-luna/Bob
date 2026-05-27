@@ -69,6 +69,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
+import traceback
 import uuid
 from collections.abc import Callable
 from typing import Any
@@ -198,7 +199,13 @@ async def chat_ws(websocket: WebSocket) -> None:
 
         task.add_done_callback(_remove_when_done)
 
-    ws_events.set_emitter(_session_emit)
+    # Register THIS session's emitter (fan-out). Pre-fix this used
+    # ``set_emitter`` which replaced the single global slot, so opening a
+    # second window stole the channel from the first — task events, streamed
+    # ui_payload/speech_delta and proactive pushes only reached the
+    # last-connected window. ``add_emitter`` + ``remove_emitter`` (finally)
+    # make every open window receive them.
+    ws_events.add_emitter(_session_emit)
 
     try:
         await websocket.send_json({"type": "session", "session_id": session_id})
@@ -211,7 +218,7 @@ async def chat_ws(websocket: WebSocket) -> None:
     except WebSocketDisconnect:
         pass
     finally:
-        ws_events.set_emitter(None)
+        ws_events.remove_emitter(_session_emit)
         await _cancel_active_tts(session_id, emit_audio_end=False, websocket=None)
         _sessions.pop(session_id, None)
         # Slice 0039: disconnect-time debug event. Lives outside any user turn.
@@ -590,6 +597,17 @@ async def _handle_client_message(
 
     voice_requested = bool(payload.get("voice"))
 
+    # TTS invariant: an output speech must ALWAYS reach TTS once the user is
+    # interacting by voice — including proactive pushes (sub-task done / failed
+    # synthesis), which voice on the sticky session ``voice_mode`` flag. Before
+    # this, per-message ``voice`` and session ``voice_mode`` were disjoint, so a
+    # client that only set per-message ``voice`` got silent failure / done
+    # announcements. A voice-carrying turn now marks the session voice-on.
+    if voice_requested:
+        voice_session = _sessions.get(session_id)
+        if voice_session is not None:
+            voice_session["voice_mode"] = True
+
     # New user msg = "stop talking about the previous one", whether or not
     # this new turn wants voice itself.
     await _cancel_active_tts(session_id, emit_audio_end=True, websocket=websocket)
@@ -597,22 +615,55 @@ async def _handle_client_message(
     await websocket.send_json({"type": "thinking", "state": "start"})
     try:
         response = await orchestrator.process_user_message(session_id, content)
-    except (httpx.ConnectError, openai.APIConnectionError, ConnectionError):
+    except (httpx.ConnectError, openai.APIConnectionError, ConnectionError) as exc:
         _logger.error("ws_chat.llm_unreachable", session_id=session_id)
+        # Issue: structlog uses ``PrintLoggerFactory`` which bypasses stdlib
+        # logging, so the ``_DebugBridgeHandler`` never forwards these records
+        # to the debug feed. Emit explicitly so turn failures are visible in
+        # ``orchestration.jsonl`` (this is what hid the v2-spawn crash).
+        emit_debug(
+            category="system",
+            severity="error",
+            source="bob.ws_router.chat_ws",
+            summary="LLM injoignable pendant le turn",
+            payload={"session_id": session_id, "error": repr(exc), "code": "LLM_UNREACHABLE"},
+        )
         await websocket.send_json(
             {"type": "error", "code": "LLM_UNREACHABLE", "message": "LLM provider injoignable"}
         )
         await websocket.send_json({"type": "thinking", "state": "end"})
         return
-    except (TimeoutError, openai.APITimeoutError):
+    except (TimeoutError, openai.APITimeoutError) as exc:
         _logger.error("ws_chat.llm_timeout", session_id=session_id)
+        emit_debug(
+            category="system",
+            severity="error",
+            source="bob.ws_router.chat_ws",
+            summary="Timeout LLM pendant le turn",
+            payload={"session_id": session_id, "error": repr(exc), "code": "LLM_TIMEOUT"},
+        )
         await websocket.send_json(
             {"type": "error", "code": "LLM_TIMEOUT", "message": "Timeout LLM"}
         )
         await websocket.send_json({"type": "thinking", "state": "end"})
         return
-    except Exception:
+    except Exception as exc:
         _logger.exception("ws_chat.internal_error", session_id=session_id)
+        # The catch-all is the chokepoint that silently swallowed the v2
+        # ``spawn_task`` AssertionError. Surface the full traceback into the
+        # observable debug log so the next failure is diagnosable offline.
+        emit_debug(
+            category="system",
+            severity="error",
+            source="bob.ws_router.chat_ws",
+            summary=f"Erreur interne pendant le turn: {type(exc).__name__}: {exc}",
+            payload={
+                "session_id": session_id,
+                "error": repr(exc),
+                "traceback": traceback.format_exc(),
+                "code": "INTERNAL",
+            },
+        )
         await websocket.send_json(
             {"type": "error", "code": "INTERNAL", "message": "Erreur interne"}
         )

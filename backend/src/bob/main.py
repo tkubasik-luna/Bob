@@ -31,7 +31,11 @@ from bob import task_scheduler as task_scheduler_module
 from bob import task_store as task_store_module
 from bob.config import get_settings
 from bob.db.migrations_runner import apply_migrations, default_migrations_dir
-from bob.debug_log import install_structlog_bridge
+from bob.debug_log import (
+    install_file_sink,
+    install_structlog_bridge,
+    uninstall_file_sink,
+)
 from bob.debug_router import router as debug_router
 from bob.event_bus import EventBus, set_event_bus
 from bob.jarvis_prompt_loader import load_jarvis_prompt
@@ -79,6 +83,13 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
     data_dir = settings.BOB_DATA_DIR
     data_dir.mkdir(parents=True, exist_ok=True)
+
+    # Durable orchestration trace: tee every debug event to a JSONL file so the
+    # full task lifecycle can be inspected offline (the WS feed is live-only and
+    # the ring buffer is bounded + in-memory). Installed early so boot-time
+    # events are captured; torn down in the finally below.
+    if settings.ORCHESTRATION_LOG_ENABLED:
+        install_file_sink("logs/orchestration.jsonl")
 
     db_path = data_dir / _DB_FILENAME
     if settings.BOB_CLEAR_ON_START and db_path.exists():
@@ -208,6 +219,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         task_store_module.set_default_store(None)
         jarvis_store_module.set_default_store(None)
         conn.close()
+        uninstall_file_sink()
 
 
 app = FastAPI(title="Bob backend", lifespan=lifespan)

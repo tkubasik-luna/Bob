@@ -171,22 +171,46 @@ ASK_USER_PARAPHRASE_TEMPLATE = PromptFragment(
 
 DONE_SYNTHESIS_TEMPLATE = PromptFragment(
     id="done_synthesis",
-    version=1,
+    version=2,
     template=(
         "La sous-tâche '{task_title}' vient de terminer.\n"
         "Résultat brut : '{result}'.\n"
+        "Ta réponse sera LUE À VOIX HAUTE (TTS) — elle doit donc être très "
+        "courte et parlée.\n"
         "Étape 1 — Vérifie le contenu : si le résultat est vide, incohérent ou "
         "manifestement raté, dis-le franchement à l'utilisateur en une phrase "
         "et arrête-toi là.\n"
-        "Étape 2 — Sinon, ouvre impérativement par "
-        "« Voilà ce que j'ai trouvé à propos de <sujet> … » (remplace <sujet> "
-        "par le thème exact de la sous-tâche, pas son titre brut) puis résume "
-        "les points clés en 2-3 lignes max dans ton ton. "
-        "Propose une suite si pertinent."
+        "Étape 2 — Sinon, ouvre par « Voilà ce que j'ai trouvé à propos de "
+        "<sujet> … » (remplace <sujet> par le thème exact de la sous-tâche, "
+        "pas son titre brut), puis donne UNIQUEMENT l'essentiel en 2 phrases "
+        "courtes maximum (~40 mots au total). Interdits : listes, titres, "
+        "énumérations, markdown, et tout détail du résultat brut au-delà de ces "
+        "2 phrases — l'utilisateur ouvrira le résultat complet s'il veut le "
+        "détail. Termine par une seule question de relance courte."
     ),
     description=(
         "Prompt fed to Jarvis when a sub-task emits ``done`` and we want "
         "Jarvis to announce + frame the result in his tone."
+    ),
+)
+
+
+FAILED_SYNTHESIS_TEMPLATE = PromptFragment(
+    id="failed_synthesis",
+    version=1,
+    template=(
+        "La sous-tâche '{task_title}' a échoué.\n"
+        "Raison brute : '{result}'.\n"
+        "Annonce l'échec à l'utilisateur en 1-2 phrases max dans ton ton, "
+        "sans jargon technique (ne dis pas 'sub-agent', dis 'la tâche'). "
+        "Si la raison est parlante (ex : trop long, délai dépassé / timeout), "
+        "explique-la simplement, puis propose de réessayer ou de découper la "
+        "demande en plus petit. Ne fais pas semblant d'avoir un résultat."
+    ),
+    description=(
+        "Prompt fed to Jarvis when a sub-task transitions to ``failed`` "
+        "(natural failure — not a user cancel) so Jarvis announces the "
+        "failure + a recovery suggestion in his tone."
     ),
 )
 
@@ -273,15 +297,22 @@ SUB_AGENT_V2_SYSTEM_PROMPT = PromptFragment(
         '  - {{"action": "tool_call", "name": "<nom>", "args": {{...}}}} '
         "pour invoquer un outil disponible ci-dessous (la boucle continue "
         "après l'exécution).\n"
-        '  - {{"action": "done", "result_summary": "<résumé>", '
-        '"ui_payload": null, "status": "complete", '
-        '"reason_code": "ok", "cost": {{}}}} pour terminer.\n'
+        '  - {{"action": "done", "result_summary": "<résumé 1-2 phrases>", '
+        '"ui_payload": "<livrable Markdown complet, ou null>", '
+        '"status": "complete", "reason_code": "ok", "cost": {{}}}} pour '
+        "terminer.\n"
+        "Quand la tâche produit un livrable (exposé, rapport, chronologie, "
+        "document…), mets le contenu Markdown COMPLET dans ``ui_payload`` "
+        "(une chaîne Markdown, pas un objet) et un résumé court (1-2 "
+        "phrases) dans ``result_summary``. Si la tâche n'a pas de livrable "
+        "à afficher, ``ui_payload`` vaut null.\n"
         "Statuts ``done`` : ``complete`` (but atteint), ``degraded`` "
         "(résultat partiel sous contrainte), ``failed`` (erreur non "
         "récupérable). ``cancelled`` et ``timeout`` sont émis par le "
         "runner lui-même, ne les renvoie pas.\n"
-        "Réponds avec l'objet JSON UNIQUEMENT, sans markdown ni prose "
-        "autour."
+        "Réponds avec l'objet JSON UNIQUEMENT, sans texte autour. Le "
+        "Markdown du livrable vit À L'INTÉRIEUR de la chaîne ``ui_payload`` "
+        "— l'enveloppe reste du JSON pur."
     ),
     description=(
         "System prompt for sub-agents under the v2 contract (PRD 0006 / "

@@ -125,6 +125,16 @@ export function SphereUI() {
   // streaming buffer lifecycle (the buffer is cleared when the
   // `assistant_msg` lands; we still need to remember we already acted).
   const evaluatedStreamUiRef = useRef<Set<string>>(new Set());
+  // Mirror `openTaskId` into a ref so the task-result auto-open effect can
+  // read the currently-open task without taking it as a dependency (which
+  // would re-run that effect on unrelated opens). When a task is already open
+  // in `TaskOverlay`, that overlay renders the result markdown itself on
+  // completion — auto-opening the standalone `MarkdownOverlay` too would stack
+  // two identical cards (the "two MD windows" bug).
+  const openTaskIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    openTaskIdRef.current = openTaskId;
+  }, [openTaskId]);
   // PRD 0006 / issue 0049 — open the overlay as soon as the streamed
   // `ui_payload` lands. Today the `say` tool only emits a Markdown
   // descriptor; the heuristic-driven path below still handles
@@ -148,13 +158,43 @@ export function SphereUI() {
     if (typeof content !== "string" || content.length === 0) return;
     setOverlayContent(content);
   }, [streamingUi]);
+  // Fallback for the streamed `ui_payload` path: open the overlay from the
+  // FINAL `assistant_msg`'s `ui` field. The streamed `ui_payload` frame is
+  // routed through the single process-wide ws emitter (last-connected window
+  // wins), so a window that asked the question can miss it entirely — but it
+  // always receives the closing `assistant_msg`, which carries the same
+  // Markdown descriptor. Dedup by msg id via the shared
+  // `evaluatedStreamUiRef` so the streaming path and this one never
+  // double-open (or re-open after the user dismissed the card).
+  useEffect(() => {
+    let lastAssistant: (typeof messages)[number] | null = null;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const m = messages[i];
+      if (m.role === "assistant" && !m.proactive) {
+        lastAssistant = m;
+        break;
+      }
+    }
+    if (lastAssistant === null) return;
+    if (evaluatedStreamUiRef.current.has(lastAssistant.id)) return;
+    const descriptor = lastAssistant.ui?.[0];
+    if (!descriptor || descriptor.component !== "Markdown") return;
+    const content = descriptor.props?.content;
+    if (typeof content !== "string" || content.length === 0) return;
+    evaluatedStreamUiRef.current.add(lastAssistant.id);
+    setOverlayContent(content);
+  }, [messages]);
   useEffect(() => {
     // Walk back to the most recent non-empty assistant message; older entries
     // are uninteresting because the heuristic is evaluated per *latest* turn.
+    // Proactive pushes (sub-task done/ask_user synthesis) are spoken-only —
+    // their text is a short TTS announcement, never an overlay card. The full
+    // task result surfaces via the task-result effect below instead, so a long
+    // synthesis must not trip `shouldOverlayResponse` and duplicate itself.
     let lastAssistant: { id: string; content: string } | null = null;
     for (let i = messages.length - 1; i >= 0; i--) {
       const m = messages[i];
-      if (m.role === "assistant" && m.content.length > 0) {
+      if (m.role === "assistant" && !m.proactive && m.content.length > 0) {
         lastAssistant = { id: m.id, content: m.content };
         break;
       }
@@ -178,6 +218,9 @@ export function SphereUI() {
     if (!latest) return;
     if (evaluatedTaskIdsRef.current.has(latest.id)) return;
     evaluatedTaskIdsRef.current.add(latest.id);
+    // Already showing this task in the per-task overlay? It renders the result
+    // itself on completion — don't also pop the standalone overlay.
+    if (openTaskIdRef.current === latest.id) return;
     const result = latest.result;
     if (typeof result !== "string") return;
     if (!shouldOverlayResponse(result)) return;
@@ -215,8 +258,10 @@ export function SphereUI() {
         </div>
         <MarkdownOverlay content={overlayContent} onClose={() => setOverlayContent(null)} />
         {/* Per-task overlay (issue 0052) — opens on row click in HudTasks.
-         * The two overlays are mutually exclusive in practice (HudTasks
-         * triggers exactly one); rendering both unconditionally keeps the
+         * Kept mutually exclusive with the standalone MarkdownOverlay above:
+         * the task-result auto-open effect skips a task that is already open
+         * here (`openTaskIdRef` guard), so a finishing task doesn't stack two
+         * identical result cards. Rendering both unconditionally keeps the
          * Esc/backdrop dismiss paths independent. */}
         <TaskOverlay task={openTask} onClose={() => setOpenTaskId(null)} />
         <MuteToggle />

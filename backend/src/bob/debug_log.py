@@ -57,14 +57,18 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
+import os
+import threading
 import uuid
 from collections import deque
 from collections.abc import AsyncGenerator, Callable
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any, Literal
+from pathlib import Path
+from typing import Any, Literal, TextIO
 
 DebugCategory = Literal[
     "input",
@@ -196,6 +200,15 @@ class DebugEvent:
 _buffer: deque[DebugEvent] = deque(maxlen=_RING_BUFFER_MAXLEN)
 _subscribers: list[asyncio.Queue[DebugEvent]] = []
 
+# Optional JSONL file sink (debugging aid). When installed via
+# :func:`install_file_sink`, every emitted event is also appended as a single
+# JSON line to a persistent file handle so the orchestration trace survives the
+# process and can be read / grepped offline — the WS feed only lives as long as
+# a client is connected and the ring buffer is bounded + in-memory. The handle
+# is opened once and flushed per line so a crash still leaves a complete log.
+_file_sink: TextIO | None = None
+_file_sink_lock = threading.Lock()
+
 
 def _now_iso() -> str:
     """Return the current UTC instant as an ISO 8601 string with ms precision.
@@ -305,6 +318,12 @@ def emit_debug(
     # policy adds dimensions the deque cannot express on its own.
     _enforce_retention()
 
+    # Persist to the optional JSONL file sink before fanning out to live
+    # subscribers. Unlike the ring buffer (bounded, in-memory) and the WS
+    # subscribers (drop-oldest under backpressure), the file sink keeps a
+    # complete, ordered trace on disk for offline debugging.
+    _write_to_file_sink(event)
+
     # Drop strategy: drop the oldest queued event for the slow subscriber,
     # then place the new one. We iterate over a snapshot of the subscriber
     # list so subscribe / unsubscribe during emit don't blow up.
@@ -352,6 +371,91 @@ def clear() -> None:
     """
 
     _buffer.clear()
+
+
+# --- JSONL file sink (offline debugging) -------------------------------------
+#
+# The ring buffer + WS subscribers are great for a live UI but useless once the
+# process exits or when no client is connected: the buffer is in-memory and
+# bounded, the subscriber queues drop-oldest under backpressure. The file sink
+# closes that gap by appending every emitted event as a JSON line to a
+# persistent handle, giving a complete, ordered, crash-durable trace that can
+# be read / grepped offline. Installed from the FastAPI lifespan; opt-out via
+# the ``ORCHESTRATION_LOG_ENABLED`` setting.
+
+
+def install_file_sink(path: str | Path) -> None:
+    """Open a JSONL file sink so every emitted event is also written to disk.
+
+    Idempotent: a second call while a sink is already open keeps the existing
+    handle. The parent directory is created if missing; the file is opened in
+    append mode and accumulates across process restarts. A ``session_start``
+    marker line is written directly to the file (not via :func:`emit_debug`)
+    so each run is delimited on disk without polluting the live WS feed.
+    """
+
+    global _file_sink
+    with _file_sink_lock:
+        if _file_sink is not None:
+            return
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        _file_sink = target.open("a", encoding="utf-8")
+        marker = {
+            "ts": _now_iso(),
+            "category": "system",
+            "severity": "info",
+            "source": "debug_log.install_file_sink",
+            "summary": "=== session start ===",
+            "payload": {"path": str(target), "pid": os.getpid()},
+            "turn_id": None,
+            "correlation_id": None,
+            "parent_task_id": None,
+            "task_id": None,
+            "replayed": False,
+        }
+        with contextlib.suppress(Exception):
+            _file_sink.write(json.dumps(marker, ensure_ascii=False) + "\n")
+            _file_sink.flush()
+
+
+def uninstall_file_sink() -> None:
+    """Flush + close the JSONL file sink. Idempotent."""
+
+    global _file_sink
+    with _file_sink_lock:
+        if _file_sink is None:
+            return
+        with contextlib.suppress(Exception):
+            _file_sink.flush()
+            _file_sink.close()
+        _file_sink = None
+
+
+def _write_to_file_sink(event: DebugEvent) -> None:
+    """Append ``event`` to the JSONL file sink if one is installed.
+
+    Fire-and-forget: any serialisation / I/O error is swallowed so a broken
+    sink never propagates into the producer hot path. ``default=str`` guards
+    payloads carrying non-JSON-native values (datetimes, enums, ...). Flushed
+    per line so a crash still leaves a complete log.
+    """
+
+    if _file_sink is None:
+        return
+    try:
+        line = json.dumps(event.to_dict(), ensure_ascii=False, default=str)
+    except Exception:
+        return
+    with _file_sink_lock:
+        sink = _file_sink
+        if sink is None:
+            return
+        try:
+            sink.write(line + "\n")
+            sink.flush()
+        except Exception:
+            return
 
 
 # --- Retention policy hook (issue 0052) --------------------------------------

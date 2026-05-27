@@ -200,6 +200,33 @@ async def test_claude_cli_chat_invokes_subprocess_with_schema(
     assert "--json-schema" not in argv
     assert "--model" in argv and argv[argv.index("--model") + 1] == "sonnet"
     assert fake_proc.received_stdin == b"hello"
+    # Isolation defaults on: quarantine from the user's ~/.claude.
+    assert "--strict-mcp-config" in argv
+    assert "--setting-sources" in argv and argv[argv.index("--setting-sources") + 1] == ""
+    assert captured_argv["kwargs"].get("cwd") is not None
+
+
+@pytest.mark.asyncio
+async def test_claude_cli_chat_isolation_disabled_inherits_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = ClaudeCliClient(_claude_settings(CLAUDE_CLI_ISOLATED=False))
+    fake_proc = _FakeProc(stdout=json.dumps({"result": "hi"}).encode("utf-8"))
+    captured_argv: dict[str, Any] = {}
+
+    async def _fake_exec(*argv: str, **kwargs: Any) -> _FakeProc:
+        captured_argv["argv"] = list(argv)
+        captured_argv["kwargs"] = kwargs
+        return fake_proc
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", _fake_exec)
+
+    await client.chat(messages=[{"role": "user", "content": "hello"}])
+
+    argv = captured_argv["argv"]
+    assert "--strict-mcp-config" not in argv
+    assert "--setting-sources" not in argv
+    assert captured_argv["kwargs"].get("cwd") is None
 
 
 @pytest.mark.asyncio

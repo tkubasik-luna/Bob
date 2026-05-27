@@ -49,7 +49,11 @@ from bob.sub_agent import (
     build_default_subagent_registry,
     parse_action,
 )
-from bob.sub_agent.tool_registry import WebSearchArgs
+from bob.sub_agent.tool_registry import (
+    WebSearchArgs,
+    build_web_fetch_tool,
+    build_web_search_tool,
+)
 from bob.task_store import TaskStore
 
 
@@ -502,15 +506,23 @@ async def test_addendum_drained_only_at_iteration_boundary() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_default_subagent_registry_carries_web_search_and_web_fetch() -> None:
-    """Acceptance: registry contains ``web_search`` and ``web_fetch`` v1."""
+def test_default_subagent_registry_is_empty_until_real_web_backend() -> None:
+    """``web_search`` / ``web_fetch`` are unwired until a real backend lands.
+
+    They were placeholders raising ``NotImplementedError``; exposing them made
+    every research sub-task burn an LLM round-trip on a ``handler_failed`` tool
+    call before falling back to pure-knowledge generation. The builders still
+    exist for the future, but the default registry is empty.
+    """
 
     registry = build_default_subagent_registry()
-    assert registry.names() == ["web_search", "web_fetch"]
-    web_search = registry.get("web_search")
-    assert web_search is not None
+    assert registry.names() == []
+    # Scaffolding remains available so a future slice can register a real
+    # backend without re-deriving the tool shape.
+    web_search = build_web_search_tool()
     assert web_search.qualified_name == "v1.web_search"
     assert web_search.args_model is WebSearchArgs
+    assert build_web_fetch_tool().name == "web_fetch"
 
 
 def test_subagent_registry_disjoint_from_jarvis_registry() -> None:

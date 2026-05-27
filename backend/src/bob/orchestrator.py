@@ -93,6 +93,7 @@ from bob.context.prompt_fragments import (
     ASK_USER_PARAPHRASE_TEMPLATE,
     CANCEL_CONFIRMATION,
     DONE_SYNTHESIS_TEMPLATE,
+    FAILED_SYNTHESIS_TEMPLATE,
     FORWARD_CONFIRMATION,
     SPAWN_CONFIRMATION,
     TOOLS_SYSTEM_ADDENDUM,
@@ -176,6 +177,14 @@ _ASK_USER_PARAPHRASE_TEMPLATE = ASK_USER_PARAPHRASE_TEMPLATE.template
 _DONE_SYNTHESIS_TEMPLATE = DONE_SYNTHESIS_TEMPLATE.template
 
 
+# Template for the ``failed`` proactive synthesis. A sub-task that fails on
+# its own (LLM error, timeout, …) must still come back to the user — pre-fix
+# the proactivity handler silently ignored ``failed`` so the user was left
+# hanging. User-initiated cancels do NOT reach this path (the scheduler's
+# ``_finalize_cancelled`` emits no ``task_state_changed``).
+_FAILED_SYNTHESIS_TEMPLATE = FAILED_SYNTHESIS_TEMPLATE.template
+
+
 # Debounce window before ``_user_typing`` falls back to false on its own. The
 # frontend already debounces keystrokes at 500ms, but a network hiccup could
 # drop the trailing ``client_typing=false`` — we don't want a proactive push
@@ -190,7 +199,7 @@ _FLUSH_POLL_INTERVAL_S = 0.05
 
 # Event kinds accepted by the proactive queue. The literal is exposed so
 # call sites (handler + tests) cannot smuggle in a typo.
-ProactiveEventKind = Literal["ask_user", "done"]
+ProactiveEventKind = Literal["ask_user", "done", "failed"]
 
 
 JarvisState = Literal["idle", "thinking"]
@@ -584,6 +593,18 @@ class Orchestrator:
                     attempt=envelope.attempts,
                     text_preview=(decision.text or "")[:120],
                 )
+                emit_debug(
+                    category="decision",
+                    severity="warn",
+                    source="orchestrator._run_jarvis_turn_with_retry",
+                    summary=f"Violation contrat: aucun tool call (attempt {envelope.attempts})",
+                    payload={
+                        "session_id": session_id,
+                        "attempt": envelope.attempts,
+                        "retries_used": envelope.retries_used,
+                        "text_preview": (decision.text or "")[:200],
+                    },
+                )
                 # Default policy (no tool resolved) — the LLM did not
                 # pick a tool yet so the policy table cannot key on a
                 # name. Use the global default budget.
@@ -632,6 +653,23 @@ class Orchestrator:
                 tool_call_count=len(decision.tool_calls),
                 attempt=envelope.attempts,
                 error_code=error_code,
+            )
+            emit_debug(
+                category="decision",
+                severity="warn",
+                source="orchestrator._run_jarvis_turn_with_retry",
+                summary=(
+                    f"Violation contrat: dispatch {tool_name or '?'} échoué "
+                    f"({error_code}, attempt {envelope.attempts})"
+                ),
+                payload={
+                    "session_id": session_id,
+                    "tool_name": tool_name,
+                    "error_code": error_code,
+                    "error_message": error_message,
+                    "attempt": envelope.attempts,
+                    "retries_used": envelope.retries_used,
+                },
             )
             if envelope.retries_used >= policy.max_retries:
                 return await self._degrade_validation_exhausted(
@@ -830,6 +868,22 @@ class Orchestrator:
                 task_id=None,
             )
         )
+        # Observability: the degrade is the user-visible symptom ("Désolé,
+        # peux-tu reformuler ?"). Surface it + the last error in the unified
+        # debug log so the cause is one grep away (structlog warnings bypass
+        # the debug bridge — see ws_router #3).
+        emit_debug(
+            category="decision",
+            severity="error",
+            source="orchestrator._degrade_validation_exhausted",
+            summary="Budget retry épuisé → degrade 'Désolé, peux-tu reformuler ?'",
+            payload={
+                "tool_name": envelope.tool_name,
+                "retries_used": envelope.retries_used,
+                "attempts": envelope.attempts,
+                "last_error_message": last_error_message,
+            },
+        )
         speech = JARVIS_DEGRADE_SPEECH_FRAGMENT.template
         return OrchestratorResponse(
             speech=speech,
@@ -852,7 +906,7 @@ class Orchestrator:
         proactivity must never crash the producer subscriber.
         """
 
-        if event_kind not in ("ask_user", "done"):
+        if event_kind not in ("ask_user", "done", "failed"):
             _logger.info(
                 "orchestrator.proactive_event_ignored",
                 task_id=task_id,
@@ -1074,6 +1128,8 @@ class Orchestrator:
 
                 if kind == "ask_user":
                     await self._do_generate_ask_user_paraphrase(task_id)
+                elif kind == "failed":
+                    await self._do_generate_failed_synthesis(task_id)
                 else:
                     await self._do_generate_done_synthesis(task_id)
             except asyncio.CancelledError:
@@ -1128,6 +1184,34 @@ class Orchestrator:
 
         result_text = task.result if task.result is not None else ""
         prompt = _DONE_SYNTHESIS_TEMPLATE.format(
+            task_title=task.title,
+            result=result_text,
+        )
+        text = await self._render_proactive_text(task_id, prompt)
+        if text is None:
+            return
+        await self._push_proactive_assistant_msg(text)
+
+    async def _do_generate_failed_synthesis(self, task_id: str) -> None:
+        """Synthesise + push the ``failed`` announcement for ``task_id``.
+
+        Mirrors :meth:`_do_generate_done_synthesis` but renders the failure
+        template so Jarvis tells the user the task could not be completed and
+        offers a recovery path, rather than leaving them waiting on a result
+        that will never arrive.
+        """
+
+        try:
+            task = self._task_store.get_task(task_id)
+        except TaskStoreError:
+            _logger.warning(
+                "orchestrator.proactive_task_missing",
+                task_id=task_id,
+            )
+            return
+
+        result_text = task.result if task.result is not None else ""
+        prompt = _FAILED_SYNTHESIS_TEMPLATE.format(
             task_title=task.title,
             result=result_text,
         )
@@ -1518,7 +1602,37 @@ class Orchestrator:
         # Pure ``say`` turn. The handler already persisted the assistant
         # row in :class:`JarvisStore`; here we only lift speech + ui
         # into the response shape the WS router consumes.
-        assert say_speech is not None
+        if say_speech is None:
+            # Defensive: a tool dispatched ``ok`` but was neither ``say``
+            # nor a recognised task tool, so no speech was produced. Before
+            # the v2-bucket fix this hit ``assert say_speech is not None``
+            # and crashed the turn — and the crash was invisible (swallowed
+            # by the ws_router catch-all + the structlog→debug bridge being
+            # bypassed by ``PrintLoggerFactory``). Surface it loudly and
+            # degrade to an empty reply instead of killing the turn.
+            emit_debug(
+                category="system",
+                severity="error",
+                source="orchestrator._dispatch_tool_calls_with_diagnostics",
+                summary="dispatch ok but no speech produced (unbucketed tool?)",
+                payload={
+                    "tool_names": [call.name for call in tool_calls],
+                    "spawned": spawned,
+                    "forwarded": forwarded,
+                    "cancelled": cancelled,
+                },
+            )
+            return (
+                OrchestratorResponse(
+                    speech="",
+                    ui=[],
+                    spawned_task_ids=spawned,
+                    forwarded_task_ids=forwarded,
+                    cancelled_task_ids=cancelled,
+                    msg_id=msg_id,
+                ),
+                None,
+            )
         return (
             OrchestratorResponse(
                 speech=say_speech,
@@ -1550,17 +1664,28 @@ class Orchestrator:
 
         if not result.ok or result.task_id is None:
             return
-        if result.tool_name == "spawn_subtask":
+        # Bucket BOTH the legacy v1 names (``*_subtask``) and the v2 task
+        # surface (``spawn_task`` / ``replan_task`` / ``cancel_task``,
+        # PRD 0006 / issue 0050). ``forward_to_subtask`` is shared across
+        # both versions. Pre-fix only the v1 names were recognised, so a
+        # v2 ``spawn_task`` (the canonical entry point the prompt now
+        # advertises) fell through every branch → ``spawned`` stayed empty
+        # → the caller hit ``assert say_speech is not None`` and crashed
+        # the whole turn, leaving the spawn unannounced.
+        if result.tool_name in ("spawn_subtask", "spawn_task", "replan_task"):
+            # ``replan_task`` cancels the old task and respawns a replacement;
+            # the new task is the live one to confirm, so it shares the spawn
+            # confirmation copy.
             spawned.append(result.task_id)
         elif result.tool_name == "forward_to_subtask":
             forwarded.append(result.task_id)
-        elif result.tool_name == "cancel_subtask":
+        elif result.tool_name in ("cancel_subtask", "cancel_task"):
             cancelled.append(result.task_id)
         # Unknown-tool-on-success is structurally impossible (the
-        # registry would have rejected the call upstream), but if a
-        # future tool ships without an orchestrator branch the result is
-        # silently ignored at this layer — the dispatcher still recorded
-        # the route event.
+        # registry would have rejected the call upstream). The caller's
+        # ``say_speech is None`` guard now degrades gracefully (+ emits a
+        # debug error) instead of crashing if a future tool ships without
+        # an orchestrator branch here.
 
 
 def _coerce_say_ui(ui: Any) -> list[ComponentDescriptor]:

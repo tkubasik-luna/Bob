@@ -183,6 +183,38 @@ describe("SphereUI — overlay auto-trigger integration", () => {
     expect(container.querySelector(".hud-transcript")).toBeNull();
   });
 
+  test("assistant message with ui Markdown opens the overlay despite short speech", () => {
+    // Regression: the streamed `ui_payload` frame is routed through the single
+    // process-wide ws emitter (last-connected window wins), so the window that
+    // asked the question can miss it. The closing `assistant_msg` still carries
+    // the Markdown `ui`; the overlay must open from that even though the SPEECH
+    // is a short intro `shouldOverlayResponse` rejects (see the test below).
+    const { container } = render(<SphereUI />);
+    expect(container.querySelector(".overlay-card")).toBeNull();
+
+    act(() => {
+      useChatStore.setState({
+        messages: [
+          {
+            id: "ui1",
+            role: "assistant",
+            content: "Voilà les grands moments :",
+            ui: [
+              {
+                component: "Markdown",
+                props: {
+                  content: "## Bitcoin\n\n**2008** — whitepaper\n**2009** — genesis block",
+                },
+              },
+            ],
+          },
+        ],
+      });
+    });
+
+    expect(container.querySelector(".overlay-card")).not.toBeNull();
+  });
+
   test("a short plain assistant message leaves the overlay closed", () => {
     const { container } = render(<SphereUI />);
 
@@ -196,6 +228,31 @@ describe("SphereUI — overlay auto-trigger integration", () => {
     // The transcript line stays mounted in this branch — short plain text
     // belongs there per the PRD.
     expect(container.querySelector(".hud-transcript")).not.toBeNull();
+  });
+
+  test("a proactive (spoken-only) push never opens the overlay", () => {
+    // Regression: a sub-task done synthesis arrives as a proactive
+    // assistant_msg whose text is read aloud via TTS. Even when that text is
+    // long/structured enough to trip `shouldOverlayResponse`, it must NOT
+    // duplicate itself as a MarkdownOverlay card — the full result surfaces via
+    // the task-result path instead.
+    const { container } = render(<SphereUI />);
+
+    act(() => {
+      useChatStore.setState({
+        messages: [
+          {
+            id: "p1",
+            role: "assistant",
+            content:
+              "Voilà ce que j'ai trouvé à propos d'Ethereum…\n\nPlateforme de smart contracts.\nMigration vers le Proof of Stake.\nÉcosystème DeFi/NFT dominant.",
+            proactive: true,
+          },
+        ],
+      });
+    });
+
+    expect(container.querySelector(".overlay-card")).toBeNull();
   });
 
   test("dismissed overlay does not reopen on same assistant message", () => {

@@ -101,8 +101,15 @@ async def test_malformed_payload_then_valid_recovers() -> None:
 
 
 @pytest.mark.asyncio
-async def test_two_malformed_payloads_force_failed_invalid_output() -> None:
-    """Exhausted retry budget → forced done(failed, invalid_output)."""
+async def test_two_malformed_payloads_salvages_last_output_as_degraded_done() -> None:
+    """Exhausted retry budget on NON-EMPTY output → salvage as done(degraded).
+
+    Deliverable tasks routinely come back as raw prose/markdown that never
+    parses as the JSON action envelope (claude -p does this for big outputs).
+    Discarding it as ``done(failed, invalid_output)`` threw away the work and
+    left the user with nothing; the runner now keeps the last raw output as a
+    degraded ``done`` so it survives to Jarvis' done-synthesis.
+    """
 
     store = _make_store()
     task_id = _running_task(store)
@@ -117,21 +124,42 @@ async def test_two_malformed_payloads_force_failed_invalid_output() -> None:
     await runner.run(task_id)
 
     task = store.get_task(task_id)
+    # Salvaged: terminal state is ``done`` (degraded), carrying the raw output
+    # so Jarvis can interpret + present it rather than announcing a failure.
+    assert task.state == "done"
+    assert task.result == "still not json"
+
+
+@pytest.mark.asyncio
+async def test_empty_output_after_retries_still_fails() -> None:
+    """Truly empty output has nothing to salvage → forced done(failed)."""
+
+    store = _make_store()
+    task_id = _running_task(store)
+    client = _ScriptedClient(["", "   "])
+    runner = SubAgentRunner(
+        subagent_client=client,
+        task_store=store,
+        event_bus=EventBus(),
+        policy=SubAgentPolicy(max_iterations=99, wall_clock_seconds=999.0, token_cap=999_999),
+    )
+
+    await runner.run(task_id)
+
+    task = store.get_task(task_id)
     assert task.state == "failed"
-    # Reason recorded as system message body (matches runner v2 behaviour).
     system_rows = [m for m in store.get_task_messages(task_id) if m.role == "system"]
     assert system_rows
     assert REASON_INVALID_OUTPUT in system_rows[-1].content or "invalid" in system_rows[-1].content
 
 
 @pytest.mark.asyncio
-async def test_force_failed_invalid_output_preserves_lineage() -> None:
-    """The forced terminal done() preserves the existing task row.
+async def test_salvaged_terminal_done_preserves_lineage() -> None:
+    """The salvaged terminal done() preserves the existing task row.
 
-    The runner's ``force_failed_invalid_output`` goes through
-    ``_finalize_done`` so the row state flip + system message
-    persistence matches the regular fail path. Lineage is preserved on
-    the task row throughout (never cleared by the validation degrade).
+    Salvage goes through ``_finalize_done`` (same as the forced-failure path),
+    so the row state flip + persistence are consistent and lineage is never
+    cleared by the validation degrade.
     """
 
     store = _make_store()
@@ -149,6 +177,8 @@ async def test_force_failed_invalid_output_preserves_lineage() -> None:
     await runner.run(task_id)
 
     task = store.get_task(task_id)
-    assert task.state == "failed"
+    # Non-empty output → salvaged to a degraded ``done``.
+    assert task.state == "done"
+    assert task.result == "junk2"
     # Lineage is unchanged.
     assert task.lineage == [parent_id]

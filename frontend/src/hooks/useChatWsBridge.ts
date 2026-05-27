@@ -81,16 +81,20 @@ export function useChatWsBridge(): UseChatWsBridgeResult {
           setWaiting(msg.state === "start");
           break;
         case "assistant_msg":
-          // Proactive pushes (slice #0021) are auto-emitted by Jarvis without
-          // a user prompt — they must NOT interrupt the previous turn's audio
-          // and must NOT reset `currentMsgIdRef` (otherwise pending audio
-          // frames for the legitimate previous turn would be dropped).
+          // A user-turn reply supersedes any in-flight audio (the user moved
+          // on); a proactive push (slice #0021 paraphrase, or a task-done
+          // synthesis under PRD 0004 voice mode) must NOT hard-cut it.
           if (!msg.proactive) {
             audioStop();
             audioStreamRef.current = null;
-            if (msg.msg_id) {
-              currentMsgIdRef.current = msg.msg_id;
-            }
+          }
+          // Register the msg_id for BOTH kinds. Proactive task-done pushes now
+          // carry their own TTS stream (ws_router synthesises for proactive
+          // assistant_msg in voice mode); without claiming the audio channel
+          // here, the matching `audio_start` is rejected as stale below and
+          // every PCM frame is dropped — i.e. no voice at task exit.
+          if (msg.msg_id) {
+            currentMsgIdRef.current = msg.msg_id;
           }
           addAssistantMessage(msg.speech, msg.ui, msg.msg_id, msg.proactive);
           // PRD 0006 / issue 0049 — the persisted bubble takes over from
