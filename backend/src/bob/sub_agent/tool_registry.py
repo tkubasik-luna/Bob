@@ -471,22 +471,35 @@ async def _gmail_search_handler(
             error_message=str(exc),
         )
 
+    # Issue 0056 — distinguish "Gmail API unreachable" (HTTP 5xx, quota,
+    # network timeout) from other handler failures so the sub-agent can
+    # produce a "Gmail down, try again later" speech rather than a generic
+    # "search failed" message. The detection is best-effort and structural:
+    # we look for the concrete ``HttpError`` raised by
+    # ``googleapiclient.errors`` plus common ``OSError`` / ``TimeoutError``
+    # subclasses that ``httplib2`` (the transport googleapiclient ships
+    # with) bubbles up on socket failures. Anything that does not match
+    # the unreachable taxonomy falls through to ``gmail_search_failed`` —
+    # the LLM treats the two distinctly per the system prompt.
     try:
         client = GmailClient(credentials)
         messages = client.search_messages(query, max_results=args.max_results)
     except Exception as exc:
-        # ``googleapiclient`` raises a wide taxonomy (HttpError,
-        # SocketTimeout, etc.). We do NOT depend on the concrete classes
-        # here — surfacing a generic failure code keeps the connector
-        # boundary clean and the handler unit-testable without HTTP
-        # stubs. The dispatcher converts uncaught exceptions to
-        # ``handler_failed``; we intercept first to attach a more useful
-        # error_code for the LLM and downstream consumers.
+        # Metadata only in the warn log — message id / thread id / sender
+        # never leak here because we never had them (the call failed before
+        # any message decode). Subject / snippet are by construction absent
+        # from the exception text.
         _logger.warning(
             "gmail_search.api_failed",
             error=str(exc),
             error_type=type(exc).__name__,
         )
+        if _is_api_unreachable_exception(exc):
+            return SubAgentToolHandlerOutcome(
+                status="error",
+                error_code="gmail_search_api_unreachable",
+                error_message=f"Gmail API unreachable: {exc}",
+            )
         return SubAgentToolHandlerOutcome(
             status="error",
             error_code="gmail_search_failed",
@@ -501,6 +514,40 @@ async def _gmail_search_handler(
             "messages": [to_mail_props(msg) for msg in messages],
         },
     )
+
+
+def _is_api_unreachable_exception(exc: BaseException) -> bool:
+    """Heuristic — does ``exc`` smell like a Gmail transport / API outage?
+
+    Matches:
+
+    - :class:`googleapiclient.errors.HttpError` — any HTTP failure from
+      the Gmail API (5xx, quota, 401 from a revoked oauth scope, …). The
+      sub-agent system prompt maps both 5xx and quota into the
+      "réessaie dans un moment" speech; auth-revoked 401s would normally
+      already surface as :class:`RefreshFailedError` upstream, but a
+      raw 401 reaching the handler still routes to "unreachable" rather
+      than the generic catch-all.
+    - :class:`TimeoutError` and :class:`ConnectionError` — surface for
+      pure socket-level failures (DNS down, host unreachable, slow
+      response triggering a client-side timeout).
+
+    Imported lazily so the handler module stays light when
+    ``googleapiclient`` is not installed (e.g. a unit-test environment
+    that stubs the connector boundary).
+    """
+
+    _HttpError: type[BaseException] | None
+    try:
+        from googleapiclient.errors import HttpError
+
+        _HttpError = HttpError
+    except Exception:  # pragma: no cover — defensive when googleapiclient missing
+        _HttpError = None
+
+    if _HttpError is not None and isinstance(exc, _HttpError):
+        return True
+    return isinstance(exc, TimeoutError | ConnectionError)
 
 
 def build_gmail_search_tool() -> SubAgentToolDefinition:

@@ -213,6 +213,61 @@ def _deliverable_text(ui_payload: dict[str, Any] | str | None) -> str | None:
     return None
 
 
+# Issue 0056 — privacy redaction for the Mail ``ui_payload`` in debug events.
+#
+# The sub-agent's ``done`` action embeds the full Mail props (subject +
+# snippet / bodyPreview) so the LLM and the assistant_msg pipeline can carry
+# them through to the overlay. That same payload is currently echoed in the
+# ``status_change`` :func:`emit_debug` envelope which lands in the in-memory
+# ring buffer, on the WS ``/ws/debug`` subscriber feed and on the JSONL file
+# sink. Per the PRD's privacy posture only metadata (message id, thread id,
+# sender email, label set) may live in DebugEvent payloads — subject /
+# snippet / bodyPreview must be scrubbed before emit.
+#
+# The redaction keys on the component discriminator: a Mail descriptor
+# (``{"component": "Mail", "props": {...}}``) gets its props passed through
+# the field-level scrubber. Non-Mail payloads (Markdown deliverables,
+# arbitrary structured payloads from other tools) are returned unchanged so
+# this slice does not regress on the existing Markdown overlay path.
+_MAIL_PROP_FIELDS_REDACTED = ("subject", "bodyPreview", "snippet", "body")
+_MAIL_REDACTED_PLACEHOLDER = "<redacted-for-privacy>"
+
+
+def _redact_ui_payload_for_debug(
+    ui_payload: dict[str, Any] | str | None,
+) -> dict[str, Any] | str | None:
+    """Return ``ui_payload`` with email body fields scrubbed for debug events.
+
+    Only Mail descriptors are touched (keyed on ``component == "Mail"``).
+    Every other shape is passed through untouched so non-Gmail flows
+    (Markdown deliverables, future overlays) are unaffected. The returned
+    value is a shallow copy when a Mail dict is detected — never the same
+    object — so subsequent mutation of the original payload does not leak
+    back into the captured debug event.
+
+    Fields scrubbed: ``subject``, ``bodyPreview``, ``snippet``, ``body``.
+    Metadata kept: ``messageId``, ``threadId``, ``from`` (sender), ``flags``,
+    ``labels``, ``attachments`` (filename + size + mime — no bytes), the
+    ``gmailWebUrl`` deep link, and ``receivedAt``.
+    """
+
+    if not isinstance(ui_payload, dict):
+        return ui_payload
+    if ui_payload.get("component") != "Mail":
+        return ui_payload
+
+    redacted_payload = dict(ui_payload)
+    raw_props = redacted_payload.get("props")
+    if not isinstance(raw_props, dict):
+        return redacted_payload
+    redacted_props = dict(raw_props)
+    for field_name in _MAIL_PROP_FIELDS_REDACTED:
+        if field_name in redacted_props:
+            redacted_props[field_name] = _MAIL_REDACTED_PLACEHOLDER
+    redacted_payload["props"] = redacted_props
+    return redacted_payload
+
+
 def _salvage_display(raw: str) -> str:
     """Best-effort clean text from a sub-agent output that failed validation.
 
@@ -1059,6 +1114,25 @@ class SubAgentRunner:
             _logger.exception("sub_agent_runner.finalize_reload_done_failed", task_id=task_id)
             return
 
+        # Issue 0056 — scrub the Mail subject / bodyPreview / snippet before
+        # the payload lands in the debug ring buffer + WS / file sinks. The
+        # original ``ui_payload`` continues to flow through ``task.result`` /
+        # ``task_result`` WS event / LLM context unchanged; only the debug
+        # envelope sees the redacted copy. Non-Mail payloads round-trip
+        # untouched so Markdown deliverables stay intact.
+        debug_ui_payload = _redact_ui_payload_for_debug(ui_payload)
+        # The ``result`` field of the debug payload also carries the LLM's
+        # spoken ``result_summary`` which for Mail responses typically
+        # contains the subject ("Mail de X, sujet '<subject>', ..."). The
+        # frontend already gets that string via the ``task_result`` WS
+        # event; duplicating it into the debug envelope only widens the
+        # privacy surface for no observability gain. When the payload is
+        # a Mail descriptor we elide ``result`` and let the per-task
+        # overlay derive the summary from ``task.result`` itself.
+        is_mail_payload = isinstance(ui_payload, dict) and ui_payload.get("component") == "Mail"
+        debug_result_field: str | None = (
+            None if store_state != "done" or is_mail_payload else persisted_result
+        )
         emit_debug(
             category="task",
             severity="info" if store_state == "done" else "warn",
@@ -1075,11 +1149,11 @@ class SubAgentRunner:
             payload={
                 "task_id": task_id,
                 "title": task.title,
-                "result": persisted_result if store_state == "done" else None,
+                "result": debug_result_field,
                 "reason": reason_code if store_state != "done" else None,
                 "status": status,
                 "reason_code": reason_code,
-                "ui_payload": ui_payload,
+                "ui_payload": debug_ui_payload,
                 "cost": cost,
                 # Issue 0052: status_change reflection so the overlay
                 # can render a terminal pill in the timeline.

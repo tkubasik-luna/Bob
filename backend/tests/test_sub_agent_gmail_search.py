@@ -215,7 +215,13 @@ async def test_gmail_search_runner_e2e(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "lecture du mail" in thought_summaries
 
     # 4. The final ``status_change`` reflection carries the Mail ui_payload
-    #    so the overlay can pick it up.
+    #    so the overlay can pick it up — but the subject / bodyPreview are
+    #    REDACTED in the debug envelope per the issue 0056 privacy posture.
+    #    Metadata (sender email, thread id, message id, labels) is allowed
+    #    to flow through the overlay subscriber unchanged. The unredacted
+    #    Mail props still reach the LLM and the Mail overlay via the
+    #    ``task_result`` WS event and the streaming ``ui_payload`` frame —
+    #    just not through this debug payload.
     status_change_events = [
         ev
         for ev in captured_events
@@ -227,9 +233,14 @@ async def test_gmail_search_runner_e2e(monkeypatch: pytest.MonkeyPatch) -> None:
     assert isinstance(final_payload.get("ui_payload"), dict)
     assert final_payload["ui_payload"]["component"] == "Mail"
     mail_props = final_payload["ui_payload"]["props"]
+    # Metadata stays in clear — needed to route the event downstream.
     assert mail_props["from"]["name"] == "Holyana Callejon"
-    assert mail_props["subject"] == "Récap réunion produit"
+    assert mail_props["from"]["email"] == "holyana@example.com"
     assert mail_props["threadId"] == "thread-99"
+    assert mail_props["messageId"] == "msg-12345"
+    # Body fields are scrubbed.
+    assert mail_props["subject"] == "<redacted-for-privacy>"
+    assert mail_props["bodyPreview"] == "<redacted-for-privacy>"
 
 
 @pytest.mark.asyncio

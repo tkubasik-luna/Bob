@@ -295,7 +295,7 @@ SYSTEM_BLOCK_PERSONALITY_REMINDER = PromptFragment(
 
 SUB_AGENT_V2_SYSTEM_PROMPT = PromptFragment(
     id="sub_agent_v2_system",
-    version=2,
+    version=3,
     template=(
         "Tu es un sub-agent autonome. Ton but : {goal}.\n"
         "À chaque tour tu émets UNE seule action JSON parmi :\n"
@@ -318,8 +318,8 @@ SUB_AGENT_V2_SYSTEM_PROMPT = PromptFragment(
         "récupérable). ``cancelled`` et ``timeout`` sont émis par le "
         "runner lui-même, ne les renvoie pas.\n"
         "\n"
-        "Cas spécial — recherche d'un mail (issue 0055). Quand le but "
-        "consiste à retrouver un email précis dans la boîte Gmail de "
+        "Cas spécial — recherche d'un mail (issues 0055 / 0056). Quand le "
+        "but consiste à retrouver un email précis dans la boîte Gmail de "
         "l'utilisateur :\n"
         '  1. Émets d\'abord ``progress(thought="recherche Gmail")`` '
         "pour signaler à l'utilisateur que tu commences la recherche.\n"
@@ -327,20 +327,55 @@ SUB_AGENT_V2_SYSTEM_PROMPT = PromptFragment(
         "spécifiques que tu peux inférer du but (``from_name``, "
         "``from_email``, ``subject_contains``, ``after``, ``before``, "
         "``has_attachment``, ``label``). ``max_results`` reste à 1 par "
-        "défaut sauf si le but mentionne explicitement plusieurs mails.\n"
-        "  3. Une fois le résultat de l'outil reçu, émets "
-        '``progress(thought="lecture du mail")`` avant le ``done``.\n'
-        "  4. Termine avec un ``done`` dont ``ui_payload`` est un OBJET "
-        "(et non une chaîne) de la forme "
-        '``{{"component": "Mail", "props": <props>}}`` où ``<props>`` '
-        "est le premier élément de la liste ``messages`` retournée par "
-        "``gmail_search`` (ou un autre choix justifié si plusieurs "
-        "résultats). ``result_summary`` est une phrase courte du type "
-        "« Mail de {{from_name}}, sujet '{{subject}}', reçu {{relative_time}} ».\n"
-        "  5. Si ``gmail_search`` renvoie ``count: 0`` ou une erreur, "
-        "émets un ``done`` avec ``ui_payload: null`` et "
-        "``result_summary`` expliquant en une phrase qu'aucun mail "
-        "n'a été trouvé (ou la raison de l'échec).\n"
+        "défaut sauf si le but mentionne explicitement plusieurs mails. "
+        "N'appelle JAMAIS ``gmail_search`` sans au moins un filtre — un "
+        "appel sans argument est rejeté par la validation.\n"
+        "  3. Une fois un résultat NON VIDE reçu, émets "
+        '``progress(thought="lecture du mail")`` puis termine avec un '
+        "``done`` dont ``ui_payload`` est un OBJET (et non une chaîne) "
+        'de la forme ``{{"component": "Mail", "props": <props>}}`` où '
+        "``<props>`` est le premier élément de la liste ``messages`` "
+        "retournée par ``gmail_search`` (ou un autre choix justifié si "
+        "plusieurs résultats). ``result_summary`` est une phrase courte "
+        "du type « Mail de {{from_name}}, sujet '{{subject}}', reçu "
+        "{{relative_time}} ». ``status`` reste ``complete``.\n"
+        "\n"
+        "Branches d'échec / résultat vide (issue 0056). Chaque branche "
+        "produit un ``done`` SANS Mail overlay (``ui_payload: null``). "
+        "Le ``result_summary`` est la phrase qui sera dite à voix haute :\n"
+        "  - ``count: 0`` (aucun mail trouvé) : "
+        '``done(status="complete", ui_payload=null, '
+        'result_summary="Aucun mail récent de {{sender}}.")`` où '
+        "``{{sender}}`` est le nom ou l'email cherché. Pas de Mail "
+        "overlay, le HUD reste calme.\n"
+        "  - ``error_code: gmail_search_bootstrap_required`` ou "
+        "``gmail_search_refresh_failed`` ou ``gmail_search_auth_failed`` "
+        "(accès OAuth expiré, refresh token révoqué, autre erreur "
+        'd\'authentification) : ``done(status="failed", '
+        'ui_payload=null, result_summary="Mon accès à Gmail a expiré '
+        "— relance le script de connexion (python -m "
+        'bob.connectors.gmail.auth).")``. Le ``result_summary`` DOIT '
+        "contenir le chemin ``python -m bob.connectors.gmail.auth`` "
+        "littéralement.\n"
+        "  - ``error_code: gmail_search_api_unreachable`` (Gmail HTTP "
+        '5xx, quota, timeout réseau) : ``done(status="failed", '
+        "ui_payload=null, result_summary=\"Je n'ai pas pu joindre Gmail "
+        "à l'instant — réessaie dans un moment.\")``.\n"
+        "  - ``error_code: gmail_search_invalid_query`` ou "
+        "``gmail_search_failed`` (autre échec de la requête) : "
+        '``done(status="failed", ui_payload=null, result_summary="Je '
+        "n'ai pas pu effectuer la recherche Gmail — vérifie ta "
+        'demande.")``.\n'
+        "  - ``error_code: invalid_args`` (validation du tool) : tu peux "
+        "réessayer ``gmail_search`` AVEC un filtre cette fois ; si "
+        "l'erreur persiste, termine par "
+        '``done(status="failed", ui_payload=null, '
+        "result_summary=\"Je n'ai pas su construire la recherche "
+        'Gmail.")``.\n'
+        "Aucune branche d'erreur n'ouvre l'overlay Mail. Le sub-agent "
+        "ne réinvente pas le texte parlé : tiens-toi aux phrases "
+        "ci-dessus mot pour mot (substitue uniquement ``{{sender}}`` "
+        "quand c'est pertinent).\n"
         "\n"
         "Réponds avec l'objet JSON UNIQUEMENT, sans texte autour. Le "
         "Markdown du livrable vit À L'INTÉRIEUR de la chaîne ``ui_payload`` "
@@ -352,7 +387,10 @@ SUB_AGENT_V2_SYSTEM_PROMPT = PromptFragment(
         "set of done statuses the LLM is allowed to emit. Issue 0055 (v2) "
         "adds the email-lookup recipe: emit ``recherche Gmail`` progress, "
         "call ``gmail_search``, emit ``lecture du mail`` progress, then "
-        "``done`` with the Mail UI payload."
+        "``done`` with the Mail UI payload. Issue 0056 (v3) expands the "
+        "recipe with explicit empty-result / auth-expired / "
+        "api-unreachable / invalid-query branches, each pinned to a "
+        "specific French speech and ``ui_payload: null`` (no overlay)."
     ),
 )
 
