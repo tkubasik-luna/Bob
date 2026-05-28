@@ -93,6 +93,27 @@ async def test_finalize_emits_ui_payload_for_non_null_ui() -> None:
 
 
 @pytest.mark.asyncio
+async def test_finalize_normalises_flat_ui_into_props() -> None:
+    """A flat ``{component, content}`` ui is lifted into ``{component, props}``.
+
+    Regression: the LLM emitted ``content`` as a sibling of ``component``;
+    the raw dict reached the frontend with no ``props`` so the overlay
+    rendered empty. The emitter now normalises before sending.
+    """
+
+    emitter, rec = _build_emitter()
+    await emitter.feed('{"speech":"hi","ui":{"component":"Markdown","content":"# Pizza"}}')
+    await emitter.finalize()
+
+    ui_payloads = [c for c in rec.calls if c["type"] == "ui_payload"]
+    assert len(ui_payloads) == 1
+    assert ui_payloads[0]["ui"] == {
+        "component": "Markdown",
+        "props": {"content": "# Pizza"},
+    }
+
+
+@pytest.mark.asyncio
 async def test_finalize_with_null_ui_does_not_emit() -> None:
     """``ui: null`` is the empty-overlay case — no frame."""
 

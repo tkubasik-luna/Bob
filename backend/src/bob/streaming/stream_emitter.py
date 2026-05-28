@@ -80,6 +80,7 @@ import structlog
 
 from bob.event_bus_v2 import emit_event as default_emit_event
 from bob.streaming.partial_json_parser import PartialJsonParser
+from bob.ui_registry import coerce_component_descriptor
 
 _logger = structlog.get_logger(__name__)
 
@@ -250,7 +251,13 @@ class StreamEmitter:
         if ui is None:
             # Empty / null / missing ui → no overlay open. PRD AC.
             return
-        if not isinstance(ui, dict):
+        # Normalise into the canonical ``{component, props}`` shape the
+        # frontend overlay reads (``props.content``). Tolerates the flat
+        # ``{component, content}`` variant the LLM sometimes emits — without
+        # this the raw dict reaches the frontend with no ``props`` and the
+        # overlay renders empty. ``None`` means non-dict / no component.
+        descriptor = coerce_component_descriptor(ui)
+        if descriptor is None:
             _logger.warning(
                 "stream_emitter.ui_payload_unexpected_shape",
                 msg_id=self._msg_id,
@@ -265,7 +272,7 @@ class StreamEmitter:
             {
                 "type": "ui_payload",
                 "msg_id": self._msg_id,
-                "ui": ui,
+                "ui": descriptor.model_dump(),
             }
         )
 

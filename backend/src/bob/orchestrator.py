@@ -131,7 +131,7 @@ from bob.tools import (
     ToolRegistry,
     build_default_registry,
 )
-from bob.ui_registry import ComponentDescriptor
+from bob.ui_registry import ComponentDescriptor, coerce_component_descriptor
 from bob.validation import (
     JARVIS_DEGRADE_SPEECH_FRAGMENT,
     CallEnvelope,
@@ -1691,34 +1691,25 @@ class Orchestrator:
 def _coerce_say_ui(ui: Any) -> list[ComponentDescriptor]:
     """Normalise the ``say.ui`` argument into the orchestrator's UI shape.
 
-    Pre-0047 the structured-output path validated ``ui`` against the
-    full :mod:`bob.ui_registry` JSON schema. Issue 0047 keeps the
-    contract permissive at the tool boundary (the LLM may emit ``null``
-    most of the time and an opaque ``{component, props}`` object when
-    a Markdown overlay is warranted); validation against the registry's
-    versioned schema lands with 0048's per-tool retry/degrade. Until
-    then we coerce best-effort:
+    The tool boundary stays permissive (``SayArgs.ui: dict | None``); this
+    lifts the raw value into the ``{component, props}`` shape the WS frame +
+    frontend expect, tolerating the flat ``{component, content}`` variant
+    via :func:`coerce_component_descriptor`.
 
     * ``None`` → empty list (the common case).
-    * A dict with ``component`` and ``props`` → wrap into a single
-      :class:`ComponentDescriptor` (legacy structured-output shape).
+    * A dict carrying a string ``component`` → single
+      :class:`ComponentDescriptor`, top-level props folded into ``props``.
     * Any other shape → empty list + a warning log so misuse is loud
       without breaking the live turn.
     """
 
     if ui is None:
         return []
-    if isinstance(ui, dict):
-        component = ui.get("component")
-        props = ui.get("props", {})
-        if isinstance(component, str) and isinstance(props, dict):
-            try:
-                return [ComponentDescriptor(component=component, props=props)]
-            except Exception:
-                _logger.warning("orchestrator.say_ui_invalid_component", ui=ui)
-                return []
-    _logger.warning("orchestrator.say_ui_unexpected_shape", ui=ui)
-    return []
+    descriptor = coerce_component_descriptor(ui)
+    if descriptor is None:
+        _logger.warning("orchestrator.say_ui_unexpected_shape", ui=ui)
+        return []
+    return [descriptor]
 
 
 # Process-wide singleton. Slice #0025 turns the per-call factory into a true

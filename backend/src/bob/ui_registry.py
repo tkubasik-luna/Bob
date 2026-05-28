@@ -198,6 +198,56 @@ def get_response_schema() -> dict[str, Any]:
     return _DEFAULT_REGISTRY.response_schema()
 
 
+def get_say_ui_schema() -> dict[str, Any]:
+    """JSON-Schema for the ``say`` tool's ``ui`` argument.
+
+    Constrains the LLM to emit either ``null`` (purely spoken reply) or a
+    canonical ``{component, props}`` object — one of the registry's known
+    components. Passed as the tool ``parameters.ui`` sub-schema so the model
+    is guided away from the flat ``{component, content}`` shape that drops
+    the payload through :func:`coerce_component_descriptor`. The runtime
+    stays permissive (``SayArgs.ui: dict | None``); this only shapes
+    generation, it is not a hard validation gate.
+    """
+
+    return {
+        "anyOf": [{"type": "null"}, *_DEFAULT_REGISTRY.component_schemas()],
+        "description": (
+            "Composant UI optionnel à afficher en plus de la parole. `null` "
+            "pour une réponse purement vocale, sinon un objet {component, "
+            'props}. Exemple : {"component": "Markdown", "props": {"content": '
+            '"# Titre\\n..."}}. Le contenu va TOUJOURS dans `props`.'
+        ),
+    }
+
+
+def coerce_component_descriptor(ui: Any) -> ComponentDescriptor | None:
+    """Best-effort normalise a raw ``say.ui`` value into a ComponentDescriptor.
+
+    Tolerates the flat shape ``{component, <prop>...}`` some LLM turns emit
+    instead of the canonical ``{component, props: {...}}``: any top-level key
+    besides ``component`` / ``props`` is folded into ``props`` (an explicit
+    ``props`` object wins on key conflict). Returns ``None`` when ``ui`` is
+    not a dict or lacks a string ``component`` — callers treat that as "no
+    overlay".
+    """
+
+    if not isinstance(ui, dict):
+        return None
+    component = ui.get("component")
+    if not isinstance(component, str):
+        return None
+    explicit = ui.get("props")
+    if not isinstance(explicit, dict):
+        explicit = {}
+    siblings = {k: v for k, v in ui.items() if k not in ("component", "props")}
+    props = {**siblings, **explicit}
+    try:
+        return ComponentDescriptor(component=component, props=props)
+    except Exception:
+        return None
+
+
 def get_components_description_for_prompt() -> str:
     """Return a Markdown description of the default registry's components."""
 

@@ -10,6 +10,7 @@ from bob.ui_registry import (
     ResponseSchemaError,
     UIComponent,
     build_registry,
+    coerce_component_descriptor,
 )
 
 
@@ -103,3 +104,46 @@ def test_build_registry_supports_extra_components() -> None:
     }
     parsed = registry.validate_response(payload)
     assert parsed.ui[0].component == "Banner"
+
+
+def test_coerce_component_descriptor_canonical_shape() -> None:
+    cd = coerce_component_descriptor(
+        {"component": "Markdown", "props": {"content": "# Hi"}}
+    )
+    assert cd is not None
+    assert cd.component == "Markdown"
+    assert cd.props == {"content": "# Hi"}
+
+
+def test_coerce_component_descriptor_lifts_flat_shape_into_props() -> None:
+    # The LLM sometimes emits ``content`` as a sibling of ``component``
+    # instead of nesting it under ``props`` — the flat shape that silently
+    # dropped the Markdown payload before this fix.
+    cd = coerce_component_descriptor({"component": "Markdown", "content": "# Hi"})
+    assert cd is not None
+    assert cd.component == "Markdown"
+    assert cd.props == {"content": "# Hi"}
+
+
+def test_coerce_component_descriptor_explicit_props_win_over_siblings() -> None:
+    cd = coerce_component_descriptor(
+        {"component": "Markdown", "content": "stray", "props": {"content": "real"}}
+    )
+    assert cd is not None
+    assert cd.props == {"content": "real"}
+
+
+@pytest.mark.parametrize("ui", [None, "oops", 42, [], {"props": {"content": "x"}}])
+def test_coerce_component_descriptor_returns_none_for_bad_shapes(ui: object) -> None:
+    assert coerce_component_descriptor(ui) is None
+
+
+def test_say_ui_schema_is_valid_and_allows_null_or_component() -> None:
+    schema = ui_registry.get_say_ui_schema()
+    Draft202012Validator.check_schema(schema)
+    validator = Draft202012Validator(schema)
+    assert validator.is_valid(None)
+    assert validator.is_valid({"component": "Markdown", "props": {"content": "x"}})
+    # Flat shape is rejected by the schema (guidance) even though the
+    # runtime coerces it — the schema steers the LLM toward ``props``.
+    assert not validator.is_valid({"component": "Markdown", "content": "x"})

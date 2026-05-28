@@ -48,6 +48,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from bob.tools.dispatcher import ToolHandlerContext
 from bob.tools.registry import ToolDefinition
 from bob.tools.types import ToolHandlerOutcome
+from bob.ui_registry import get_say_ui_schema
 
 _logger = structlog.get_logger(__name__)
 
@@ -111,13 +112,7 @@ _SAY_PARAMETERS = {
                 "Le texte à dire à l'utilisateur. Texte simple, en français, naturel et concis."
             ),
         },
-        "ui": {
-            "type": ["object", "null"],
-            "description": (
-                "Composant UI optionnel à afficher en plus de la parole. "
-                "Objet {component, props} ou null."
-            ),
-        },
+        "ui": get_say_ui_schema(),
     },
     "required": ["speech"],
 }
