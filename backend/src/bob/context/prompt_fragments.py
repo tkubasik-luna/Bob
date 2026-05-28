@@ -295,7 +295,7 @@ SYSTEM_BLOCK_PERSONALITY_REMINDER = PromptFragment(
 
 SUB_AGENT_V2_SYSTEM_PROMPT = PromptFragment(
     id="sub_agent_v2_system",
-    version=1,
+    version=2,
     template=(
         "Tu es un sub-agent autonome. Ton but : {goal}.\n"
         "À chaque tour tu émets UNE seule action JSON parmi :\n"
@@ -317,6 +317,31 @@ SUB_AGENT_V2_SYSTEM_PROMPT = PromptFragment(
         "(résultat partiel sous contrainte), ``failed`` (erreur non "
         "récupérable). ``cancelled`` et ``timeout`` sont émis par le "
         "runner lui-même, ne les renvoie pas.\n"
+        "\n"
+        "Cas spécial — recherche d'un mail (issue 0055). Quand le but "
+        "consiste à retrouver un email précis dans la boîte Gmail de "
+        "l'utilisateur :\n"
+        '  1. Émets d\'abord ``progress(thought="recherche Gmail")`` '
+        "pour signaler à l'utilisateur que tu commences la recherche.\n"
+        "  2. Appelle ``gmail_search`` avec les arguments les plus "
+        "spécifiques que tu peux inférer du but (``from_name``, "
+        "``from_email``, ``subject_contains``, ``after``, ``before``, "
+        "``has_attachment``, ``label``). ``max_results`` reste à 1 par "
+        "défaut sauf si le but mentionne explicitement plusieurs mails.\n"
+        "  3. Une fois le résultat de l'outil reçu, émets "
+        '``progress(thought="lecture du mail")`` avant le ``done``.\n'
+        "  4. Termine avec un ``done`` dont ``ui_payload`` est un OBJET "
+        "(et non une chaîne) de la forme "
+        '``{{"component": "Mail", "props": <props>}}`` où ``<props>`` '
+        "est le premier élément de la liste ``messages`` retournée par "
+        "``gmail_search`` (ou un autre choix justifié si plusieurs "
+        "résultats). ``result_summary`` est une phrase courte du type "
+        "« Mail de {{from_name}}, sujet '{{subject}}', reçu {{relative_time}} ».\n"
+        "  5. Si ``gmail_search`` renvoie ``count: 0`` ou une erreur, "
+        "émets un ``done`` avec ``ui_payload: null`` et "
+        "``result_summary`` expliquant en une phrase qu'aucun mail "
+        "n'a été trouvé (ou la raison de l'échec).\n"
+        "\n"
         "Réponds avec l'objet JSON UNIQUEMENT, sans texte autour. Le "
         "Markdown du livrable vit À L'INTÉRIEUR de la chaîne ``ui_payload`` "
         "— l'enveloppe reste du JSON pur."
@@ -324,7 +349,10 @@ SUB_AGENT_V2_SYSTEM_PROMPT = PromptFragment(
     description=(
         "System prompt for sub-agents under the v2 contract (PRD 0006 / "
         "issue 0045). Describes the three-action surface and the closed "
-        "set of done statuses the LLM is allowed to emit."
+        "set of done statuses the LLM is allowed to emit. Issue 0055 (v2) "
+        "adds the email-lookup recipe: emit ``recherche Gmail`` progress, "
+        "call ``gmail_search``, emit ``lecture du mail`` progress, then "
+        "``done`` with the Mail UI payload."
     ),
 )
 

@@ -47,6 +47,7 @@ from bob.sub_agent.runner import (
     SubAgentRunner,
 )
 from bob.sub_agent.tool_registry import (
+    GmailSearchArgs,
     SubAgentToolDefinition,
     SubAgentToolDispatcher,
     SubAgentToolHandlerContext,
@@ -55,6 +56,7 @@ from bob.sub_agent.tool_registry import (
     WebFetchArgs,
     WebSearchArgs,
     build_default_subagent_registry,
+    build_gmail_search_tool,
     build_web_fetch_tool,
     build_web_search_tool,
 )
@@ -73,6 +75,7 @@ __all__ = [
     "AddendumEntry",
     "AddendumQueue",
     "DoneAction",
+    "GmailSearchArgs",
     "ProgressAction",
     "SubAgentAction",
     "SubAgentActionParseError",
@@ -88,6 +91,7 @@ __all__ = [
     "WebFetchArgs",
     "WebSearchArgs",
     "build_default_subagent_registry",
+    "build_gmail_search_tool",
     "build_web_fetch_tool",
     "build_web_search_tool",
     "default_policy",

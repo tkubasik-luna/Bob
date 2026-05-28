@@ -506,19 +506,19 @@ async def test_addendum_drained_only_at_iteration_boundary() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_default_subagent_registry_is_empty_until_real_web_backend() -> None:
-    """``web_search`` / ``web_fetch`` are unwired until a real backend lands.
+def test_default_subagent_registry_exposes_gmail_search() -> None:
+    """Issue 0055: ``gmail_search`` is the first real sub-agent tool wired in.
 
-    They were placeholders raising ``NotImplementedError``; exposing them made
-    every research sub-task burn an LLM round-trip on a ``handler_failed`` tool
-    call before falling back to pure-knowledge generation. The builders still
-    exist for the future, but the default registry is empty.
+    ``web_search`` / ``web_fetch`` remain unwired until a real HTTP backend
+    lands — their handlers still raise ``NotImplementedError``. The default
+    registry now exposes ``gmail_search`` so research sub-tasks can answer
+    email-lookup goals via the Mail overlay.
     """
 
     registry = build_default_subagent_registry()
-    assert registry.names() == []
-    # Scaffolding remains available so a future slice can register a real
-    # backend without re-deriving the tool shape.
+    assert registry.names() == ["gmail_search"]
+    # Scaffolding for the web tools remains available so a future slice can
+    # re-register them without re-deriving the tool shape.
     web_search = build_web_search_tool()
     assert web_search.qualified_name == "v1.web_search"
     assert web_search.args_model is WebSearchArgs

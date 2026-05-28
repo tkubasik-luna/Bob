@@ -6,20 +6,17 @@ strictly disjoint from Jarvis's (no ``spawn_subtask`` / ``say`` on a
 sub-agent — it would let a sub-agent spawn its own children, which is
 explicitly out of scope per PRD 0006 / "Out of scope").
 
-This slice (0045) defines two placeholder tool definitions:
+Tool definitions live here:
 
-- ``web_search(query)`` — issues a web search. Real implementation
-  intentionally a ``NotImplementedError`` for now; the focus of this
-  slice is the *registry shape* (Pydantic args validation, registry
-  lookup, dispatcher event emission). The actual HTTP call lands in a
-  later product slice when product priorities decide on a backend.
-- ``web_fetch(url)`` — fetches a URL's content. Same placeholder
-  pattern.
-
-Both are intentionally **not** wired into
-:func:`build_default_subagent_registry` (it returns an empty registry):
-advertising a tool whose handler always raises only wastes an LLM
-round-trip per research task. Re-register them once a real backend lands.
+- ``gmail_search(...)`` (issue 0055) — first real tool wired in. Bridges
+  the sub-agent runtime to :mod:`bob.connectors.gmail` so research
+  sub-tasks can answer email-lookup goals and feed the ``Mail`` UI
+  component.
+- ``web_search(query)`` / ``web_fetch(url)`` — historical placeholders
+  whose handlers still raise ``NotImplementedError``. Builders remain
+  available for the day a real HTTP backend lands; the default registry
+  does not register them because advertising a never-succeeding tool
+  wastes an LLM round-trip per research task.
 
 The :class:`SubAgentToolHandlerContext` mirrors
 :class:`bob.tools.dispatcher.ToolHandlerContext` but for the sub-agent
@@ -42,7 +39,10 @@ from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
-from pydantic import BaseModel, Field, ValidationError
+import structlog
+from pydantic import BaseModel, Field, ValidationError, model_validator
+
+_logger = structlog.get_logger(__name__)
 
 
 class SubAgentToolArgsValidationError(ValueError):
@@ -297,24 +297,254 @@ def build_web_fetch_tool() -> SubAgentToolDefinition:
     )
 
 
+# ---------------------------------------------------------------------------
+# Tool definition — gmail_search (issue 0055).
+# ---------------------------------------------------------------------------
+
+
+_GMAIL_SEARCH_MAX_RESULTS_CAP = 5
+
+
+class GmailSearchArgs(BaseModel):
+    """Validated structured arguments for ``gmail_search``.
+
+    Mirrors the keyword surface of
+    :func:`bob.connectors.gmail.query_builder.build_query` so the sub-agent
+    LLM can express a precise lookup without ever touching Gmail's raw
+    operator syntax. ``max_results`` is hard-capped at 5 server-side: the
+    Mail overlay shows one card at a time, asking the LLM to triage more
+    than a handful is wasted tokens.
+
+    Validation rules:
+
+    - At least one of the seven filter fields must be set — an all-None
+      payload would otherwise emit an empty query and Gmail returns the
+      whole inbox, which is never the caller's intent.
+    - ``max_results`` is clamped into ``[1, 5]`` so out-of-range values
+      gracefully degrade instead of raising.
+    """
+
+    from_name: str | None = Field(
+        default=None,
+        description="Display name of the sender (e.g. 'Holyana Callejon').",
+    )
+    from_email: str | None = Field(
+        default=None,
+        description="Exact email address of the sender.",
+    )
+    subject_contains: str | None = Field(
+        default=None,
+        description="Substring the subject must contain.",
+    )
+    after: str | None = Field(
+        default=None,
+        description="ISO 8601 date — only mails received strictly after.",
+    )
+    before: str | None = Field(
+        default=None,
+        description="ISO 8601 date — only mails received strictly before.",
+    )
+    has_attachment: bool | None = Field(
+        default=None,
+        description="When true, restricts to messages carrying attachments.",
+    )
+    label: str | None = Field(
+        default=None,
+        description="Gmail label filter (e.g. 'INBOX', 'IMPORTANT').",
+    )
+    max_results: int = Field(
+        default=1,
+        ge=1,
+        le=_GMAIL_SEARCH_MAX_RESULTS_CAP,
+        description=("Maximum number of messages to return (1-5; cap enforced server-side)."),
+    )
+
+    @model_validator(mode="after")
+    def _require_at_least_one_filter(self) -> GmailSearchArgs:
+        """Reject all-None payloads — see class docstring."""
+
+        any_filter = any(
+            value is not None and (not isinstance(value, str) or value.strip())
+            for value in (
+                self.from_name,
+                self.from_email,
+                self.subject_contains,
+                self.after,
+                self.before,
+                self.has_attachment,
+                self.label,
+            )
+        )
+        if not any_filter:
+            raise ValueError(
+                "gmail_search requires at least one filter "
+                "(from_name / from_email / subject_contains / after / "
+                "before / has_attachment / label); got all-None."
+            )
+        return self
+
+
+async def _gmail_search_handler(
+    _ctx: SubAgentToolHandlerContext,
+    args: BaseModel,
+) -> SubAgentToolHandlerOutcome:
+    """Execute a Gmail search and surface ``to_mail_props`` dicts.
+
+    The handler is the single point of integration between the sub-agent
+    runtime and :mod:`bob.connectors.gmail`. It:
+
+    1. Builds the Gmail ``q`` parameter from the validated structured
+       arguments via :func:`query_builder.build_query`.
+    2. Acquires refreshed credentials via :func:`auth.get_credentials`
+       (silent refresh path; raises actionable errors when re-bootstrap
+       is required).
+    3. Calls :meth:`GmailClient.search_messages` and translates each
+       :class:`EmailMessage` into the props dict the ``Mail`` UI
+       component expects via :func:`to_mail_props`.
+
+    Every exception path (missing token, refresh failure, Gmail API
+    error, query build error) is folded into a structured ``error``
+    outcome — the dispatcher contract is "never raise out of a handler".
+    The sub-agent then decides how to surface the failure to the user
+    (typically a plain ``say(speech=…)`` saying "no mail found" /
+    "could not access Gmail").
+    """
+
+    assert isinstance(args, GmailSearchArgs)  # for mypy / runtime safety
+
+    # Lazy import: the gmail connector pulls in google-auth which is
+    # heavy to import; keeping it inside the handler means tool registry
+    # construction stays cheap and unit tests for unrelated tools never
+    # pay the import cost.
+    from bob.connectors.gmail import (
+        BootstrapRequiredError,
+        GmailAuthError,
+        GmailClient,
+        QueryBuilderError,
+        RefreshFailedError,
+        auth,
+        build_query,
+        to_mail_props,
+    )
+
+    try:
+        query = build_query(
+            from_name=args.from_name,
+            from_email=args.from_email,
+            subject_contains=args.subject_contains,
+            after=args.after,
+            before=args.before,
+            has_attachment=args.has_attachment,
+            label=args.label,
+        )
+    except QueryBuilderError as exc:
+        _logger.warning("gmail_search.query_build_failed", error=str(exc))
+        return SubAgentToolHandlerOutcome(
+            status="error",
+            error_code="gmail_search_invalid_query",
+            error_message=f"Invalid Gmail search arguments: {exc}",
+        )
+
+    try:
+        credentials = auth.get_credentials()
+    except BootstrapRequiredError as exc:
+        _logger.warning("gmail_search.bootstrap_required", error=str(exc))
+        return SubAgentToolHandlerOutcome(
+            status="error",
+            error_code="gmail_search_bootstrap_required",
+            error_message=str(exc),
+        )
+    except RefreshFailedError as exc:
+        _logger.warning("gmail_search.refresh_failed", error=str(exc))
+        return SubAgentToolHandlerOutcome(
+            status="error",
+            error_code="gmail_search_refresh_failed",
+            error_message=str(exc),
+        )
+    except GmailAuthError as exc:
+        # Catch-all for the auth taxonomy — keeps the runtime resilient
+        # if a new subclass lands without us updating the handler.
+        _logger.warning("gmail_search.auth_failed", error=str(exc))
+        return SubAgentToolHandlerOutcome(
+            status="error",
+            error_code="gmail_search_auth_failed",
+            error_message=str(exc),
+        )
+
+    try:
+        client = GmailClient(credentials)
+        messages = client.search_messages(query, max_results=args.max_results)
+    except Exception as exc:
+        # ``googleapiclient`` raises a wide taxonomy (HttpError,
+        # SocketTimeout, etc.). We do NOT depend on the concrete classes
+        # here — surfacing a generic failure code keeps the connector
+        # boundary clean and the handler unit-testable without HTTP
+        # stubs. The dispatcher converts uncaught exceptions to
+        # ``handler_failed``; we intercept first to attach a more useful
+        # error_code for the LLM and downstream consumers.
+        _logger.warning(
+            "gmail_search.api_failed",
+            error=str(exc),
+            error_type=type(exc).__name__,
+        )
+        return SubAgentToolHandlerOutcome(
+            status="error",
+            error_code="gmail_search_failed",
+            error_message=f"Gmail search failed: {exc}",
+        )
+
+    return SubAgentToolHandlerOutcome(
+        status="ok",
+        result={
+            "query": query,
+            "count": len(messages),
+            "messages": [to_mail_props(msg) for msg in messages],
+        },
+    )
+
+
+def build_gmail_search_tool() -> SubAgentToolDefinition:
+    """Construct the registry entry for ``gmail_search`` (v1).
+
+    Description copy speaks to the LLM; keep it concise and operational —
+    the sub-agent prompt fragment carries the longer guidance about
+    meta-summary phrasing and emitting the result as a Mail overlay.
+    """
+
+    return SubAgentToolDefinition(
+        name="gmail_search",
+        version="v1",
+        description=(
+            "Recherche dans la boîte Gmail de l'utilisateur en combinant des "
+            "filtres structurés (expéditeur, sujet, dates, etc.) et renvoie "
+            "la liste des messages correspondants prête à être affichée par "
+            "le composant ``Mail``. Utilise dès que la demande concerne un "
+            "mail précis. ``max_results`` est limité à 5."
+        ),
+        args_model=GmailSearchArgs,
+        handler=_gmail_search_handler,
+    )
+
+
 def build_default_subagent_registry() -> SubAgentToolRegistry:
     """Construct the default sub-agent tool registry.
 
-    Currently **empty**. ``web_search`` / ``web_fetch`` exist only as
-    placeholders that raise ``NotImplementedError``; exposing them made every
-    research sub-task burn an LLM round-trip on a ``handler_failed`` tool call
-    before falling back to pure-knowledge generation. The builders stay
-    available (:func:`build_web_search_tool` / :func:`build_web_fetch_tool`) and
-    should be re-registered here once a real HTTP backend lands.
+    Currently exposes the ``gmail_search`` tool (issue 0055) so research
+    sub-tasks can answer email-lookup goals. ``web_search`` / ``web_fetch``
+    remain unwired — they raise ``NotImplementedError`` until a real HTTP
+    backend lands. The builders stay available
+    (:func:`build_web_search_tool` / :func:`build_web_fetch_tool`) and
+    should be re-registered here once a real backend exists.
 
     Other slices may extend via :meth:`SubAgentToolRegistry.register` or by
     constructing a custom registry directly (tests do this).
     """
 
-    return SubAgentToolRegistry()
+    return SubAgentToolRegistry([build_gmail_search_tool()])
 
 
 __all__ = [
+    "GmailSearchArgs",
     "SubAgentToolArgsValidationError",
     "SubAgentToolDefinition",
     "SubAgentToolDispatchResult",
@@ -326,6 +556,7 @@ __all__ = [
     "WebFetchArgs",
     "WebSearchArgs",
     "build_default_subagent_registry",
+    "build_gmail_search_tool",
     "build_web_fetch_tool",
     "build_web_search_tool",
 ]
