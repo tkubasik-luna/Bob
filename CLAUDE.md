@@ -11,3 +11,4 @@ Personal AI assistant. Tauri + React frontend, FastAPI backend, LM Studio (or an
 - [0005 Debug View](docs/features/0005-debug-view.md) — Real-time event feed in a Cmd+Shift+D Tauri window over `/ws/debug` with filters, payload expand, turn highlight, tail scroll.
 - [0006 Debug View — Grouped Tree](docs/features/0006-debug-view-grouped-tree.md) — Hierarchical tree (turn → sub-tasks → fused LLM calls), auto-expand current, replay collapsed-except-last.
 - [0007 Jarvis v2 Context Overhaul](docs/features/0007-jarvis-v2-context-overhaul.md) — Bounded context + streaming TTS + task-aware tools + structured validation/retry.
+- [0008 Gmail Connector & Mail Overlay](docs/features/0008-gmail-mail-overlay.md) — Read-only Gmail search via sub-task + dedicated Mail HUD overlay.
