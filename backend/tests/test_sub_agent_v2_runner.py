@@ -49,12 +49,15 @@ from bob.sub_agent import (
     build_default_subagent_registry,
     parse_action,
 )
+from bob.sub_agent.runner import _normalise_payload
 from bob.sub_agent.tool_registry import (
     WebSearchArgs,
     build_web_fetch_tool,
     build_web_search_tool,
 )
 from bob.task_store import TaskStore
+
+from .fixtures.tool_calling import ENVELOPE_FIXTURES, EnvelopeFixture
 
 
 class _ScriptedClient(LLMClient):
@@ -683,3 +686,60 @@ async def test_cancel_between_tool_and_iteration_exits_cleanly() -> None:
     assert task.state == "failed"
     system_rows = [m for m in store.get_task_messages(task_id) if m.role == "system"]
     assert system_rows[-1].content == REASON_USER_CANCELLED
+
+
+# ---------------------------------------------------------------------------
+# Golden envelope fixtures (PRD 0008 / issue 0057).
+#
+# Path 3 of the three divergent tool-calling parse paths: the sub-agent action
+# envelope. ``runner._normalise_payload`` strips a code fence then ``json.loads``
+# the ``{"action":…}`` envelope and validates it via ``parse_action``. These
+# fixtures lock the CURRENT behaviour so the later guided-JSON phase (issue
+# 0060) can flip exactly the ``parses=False`` cases to ``True`` against named
+# fixtures. Fixture data lives in ``tests/fixtures/tool_calling.py``; paths 1
+# and 2 are locked in ``tests/test_llm_client.py``.
+#
+# Key current-behaviour facts asserted below (verified against the code — the
+# issue text predates the fence-strip in ``_normalise_payload``):
+#   * clean + cleanly-fenced (```` ```json ```` / bare ```` ``` ````) envelopes
+#     PARSE today (the fence is stripped before ``json.loads``);
+#   * prose-prefix, prose-suffix, fenced-with-trailing-prose, and a non-``json``
+#     fence language all FAIL today (``SubAgentActionParseError`` → the runner
+#     forces ``done(failed, invalid_output)``).
+# ---------------------------------------------------------------------------
+
+
+_ENVELOPE_PARSES = tuple(fx for fx in ENVELOPE_FIXTURES if fx.parses)
+_ENVELOPE_FAILS = tuple(fx for fx in ENVELOPE_FIXTURES if not fx.parses)
+
+
+@pytest.mark.parametrize("fx", _ENVELOPE_PARSES, ids=lambda fx: fx.id)
+def test_golden_envelope_parses_today(fx: EnvelopeFixture) -> None:
+    """Well-formed + cleanly-fenced envelopes are accepted by the runner today."""
+
+    normalised = _normalise_payload(fx.raw)
+    assert normalised.action is not None
+    assert normalised.action.action == fx.expected_action
+    for key, expected in fx.expected_fields.items():
+        assert getattr(normalised.action, key) == expected
+
+
+@pytest.mark.parametrize("fx", _ENVELOPE_FAILS, ids=lambda fx: fx.id)
+def test_golden_envelope_fails_today(fx: EnvelopeFixture) -> None:
+    """Prose-wrapped / fence-with-trailing-prose / wrong-fence envelopes fail today.
+
+    ``_strip_code_fence`` only strips a fence whose last line is the closer, so
+    surrounding prose survives and ``json.loads`` raises — the runner converts
+    that to ``done(failed, invalid_output)``. Locking this lets the guided-JSON
+    phase flip these specific cases to "parses" and prove the win.
+    """
+
+    with pytest.raises(SubAgentActionParseError):
+        _normalise_payload(fx.raw)
+
+
+def test_golden_envelope_fixture_coverage() -> None:
+    """Guard: both branches are exercised (no silent empty parametrization)."""
+
+    assert _ENVELOPE_PARSES, "expected at least one parsing envelope fixture"
+    assert _ENVELOPE_FAILS, "expected at least one failing envelope fixture"

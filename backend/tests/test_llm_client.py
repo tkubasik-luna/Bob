@@ -10,7 +10,24 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from bob.config import Settings
-from bob.llm_client import ClaudeCliClient, LLMClientError, LMStudioClient
+from bob.llm import LLMResponse, ToolDefinition
+from bob.llm_client import (
+    ClaudeCliClient,
+    LLMClientError,
+    LMStudioClient,
+    _repair_json_braces,
+)
+
+from .fixtures.tool_calling import (
+    CLAUDE_FENCED,
+    CLAUDE_MALFORMED_REPAIR,
+    CLAUDE_WELL_FORMED,
+    NATIVE_MALFORMED_ARGUMENTS_RAW,
+    NATIVE_WELL_FORMED,
+    ClaudeToolCallFixture,
+    MalformedRepairFixture,
+    NativeToolCallFixture,
+)
 
 
 def _make_settings() -> Settings:
@@ -384,3 +401,213 @@ async def test_chat_folds_system_validator_before_dispatch() -> None:
     assert sent_roles == ["user", "system"]
     # Validator content survives, just under a standard role.
     assert "invalid" in sent[1]["content"]
+
+
+# ---------------------------------------------------------------------------
+# Golden tool-calling fixtures (PRD 0008 / issue 0057).
+#
+# These lock the CURRENT behaviour of two of the three divergent tool-calling
+# parse paths so the later 0008 refactor phases are regression-checked at PR
+# time. They assert NO new behaviour — only what the code does today. Fixture
+# data lives in ``tests/fixtures/tool_calling.py`` so later phases re-import the
+# same cases. The third path (sub-agent envelope) is locked in
+# ``tests/test_sub_agent_v2_runner.py``.
+# ---------------------------------------------------------------------------
+
+
+def _golden_tool() -> ToolDefinition:
+    """A tool definition broad enough to carry every golden fixture's args."""
+
+    return ToolDefinition(
+        name="spawn_subtask",
+        description="Spawn a background subtask.",
+        parameters={
+            "type": "object",
+            "properties": {"title": {"type": "string"}},
+            "required": ["title"],
+        },
+    )
+
+
+def _patch_openai_native_call(
+    client: LMStudioClient, *, name: str, arguments_raw: str
+) -> AsyncMock:
+    """Stub one native ``message.tool_calls`` entry (LM Studio shape)."""
+
+    create = AsyncMock(
+        return_value=SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=None,
+                        tool_calls=[
+                            SimpleNamespace(
+                                id="call_abc",
+                                type="function",
+                                function=SimpleNamespace(name=name, arguments=arguments_raw),
+                            )
+                        ],
+                    )
+                )
+            ],
+            usage=SimpleNamespace(prompt_tokens=5, completion_tokens=9),
+        )
+    )
+    fake_chat = MagicMock()
+    fake_chat.completions.create = create
+    client._client = SimpleNamespace(chat=fake_chat)  # type: ignore[assignment]
+    return create
+
+
+# --- Path 1: Jarvis + LM Studio native (message.tool_calls) ----------------
+
+
+@pytest.mark.parametrize("fx", NATIVE_WELL_FORMED, ids=lambda fx: fx.id)
+@pytest.mark.asyncio
+async def test_golden_native_well_formed_tool_call(fx: NativeToolCallFixture) -> None:
+    """Native path: ``function.arguments`` JSON string → parsed ``ToolCall``.
+
+    Empty-string arguments decode to ``{}`` (current ``arguments_raw or {}``
+    branch). No brace-repair is applied on this path.
+    """
+
+    client = LMStudioClient(_make_settings())
+    _patch_openai_native_call(client, name=fx.name, arguments_raw=fx.arguments_raw)
+
+    response = await client.complete(
+        messages=[{"role": "user", "content": "go"}],
+        tools=[_golden_tool()],
+    )
+
+    assert isinstance(response, LLMResponse)
+    assert response.is_tool_call is True
+    assert response.text is None
+    assert len(response.tool_calls) == 1
+    call = response.tool_calls[0]
+    assert call.name == fx.expected_name
+    assert call.arguments == fx.expected_arguments
+
+
+@pytest.mark.asyncio
+async def test_golden_native_malformed_arguments_raise() -> None:
+    """Native path TODAY hard-fails on non-JSON ``function.arguments``.
+
+    Unlike the Claude CLI path, the native path has no salvage pass — a
+    non-JSON arguments string surfaces as ``LLMClientError``.
+    """
+
+    client = LMStudioClient(_make_settings())
+    _patch_openai_native_call(
+        client, name="spawn_subtask", arguments_raw=NATIVE_MALFORMED_ARGUMENTS_RAW
+    )
+
+    with pytest.raises(LLMClientError, match="not valid JSON"):
+        await client.complete(
+            messages=[{"role": "user", "content": "go"}],
+            tools=[_golden_tool()],
+        )
+
+
+# --- Path 2: Jarvis + Claude CLI prompt-based ({"tool_calls":[…]}) ----------
+
+
+def _patch_claude_chat(client: ClaudeCliClient, raw: str) -> None:
+    async def _fake_chat(
+        messages: list[dict[str, Any]],
+        schema: dict[str, Any] | None = None,
+        session_id: str | None = None,
+    ) -> str:
+        return raw
+
+    client.chat = _fake_chat  # type: ignore[method-assign]
+
+
+@pytest.mark.parametrize("fx", CLAUDE_WELL_FORMED, ids=lambda fx: fx.id)
+@pytest.mark.asyncio
+async def test_golden_claude_well_formed_tool_call(fx: ClaudeToolCallFixture) -> None:
+    """Claude CLI path: ``{"tool_calls":[…]}`` (clean or trailing-prose) parses.
+
+    ``raw_decode`` recognises the leading JSON object even when the model
+    appends a confirmation sentence after the closing brace.
+    """
+
+    client = ClaudeCliClient(_claude_settings())
+    _patch_claude_chat(client, fx.raw)
+
+    response = await client.complete(
+        messages=[{"role": "user", "content": "go"}],
+        tools=[_golden_tool()],
+    )
+
+    assert response.is_tool_call is True
+    assert response.text is None
+    parsed = tuple((c.name, c.arguments) for c in response.tool_calls)
+    assert parsed == fx.expected_calls
+
+
+@pytest.mark.asyncio
+async def test_golden_claude_fenced_tool_call_strips_fence() -> None:
+    """Claude CLI path strips a ```` ```json ```` fence before parsing."""
+
+    client = ClaudeCliClient(_claude_settings())
+    _patch_claude_chat(client, CLAUDE_FENCED.raw)
+
+    response = await client.complete(
+        messages=[{"role": "user", "content": "go"}],
+        tools=[_golden_tool()],
+    )
+
+    assert response.is_tool_call is True
+    parsed = tuple((c.name, c.arguments) for c in response.tool_calls)
+    assert parsed == CLAUDE_FENCED.expected_calls
+
+
+#: The repair fixtures that, once salvaged, yield a ``tool_calls`` payload with
+#: a recoverable first-call ``arguments`` dict (drives the end-to-end CLI test).
+_CLAUDE_SALVAGEABLE_CALLS = tuple(
+    fx for fx in CLAUDE_MALFORMED_REPAIR if fx.repairs_to_valid_json and fx.expected_arguments
+)
+
+
+@pytest.mark.parametrize("fx", _CLAUDE_SALVAGEABLE_CALLS, ids=lambda fx: fx.id)
+@pytest.mark.asyncio
+async def test_golden_claude_broken_braces_salvaged(fx: MalformedRepairFixture) -> None:
+    """Claude CLI path salvages broken-brace tool calls via ``_repair_json_braces``.
+
+    These ``raw_decode``-rejected strings are rebuilt from the open-stack and
+    the tool call survives — without the repair the call would be dropped and
+    the orchestrator would degrade to a "reformulate" fallback.
+    """
+
+    assert fx.repairs_to_valid_json is True
+    assert fx.expected_arguments is not None
+    client = ClaudeCliClient(_claude_settings())
+    _patch_claude_chat(client, fx.raw)
+
+    response = await client.complete(
+        messages=[{"role": "user", "content": "go"}],
+        tools=[_golden_tool()],
+    )
+
+    assert response.is_tool_call is True
+    assert len(response.tool_calls) == 1
+    assert response.tool_calls[0].arguments == fx.expected_arguments
+
+
+@pytest.mark.parametrize("fx", CLAUDE_MALFORMED_REPAIR, ids=lambda fx: fx.id)
+def test_golden_repair_json_braces_behaviour(fx: MalformedRepairFixture) -> None:
+    """Lock ``_repair_json_braces`` output per fixture (the salvage primitive).
+
+    ``repairs_to_valid_json`` records whether the repair returns a
+    ``json.loads``-able string (vs ``None`` for the no-opener case). This is the
+    unit the Claude CLI ``complete`` salvage branch is built on.
+    """
+
+    repaired = _repair_json_braces(fx.raw)
+    if not fx.repairs_to_valid_json:
+        assert repaired is None
+        return
+    assert repaired is not None
+    parsed = json.loads(repaired)
+    if fx.expected_arguments is not None:
+        assert parsed["tool_calls"][0]["arguments"] == fx.expected_arguments
