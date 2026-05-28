@@ -76,6 +76,17 @@ class Settings(BaseSettings):
     JARVIS_BACKEND: str | None = None
     SUBAGENT_BACKEND: str | None = None
 
+    # Tool-calling wire-format selection (PRD 0008 / issue 0058).
+    # ``auto`` (default) lets :func:`bob.llm.tooling.select_codec` pick the
+    # most robust codec the backend declares it supports (native function
+    # calling for LM Studio today). The explicit values force one codec and
+    # raise loudly if the backend does not support it, so a misconfiguration
+    # surfaces immediately instead of silently degrading. ``guided`` / ``hermes``
+    # are accepted now but their codecs land in issues 0060 / 0061; selecting
+    # them today raises ``CodecNotAvailableError``. No long-lived feature flag:
+    # this is a capability override, not an on/off switch.
+    LLM_TOOL_MODE: Literal["auto", "native", "guided", "hermes"] = "auto"
+
     # Implicit cap on concurrent running sub-tasks. The real cap + queue land
     # in slice #0020; this field exists now so callers can reference it
     # without breaking the config contract when the cap is wired up.

@@ -35,6 +35,13 @@ from openai import AsyncOpenAI
 
 from bob.config import Settings
 from bob.debug_log import emit_debug
+from bob.llm.tooling import (
+    NativeToolCallParseError,
+    ToolCodec,
+    ToolSpec,
+    capability_for_backend,
+    select_codec,
+)
 from bob.llm.types import LLMResponse, StreamChunk, ToolCall, ToolDefinition
 from bob.logging_setup import log_llm_call
 from bob.validation.system_validator import (
@@ -349,6 +356,14 @@ class LMStudioClient(LLMClient):
             base_url=settings.LLM_BASE_URL,
             api_key=settings.LLM_API_KEY,
         )
+        # PRD 0008 / issue 0058 — the codec owns the tool-calling wire format.
+        # LM Studio declares native function calling; ``select_codec`` returns
+        # the native codec under the default ``auto`` mode. Picked ONCE here so
+        # there is no per-call format branching downstream.
+        self._tool_codec: ToolCodec = select_codec(
+            capability_for_backend("lm_studio"),
+            settings.LLM_TOOL_MODE,
+        )
 
     async def chat(
         self,
@@ -527,19 +542,11 @@ class LMStudioClient(LLMClient):
             "timeout": self._settings.LLM_TIMEOUT_SECONDS,
             "max_tokens": 4096,
         }
+        # Issue 0058 — tool advertisement is delegated to the codec. For the
+        # native codec this is the OpenAI ``tools`` + ``tool_choice`` block.
         if tools:
-            kwargs["tools"] = [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": tool.name,
-                        "description": tool.description,
-                        "parameters": tool.parameters,
-                    },
-                }
-                for tool in tools
-            ]
-            kwargs["tool_choice"] = "auto"
+            specs = [ToolSpec.from_tool_definition(tool) for tool in tools]
+            kwargs.update(self._tool_codec.inject(messages, specs))
 
         # Slice 0039: pair start / end debug events via a local correlation_id
         # so the UI can group them. The id is regenerated per call (no cross-
@@ -612,17 +619,17 @@ class LMStudioClient(LLMClient):
                 "(LM Studio expects the '/v1' suffix, e.g. http://host:1234/v1)."
             )
         message = choices[0].message
-        raw_tool_calls = getattr(message, "tool_calls", None) or []
-        tool_calls: list[ToolCall] = []
-        for raw_call in raw_tool_calls:
-            function = getattr(raw_call, "function", None)
-            if function is None:
-                continue
-            name = getattr(function, "name", None) or ""
-            arguments_raw = getattr(function, "arguments", "") or ""
-            try:
-                arguments = json.loads(arguments_raw) if arguments_raw else {}
-            except json.JSONDecodeError as exc:
+        # Issue 0058 — parsing the native ``message.tool_calls`` surface is the
+        # codec's job. A malformed-arguments raise is translated back into the
+        # legacy ``LLMClientError`` (+ the same debug event) so the error
+        # surface and the 0057 golden fixtures stay byte-identical.
+        try:
+            tool_calls = self._tool_codec.parse(message)
+        except NativeToolCallParseError as exc:
+            # The legacy path emitted the ``malformed tool args`` debug event
+            # only for a JSON *decode* failure (not for the decoded-but-not-an-
+            # object case). Preserve that split exactly.
+            if exc.is_decode_error:
                 emit_debug(
                     category="llm",
                     severity="error",
@@ -631,24 +638,13 @@ class LMStudioClient(LLMClient):
                     payload={
                         "model": self._settings.LLM_MODEL,
                         "latency_ms": latency_ms,
-                        "arguments_raw": arguments_raw,
+                        "arguments_raw": exc.arguments_raw,
                         "exception": str(exc),
                         "session_id": session_id,
                     },
                     correlation_id=correlation_id,
                 )
-                raise LLMClientError(
-                    f"LM Studio tool call arguments are not valid JSON: {arguments_raw[:200]!r}"
-                ) from exc
-            if not isinstance(arguments, dict):
-                raise LLMClientError(
-                    f"LM Studio tool call arguments must decode to an object, "
-                    f"got {type(arguments).__name__}"
-                )
-            call_id = getattr(raw_call, "id", None) or f"call_{uuid4().hex[:8]}"
-            tool_calls.append(
-                ToolCall(id=call_id, name=name, arguments=cast(dict[str, Any], arguments))
-            )
+            raise LLMClientError(exc.message) from exc
 
         text: str | None
         if tool_calls:
@@ -769,19 +765,10 @@ class LMStudioClient(LLMClient):
             "max_tokens": 4096,
             "stream": True,
         }
+        # Issue 0058 — same codec injection as ``complete``.
         if tools:
-            kwargs["tools"] = [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": tool.name,
-                        "description": tool.description,
-                        "parameters": tool.parameters,
-                    },
-                }
-                for tool in tools
-            ]
-            kwargs["tool_choice"] = "auto"
+            specs = [ToolSpec.from_tool_definition(tool) for tool in tools]
+            kwargs.update(self._tool_codec.inject(messages, specs))
 
         correlation_id = uuid4().hex
         token_estimate = _estimate_tokens(messages)
@@ -855,12 +842,14 @@ class LMStudioClient(LLMClient):
         scripted iterator.
         """
 
-        # Track per-index tool-call state. The OpenAI streaming protocol
-        # emits one or more ``choices[0].delta.tool_calls[i]`` entries
-        # per chunk, where ``i`` is stable across the call. We
-        # accumulate name + arguments per ``i`` and emit chunks lazily
-        # as new bytes arrive.
-        tool_call_states: dict[int, dict[str, Any]] = {}
+        # Issue 0058 — the codec's stream parser owns the per-``index``
+        # tool-call accumulation and the ``tool_call_*`` chunk lifecycle. The
+        # core keeps the text-mode passthrough, usage/token tracking and the
+        # ``finally`` logging block (observability, not wire format). The
+        # parser re-emits the same ``args_delta`` suffixes byte-for-byte so the
+        # ``say`` tool's ``PartialJsonParser`` → ``speech_delta`` path is
+        # unchanged.
+        parser = self._tool_codec.stream_parser()
         text_buffer = ""
         tokens_in: int | None = None
         tokens_out: int | None = None
@@ -888,62 +877,9 @@ class LMStudioClient(LLMClient):
                     text_buffer += content
                     yield StreamChunk(kind="text", text_delta=content)
 
-                # Tool-call deltas. Each entry carries an ``index``,
-                # an optional ``id`` (provider-assigned), and a
-                # ``function`` with optional ``name`` + ``arguments``.
-                raw_tool_calls = getattr(delta, "tool_calls", None) or []
-                for raw_tc in raw_tool_calls:
-                    index = getattr(raw_tc, "index", 0)
-                    function = getattr(raw_tc, "function", None)
-                    state = tool_call_states.setdefault(
-                        index,
-                        {
-                            "id": getattr(raw_tc, "id", None),
-                            "name": None,
-                            "arguments": "",
-                            "started_yielded": False,
-                        },
-                    )
-                    # Provider-assigned id may arrive on the first or
-                    # second tick depending on the upstream.
-                    incoming_id = getattr(raw_tc, "id", None)
-                    if incoming_id and not state["id"]:
-                        state["id"] = incoming_id
-
-                    if function is not None:
-                        incoming_name = getattr(function, "name", None)
-                        if incoming_name and not state["name"]:
-                            state["name"] = incoming_name
-
-                    # Emit the ``tool_call_start`` chunk the first time
-                    # we have BOTH a resolved name and a resolved id.
-                    # Without a name the orchestrator can't dispatch.
-                    if not state["started_yielded"] and state["name"]:
-                        if not state["id"]:
-                            state["id"] = f"call_{uuid4().hex[:8]}"
-                        state["started_yielded"] = True
-                        yield StreamChunk(
-                            kind="tool_call_start",
-                            tool_call_id=cast(str, state["id"]),
-                            name=cast(str, state["name"]),
-                        )
-
-                    if function is not None:
-                        args_delta = getattr(function, "arguments", None) or ""
-                        if isinstance(args_delta, str) and args_delta:
-                            state["arguments"] = cast(str, state["arguments"]) + args_delta
-                            # We can only emit ``tool_call_args_delta``
-                            # once the start chunk has gone out — that
-                            # invariant matches the
-                            # :class:`bob.streaming.StreamEmitter`
-                            # expectation that ``msg_id`` is bound on
-                            # the very first frame of the turn.
-                            if state["started_yielded"]:
-                                yield StreamChunk(
-                                    kind="tool_call_args_delta",
-                                    tool_call_id=cast(str, state["id"]),
-                                    args_delta=args_delta,
-                                )
+                # Tool-call deltas — delegated to the codec's stream parser.
+                for chunk in parser.feed(delta):
+                    yield chunk
 
                 # Final usage chunk on some providers.
                 usage = getattr(raw_chunk, "usage", None)
@@ -951,19 +887,14 @@ class LMStudioClient(LLMClient):
                     tokens_in = getattr(usage, "prompt_tokens", None) or tokens_in
                     tokens_out = getattr(usage, "completion_tokens", None) or tokens_out
 
-            # Stream exhausted — emit ``tool_call_end`` per accumulated
-            # tool call, parsing the final argument JSON.
-            for state in tool_call_states.values():
-                if not state["started_yielded"]:
-                    # Defensive: the stream ended without resolving a
-                    # name. Skip the end chunk — there is no tool to
-                    # dispatch. The orchestrator's retry path will
-                    # surface the contract violation.
-                    continue
-                arguments_raw = cast(str, state["arguments"])
-                try:
-                    final_arguments = json.loads(arguments_raw) if arguments_raw else {}
-                except json.JSONDecodeError as exc:
+            # Stream exhausted — flush ``tool_call_end`` chunks. A malformed
+            # final-args raise is translated back into the legacy
+            # ``LLMClientError`` (+ the same debug event) before re-raising.
+            try:
+                for chunk in parser.finish():
+                    yield chunk
+            except NativeToolCallParseError as exc:
+                if exc.is_decode_error:
                     latency_ms = (time.perf_counter() - started) * 1000.0
                     emit_debug(
                         category="llm",
@@ -973,38 +904,17 @@ class LMStudioClient(LLMClient):
                         payload={
                             "model": self._settings.LLM_MODEL,
                             "latency_ms": latency_ms,
-                            "arguments_raw": arguments_raw,
+                            "arguments_raw": exc.arguments_raw,
                             "exception": str(exc),
                             "session_id": session_id,
                         },
                         correlation_id=correlation_id,
                     )
-                    raise LLMClientError(
-                        "LM Studio tool call arguments are not valid JSON after "
-                        f"stream close: {arguments_raw[:200]!r}"
-                    ) from exc
-                if not isinstance(final_arguments, dict):
-                    raise LLMClientError(
-                        "LM Studio tool call arguments must decode to an object, "
-                        f"got {type(final_arguments).__name__}"
-                    )
-                yield StreamChunk(
-                    kind="tool_call_end",
-                    tool_call_id=cast(str, state["id"]),
-                    final_arguments=cast(dict[str, Any], final_arguments),
-                )
+                raise LLMClientError(exc.message) from exc
         finally:
             latency_ms = (time.perf_counter() - started) * 1000.0
             # Reconstruct a raw-for-log shape mirroring :meth:`complete`.
-            log_calls = [
-                {
-                    "id": state["id"],
-                    "name": state["name"],
-                    "arguments": state["arguments"],
-                }
-                for state in tool_call_states.values()
-                if state["started_yielded"]
-            ]
+            log_calls = parser.log_calls
             raw_for_log = json.dumps(log_calls, ensure_ascii=False) if log_calls else text_buffer
 
             log_llm_call(
@@ -1027,15 +937,7 @@ class LMStudioClient(LLMClient):
                 payload={
                     "response": raw_for_log,
                     "is_tool_call": bool(log_calls),
-                    "tool_calls": [
-                        {
-                            "id": state["id"],
-                            "name": state["name"],
-                            "arguments": state["arguments"],
-                        }
-                        for state in tool_call_states.values()
-                        if state["started_yielded"]
-                    ],
+                    "tool_calls": log_calls,
                     "latency_ms": latency_ms,
                     "tokens_in": tokens_in,
                     "tokens_out": tokens_out,
