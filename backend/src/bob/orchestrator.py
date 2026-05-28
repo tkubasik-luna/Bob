@@ -1568,7 +1568,14 @@ class Orchestrator:
                 continue
             any_ok = True
             self._collect_dispatch_result(result, spawned, forwarded, cancelled)
-            if result.tool_name == "say" and say_speech is None:
+            if (
+                result.tool_name in ("say", "show_task_result")
+                and say_speech is None
+            ):
+                # ``show_task_result`` is reply-class like ``say`` — it
+                # produces speech + ui that the WS router lifts into the
+                # final ``assistant_msg`` frame. The only difference is
+                # the ui comes from ``task_store`` instead of LLM args.
                 say_speech = result.speech
                 say_ui = result.ui
 

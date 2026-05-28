@@ -193,12 +193,14 @@ def build_default_registry() -> ToolRegistry:
     from bob.tools.definitions.forward import build_forward_to_subtask_tool
     from bob.tools.definitions.replan_task import build_replan_task_tool
     from bob.tools.definitions.say import build_say_tool
+    from bob.tools.definitions.show_task_result import build_show_task_result_tool
     from bob.tools.definitions.spawn import build_spawn_subtask_tool
     from bob.tools.definitions.spawn_task import build_spawn_task_tool
 
     return ToolRegistry(
         [
             build_say_tool(),
+            build_show_task_result_tool(),
             build_spawn_task_tool(),
             build_addendum_task_tool(),
             build_replan_task_tool(),

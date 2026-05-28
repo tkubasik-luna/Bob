@@ -116,6 +116,14 @@ class _TaskStoreLike(Protocol):
 
     def mark_superseded(self, task_id: str) -> None: ...
 
+    def find_by_query(
+        self,
+        query: str,
+        *,
+        prefer_state: Any = ...,
+        limit: int = ...,
+    ) -> Any: ...
+
 
 class _JarvisStoreLike(Protocol):
     """Narrow protocol used by the ``say`` tool handler.

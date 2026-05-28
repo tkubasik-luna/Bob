@@ -399,6 +399,7 @@ async def test_complete_call_sends_v2_task_surface_plus_legacy_aliases() -> None
     names = [t.name for t in tools]
     assert names == [
         "say",
+        "show_task_result",
         "spawn_task",
         "addendum_task",
         "replan_task",
@@ -408,13 +409,13 @@ async def test_complete_call_sends_v2_task_surface_plus_legacy_aliases() -> None
         "cancel_subtask",
     ]
     say_tool = tools[0]
-    spawn_task_tool = tools[1]
-    addendum_tool = tools[2]
-    replan_tool = tools[3]
-    cancel_task_tool = tools[4]
-    legacy_spawn_tool = tools[5]
-    legacy_forward_tool = tools[6]
-    legacy_cancel_tool = tools[7]
+    spawn_task_tool = tools[2]
+    addendum_tool = tools[3]
+    replan_tool = tools[4]
+    cancel_task_tool = tools[5]
+    legacy_spawn_tool = tools[6]
+    legacy_forward_tool = tools[7]
+    legacy_cancel_tool = tools[8]
     assert say_tool.parameters["required"] == ["speech"]
     assert spawn_task_tool.parameters["required"] == ["title", "goal"]
     assert addendum_tool.parameters["required"] == ["task_id", "info"]

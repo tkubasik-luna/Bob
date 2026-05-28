@@ -114,6 +114,7 @@ def test_default_registry_contains_say_v2_tasks_and_legacy_aliases() -> None:
     registry = build_default_registry()
     assert registry.names() == [
         "say",
+        "show_task_result",
         "spawn_task",
         "addendum_task",
         "replan_task",

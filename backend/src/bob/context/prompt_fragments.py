@@ -98,12 +98,16 @@ CANCEL_CONFIRMATION = PromptFragment(
 
 TOOLS_SYSTEM_ADDENDUM = PromptFragment(
     id="tools_system_addendum",
-    version=3,
+    version=4,
     template=(
         "\n\nTu disposes des outils suivants :\n"
         "- ``say`` : pour répondre directement à l'utilisateur. C'est ton "
         "outil par défaut. ``speech`` (obligatoire) est le texte à dire ; "
         "``ui`` (optionnel) est un objet ``{component, props}`` ou ``null``.\n"
+        "- ``show_task_result`` : pour ressortir le livrable d'une tâche "
+        "déjà terminée et stockée. Fournis ``speech`` (1 phrase d'intro) "
+        "et ``query`` (mots-clés pour retrouver la tâche). Le backend "
+        "affiche le Markdown stocké — NE RÉ-GÉNÈRE PAS le contenu.\n"
         "- ``spawn_task`` : pour déléguer une tâche longue ou autonome à "
         "un sub-agent en arrière-plan (version v2 PRD 0006).\n"
         "- ``addendum_task`` : pour ajouter une info à une sous-tâche "
@@ -124,6 +128,9 @@ TOOLS_SYSTEM_ADDENDUM = PromptFragment(
         "- appelle ``cancel_task`` si l'utilisateur demande "
         "explicitement d'annuler / arrêter une tâche du bloc STATE "
         '("annule X", "laisse tomber") ;\n'
+        "- appelle ``show_task_result`` si l'utilisateur veut revoir ou "
+        "être ré-informé sur un sujet qu'une sous-tâche a déjà traité "
+        "(« ressors X », « rappelle-moi ce que tu avais trouvé sur Y ») ;\n"
         "- sinon, appelle ``say`` avec ton texte de réponse dans ``speech``.\n"
         "Quand tu annonces le résultat d'une tâche terminée, lis la "
         "valeur ``recency`` du bloc STATE : ``active`` → formule du "

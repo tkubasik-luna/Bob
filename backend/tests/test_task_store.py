@@ -98,6 +98,118 @@ def test_list_tasks_respects_limit(fresh_task_store: TaskStore) -> None:
     assert len(fresh_task_store.list_tasks(limit=10)) == 5
 
 
+def test_find_by_query_single_token_matches_title(
+    fresh_task_store: TaskStore,
+) -> None:
+    pizza_id = fresh_task_store.create_task(
+        title="Approfondissement Bitcoin Pizza Day", goal="story of 10k BTC"
+    )
+    fresh_task_store.create_task(
+        title="Révolution française en 5 points", goal="dates clés"
+    )
+
+    matches = fresh_task_store.find_by_query("pizza")
+    assert [t.id for t in matches] == [pizza_id]
+
+
+def test_find_by_query_multi_token_match_is_case_insensitive(
+    fresh_task_store: TaskStore,
+) -> None:
+    target = fresh_task_store.create_task(
+        title="Exposé Révolution Française", goal="dates clés et acteurs"
+    )
+    fresh_task_store.create_task(title="Bitcoin", goal="generic crypto")
+
+    # Tokens spread across title (Révolution) + goal (acteurs) — every
+    # token must hit somewhere in ``title || ' ' || goal``.
+    matches = fresh_task_store.find_by_query("RÉVOLUTION acteurs")
+    assert [t.id for t in matches] == [target]
+
+
+def test_find_by_query_no_match_returns_empty(
+    fresh_task_store: TaskStore,
+) -> None:
+    fresh_task_store.create_task(title="Pizza", goal="day")
+
+    assert fresh_task_store.find_by_query("révolution française") == []
+
+
+def test_find_by_query_blank_query_returns_empty(
+    fresh_task_store: TaskStore,
+) -> None:
+    fresh_task_store.create_task(title="Pizza Day", goal="…")
+
+    assert fresh_task_store.find_by_query("") == []
+    assert fresh_task_store.find_by_query("   ") == []
+
+
+def test_find_by_query_prefer_state_ranks_done_first(
+    fresh_task_store: TaskStore,
+) -> None:
+    running_id = fresh_task_store.create_task(title="Pizza Day", goal="…")
+    fresh_task_store.update_state(running_id, "running")
+
+    done_id = fresh_task_store.create_task(title="Pizza Day", goal="…")
+    fresh_task_store.update_state(done_id, "running")
+    fresh_task_store.update_state(done_id, "done")
+
+    matches = fresh_task_store.find_by_query(
+        "pizza", prefer_state="done", limit=2
+    )
+    # The done row wins the rank even though the running row was inserted
+    # first (created_at-ASC would otherwise put it on top).
+    assert matches[0].id == done_id
+    assert matches[1].id == running_id
+
+
+def test_find_by_query_delivered_at_turn_breaks_ties(
+    fresh_task_store: TaskStore,
+) -> None:
+    old = fresh_task_store.create_task(title="Pizza Day", goal="…")
+    fresh_task_store.update_state(old, "running")
+    fresh_task_store.update_state(old, "done")
+    fresh_task_store.set_delivered_at_turn(old, 12)
+
+    new = fresh_task_store.create_task(title="Pizza Day", goal="…")
+    fresh_task_store.update_state(new, "running")
+    fresh_task_store.update_state(new, "done")
+    fresh_task_store.set_delivered_at_turn(new, 47)
+
+    matches = fresh_task_store.find_by_query("pizza", limit=2)
+    assert matches[0].id == new
+    assert matches[1].id == old
+
+
+def test_find_by_query_excludes_dismissed(fresh_task_store: TaskStore) -> None:
+    visible = fresh_task_store.create_task(title="Pizza Day", goal="…")
+    dismissed = fresh_task_store.create_task(title="Pizza Day", goal="…")
+    fresh_task_store.dismiss_task(dismissed)
+
+    matches = fresh_task_store.find_by_query("pizza", limit=5)
+    assert [t.id for t in matches] == [visible]
+
+
+def test_find_by_query_respects_limit(fresh_task_store: TaskStore) -> None:
+    for _ in range(4):
+        fresh_task_store.create_task(title="Pizza Day", goal="…")
+
+    assert len(fresh_task_store.find_by_query("pizza", limit=2)) == 2
+
+
+def test_find_by_query_escapes_like_wildcards(
+    fresh_task_store: TaskStore,
+) -> None:
+    # A literal ``%`` in the stored title is matched only by a literal ``%``
+    # in the query — the wildcard must NOT be interpreted as a glob.
+    plain = fresh_task_store.create_task(title="Pizza Day", goal="…")
+    fresh_task_store.create_task(title="100% real", goal="…")
+
+    # ``%`` here is escaped → searches for the literal char. Only the
+    # "100% real" row contains it.
+    literal_pct = fresh_task_store.find_by_query("%")
+    assert all(t.id != plain for t in literal_pct)
+
+
 def test_valid_transition_chain(fresh_task_store: TaskStore) -> None:
     """pending → running → waiting_input → running → done."""
 

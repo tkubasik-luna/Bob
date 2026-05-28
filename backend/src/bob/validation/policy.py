@@ -88,6 +88,14 @@ POLICY_TABLE: dict[str, RetryPolicy] = {
         degrade_action="hardcoded_say",
         accept_partial=True,
     ),
+    # ``show_task_result`` mirrors ``say``: same retry budget, same degrade
+    # path, ``accept_partial`` on so a stray key ("emotion", "tone") next
+    # to the required ``speech`` + ``query`` does not eat the turn.
+    "show_task_result": RetryPolicy(
+        max_retries=1,
+        degrade_action="hardcoded_say",
+        accept_partial=True,
+    ),
     "spawn_subtask": RetryPolicy(
         max_retries=1,
         degrade_action="hardcoded_say",

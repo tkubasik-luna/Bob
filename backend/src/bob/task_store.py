@@ -231,6 +231,73 @@ class TaskStore:
             rows = cursor.fetchall()
         return [_row_to_task(row) for row in rows]
 
+    def find_by_query(
+        self,
+        query: str,
+        *,
+        prefer_state: TaskState | None = None,
+        limit: int = 1,
+    ) -> list[Task]:
+        """Fuzzy-match tasks against ``query`` on ``title`` + ``goal``.
+
+        Splits ``query`` on whitespace and requires every token to appear
+        (case-insensitively) somewhere in ``title || ' ' || goal``. Ranks
+        ``prefer_state`` first (e.g. ``"done"`` for "ressortir un livrable"
+        flows), then by ``delivered_at_turn`` descending (delivered tasks
+        first), then by ``created_at`` descending (recent first). Dismissed
+        rows are excluded — the result feeds Jarvis tool calls that surface
+        a user-visible deliverable, and dismissed cards were explicitly
+        hidden by the user.
+
+        Returns an empty list when ``query`` is blank or no row matches.
+        """
+
+        tokens = [t.strip().lower() for t in query.split() if t.strip()]
+        if not tokens:
+            return []
+
+        # Basic LIKE escaping so a raw ``%`` / ``_`` / ``\`` in the query
+        # behaves as a literal. The ESCAPE clause below activates the
+        # escape character. Single-user desktop scope so SQL-injection is
+        # not the threat model — we just want predictable matches.
+        def _escape_like(token: str) -> str:
+            return (
+                token.replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_")
+            )
+
+        where_clauses = [
+            "LOWER(title || ' ' || goal) LIKE ? ESCAPE '\\'" for _ in tokens
+        ]
+        where_clauses.append("dismissed = 0")
+        params: list[object] = [f"%{_escape_like(t)}%" for t in tokens]
+
+        order_parts: list[str] = []
+        if prefer_state is not None:
+            order_parts.append("CASE WHEN state = ? THEN 0 ELSE 1 END")
+            params.append(prefer_state)
+        # Treat NULL ``delivered_at_turn`` as the lowest so already-delivered
+        # rows outrank queued-completion rows that never reached the user.
+        order_parts.append("COALESCE(delivered_at_turn, -1) DESC")
+        order_parts.append("created_at DESC")
+        order_parts.append("rowid DESC")
+
+        sql = (
+            "SELECT id, title, goal, state, needs_attention, result, parent_task_id,"
+            " created_at, updated_at, dismissed, lineage, delivered_at_turn"
+            " FROM tasks"
+            f" WHERE {' AND '.join(where_clauses)}"
+            f" ORDER BY {', '.join(order_parts)}"
+            " LIMIT ?"
+        )
+        params.append(limit)
+
+        with self._lock:
+            cursor = self._conn.execute(sql, params)
+            rows = cursor.fetchall()
+        return [_row_to_task(row) for row in rows]
+
     def update_state(self, task_id: str, new_state: TaskState) -> None:
         """Validate the transition then persist ``new_state`` + bump ``updated_at``.
 
