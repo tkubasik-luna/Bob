@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from jsonschema import Draft202012Validator
+from jsonschema import Draft202012Validator, FormatChecker
 from jsonschema.exceptions import ValidationError
 from pydantic import BaseModel, Field
 
@@ -116,7 +116,12 @@ class UIRegistry:
         """
 
         inner_schema = self.response_schema()["schema"]
-        validator = Draft202012Validator(inner_schema)
+        # ``format_checker`` upgrades ``format`` keywords (e.g. ``date-time``,
+        # ``email``, ``uri`` used by the Mail component) from informational
+        # annotations into hard validation constraints. Without it a bad
+        # ``receivedAt`` string would silently pass — the issue's acceptance
+        # criteria require we reject it.
+        validator = Draft202012Validator(inner_schema, format_checker=FormatChecker())
         errors: list[ValidationError] = sorted(
             validator.iter_errors(payload), key=lambda e: list(e.path)
         )
@@ -172,6 +177,91 @@ MARKDOWN = UIComponent(
     },
 )
 
+MAIL = UIComponent(
+    name="Mail",
+    description=(
+        "A single Gmail message rendered as an overlay card. Drives the "
+        "`MailOverlay` frontend surface: avatar, from name/role/address, "
+        "subject, snippet, optional flag pills and attachment chips, plus "
+        "the Gmail web URL for the OPEN action."
+    ),
+    props_schema={
+        "type": "object",
+        "additionalProperties": False,
+        "required": [
+            "from",
+            "receivedAt",
+            "subject",
+            "bodyPreview",
+            "threadId",
+            "messageId",
+            "gmailWebUrl",
+        ],
+        "properties": {
+            "from": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["name", "email"],
+                "properties": {
+                    "name": {"type": "string"},
+                    # `format: email` is enforced via ``FormatChecker`` in
+                    # ``UIRegistry.validate_response`` (email is one of the
+                    # built-in checkers jsonschema ships, no extra dep).
+                    "email": {"type": "string", "format": "email"},
+                    "role": {"type": "string"},
+                },
+            },
+            # ISO 8601 timestamp. We use a regex ``pattern`` rather than
+            # ``format: date-time`` because the latter requires the optional
+            # ``rfc3339-validator`` extra; the regex is good enough to catch
+            # garbage strings (the issue's reject-malformed-date test) and
+            # is enforced by the core validator without extra dependencies.
+            # Accepts e.g. ``2026-05-28T14:22:00Z`` or
+            # ``2026-05-28T14:22:00.000+02:00``.
+            "receivedAt": {
+                "type": "string",
+                "pattern": (
+                    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
+                    r"(\.\d+)?(Z|[+-]\d{2}:\d{2})$"
+                ),
+            },
+            "subject": {"type": "string"},
+            "bodyPreview": {"type": "string"},
+            "flags": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": ["priority", "unread", "starred"],
+                },
+                "default": [],
+            },
+            "attachments": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["name", "sizeBytes", "mime"],
+                    "properties": {
+                        "name": {"type": "string"},
+                        "sizeBytes": {"type": "integer", "minimum": 0},
+                        "mime": {"type": "string"},
+                    },
+                },
+                "default": [],
+            },
+            "threadId": {"type": "string"},
+            "messageId": {"type": "string"},
+            # The full Gmail web URL the OPEN action will browse to. Pattern
+            # asserts an http(s) prefix so a free-form string can't slip in
+            # — same dep-free strategy as ``receivedAt`` above.
+            "gmailWebUrl": {
+                "type": "string",
+                "pattern": r"^https?://.+",
+            },
+        },
+    },
+)
+
 
 def build_registry(extra_components: dict[str, UIComponent] | None = None) -> UIRegistry:
     """Construct a :class:`UIRegistry` containing the V0 components.
@@ -183,6 +273,7 @@ def build_registry(extra_components: dict[str, UIComponent] | None = None) -> UI
     components: dict[str, UIComponent] = {
         CHAT_MESSAGE.name: CHAT_MESSAGE,
         MARKDOWN.name: MARKDOWN,
+        MAIL.name: MAIL,
     }
     if extra_components:
         components.update(extra_components)

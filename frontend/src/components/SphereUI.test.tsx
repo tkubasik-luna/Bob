@@ -395,6 +395,123 @@ describe("SphereUI — overlay auto-trigger integration", () => {
     expect(container.querySelector(".overlay-card")).not.toBeNull();
   });
 
+  test("dispatches a Mail assistant_msg.ui to MailOverlay (issue 0053)", () => {
+    // The dispatcher routes on `component`: a "Mail" descriptor should land
+    // in the MailOverlay (`.surface-email`), not the MarkdownOverlay
+    // (`.surface-notes`). Same trigger path as the Markdown regression
+    // above, swapped to the new component.
+    const { container } = render(<SphereUI />);
+    expect(container.querySelector(".overlay-card")).toBeNull();
+
+    act(() => {
+      useChatStore.setState({
+        messages: [
+          {
+            id: "mail-1",
+            role: "assistant",
+            content: "Voilà l'email de Marie.",
+            ui: [
+              {
+                component: "Mail",
+                props: {
+                  from: {
+                    name: "Marie Lefèvre",
+                    email: "marie.lefevre@lunabee.com",
+                    role: "CFO · Lunabee",
+                  },
+                  receivedAt: "2026-05-28T14:22:00Z",
+                  subject: "Q3 forecast — final review before Thursday",
+                  bodyPreview: "Bob, can you have the deck ready by Thursday afternoon?",
+                  flags: ["priority"],
+                  attachments: [
+                    {
+                      name: "Q3-forecast-v4.pdf",
+                      sizeBytes: 2_400_000,
+                      mime: "application/pdf",
+                    },
+                  ],
+                  threadId: "thread-xyz-001",
+                  messageId: "msg-xyz-001",
+                  gmailWebUrl: "https://mail.google.com/mail/u/0/#inbox/thread-xyz-001",
+                },
+              },
+            ],
+          },
+        ],
+      });
+    });
+
+    // The MailOverlay's `.surface-email` card must be mounted; the
+    // MarkdownOverlay's `.surface-notes` must NOT.
+    expect(container.querySelector(".overlay-card.surface-email")).not.toBeNull();
+    expect(container.querySelector(".overlay-card.surface-notes")).toBeNull();
+    // Body content matches the fixture.
+    expect(container.querySelector(".ov-email-name")?.textContent).toBe("Marie Lefèvre");
+  });
+
+  test("dispatches a Markdown assistant_msg.ui to MarkdownOverlay (issue 0053 regression)", () => {
+    // Companion to the Mail dispatch test: a "Markdown" descriptor must
+    // still route to the markdown surface after the dispatcher refactor.
+    const { container } = render(<SphereUI />);
+
+    act(() => {
+      useChatStore.setState({
+        messages: [
+          {
+            id: "md-1",
+            role: "assistant",
+            content: "Voilà.",
+            ui: [
+              {
+                component: "Markdown",
+                props: {
+                  content: "## Bitcoin\n\n**2008** — whitepaper",
+                },
+              },
+            ],
+          },
+        ],
+      });
+    });
+
+    expect(container.querySelector(".overlay-card.surface-notes")).not.toBeNull();
+    expect(container.querySelector(".overlay-card.surface-email")).toBeNull();
+  });
+
+  test("dispatches a streaming Mail ui_payload to MailOverlay (issue 0053)", () => {
+    // Streaming `ui_payload` path: the `streamingAssistant.ui` field on the
+    // chat store carries the descriptor mid-turn (before the closing
+    // `assistant_msg`). The dispatcher must route Mail here too.
+    const { container } = render(<SphereUI />);
+    expect(container.querySelector(".overlay-card")).toBeNull();
+
+    act(() => {
+      useChatStore.setState({
+        streamingAssistant: {
+          msgId: "stream-mail-1",
+          speech: "Voilà l'email de Marie.",
+          ui: {
+            component: "Mail",
+            props: {
+              from: { name: "Marie Lefèvre", email: "marie.lefevre@lunabee.com" },
+              receivedAt: "2026-05-28T14:22:00Z",
+              subject: "Q3 forecast",
+              bodyPreview: "Hi Bob",
+              flags: [],
+              attachments: [],
+              threadId: "thread-stream-1",
+              messageId: "msg-stream-1",
+              gmailWebUrl: "https://mail.google.com/mail/u/0/#inbox/thread-stream-1",
+            },
+          },
+        },
+      });
+    });
+
+    expect(container.querySelector(".overlay-card.surface-email")).not.toBeNull();
+    expect(container.querySelector(".ov-email-name")?.textContent).toBe("Marie Lefèvre");
+  });
+
   test("renders the Tauri drag region as the first child of the .app wrapper (#0036)", () => {
     // The borderless `?ui=new` Tauri window has `decorations: false`, so the
     // user needs a 28px transparent strip up top to move it. The styling

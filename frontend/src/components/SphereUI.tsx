@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useChatWsBridge } from "../hooks/useChatWsBridge";
 import { shouldOverlayResponse } from "../lib/overlayHeuristic";
 import { SphereCanvas } from "../sphere/SphereCanvas";
@@ -6,10 +6,11 @@ import { useAudioLevel } from "../sphere/useAudioLevel";
 import { type SphereDerivedState, useSphereState } from "../sphere/useSphereState";
 import { useDevTweaksStore } from "../state/devTweaksStore";
 import { useChatStore } from "../store/chatStore";
-import type { Task } from "../types/ws";
+import type { ComponentDescriptor, MailProps, Task } from "../types/ws";
 import { DevControls } from "./sphere/DevControls";
 import { HudTasks } from "./sphere/HudTasks";
 import { InputField } from "./sphere/InputField";
+import { MailOverlay } from "./sphere/MailOverlay";
 import { MarkdownOverlay } from "./sphere/MarkdownOverlay";
 import { MuteToggle } from "./sphere/MuteToggle";
 import { TaskOverlay } from "./sphere/TaskOverlay";
@@ -91,6 +92,13 @@ export function SphereUI() {
   // at the very end of the turn.
   const streamingUi = useChatStore((s) => s.streamingAssistant?.ui ?? null);
   const [overlayContent, setOverlayContent] = useState<string | null>(null);
+  // Issue 0053 — parallel state for the Mail overlay. Kept separate from
+  // `overlayContent` so each surface owns its own open/close lifecycle and
+  // the existing markdown effects don't need to learn about the new union.
+  // The dispatcher below routes a descriptor to whichever setter matches
+  // `component`; unknown components silently no-op so the registry can
+  // grow without breaking older frontends.
+  const [overlayMail, setOverlayMail] = useState<MailProps | null>(null);
   // Issue 0052 — per-task overlay state. Clicking a task in `HudTasks`
   // sets this; the overlay subscribes to the task's live reflections
   // (running) or renders its markdown / empty state (finished).
@@ -135,37 +143,63 @@ export function SphereUI() {
   useEffect(() => {
     openTaskIdRef.current = openTaskId;
   }, [openTaskId]);
+  // Issue 0053 — single dispatch point for a `ComponentDescriptor` -> overlay
+  // setter. Both the streaming `ui_payload` path and the final
+  // `assistant_msg.ui` fallback funnel through this so adding a new surface
+  // (Map, Doc, Contact, …) only requires extending the switch. Unknown
+  // components return `false` silently so the registry can grow without
+  // crashing older frontends that don't know about them yet.
+  //
+  // Wrapped in `useCallback` with an empty dep array — both setters are
+  // stable across renders, so the dispatcher identity stays stable too and
+  // the effects below can list it as a dep without re-running each render.
+  const openOverlayFromDescriptor = useCallback(
+    (descriptor: ComponentDescriptor | null): boolean => {
+      if (!descriptor) return false;
+      if (descriptor.component === "Markdown") {
+        const content = descriptor.props?.content;
+        if (typeof content !== "string" || content.length === 0) return false;
+        setOverlayContent(content);
+        return true;
+      }
+      if (descriptor.component === "Mail") {
+        // The Mail props are validated server-side via the JSON schema, so a
+        // descriptor that reaches the frontend should already be well-formed.
+        // We still check that `messageId` looks like a string before calling
+        // `setOverlayMail` — a defensive cast keeps a malformed payload from
+        // crashing the React render.
+        const props = descriptor.props as Partial<MailProps> | undefined;
+        if (!props || typeof props.messageId !== "string") return false;
+        setOverlayMail(props as MailProps);
+        return true;
+      }
+      return false;
+    },
+    [],
+  );
+
   // PRD 0006 / issue 0049 — open the overlay as soon as the streamed
-  // `ui_payload` lands. Today the `say` tool only emits a Markdown
-  // descriptor; the heuristic-driven path below still handles
-  // legacy / non-streamed bubbles (proactive pushes, degrade paths) so we
-  // do NOT bypass it.
+  // `ui_payload` lands. Issue 0053 generalised the dispatch over the
+  // component discriminator (Markdown vs Mail today, more later) via
+  // `openOverlayFromDescriptor`. The heuristic-driven path below still
+  // handles legacy / non-streamed bubbles (proactive pushes, degrade
+  // paths) so we do NOT bypass it.
   useEffect(() => {
     if (streamingUi === null) return;
     const msgId = useChatStore.getState().streamingAssistant?.msgId ?? null;
     if (msgId === null) return;
     if (evaluatedStreamUiRef.current.has(msgId)) return;
     evaluatedStreamUiRef.current.add(msgId);
-    // The unified say tool's `ui` is a Markdown component descriptor:
-    // `{component: "Markdown", props: {content: "..."}}`. Extract the
-    // string so the existing `MarkdownOverlay` (which takes a markdown
-    // string) renders it. Other component types would need the
-    // `Dispatcher` path — out of scope for issue 0049, which only
-    // streams the say tool. Drop the frame silently for those (a
-    // warning would spam the dev console once the registry grows).
-    if (streamingUi.component !== "Markdown") return;
-    const content = streamingUi.props?.content;
-    if (typeof content !== "string" || content.length === 0) return;
-    setOverlayContent(content);
-  }, [streamingUi]);
+    openOverlayFromDescriptor(streamingUi);
+  }, [streamingUi, openOverlayFromDescriptor]);
   // Fallback for the streamed `ui_payload` path: open the overlay from the
   // FINAL `assistant_msg`'s `ui` field. The streamed `ui_payload` frame is
   // routed through the single process-wide ws emitter (last-connected window
   // wins), so a window that asked the question can miss it entirely — but it
   // always receives the closing `assistant_msg`, which carries the same
-  // Markdown descriptor. Dedup by msg id via the shared
-  // `evaluatedStreamUiRef` so the streaming path and this one never
-  // double-open (or re-open after the user dismissed the card).
+  // descriptor. Dedup by msg id via the shared `evaluatedStreamUiRef` so the
+  // streaming path and this one never double-open (or re-open after the user
+  // dismissed the card). The dispatcher routes Markdown vs Mail.
   useEffect(() => {
     let lastAssistant: (typeof messages)[number] | null = null;
     for (let i = messages.length - 1; i >= 0; i--) {
@@ -177,13 +211,10 @@ export function SphereUI() {
     }
     if (lastAssistant === null) return;
     if (evaluatedStreamUiRef.current.has(lastAssistant.id)) return;
-    const descriptor = lastAssistant.ui?.[0];
-    if (!descriptor || descriptor.component !== "Markdown") return;
-    const content = descriptor.props?.content;
-    if (typeof content !== "string" || content.length === 0) return;
+    const descriptor = lastAssistant.ui?.[0] ?? null;
+    if (!openOverlayFromDescriptor(descriptor)) return;
     evaluatedStreamUiRef.current.add(lastAssistant.id);
-    setOverlayContent(content);
-  }, [messages]);
+  }, [messages, openOverlayFromDescriptor]);
   useEffect(() => {
     // Walk back to the most recent non-empty assistant message; older entries
     // are uninteresting because the heuristic is evaluated per *latest* turn.
@@ -227,7 +258,7 @@ export function SphereUI() {
     setOverlayContent(result);
   }, [tasks]);
 
-  const overlayOpen = overlayContent !== null;
+  const overlayOpen = overlayContent !== null || overlayMail !== null;
   return (
     <SphereWsContext.Provider value={send}>
       <div
@@ -257,6 +288,12 @@ export function SphereUI() {
           <InputField />
         </div>
         <MarkdownOverlay content={overlayContent} onClose={() => setOverlayContent(null)} />
+        {/* Mail overlay (issue 0053) — opens via the say-tool dispatcher
+         * above when a Mail descriptor lands. Kept independent from
+         * MarkdownOverlay so each surface owns its own open/close
+         * lifecycle; the Esc / backdrop / DISMISS paths are scoped to
+         * whichever card is mounted. */}
+        <MailOverlay mail={overlayMail} onClose={() => setOverlayMail(null)} />
         {/* Per-task overlay (issue 0052) — opens on row click in HudTasks.
          * Kept mutually exclusive with the standalone MarkdownOverlay above:
          * the task-result auto-open effect skips a task that is already open

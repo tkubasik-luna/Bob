@@ -23,6 +23,48 @@ import {
   type DevTweaksTheme,
   useDevTweaksStore,
 } from "../../state/devTweaksStore";
+import { useChatStore } from "../../store/chatStore";
+import type { ComponentDescriptor, MailProps } from "../../types/ws";
+
+/** Fixture matching the design mockup (Marie Lefèvre, Q3 forecast,
+ * 2 attachments, PRIORITY flag) — see issue 0053 acceptance criteria.
+ * Used by the dev-mode "Surface MAIL" button to demo the overlay
+ * without Gmail credentials. */
+const MAIL_FIXTURE: MailProps = {
+  from: {
+    name: "Marie Lefèvre",
+    email: "marie.lefevre@lunabee.com",
+    role: "CFO · Lunabee",
+  },
+  receivedAt: new Date().toISOString(),
+  subject: "Q3 forecast — final review before Thursday",
+  bodyPreview:
+    "Bob, can you have the deck ready by Thursday afternoon? I want to walk through it with Antoine before the board call. The numbers from finance should now be locked, but I'd like one more pass on the narrative — particularly the Asia slowdown slide.",
+  flags: ["priority"],
+  attachments: [
+    { name: "Q3-forecast-v4.pdf", sizeBytes: 2_400_000, mime: "application/pdf" },
+    { name: "Asia-deck-notes.md", sizeBytes: 18_432, mime: "text/markdown" },
+  ],
+  threadId: "thread-fixture-001",
+  messageId: "msg-fixture-001",
+  gmailWebUrl: "https://mail.google.com/mail/u/0/#inbox/thread-fixture-001",
+};
+
+/** Push a fake assistant turn carrying `descriptor` as its `ui[0]`. The
+ * `SphereUI` dispatcher reacts to the new message via the message-list
+ * effect (final-`assistant_msg.ui` path), then opens the matching
+ * overlay. Uses a unique `msg_id` per call so consecutive clicks
+ * re-trigger the dispatcher (it dedupes by id). */
+function injectFixtureDescriptor(descriptor: ComponentDescriptor): void {
+  const msgId = `dev-fixture-${descriptor.component}-${Date.now()}`;
+  useChatStore
+    .getState()
+    .addAssistantMessage(
+      descriptor.component === "Mail" ? "Voilà l'email de Marie." : "Voilà le contenu surfacé.",
+      [descriptor],
+      msgId,
+    );
+}
 
 /** Order of the state pills — matches mockup `app.jsx` keyboard mapping
  * (`1=idle, 2=listen, 3=think, 4=speak, 5=alert, 6=error`). The same array
@@ -276,6 +318,39 @@ function DevControlsActive() {
               <option value="warm">warm</option>
               <option value="cold">cold</option>
             </select>
+          </div>
+
+          <div className="twk-sect">Surfaces (issue 0053)</div>
+          <div className="twk-row twk-row-h">
+            <div className="twk-lbl">
+              <span>Inject fixture</span>
+            </div>
+            <div style={{ display: "flex", gap: 6 }}>
+              <button
+                type="button"
+                className="twk-toggle"
+                aria-label="Inject Mail fixture"
+                onClick={() => injectFixtureDescriptor({ component: "Mail", props: MAIL_FIXTURE })}
+              >
+                Mail
+              </button>
+              <button
+                type="button"
+                className="twk-toggle"
+                aria-label="Inject Markdown fixture"
+                onClick={() =>
+                  injectFixtureDescriptor({
+                    component: "Markdown",
+                    props: {
+                      content:
+                        "# Demo overlay\n\nA short demo card — *useful* to verify the Markdown path still works after wiring the Mail dispatcher.",
+                    },
+                  })
+                }
+              >
+                MD
+              </button>
+            </div>
           </div>
 
           <div className="twk-hint">

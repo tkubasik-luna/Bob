@@ -3,10 +3,55 @@
  * Keep in sync with backend `bob.ws_router`.
  */
 
-export type ComponentDescriptor = {
-  component: string;
-  props: Record<string, unknown>;
+/** Props for the `Markdown` UI component — single rich-text content slot.
+ * Mirrors `backend/src/bob/ui_registry.py::MARKDOWN`. */
+export type MarkdownProps = {
+  content: string;
 };
+
+/** Props for the `Mail` UI component — a single Gmail message rendered as
+ * an overlay card. Mirrors `backend/src/bob/ui_registry.py::MAIL`. Fields
+ * marked optional in the schema (`from.role`, `flags`, `attachments`) are
+ * optional here too; the rest are required. */
+export type MailProps = {
+  from: {
+    name: string;
+    email: string;
+    /** Optional human-readable role / org affiliation. */
+    role?: string;
+  };
+  /** ISO 8601 timestamp (e.g. `2026-05-28T14:22:00Z`). */
+  receivedAt: string;
+  subject: string;
+  /** Gmail-style snippet of the message body. */
+  bodyPreview: string;
+  /** Visual flag pills rendered in the header (`PRIORITY`, `UNREAD`, …).
+   * Defaults to an empty array on the wire. */
+  flags?: ("priority" | "unread" | "starred")[];
+  /** Attachment chips rendered under the body. Defaults to empty. */
+  attachments?: {
+    name: string;
+    sizeBytes: number;
+    mime: string;
+  }[];
+  threadId: string;
+  messageId: string;
+  /** Full Gmail web URL the OPEN button browses to. */
+  gmailWebUrl: string;
+};
+
+/** Discriminated union of the components the LLM can emit. The
+ * `component` field selects the variant; `props` is typed accordingly so
+ * `SphereUI`'s dispatcher gets exhaustiveness checks for free.
+ *
+ * The catch-all `{ component: string; props: Record<string, unknown> }`
+ * branch keeps us forward-compatible with components added on the backend
+ * but not yet known to the frontend — they fall through the dispatcher
+ * and render nothing (no runtime crash). */
+export type ComponentDescriptor =
+  | { component: "Markdown"; props: MarkdownProps }
+  | { component: "Mail"; props: MailProps }
+  | { component: string; props: Record<string, unknown> };
 
 // Client → server
 export type UserMsg = {
