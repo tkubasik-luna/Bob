@@ -166,18 +166,16 @@ def build_default_registry() -> ToolRegistry:
     Registered tools (in LLM-facing display order):
 
     1. ``say`` (issue 0047) — unified direct-reply path.
-    2. ``spawn_task`` (issue 0050) — v2 spawn entry point.
-    3. ``addendum_task`` (issue 0050) — push info into a running runner.
-    4. ``replan_task`` (issue 0050) — cancel + respawn with lineage.
-    5. ``cancel_task`` (issue 0050) — v2 cancel entry point.
-    6. ``spawn_subtask`` (issue 0044) — legacy v1 spawn; kept as a
-       deprecated alias so slice #0018..#0023 integration tests + WS
-       paths keep working through the migration. A future cleanup
-       removes this once every call site has switched to ``spawn_task``.
-    7. ``forward_to_subtask`` (issue 0044) — legacy v1 forward for
-       ``waiting_input`` tasks; superseded by ``addendum_task``.
-    8. ``cancel_subtask`` (issue 0044) — legacy v1 cancel; superseded by
-       ``cancel_task``.
+    2. ``show_task_result`` — recall a stored task deliverable.
+    3. ``spawn_task`` (issue 0050) — v2 spawn entry point.
+    4. ``addendum_task`` (issue 0050) — push info into a running runner.
+    5. ``replan_task`` (issue 0050) — cancel + respawn with lineage.
+    6. ``cancel_task`` (issue 0050) — v2 cancel entry point.
+
+    The v1 aliases ``spawn_subtask`` / ``forward_to_subtask`` /
+    ``cancel_subtask`` (issue 0044) have been removed: every call site
+    has migrated to the v2 task surface, and the prompt no longer
+    advertises them.
 
     The order pins the LLM-facing tool list. The ``TOOLS_SYSTEM_ADDENDUM``
     prompt fragment must describe the tools in this exact order so the
@@ -188,13 +186,10 @@ def build_default_registry() -> ToolRegistry:
     # orchestrator-adjacent modules into the import graph during the
     # tests that target the registry in isolation.
     from bob.tools.definitions.addendum_task import build_addendum_task_tool
-    from bob.tools.definitions.cancel import build_cancel_subtask_tool
     from bob.tools.definitions.cancel_task import build_cancel_task_tool
-    from bob.tools.definitions.forward import build_forward_to_subtask_tool
     from bob.tools.definitions.replan_task import build_replan_task_tool
     from bob.tools.definitions.say import build_say_tool
     from bob.tools.definitions.show_task_result import build_show_task_result_tool
-    from bob.tools.definitions.spawn import build_spawn_subtask_tool
     from bob.tools.definitions.spawn_task import build_spawn_task_tool
 
     return ToolRegistry(
@@ -205,8 +200,5 @@ def build_default_registry() -> ToolRegistry:
             build_addendum_task_tool(),
             build_replan_task_tool(),
             build_cancel_task_tool(),
-            build_spawn_subtask_tool(),
-            build_forward_to_subtask_tool(),
-            build_cancel_subtask_tool(),
         ]
     )

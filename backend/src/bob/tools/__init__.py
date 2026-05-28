@@ -1,12 +1,15 @@
 """Tool registry + dispatcher for the Jarvis-side tool surface (PRD 0006).
 
-Issue 0044 replaces the hardcoded ``spawn_subtask`` / ``forward_to_subtask`` /
-``cancel_subtask`` ``elif`` chain in :mod:`bob.orchestrator` with a versioned
-:class:`ToolDefinition` registry and a single :class:`ToolDispatcher`. Every
-dispatch validates the argument shape with Pydantic before invoking the
-handler, returns a structured :class:`DispatchResult`, and emits a
-``jarvis.route`` structured debug event so future "why did Jarvis chat
-instead of spawning?" introspection is grep-friendly.
+Issue 0044 introduced a versioned :class:`ToolDefinition` registry and a
+single :class:`ToolDispatcher` (replacing the original hardcoded ``elif``
+chain in :mod:`bob.orchestrator`). The v1 ``*_subtask`` aliases shipped
+in that slice have since been removed — every call site has migrated to
+the v2 task surface (``spawn_task`` / ``addendum_task`` / ``replan_task``
+/ ``cancel_task``). Every dispatch validates the argument shape with
+Pydantic before invoking the handler, returns a structured
+:class:`DispatchResult`, and emits a ``jarvis.route`` structured debug
+event so future "why did Jarvis chat instead of spawning?" introspection
+is grep-friendly.
 
 Public surface used by the orchestrator and by later slices (0045 sub-agent
 contract rewrite, 0047 unified ``say`` tool, 0048 retry policy, 0050

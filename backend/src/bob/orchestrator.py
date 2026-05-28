@@ -1671,22 +1671,15 @@ class Orchestrator:
 
         if not result.ok or result.task_id is None:
             return
-        # Bucket BOTH the legacy v1 names (``*_subtask``) and the v2 task
-        # surface (``spawn_task`` / ``replan_task`` / ``cancel_task``,
-        # PRD 0006 / issue 0050). ``forward_to_subtask`` is shared across
-        # both versions. Pre-fix only the v1 names were recognised, so a
-        # v2 ``spawn_task`` (the canonical entry point the prompt now
-        # advertises) fell through every branch → ``spawned`` stayed empty
-        # → the caller hit ``assert say_speech is not None`` and crashed
-        # the whole turn, leaving the spawn unannounced.
-        if result.tool_name in ("spawn_subtask", "spawn_task", "replan_task"):
+        # Bucket the v2 task surface (``spawn_task`` / ``replan_task`` /
+        # ``cancel_task``, PRD 0006 / issue 0050). The v1 ``*_subtask``
+        # aliases have been removed — every call site has migrated to v2.
+        if result.tool_name in ("spawn_task", "replan_task"):
             # ``replan_task`` cancels the old task and respawns a replacement;
             # the new task is the live one to confirm, so it shares the spawn
             # confirmation copy.
             spawned.append(result.task_id)
-        elif result.tool_name == "forward_to_subtask":
-            forwarded.append(result.task_id)
-        elif result.tool_name in ("cancel_subtask", "cancel_task"):
+        elif result.tool_name == "cancel_task":
             cancelled.append(result.task_id)
         # Unknown-tool-on-success is structurally impossible (the
         # registry would have rejected the call upstream). The caller's

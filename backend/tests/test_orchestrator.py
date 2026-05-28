@@ -125,7 +125,7 @@ def _make_orchestrator(
 def _spawn_tool_call(*, title: str = "Buy milk", goal: str = "Acheter du lait") -> ToolCall:
     return ToolCall(
         id=f"call_{uuid4().hex[:6]}",
-        name="spawn_subtask",
+        name="spawn_task",
         arguments={"title": title, "goal": goal},
     )
 
@@ -246,7 +246,7 @@ async def test_spawn_with_invalid_args_then_invalid_again_degrades() -> None:
 
     bad_call = ToolCall(
         id="call_bad",
-        name="spawn_subtask",
+        name="spawn_task",
         arguments={"title": "no goal here"},
     )
     orchestrator, jarvis_client, _sub_client, jarvis_store, task_store, scheduler = (
@@ -385,8 +385,12 @@ async def test_say_tool_call_uses_jarvis_prompt_in_system_message() -> None:
 
 
 @pytest.mark.asyncio
-async def test_complete_call_sends_v2_task_surface_plus_legacy_aliases() -> None:
-    """PRD 0006 / issue 0050: v2 tools register ahead of legacy aliases."""
+async def test_complete_call_sends_unified_tool_surface() -> None:
+    """The v2 task surface plus ``say`` + ``show_task_result`` are advertised.
+
+    The v1 ``*_subtask`` aliases (issue 0044) have been removed — every
+    call site uses the v2 names and the prompt no longer mentions them.
+    """
 
     orchestrator, jarvis_client, _sub, _store, _ts, _scheduler = _make_orchestrator(
         complete_responses=[_say_response(speech="ok")],
@@ -404,26 +408,19 @@ async def test_complete_call_sends_v2_task_surface_plus_legacy_aliases() -> None
         "addendum_task",
         "replan_task",
         "cancel_task",
-        "spawn_subtask",
-        "forward_to_subtask",
-        "cancel_subtask",
     ]
     say_tool = tools[0]
+    show_tool = tools[1]
     spawn_task_tool = tools[2]
     addendum_tool = tools[3]
     replan_tool = tools[4]
     cancel_task_tool = tools[5]
-    legacy_spawn_tool = tools[6]
-    legacy_forward_tool = tools[7]
-    legacy_cancel_tool = tools[8]
     assert say_tool.parameters["required"] == ["speech"]
+    assert show_tool.parameters["required"] == ["speech", "query"]
     assert spawn_task_tool.parameters["required"] == ["title", "goal"]
     assert addendum_tool.parameters["required"] == ["task_id", "info"]
     assert replan_tool.parameters["required"] == ["task_id", "new_goal"]
     assert cancel_task_tool.parameters["required"] == ["task_id"]
-    assert legacy_spawn_tool.parameters["required"] == ["title", "goal"]
-    assert legacy_forward_tool.parameters["required"] == ["task_id", "response"]
-    assert legacy_cancel_tool.parameters["required"] == ["task_id"]
 
 
 # ---------------------------------------------------------------------------
@@ -472,7 +469,7 @@ async def test_spawn_emits_task_created_via_orchestrator() -> None:
     assert len(task_events) == 1
     created = task_events[0]
     assert created["type"] == "task_created"
-    assert created["state"] == "pending"
+    assert created["state"] == "spawned"
     assert created["title"] == "T"
     assert created["goal"] == "G"
     assert isinstance(created["created_at"], str)
@@ -501,7 +498,7 @@ async def test_spawn_with_invalid_args_does_not_emit_events() -> None:
     try:
         bad = ToolCall(
             id="call_bad",
-            name="spawn_subtask",
+            name="spawn_task",
             arguments={"title": "no goal"},
         )
         orchestrator, _jc, _sc, _js, _ts, _scheduler = _make_orchestrator(
@@ -575,159 +572,6 @@ async def test_end_to_end_spawn_and_complete() -> None:
     messages = task_store.get_task_messages(task_id)
     assert any(m.action == "done" for m in messages)
 
-
-# ---------------------------------------------------------------------------
-# forward_to_subtask tool dispatch (slice #0021)
-# ---------------------------------------------------------------------------
-
-
-def _forward_tool_call(*, task_id: str, response: str = "Amical.") -> ToolCall:
-    return ToolCall(
-        id=f"call_{uuid4().hex[:6]}",
-        name="forward_to_subtask",
-        arguments={"task_id": task_id, "response": response},
-    )
-
-
-@pytest.mark.asyncio
-async def test_forward_to_subtask_inserts_message_and_calls_resume() -> None:
-    """A ``forward_to_subtask`` tool call must append the user message + resume."""
-
-    orchestrator, jarvis_client, _sub, jarvis_store, task_store, scheduler = _make_orchestrator()
-
-    # Seed a task in waiting_input with a prior ask_user question.
-    target_id = task_store.create_task(title="Draft email", goal="Write a draft")
-    task_store.update_state(target_id, "running")
-    task_store.append_message(target_id, role="assistant", content="Quel ton ?", action="ask_user")
-    task_store.update_state(target_id, "waiting_input")
-
-    # Now feed the orchestrator a turn whose only tool call is a forward.
-    jarvis_client._complete_responses.append(
-        LLMResponse(
-            text=None,
-            tool_calls=[_forward_tool_call(task_id=target_id, response="Amical.")],
-        )
-    )
-
-    response = await orchestrator.process_user_message("s1", "Amical.")
-
-    assert response.forwarded_task_ids == [target_id]
-    assert response.spawned_task_ids == []
-    assert "transmets" in response.speech
-
-    assert scheduler.resumed == [target_id]
-    # Recording-scheduler transitions the task to running on resume.
-    assert task_store.get_task(target_id).state == "running"
-
-    # The user's reply was persisted as a ``user`` row on the task log.
-    forwarded_msg = [m for m in task_store.get_task_messages(target_id) if m.role == "user"]
-    assert [m.content for m in forwarded_msg] == ["Amical."]
-
-    # The orchestrator must have advertised the waiting_input task in its
-    # system prompt so Jarvis knows the task_id to forward to.
-    system_content = jarvis_client.complete_calls[-1]["messages"][0]["content"]
-    assert target_id in system_content
-    assert "Quel ton ?" in system_content
-
-    # Jarvis confirmation persisted in history.
-    history = jarvis_store.history()
-    assert history[-1]["role"] == "assistant"
-    assert "transmets" in history[-1]["content"]
-
-
-@pytest.mark.asyncio
-async def test_forward_to_subtask_emits_task_message_event() -> None:
-    """The forwarded user reply surfaces as a ``task_message`` WS event."""
-
-    orchestrator, jarvis_client, _sub, _js, task_store, _scheduler = _make_orchestrator()
-
-    target_id = task_store.create_task(title="Draft email", goal="Write a draft")
-    task_store.update_state(target_id, "running")
-    task_store.append_message(target_id, role="assistant", content="Quel ton ?", action="ask_user")
-    task_store.update_state(target_id, "waiting_input")
-
-    jarvis_client._complete_responses.append(
-        LLMResponse(
-            text=None,
-            tool_calls=[_forward_tool_call(task_id=target_id, response="Amical.")],
-        )
-    )
-
-    received: list[dict[str, Any]] = []
-
-    async def _emitter(event: dict[str, Any]) -> None:
-        received.append(event)
-
-    ws_events.set_emitter(_emitter)
-    try:
-        await orchestrator.process_user_message("s1", "Amical.")
-    finally:
-        ws_events.set_emitter(None)
-
-    task_messages = [e for e in received if e["type"] == "task_message"]
-    assert len(task_messages) == 1
-    evt = task_messages[0]
-    assert evt["task_id"] == target_id
-    assert evt["role"] == "user"
-    assert evt["content"] == "Amical."
-    assert evt["action"] is None
-    assert isinstance(evt["message_id"], int)
-
-
-@pytest.mark.asyncio
-async def test_forward_to_unknown_task_degrades_after_retry() -> None:
-    """Issue 0048: an unknown ``task_id`` retries once then degrades."""
-
-    bad_call = ToolCall(
-        id="call_bad",
-        name="forward_to_subtask",
-        arguments={"task_id": "does-not-exist", "response": "x"},
-    )
-    orchestrator, _jarvis_client, _sub, _js, task_store, scheduler = _make_orchestrator(
-        complete_responses=[
-            LLMResponse(text=None, tool_calls=[bad_call]),
-            LLMResponse(text=None, tool_calls=[bad_call]),
-        ],
-    )
-
-    response = await orchestrator.process_user_message("s1", "Amical.")
-
-    assert response.speech == "Désolé, peux-tu reformuler ?"
-    assert scheduler.resumed == []
-    assert task_store.list_tasks() == []
-
-
-@pytest.mark.asyncio
-async def test_forward_to_task_not_in_waiting_input_degrades_after_retry() -> None:
-    """Forward must target a task in ``waiting_input``; running rejects it.
-
-    Issue 0048: rejection retries once then surfaces the degrade speech
-    through the live SayTool dispatcher path.
-    """
-
-    orchestrator, jarvis_client, _sub, _js, task_store, scheduler = _make_orchestrator()
-    target_id = task_store.create_task(title="t", goal="g")
-    task_store.update_state(target_id, "running")  # Not waiting_input!
-
-    jarvis_client._complete_responses.append(
-        LLMResponse(
-            text=None,
-            tool_calls=[_forward_tool_call(task_id=target_id, response="x")],
-        )
-    )
-    jarvis_client._complete_responses.append(
-        LLMResponse(
-            text=None,
-            tool_calls=[_forward_tool_call(task_id=target_id, response="x")],
-        )
-    )
-
-    response = await orchestrator.process_user_message("s1", "x")
-
-    assert response.speech == "Désolé, peux-tu reformuler ?"
-    assert scheduler.resumed == []
-    # Original task untouched.
-    assert task_store.get_task(target_id).state == "running"
 
 
 # ---------------------------------------------------------------------------
@@ -1143,7 +987,7 @@ def _cancel_tool_call(*, task_id: str, reason: str | None = None) -> ToolCall:
         args["reason"] = reason
     return ToolCall(
         id=f"call_{uuid4().hex[:6]}",
-        name="cancel_subtask",
+        name="cancel_task",
         arguments=args,
     )
 
@@ -1213,7 +1057,7 @@ async def test_cancel_subtask_with_bad_task_id_degrades_after_retry() -> None:
 
     bad_call = ToolCall(
         id="call_bad",
-        name="cancel_subtask",
+        name="cancel_task",
         arguments={"reason": "nope"},
     )
     orchestrator, _jc, _sub, _js, _ts, scheduler = _make_orchestrator(
@@ -1370,7 +1214,7 @@ async def test_spawn_subtask_emits_decision_debug_event() -> None:
     spawn_events = [
         e
         for e in debug_log.snapshot()
-        if e.category == "decision" and "lance sub-task" in e.summary
+        if e.category == "decision" and "lance task v2" in e.summary
     ]
     assert len(spawn_events) == 1
     assert "Drafts" in spawn_events[0].summary

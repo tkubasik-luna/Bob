@@ -11,7 +11,7 @@ Covers the behavioural acceptance criteria:
   ``jarvis.validation_failed`` event (asserted via debug_log).
 - The retry counter is NEVER persisted to any :class:`ContextEntry`
   row (no DB column carries it).
-- Unknown ``task_id`` on ``forward_to_subtask`` follows the same
+- Unknown ``task_id`` on ``addendum_task`` follows the same
   degrade path with the same speech.
 """
 
@@ -123,7 +123,7 @@ def _say_call(speech: str = "ok", ui: object | None = None) -> ToolCall:
 def _spawn_call(*, title: str, goal: str) -> ToolCall:
     return ToolCall(
         id=f"call_{uuid4().hex[:6]}",
-        name="spawn_subtask",
+        name="spawn_task",
         arguments={"title": title, "goal": goal},
     )
 
@@ -198,7 +198,7 @@ async def test_invalid_args_then_valid_recovers() -> None:
                 tool_calls=[
                     ToolCall(
                         id="call_bad",
-                        name="spawn_subtask",
+                        name="spawn_task",
                         arguments={"title": "Just a title"},
                     )
                 ],
@@ -220,20 +220,20 @@ async def test_invalid_args_then_valid_recovers() -> None:
     validator_msgs = [m for m in retry_messages if m["role"] == SYSTEM_VALIDATOR_ROLE]
     assert validator_msgs
     assert "Validation a échoué" in validator_msgs[0]["content"]
-    assert "spawn_subtask" in validator_msgs[0]["content"]
+    assert "spawn_task" in validator_msgs[0]["content"]
     # Task did get created on the second attempt.
     assert task_store.list_tasks(state="running")[0].title == "Drafts"
 
 
 @pytest.mark.asyncio
 async def test_unknown_task_id_degrades_via_same_handler() -> None:
-    """Unknown ``task_id`` on forward_to_subtask routes through the degrade."""
+    """Unknown ``task_id`` on ``addendum_task`` routes through the degrade."""
 
     # Both attempts reference a missing task id → exhaustion path.
     bad_call = ToolCall(
         id="call_bad",
-        name="forward_to_subtask",
-        arguments={"task_id": "does-not-exist", "response": "x"},
+        name="addendum_task",
+        arguments={"task_id": "does-not-exist", "info": "x"},
     )
     orchestrator, client, jarvis_store, _ts, scheduler = _make_orchestrator(
         [

@@ -96,21 +96,6 @@ POLICY_TABLE: dict[str, RetryPolicy] = {
         degrade_action="hardcoded_say",
         accept_partial=True,
     ),
-    "spawn_subtask": RetryPolicy(
-        max_retries=1,
-        degrade_action="hardcoded_say",
-        accept_partial=False,
-    ),
-    "forward_to_subtask": RetryPolicy(
-        max_retries=1,
-        degrade_action="hardcoded_say",
-        accept_partial=False,
-    ),
-    "cancel_subtask": RetryPolicy(
-        max_retries=1,
-        degrade_action="hardcoded_say",
-        accept_partial=False,
-    ),
 }
 
 

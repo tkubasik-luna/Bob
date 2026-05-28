@@ -154,12 +154,12 @@ async def test_say_rejects_missing_required_field_even_with_accept_partial() -> 
 
 @pytest.mark.asyncio
 async def test_strict_tool_rejects_extra_keys() -> None:
-    """``accept_partial=False`` (default for spawn_subtask) still rejects garbage."""
+    """``accept_partial=False`` (default for ``spawn_task``) still rejects garbage."""
 
     dispatcher, _store = _make_dispatcher()
     call = ToolCall(
         id="call_z",
-        name="spawn_subtask",
+        name="spawn_task",
         arguments={"title": "T", "goal": "G", "extra_garbage": True},
     )
     # Pydantic v2 ignores extra fields by default, so the strict path
@@ -167,7 +167,7 @@ async def test_strict_tool_rejects_extra_keys() -> None:
     # send an invalid required field:
     bad_call = ToolCall(
         id="call_w",
-        name="spawn_subtask",
+        name="spawn_task",
         arguments={"title": "", "goal": "G"},
     )
     ok_result = await dispatcher.dispatch(call)
