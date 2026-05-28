@@ -42,7 +42,7 @@ class Settings(BaseSettings):
     LLM_BASE_URL: str | None = None
     LLM_MODEL: str | None = None
     LLM_API_KEY: str | None = None
-    LLM_TIMEOUT_SECONDS: float = 60.0
+    LLM_TIMEOUT_SECONDS: float = 3600.0
 
     # Claude CLI backend (used when LLM_PROVIDER=claude_cli)
     CLAUDE_CLI_BIN: str = "claude"

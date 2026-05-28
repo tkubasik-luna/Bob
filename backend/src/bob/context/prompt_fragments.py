@@ -295,7 +295,7 @@ SYSTEM_BLOCK_PERSONALITY_REMINDER = PromptFragment(
 
 SUB_AGENT_V2_SYSTEM_PROMPT = PromptFragment(
     id="sub_agent_v2_system",
-    version=3,
+    version=4,
     template=(
         "Tu es un sub-agent autonome. Ton but : {goal}.\n"
         "À chaque tour tu émets UNE seule action JSON parmi :\n"
@@ -329,7 +329,14 @@ SUB_AGENT_V2_SYSTEM_PROMPT = PromptFragment(
         "``has_attachment``, ``label``). ``max_results`` reste à 1 par "
         "défaut sauf si le but mentionne explicitement plusieurs mails. "
         "N'appelle JAMAIS ``gmail_search`` sans au moins un filtre — un "
-        "appel sans argument est rejeté par la validation.\n"
+        "appel sans argument est rejeté par la validation. "
+        "**Fallback obligatoire quand le but est générique** (« dernier "
+        "mail », « dernier mail reçu », « ma boîte », « inbox », sans "
+        "expéditeur ni sujet ni date) : utilise ``label=\"INBOX\"`` "
+        "comme filtre minimal. Pour « dernier mail envoyé » sans cible, "
+        "utilise ``label=\"SENT\"``. Ne retente JAMAIS deux fois le même "
+        "appel sans filtre — choisis le fallback ``label`` au premier "
+        "essai si rien d'autre n'est inférable.\n"
         "  3. Une fois un résultat NON VIDE reçu, émets "
         '``progress(thought="lecture du mail")`` puis termine avec un '
         "``done`` dont ``ui_payload`` est un OBJET (et non une chaîne) "

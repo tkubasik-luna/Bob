@@ -525,6 +525,27 @@ def test_default_subagent_registry_exposes_gmail_search() -> None:
     assert build_web_fetch_tool().name == "web_fetch"
 
 
+def test_sub_agent_v2_prompt_documents_inbox_fallback() -> None:
+    """Regression for the 2026-05-28 12:24 ``iteration_cap`` post-mortem.
+
+    Task ``73146d06…`` ("Dernier mail reçu") looped 24 times because the LLM
+    kept calling ``gmail_search`` with no filter and the validator rejected
+    every attempt with ``error_code: invalid_args``. The prompt now MUST
+    instruct the model to fall back to ``label="INBOX"`` (received) or
+    ``label="SENT"`` (sent) when the goal is generic, so a single rejected
+    call is impossible.
+    """
+
+    from bob.context.prompt_fragments import SUB_AGENT_V2_SYSTEM_PROMPT
+
+    rendered = SUB_AGENT_V2_SYSTEM_PROMPT.render(goal="dummy")
+    assert 'label="INBOX"' in rendered
+    assert 'label="SENT"' in rendered
+    # Must be framed as a fallback for the generic-goal branch, not as an
+    # always-on default (the specific-filter happy path stays untouched).
+    assert "Fallback" in rendered or "fallback" in rendered
+
+
 def test_subagent_registry_disjoint_from_jarvis_registry() -> None:
     """Sub-agent registry is a SEPARATE instance from :mod:`bob.tools`."""
 

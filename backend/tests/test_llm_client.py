@@ -320,3 +320,67 @@ def test_claude_cli_render_history_concatenates_multi_turn() -> None:
     rendered = ClaudeCliClient._render_history(history)
     assert "first" in rendered and "reply" in rendered and "second" in rendered
     assert rendered.rstrip().endswith("second")
+
+
+# ---------------------------------------------------------------------------
+# Role-leak regression (issue 0048 post-mortem — logs 2026-05-28 11:46/11:48).
+# A stale backend ran pre-fold code and shipped a ``system_validator`` row to
+# LM Studio, which returned an opaque HTTP 400. The fold is now in place on
+# all three OpenAI-bound paths and ``_assert_standard_roles`` raises loudly
+# if any future regression drops a fold call — so we never ship a non-standard
+# role over the wire again.
+# ---------------------------------------------------------------------------
+
+
+def test_assert_standard_roles_passes_for_valid_messages() -> None:
+    from bob.llm_client import _assert_standard_roles
+
+    _assert_standard_roles(
+        [
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "u"},
+            {"role": "assistant", "content": "a"},
+            {"role": "tool", "content": "t"},
+        ]
+    )
+
+
+def test_assert_standard_roles_raises_on_system_validator() -> None:
+    from bob.llm_client import _assert_standard_roles
+
+    with pytest.raises(LLMClientError, match="system_validator"):
+        _assert_standard_roles(
+            [
+                {"role": "user", "content": "u"},
+                {"role": "system_validator", "content": "feedback"},
+            ]
+        )
+
+
+@pytest.mark.asyncio
+async def test_chat_folds_system_validator_before_dispatch() -> None:
+    """``chat`` must NOT leak ``system_validator`` to the OpenAI endpoint.
+
+    Without the fold the call would surface the LM Studio 400 we hit in
+    production on 2026-05-28; with the fold the post-dispatch messages
+    contain only standard roles and the validator content is prefixed
+    into a ``system`` message.
+    """
+
+    client = LMStudioClient(_make_settings())
+    create = _patch_openai(client)
+
+    messages: list[dict[str, Any]] = [
+        {"role": "user", "content": "hi"},
+        {"role": "system_validator", "content": "your last output was invalid"},
+    ]
+    await client.chat(messages=messages)
+
+    create.assert_awaited_once()
+    assert create.await_args is not None
+    sent = create.await_args.kwargs["messages"]
+    sent_roles = [m["role"] for m in sent]
+    assert "system_validator" not in sent_roles
+    assert sent_roles == ["user", "system"]
+    # Validator content survives, just under a standard role.
+    assert "invalid" in sent[1]["content"]

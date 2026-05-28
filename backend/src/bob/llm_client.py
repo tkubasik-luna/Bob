@@ -10,15 +10,13 @@ retry budgets and degrade fallbacks. Pre-0048 the
 deleted in 0048 because the silent raw-text fallback amounted to assistant-
 history corruption.
 
-Issue 0048 adds the ``system_validator`` role contract. Each client
-normalises ``system_validator`` rows before dispatching:
-
-- :class:`LMStudioClient` passes them through verbatim (OpenAI-compatible
-  endpoints tolerate arbitrary role strings).
-- :class:`ClaudeCliClient` folds them into ``system`` rows prefixed with
-  :data:`bob.validation.system_validator.FALLBACK_VALIDATOR_PREFIX`
-  because the CLI's prompt rendering only understands the four standard
-  roles.
+Issue 0048 adds the ``system_validator`` role contract. Both clients
+fold ``system_validator`` rows into ``system`` rows prefixed with
+:data:`bob.validation.system_validator.FALLBACK_VALIDATOR_PREFIX` before
+dispatching: LM Studio rejects unknown roles with HTTP 400
+("'messages' array must only contain objects with a 'role' field that
+is in [user, assistant, system, tool]"), and the Claude CLI's prompt
+rendering only understands the four standard roles.
 """
 
 from __future__ import annotations
@@ -47,13 +45,13 @@ from bob.validation.system_validator import (
 _logger = structlog.get_logger(__name__)
 
 
-#: Roles known to be accepted by every OpenAI-compatible endpoint Bob
-#: targets (LM Studio, vLLM, llama.cpp's server, Claude CLI in tool
-#: mode). When the validation path hands us a message with a role
-#: outside this set we either pass it through (LM Studio: arbitrary role
-#: strings are accepted) or wrap it into a ``system`` message prefixed
-#: with :data:`FALLBACK_VALIDATOR_PREFIX`. Issue 0048 — the wrap path is
-#: the safety net documented in :mod:`bob.validation.system_validator`.
+#: Roles accepted by the OpenAI-compatible endpoints Bob targets
+#: (LM Studio, vLLM, llama.cpp's server, Claude CLI in tool mode). LM
+#: Studio enforces this set strictly — passing ``system_validator``
+#: returns HTTP 400. The validation path therefore folds unknown roles
+#: into ``system`` messages prefixed with :data:`FALLBACK_VALIDATOR_PREFIX`.
+#: Issue 0048 — the fold path is documented in
+#: :mod:`bob.validation.system_validator`.
 _STANDARD_ROLES: frozenset[str] = frozenset({"system", "user", "assistant", "tool"})
 
 
@@ -90,6 +88,32 @@ def _normalise_validator_role(
             }
         )
     return normalised
+
+
+def _assert_standard_roles(messages: list[dict[str, Any]]) -> None:
+    """Belt-and-suspenders: raise if any non-standard role survived the fold.
+
+    Issue 0048 post-mortem (logs 2026-05-28 11:46/11:48): a stale backend
+    process running pre-fold code shipped ``system_validator`` rows straight
+    to LM Studio and got a cryptic HTTP 400 in return. The fold is now
+    wired into all three OpenAI-bound entry points (``chat`` / ``complete``
+    / ``stream_complete``), but a future regression that drops the fold
+    call would surface the same opaque 400 again. This helper turns that
+    failure mode into a loud :class:`LLMClientError` raised before any
+    network round-trip — caught by the unit tests below.
+
+    Cost on the happy path is one frozenset membership per message; trivial.
+    """
+
+    for index, msg in enumerate(messages):
+        role = msg.get("role")
+        if role not in _STANDARD_ROLES:
+            raise LLMClientError(
+                f"Non-standard role {role!r} at messages[{index}] would be "
+                f"rejected by the OpenAI-compatible endpoint. Expected one "
+                f"of {sorted(_STANDARD_ROLES)}. Did you forget to call "
+                f"_normalise_validator_role()?"
+            )
 
 
 def _estimate_tokens(messages: list[dict[str, Any]]) -> int:
@@ -332,13 +356,13 @@ class LMStudioClient(LLMClient):
         schema: dict[str, Any] | None = None,
         session_id: str | None = None,
     ) -> str:
-        # Issue 0048 — pass ``system_validator`` rows straight through.
-        # LM Studio (and every OpenAI-compatible endpoint Bob targets)
-        # tolerates arbitrary role strings on chat messages. The fold
-        # path in :func:`_normalise_validator_role` exists for upstream
-        # providers that reject unknown roles; we opt in to it only on
-        # the Claude CLI client below.
-        messages = _normalise_validator_role(messages, allow_arbitrary_roles=True)
+        # Issue 0048 — LM Studio rejects unknown roles with HTTP 400
+        # ("'messages' array must only contain objects with a 'role'
+        # field that is in [user, assistant, system, tool]"). Fold the
+        # ``system_validator`` rows into prefixed ``system`` messages so
+        # the validator payload still reads distinctly in the prompt.
+        messages = _normalise_validator_role(messages, allow_arbitrary_roles=False)
+        _assert_standard_roles(messages)
         kwargs: dict[str, Any] = {
             "model": self._settings.LLM_MODEL,
             "messages": messages,
@@ -493,10 +517,10 @@ class LMStudioClient(LLMClient):
         tools: list[ToolDefinition] | None = None,
         session_id: str | None = None,
     ) -> LLMResponse:
-        # Issue 0048 — same passthrough policy as ``chat``: LM Studio
-        # accepts the ``system_validator`` role verbatim. See
-        # :func:`_normalise_validator_role` for the rationale.
-        messages = _normalise_validator_role(messages, allow_arbitrary_roles=True)
+        # Issue 0048 — same fold policy as ``chat``: LM Studio rejects
+        # unknown roles with HTTP 400. See :func:`_normalise_validator_role`.
+        messages = _normalise_validator_role(messages, allow_arbitrary_roles=False)
+        _assert_standard_roles(messages)
         kwargs: dict[str, Any] = {
             "model": self._settings.LLM_MODEL,
             "messages": messages,
@@ -735,8 +759,9 @@ class LMStudioClient(LLMClient):
         provider) lands on the end event.
         """
 
-        # Issue 0048 — same passthrough policy as ``complete``.
-        messages = _normalise_validator_role(messages, allow_arbitrary_roles=True)
+        # Issue 0048 — same fold policy as ``complete``.
+        messages = _normalise_validator_role(messages, allow_arbitrary_roles=False)
+        _assert_standard_roles(messages)
         kwargs: dict[str, Any] = {
             "model": self._settings.LLM_MODEL,
             "messages": messages,
