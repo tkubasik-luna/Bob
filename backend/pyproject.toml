@@ -20,6 +20,9 @@ dependencies = [
     "numpy>=2.0",
     "torch>=2.4",
     "partial-json-parser>=0.2.1.1.post7",
+    "google-auth>=2.36",
+    "google-auth-oauthlib>=1.2",
+    "google-api-python-client>=2.150",
 ]
 
 [dependency-groups]
@@ -65,6 +68,15 @@ ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = ["partial_json_parser.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = [
+    "google.auth.*",
+    "google.oauth2.*",
+    "google_auth_oauthlib.*",
+    "googleapiclient.*",
+]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

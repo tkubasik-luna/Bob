@@ -134,6 +134,16 @@ class Settings(BaseSettings):
     KOKORO_DEFAULT_SPEED: float = 1.0
     KOKORO_HF_REPO_ID: str = "hexgrad/Kokoro-82M"
 
+    # Gmail connector (PRD 0007) — paths to the OAuth client secrets file
+    # downloaded from the user's GCP project and the cached user token
+    # persisted after the first interactive consent. Both default under
+    # ``~/.bob/gmail/`` (kept separate from ``BOB_DATA_DIR``'s SQLite store
+    # so the user can wipe the chat DB without losing their Gmail token).
+    # Environment overrides: ``GMAIL_CREDENTIALS_PATH`` and
+    # ``GMAIL_TOKEN_PATH``.
+    GMAIL_CREDENTIALS_PATH: Path = Path.home() / ".bob" / "gmail" / "credentials.json"
+    GMAIL_TOKEN_PATH: Path = Path.home() / ".bob" / "gmail" / "token.json"
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
