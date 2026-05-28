@@ -252,11 +252,22 @@ export function SphereUI() {
     // Already showing this task in the per-task overlay? It renders the result
     // itself on completion — don't also pop the standalone overlay.
     if (openTaskIdRef.current === latest.id) return;
+    // PRD 0008 / issue 0064 — when the sub-agent produced a STRUCTURED
+    // deliverable (e.g. a Mail card), `resultPayload` carries the original
+    // `{ component, props }` descriptor. Dispatch on it so the matching
+    // overlay rebuilds itself (Mail → MailOverlay) instead of wrapping the
+    // spoken result text as Markdown — the bug this fixes was the Mail card
+    // never appearing because this effect always called `setOverlayContent`.
+    // The dispatcher returns `false` for an unknown / malformed descriptor; in
+    // that case we fall through to the legacy Markdown path on `result`.
+    if (latest.resultPayload && openOverlayFromDescriptor(latest.resultPayload)) {
+      return;
+    }
     const result = latest.result;
     if (typeof result !== "string") return;
     if (!shouldOverlayResponse(result)) return;
     setOverlayContent(result);
-  }, [tasks]);
+  }, [tasks, openOverlayFromDescriptor]);
 
   const overlayOpen = overlayContent !== null || overlayMail !== null;
   return (

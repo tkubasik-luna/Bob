@@ -1,0 +1,30 @@
+-- 0009 — Add ``tasks.result_payload`` JSON column for PRD 0008 (issue 0064).
+--
+-- Background: a sub-agent ``done`` action carries TWO renderable pieces — the
+-- spoken ``result_summary`` (short prose) and the structured ``ui_payload``
+-- descriptor (``{"component": "Mail"/"Markdown", "props": {...}}``). Until now
+-- only the flattened text survived: ``_deliverable_text`` collapsed the
+-- descriptor to a markdown string and stored it in ``tasks.result`` (a plain
+-- ``TEXT`` column), so the Mail overlay could never reconstruct itself — the
+-- component discriminator and structured props were lost at persistence.
+--
+-- This migration adds ``result_payload`` to hold the FULL descriptor as
+-- JSON-text alongside the existing ``result`` text. Reads ``json.loads`` it
+-- back into a Python dict at the data layer; ``NULL`` means "no structured
+-- deliverable" (plain Markdown / summary-only tasks), which keeps every
+-- pre-0009 row valid without a back-fill UPDATE.
+--
+-- ``result`` stays the spoken / markdown text source of truth for the
+-- ``task_result`` WS string and ``show_task_result`` recall fallback; the new
+-- column is purely additive so the existing string path never regresses.
+--
+-- Idempotency: gated by the runner (``bob.db.migrations_runner``) via the
+-- ``_migrations`` bookkeeping row. SQLite ``ALTER TABLE … ADD COLUMN`` is not
+-- natively idempotent but the runner skips already-applied files.
+--
+-- Down migration (manual, documentation only):
+--   DELETE FROM _migrations WHERE filename = '0009_tasks_result_payload.sql';
+--   -- and rebuild ``tasks`` without ``result_payload`` via the standard
+--   -- sqlite CREATE/INSERT/DROP/RENAME dance. Leaving the column is free.
+
+ALTER TABLE tasks ADD COLUMN result_payload TEXT;

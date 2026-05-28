@@ -32,6 +32,7 @@ from typing import Any
 
 import pytest
 
+from bob import ws_events
 from bob.connectors.gmail.models import Attachment, EmailMessage, to_mail_props
 from bob.db.migrations_runner import apply_migrations, default_migrations_dir
 from bob.debug_log import snapshot_for_task
@@ -177,11 +178,24 @@ async def test_gmail_search_runner_e2e(monkeypatch: pytest.MonkeyPatch) -> None:
         tool_registry=build_default_subagent_registry(),
     )
 
-    await runner.run(task_id)
-    # Yield once so any queued emits flush through the ring buffer before
-    # we snapshot it.
-    for _ in range(5):
-        await asyncio.sleep(0)
+    # Capture the chat WS frames (issue 0064): the runner forwards the REAL
+    # Mail props on the ``task_result`` event to the chat socket while only a
+    # redacted copy lands in the debug ring buffer. We assert both posture
+    # ends here, so we tap the WS emitter in addition to the debug snapshot.
+    ws_frames: list[dict[str, Any]] = []
+
+    async def _capture_ws(event: dict[str, Any]) -> None:
+        ws_frames.append(event)
+
+    ws_events.set_emitter(_capture_ws)
+    try:
+        await runner.run(task_id)
+        # Yield once so any queued emits flush through the ring buffer before
+        # we snapshot it.
+        for _ in range(5):
+            await asyncio.sleep(0)
+    finally:
+        ws_events.set_emitter(None)
 
     # Collect every debug event the runner emitted for this task.
     captured_events = [event.to_dict() for event in snapshot_for_task(task_id)]
@@ -241,6 +255,53 @@ async def test_gmail_search_runner_e2e(monkeypatch: pytest.MonkeyPatch) -> None:
     # Body fields are scrubbed.
     assert mail_props["subject"] == "<redacted-for-privacy>"
     assert mail_props["bodyPreview"] == "<redacted-for-privacy>"
+
+    # 5. PRD 0008 / issue 0064 — the structured Mail descriptor SURVIVES
+    #    persistence: ``task.result_payload`` holds the full ``{component,
+    #    props}`` shape with the REAL (unredacted) subject so the recall path
+    #    (``show_task_result``) and a reconnect replay can rebuild the overlay.
+    assert task.result_payload is not None
+    assert task.result_payload["component"] == "Mail"
+    persisted_props = task.result_payload["props"]
+    assert isinstance(persisted_props, dict)
+    assert persisted_props["messageId"] == "msg-12345"
+    assert persisted_props["subject"] == "Récap réunion produit"
+    assert persisted_props == expected_props
+
+    # 6. The chat WS ``task_result`` frame carries the REAL props (the overlay
+    #    needs the subject / body to render) — this is the frame the frontend
+    #    dispatches on ``component`` to open MailOverlay.
+    ws_task_results = [f for f in ws_frames if f.get("type") == "task_result"]
+    assert ws_task_results
+    ws_result = ws_task_results[-1]
+    assert ws_result["task_id"] == task_id
+    assert "result_payload" in ws_result
+    assert ws_result["result_payload"]["component"] == "Mail"
+    ws_props = ws_result["result_payload"]["props"]
+    assert ws_props["subject"] == "Récap réunion produit"
+    assert ws_props["bodyPreview"] == expected_props["bodyPreview"]
+
+    # 7. Privacy: the SAME ``task_result`` event, as captured in the debug ring
+    #    buffer, must carry the REDACTED descriptor — the subject / bodyPreview
+    #    never reach the debug feed / JSONL sink. The chat WS (asserted above)
+    #    still got the real content; only the debug copy is scrubbed.
+    debug_task_results = [
+        ev
+        for ev in captured_events
+        if isinstance(ev.get("payload", {}).get("ws_event"), dict)
+        and ev["payload"]["ws_event"].get("type") == "task_result"
+    ]
+    assert debug_task_results
+    debug_ws_event = debug_task_results[-1]["payload"]["ws_event"]
+    assert debug_ws_event["result_payload"]["component"] == "Mail"
+    debug_props = debug_ws_event["result_payload"]["props"]
+    assert debug_props["subject"] == "<redacted-for-privacy>"
+    assert debug_props["bodyPreview"] == "<redacted-for-privacy>"
+    # Metadata still flows (needed to route / identify the mail downstream).
+    assert debug_props["messageId"] == "msg-12345"
+    # For a Mail payload the redacted ``result`` text is elided entirely
+    # (it typically embeds the subject) — matching the status_change posture.
+    assert debug_ws_event["result"] is None
 
 
 @pytest.mark.asyncio

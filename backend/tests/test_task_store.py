@@ -11,6 +11,7 @@ from bob.db.migrations_runner import apply_migrations, default_migrations_dir
 from bob.task_store import (
     TaskStore,
     TaskStoreError,
+    _decode_result_payload,
 )
 
 
@@ -104,9 +105,7 @@ def test_find_by_query_single_token_matches_title(
     pizza_id = fresh_task_store.create_task(
         title="Approfondissement Bitcoin Pizza Day", goal="story of 10k BTC"
     )
-    fresh_task_store.create_task(
-        title="Révolution française en 5 points", goal="dates clés"
-    )
+    fresh_task_store.create_task(title="Révolution française en 5 points", goal="dates clés")
 
     matches = fresh_task_store.find_by_query("pizza")
     assert [t.id for t in matches] == [pizza_id]
@@ -153,9 +152,7 @@ def test_find_by_query_prefer_state_ranks_done_first(
     fresh_task_store.update_state(done_id, "running")
     fresh_task_store.update_state(done_id, "done")
 
-    matches = fresh_task_store.find_by_query(
-        "pizza", prefer_state="done", limit=2
-    )
+    matches = fresh_task_store.find_by_query("pizza", prefer_state="done", limit=2)
     # The done row wins the rank even though the running row was inserted
     # first (created_at-ASC would otherwise put it on top).
     assert matches[0].id == done_id
@@ -307,6 +304,64 @@ def test_set_result_does_not_change_state(fresh_task_store: TaskStore) -> None:
 def test_set_result_unknown_task_raises(fresh_task_store: TaskStore) -> None:
     with pytest.raises(TaskStoreError):
         fresh_task_store.set_result("missing-id", "X")
+
+
+def test_set_result_defaults_result_payload_to_none(
+    fresh_task_store: TaskStore,
+) -> None:
+    """PRD 0008 / issue 0064 — no descriptor → ``result_payload`` stays ``None``."""
+
+    task_id = fresh_task_store.create_task(title="T", goal="g")
+    fresh_task_store.set_result(task_id, "plain markdown deliverable")
+    task = fresh_task_store.get_task(task_id)
+    assert task.result == "plain markdown deliverable"
+    assert task.result_payload is None
+
+
+def test_set_result_round_trips_structured_payload(
+    fresh_task_store: TaskStore,
+) -> None:
+    """PRD 0008 / issue 0064 — a ``{component, props}`` descriptor survives a
+    set/get round-trip as a Python dict (JSON-text column under the hood)."""
+
+    task_id = fresh_task_store.create_task(title="T", goal="g")
+    descriptor: dict[str, object] = {
+        "component": "Mail",
+        "props": {"messageId": "msg-1", "subject": "Récap réunion produit"},
+    }
+    fresh_task_store.set_result(task_id, "spoken summary", result_payload=descriptor)
+    task = fresh_task_store.get_task(task_id)
+    assert task.result == "spoken summary"
+    assert task.result_payload == descriptor
+    # list_tasks goes through the same SELECT / decode path.
+    listed = {t.id: t for t in fresh_task_store.list_tasks()}
+    assert listed[task_id].result_payload == descriptor
+
+
+def test_set_result_clears_stale_payload(fresh_task_store: TaskStore) -> None:
+    """Passing ``result_payload=None`` overwrites a previously stored descriptor
+    so a stale Mail card never lingers under a later summary-only result."""
+
+    task_id = fresh_task_store.create_task(title="T", goal="g")
+    fresh_task_store.set_result(
+        task_id,
+        "first",
+        result_payload={"component": "Mail", "props": {"messageId": "m"}},
+    )
+    assert fresh_task_store.get_task(task_id).result_payload is not None
+    fresh_task_store.set_result(task_id, "second")
+    assert fresh_task_store.get_task(task_id).result_payload is None
+
+
+def test_decode_result_payload_robustness() -> None:
+    """The decoder collapses NULL / corrupt / non-object JSON to ``None`` — the
+    descriptor is a rendering hint, never load-bearing for task execution."""
+
+    assert _decode_result_payload(None) is None
+    assert _decode_result_payload("not json {{{") is None
+    assert _decode_result_payload("[1, 2, 3]") is None  # JSON array, not object
+    assert _decode_result_payload('"a string"') is None
+    assert _decode_result_payload('{"component": "Mail"}') == {"component": "Mail"}
 
 
 def test_append_message_returns_increasing_ids(fresh_task_store: TaskStore) -> None:

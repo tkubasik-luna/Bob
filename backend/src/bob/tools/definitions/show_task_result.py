@@ -65,6 +65,22 @@ class ShowTaskResultArgs(BaseModel):
     )
 
 
+def _is_renderable_descriptor(payload: dict[str, object] | None) -> bool:
+    """True when ``payload`` is a structured ``{component, props}`` descriptor.
+
+    PRD 0008 / issue 0064. Guards the recall path so a stored descriptor
+    (Mail, Markdown, future surfaces) is re-emitted verbatim with its original
+    ``component``. ``None`` (summary-only tasks) and any malformed value fall
+    through to the legacy Markdown wrap of ``task.result``.
+    """
+
+    return (
+        isinstance(payload, dict)
+        and isinstance(payload.get("component"), str)
+        and bool(payload.get("component"))
+    )
+
+
 _DESCRIPTION = (
     "Affiche à l'écran le livrable d'une tâche déjà terminée et stockée. "
     "Utilise ce tool quand l'utilisateur veut revoir ou être ré-informé sur "
@@ -101,9 +117,7 @@ _PARAMETERS = {
 }
 
 
-async def _show_task_result_handler(
-    ctx: ToolHandlerContext, args: BaseModel
-) -> ToolHandlerOutcome:
+async def _show_task_result_handler(ctx: ToolHandlerContext, args: BaseModel) -> ToolHandlerOutcome:
     """Look up the stored deliverable and thread speech + ui to the orchestrator.
 
     Persistence mirrors ``say``: the spoken intro is appended to the
@@ -132,9 +146,7 @@ async def _show_task_result_handler(
     # Prefer ``done`` tasks first — that's the natural target for a
     # "ressort les infos" intent. A still-running task with a partial
     # progress write would be misleading to surface.
-    matches = ctx.task_store.find_by_query(
-        query, prefer_state="done", limit=1
-    )
+    matches = ctx.task_store.find_by_query(query, prefer_state="done", limit=1)
     if not matches:
         _logger.info(
             "orchestrator.show_task_result_no_match",
@@ -158,15 +170,26 @@ async def _show_task_result_handler(
             status="error",
             error_code="no_persisted_result",
             error_message=(
-                f"task {task.id} ({task.state}) matches query but has no "
-                "persisted result yet"
+                f"task {task.id} ({task.state}) matches query but has no persisted result yet"
             ),
         )
 
-    ui: dict[str, Any] = {
-        "component": "Markdown",
-        "props": {"content": task.result},
-    }
+    # PRD 0008 / issue 0064 — recall the deliverable with its ORIGINAL
+    # component. When the sub-agent produced a structured descriptor (e.g. a
+    # Mail card), it now survives in ``task.result_payload``; re-emit that
+    # verbatim so the recall path rebuilds the same overlay the live
+    # completion did (Mail → MailOverlay) instead of forcing a Markdown wrap.
+    # Tasks with no structured deliverable (plain documents / summaries) keep
+    # the Markdown wrap of the stored ``task.result`` text — unchanged.
+    ui: dict[str, Any]
+    if _is_renderable_descriptor(task.result_payload):
+        assert task.result_payload is not None  # narrowed by the guard above
+        ui = dict(task.result_payload)
+    else:
+        ui = {
+            "component": "Markdown",
+            "props": {"content": task.result},
+        }
 
     if ctx.jarvis_store is not None:
         try:

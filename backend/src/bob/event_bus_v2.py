@@ -130,6 +130,7 @@ async def emit_event(
     severity: DebugSeverity = "info",
     source: str = "bob.event_bus_v2.emit_event",
     summary: str | None = None,
+    debug_payload: WsTaskEvent | None = None,
 ) -> None:
     """Single producer for WS task events — also lands in the ring buffer.
 
@@ -146,10 +147,22 @@ async def emit_event(
     - Forwards the same payload to the registered WS emitter so the chat
       client's existing handlers (sidebar, task drawer) keep working.
 
+    Privacy (PRD 0008 / issue 0064 building on 0056): the chat WS frame may
+    carry sensitive fields the debug sinks must NOT see — e.g. a
+    ``task_result`` event now ships the REAL Mail ``result_payload`` (subject /
+    bodyPreview) so the overlay can render, but the debug ring buffer +
+    ``/ws/debug`` feed + JSONL sink may only hold redacted metadata. Pass
+    ``debug_payload`` with a scrubbed copy: it is what lands in the ring
+    buffer, while the unmodified ``payload`` is still forwarded to the chat
+    WS. When ``None`` (the default) the same ``payload`` is used for both, so
+    every existing call site is unchanged.
+
     Concurrency: the debug emit is synchronous; the WS forward is awaited
     so a slow socket can be back-pressured by the caller (matches the
     legacy :func:`bob.ws_events.emit` contract).
     """
+
+    captured_payload = debug_payload if debug_payload is not None else payload
 
     # Resolve the task id: prefer the explicit ``payload["task_id"]``
     # (orchestrator/scheduler level) over the ContextVar (sub-agent
@@ -162,13 +175,13 @@ async def emit_event(
     else:
         resolved_task_id = current_task_id.get()
 
-    effective_summary = summary or _default_summary(payload)
+    effective_summary = summary or _default_summary(captured_payload)
     emit_debug(
         category=category,
         severity=severity,
         source=source,
         summary=effective_summary,
-        payload={"ws_event": payload},
+        payload={"ws_event": captured_payload},
         # When the producer is the orchestrator/scheduler (no ContextVar
         # task), we still want the per-task overlay to pick up this
         # event. We forge the field via the explicit ``task_id`` route on

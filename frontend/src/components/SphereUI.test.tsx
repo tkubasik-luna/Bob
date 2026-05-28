@@ -338,6 +338,52 @@ describe("SphereUI — overlay auto-trigger integration", () => {
     expect(container.querySelector(".overlay-card")).not.toBeNull();
   });
 
+  test("subtask done with Mail resultPayload opens the MailOverlay (issue 0064)", () => {
+    // PRD 0008 / issue 0064 — a sub-agent that produced a STRUCTURED Mail
+    // deliverable carries it on `tasks[id].resultPayload` (alongside the
+    // spoken `result` text). The task-result effect must dispatch on the
+    // descriptor's `component` so the Mail card lands in the MailOverlay
+    // (`.surface-email`) — NOT wrap the spoken result text as Markdown
+    // (`.surface-notes`). This was the bug: the Mail overlay never appeared
+    // on a recalled / completed sub-task because the effect always called
+    // `setOverlayContent`.
+    const { container } = render(<SphereUI />);
+    expect(container.querySelector(".overlay-card")).toBeNull();
+
+    act(() => {
+      useChatStore.setState({
+        tasks: {
+          t1: {
+            ...makeDoneTask("t1", "Mail de Marie, sujet 'Q3 forecast'"),
+            resultPayload: {
+              component: "Mail",
+              props: {
+                from: {
+                  name: "Marie Lefèvre",
+                  email: "marie.lefevre@lunabee.com",
+                  role: "CFO · Lunabee",
+                },
+                receivedAt: "2026-05-28T14:22:00Z",
+                subject: "Q3 forecast — final review before Thursday",
+                bodyPreview: "Bob, can you have the deck ready by Thursday afternoon?",
+                flags: ["priority"],
+                attachments: [],
+                threadId: "thread-xyz-001",
+                messageId: "msg-xyz-001",
+                gmailWebUrl: "https://mail.google.com/mail/u/0/#inbox/thread-xyz-001",
+              },
+            },
+          },
+        },
+      });
+    });
+
+    // The Mail card surfaces; the Markdown surface must stay closed.
+    expect(container.querySelector(".overlay-card.surface-email")).not.toBeNull();
+    expect(container.querySelector(".overlay-card.surface-notes")).toBeNull();
+    expect(container.querySelector(".ov-email-name")?.textContent).toBe("Marie Lefèvre");
+  });
+
   test("dismissed task-result overlay does not reopen on same task", () => {
     const { container } = render(<SphereUI />);
 

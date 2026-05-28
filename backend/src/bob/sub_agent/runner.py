@@ -93,7 +93,7 @@ import json
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypeGuard
 
 import structlog
 
@@ -193,6 +193,28 @@ def _strip_code_fence(text: str) -> str:
     return "\n".join(lines[1:body_end]).strip()
 
 
+def _is_component_descriptor(
+    ui_payload: dict[str, Any] | str | None,
+) -> TypeGuard[dict[str, Any]]:
+    """True when ``ui_payload`` is a structured ``{component, props}`` descriptor.
+
+    PRD 0008 / issue 0064. A descriptor (e.g. ``{"component": "Mail",
+    "props": {...}}`` or ``{"component": "Markdown", "props": {...}}``) must
+    survive to the frontend STRUCTURED so the matching overlay can rebuild
+    itself — it must NOT be flattened to a markdown string by
+    :func:`_deliverable_text`. We key on the presence of a non-empty string
+    ``component`` discriminator; the props bag is validated downstream. The
+    :class:`typing.TypeGuard` return narrows ``ui_payload`` to ``dict`` for
+    the caller so the persisted descriptor stays well-typed.
+    """
+
+    return (
+        isinstance(ui_payload, dict)
+        and isinstance(ui_payload.get("component"), str)
+        and bool(ui_payload.get("component"))
+    )
+
+
 def _deliverable_text(ui_payload: dict[str, Any] | str | None) -> str | None:
     """Pull the renderable markdown deliverable out of a ``done`` ui_payload.
 
@@ -201,6 +223,15 @@ def _deliverable_text(ui_payload: dict[str, Any] | str | None) -> str | None:
     may instead carry it under a ``markdown`` / ``content`` / ``text`` key.
     Returns ``None`` when there is nothing renderable so the caller falls back
     to ``result_summary``.
+
+    PRD 0008 / issue 0064: a structured ``{component, props}`` descriptor is
+    NOT flattened here — it carries no top-level markdown key and is meant to
+    travel structured to the frontend via ``task.result_payload``. The bug
+    this fixes was a Mail descriptor being collapsed to ``None`` (and the
+    overlay therefore never rendering). The ``{"component": "Markdown",
+    "props": {"content": ...}}`` shape used by the recall path also returns
+    ``None`` here on purpose — its renderable text lives under
+    ``props.content``, not a top-level key, so the descriptor survives intact.
     """
 
     if isinstance(ui_payload, str):
@@ -1042,7 +1073,7 @@ class SubAgentRunner:
         status: SubAgentDoneStatus,
         reason_code: str,
         result_summary: str,
-        ui_payload: dict[str, Any] | None,
+        ui_payload: dict[str, Any] | str | None,
         cost: dict[str, Any],
     ) -> None:
         """Persist the terminal state + emit WS / bus events.
@@ -1068,12 +1099,24 @@ class SubAgentRunner:
             return
 
         store_state: str
+        # PRD 0008 / issue 0064 — a structured ``{component, props}`` descriptor
+        # (Mail today, more later) is carried to the frontend STRUCTURED via
+        # ``task.result_payload`` + the ``task_result`` WS event so the matching
+        # overlay rebuilds itself. It is NOT flattened to text (the bug this
+        # fixes). A plain-markdown ``ui_payload`` (exposé / report string, or a
+        # ``{markdown/content/text}`` bag) keeps the legacy text-only path —
+        # ``result_payload`` stays ``None`` so nothing changes for those tasks.
+        structured_payload: dict[str, Any] | None = (
+            ui_payload if _is_component_descriptor(ui_payload) else None
+        )
         if status in ("complete", "degraded"):
             store_state = "done"
-            # The overlay renders ``task.result`` as markdown. Prefer the
-            # full deliverable from ``ui_payload`` (the exposé / report the
-            # sub-agent produced); fall back to the short ``result_summary``
-            # for tasks with no rendered artefact.
+            # The overlay renders ``task.result`` as markdown when no structured
+            # descriptor is present. Prefer the full markdown deliverable from
+            # ``ui_payload`` (the exposé / report the sub-agent produced); fall
+            # back to the short ``result_summary`` (also the spoken text for a
+            # Mail descriptor, whose renderable content lives in
+            # ``result_payload`` instead).
             persisted_result = _deliverable_text(ui_payload) or result_summary
         else:
             store_state = "failed"
@@ -1089,7 +1132,9 @@ class SubAgentRunner:
         # string.
         try:
             if store_state == "done":
-                self._task_store.set_result(task_id, persisted_result)
+                self._task_store.set_result(
+                    task_id, persisted_result, result_payload=structured_payload
+                )
                 message_id = self._task_store.append_message(
                     task_id,
                     role="assistant",
@@ -1173,13 +1218,40 @@ class SubAgentRunner:
                 "updated_at": task.updated_at,
             }
         )
-        await ws_events.emit(
-            {
+        # PRD 0008 / issue 0064 — ship the structured deliverable descriptor
+        # alongside the spoken/markdown ``result`` text so the frontend
+        # task-result effect can dispatch on ``component`` (Mail → MailOverlay,
+        # Markdown → MarkdownOverlay) instead of always treating it as
+        # markdown. The REAL props travel here (the overlay needs the subject /
+        # body to render) — only the debug / JSONL sinks above see the redacted
+        # copy. The field is omitted entirely for summary-only / failed tasks
+        # so older frontends keep working off ``result``.
+        task_result_event: dict[str, Any] = {
+            "type": "task_result",
+            "task_id": task_id,
+            "result": persisted_result,
+        }
+        if structured_payload is not None:
+            task_result_event["result_payload"] = structured_payload
+        # The ``ws_events.emit`` shim funnels every WS frame through the
+        # unified bus, which ALSO captures it into the debug ring buffer +
+        # ``/ws/debug`` feed + JSONL sink. So the real ``result_payload`` we
+        # just attached (Mail subject / bodyPreview / snippet) would leak there
+        # unless we hand the bus a scrubbed copy. ``debug_task_result_event``
+        # redacts the descriptor's email fields and, for a Mail payload, elides
+        # the ``result`` text too (it typically embeds the subject) — matching
+        # the redaction posture the ``status_change`` debug envelope above
+        # already applies. The chat client still receives the unmodified
+        # ``task_result_event`` so the overlay renders the full message.
+        debug_task_result_event: dict[str, Any] | None = None
+        if structured_payload is not None:
+            debug_task_result_event = {
                 "type": "task_result",
                 "task_id": task_id,
-                "result": persisted_result,
+                "result": None if is_mail_payload else persisted_result,
+                "result_payload": _redact_ui_payload_for_debug(structured_payload),
             }
-        )
+        await ws_events.emit(task_result_event, debug_event=debug_task_result_event)
         await self._bus.publish(
             "task_state_changed",
             {

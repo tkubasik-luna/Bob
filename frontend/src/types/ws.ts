@@ -229,6 +229,14 @@ export type Task = {
   state: TaskState;
   needsAttention?: boolean;
   result?: string;
+  /** PRD 0008 / issue 0064 — structured deliverable descriptor the sub-agent
+   * emitted in `done.ui_payload` (e.g. a Mail card), carried alongside the
+   * `result` text. Present only for tasks with a structured deliverable;
+   * summary-only / plain-Markdown tasks render off `result` as before. The
+   * task-result effect dispatches on `result_payload.component` to rebuild
+   * the matching overlay (Mail → MailOverlay) instead of always treating the
+   * payload as Markdown. */
+  resultPayload?: ComponentDescriptor;
   createdAt: string;
   updatedAt?: string;
   /** Slice #0024 — the user has dismissed the card from the sidebar.
@@ -292,6 +300,14 @@ export type TaskResultMsg = {
   type: "task_result";
   task_id: string;
   result: string;
+  /** PRD 0008 / issue 0064 — the structured deliverable descriptor
+   * (`{ component, props }`) the sub-agent produced. Sent on the live
+   * completion event and replayed at connect time when the task persisted a
+   * structured deliverable. Omitted for summary-only / plain-Markdown tasks,
+   * so older clients keep rendering off `result`. The backend ships the REAL
+   * props here (the overlay needs subject / body to render); only the debug
+   * sinks see a redacted copy. */
+  result_payload?: ComponentDescriptor;
   replayed?: boolean;
 };
 

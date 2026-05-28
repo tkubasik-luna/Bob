@@ -77,6 +77,14 @@ class Task:
     created_at: str
     updated_at: str
     dismissed: bool
+    #: Structured deliverable descriptor persisted alongside the spoken /
+    #: markdown ``result`` text (PRD 0008 / issue 0064). Holds the full
+    #: ``{"component": ..., "props": {...}}`` shape the sub-agent emitted in
+    #: ``done.ui_payload`` so the frontend can reconstruct the matching overlay
+    #: (Mail, Markdown, future surfaces) on the completion event and on recall.
+    #: ``None`` for tasks with no structured deliverable (summary-only / cap
+    #: paths) — the ``result`` text remains the rendering source in that case.
+    result_payload: dict[str, object] | None = None
     lineage: list[str] = field(default_factory=list)
     #: Turn index at which Jarvis delivered this task's result to the user.
     #:
@@ -178,8 +186,9 @@ class TaskStore:
 
         with self._lock:
             cursor = self._conn.execute(
-                "SELECT id, title, goal, state, needs_attention, result, parent_task_id,"
-                " created_at, updated_at, dismissed, lineage, delivered_at_turn"
+                "SELECT id, title, goal, state, needs_attention, result, result_payload,"
+                " parent_task_id, created_at, updated_at, dismissed, lineage,"
+                " delivered_at_turn"
                 " FROM tasks WHERE id = ?",
                 (task_id,),
             )
@@ -204,8 +213,8 @@ class TaskStore:
         """
 
         query = (
-            "SELECT id, title, goal, state, needs_attention, result, parent_task_id,"
-            " created_at, updated_at, dismissed, lineage, delivered_at_turn"
+            "SELECT id, title, goal, state, needs_attention, result, result_payload,"
+            " parent_task_id, created_at, updated_at, dismissed, lineage, delivered_at_turn"
             " FROM tasks"
         )
         where: list[str] = []
@@ -261,15 +270,9 @@ class TaskStore:
         # escape character. Single-user desktop scope so SQL-injection is
         # not the threat model — we just want predictable matches.
         def _escape_like(token: str) -> str:
-            return (
-                token.replace("\\", "\\\\")
-                .replace("%", "\\%")
-                .replace("_", "\\_")
-            )
+            return token.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
-        where_clauses = [
-            "LOWER(title || ' ' || goal) LIKE ? ESCAPE '\\'" for _ in tokens
-        ]
+        where_clauses = ["LOWER(title || ' ' || goal) LIKE ? ESCAPE '\\'" for _ in tokens]
         where_clauses.append("dismissed = 0")
         params: list[object] = [f"%{_escape_like(t)}%" for t in tokens]
 
@@ -284,8 +287,8 @@ class TaskStore:
         order_parts.append("rowid DESC")
 
         sql = (
-            "SELECT id, title, goal, state, needs_attention, result, parent_task_id,"
-            " created_at, updated_at, dismissed, lineage, delivered_at_turn"
+            "SELECT id, title, goal, state, needs_attention, result, result_payload,"
+            " parent_task_id, created_at, updated_at, dismissed, lineage, delivered_at_turn"
             " FROM tasks"
             f" WHERE {' AND '.join(where_clauses)}"
             f" ORDER BY {', '.join(order_parts)}"
@@ -336,17 +339,35 @@ class TaskStore:
             if cursor.rowcount == 0:
                 raise TaskStoreError(f"task not found: {task_id}")
 
-    def set_result(self, task_id: str, result: str) -> None:
-        """Store a task's final result payload. Does NOT change state.
+    def set_result(
+        self,
+        task_id: str,
+        result: str,
+        *,
+        result_payload: dict[str, object] | None = None,
+    ) -> None:
+        """Store a task's final result text + optional structured descriptor.
 
-        State transitions go through :meth:`update_state` so the orchestrator
-        keeps full control over when (e.g.) ``done`` is recorded.
+        ``result`` is the spoken / markdown text (the source of truth for the
+        ``task_result`` WS string and ``show_task_result`` recall). PRD 0008 /
+        issue 0064 adds ``result_payload``: when the sub-agent emitted a
+        structured ``{"component": ..., "props": {...}}`` deliverable in
+        ``done.ui_payload`` the runner passes it here so the descriptor
+        survives to the frontend and can rebuild the matching overlay (Mail,
+        Markdown, …). Pass ``None`` (the default) for summary-only / cap
+        results — the column is cleared so a stale descriptor never lingers.
+
+        Does NOT change state — transitions go through :meth:`update_state` so
+        the orchestrator keeps full control over when (e.g.) ``done`` is
+        recorded.
         """
 
+        payload_json = json.dumps(result_payload) if result_payload is not None else None
         with self._lock, self._conn:
             cursor = self._conn.execute(
-                "UPDATE tasks SET result = ?, updated_at = datetime('now') WHERE id = ?",
-                (result, task_id),
+                "UPDATE tasks SET result = ?, result_payload = ?,"
+                " updated_at = datetime('now') WHERE id = ?",
+                (result, payload_json, task_id),
             )
             if cursor.rowcount == 0:
                 raise TaskStoreError(f"task not found: {task_id}")
@@ -479,6 +500,7 @@ def _row_to_task(row: tuple[object, ...]) -> Task:
         state,
         needs_attention,
         result,
+        result_payload_raw,
         parent_task_id,
         created_at,
         updated_at,
@@ -492,6 +514,7 @@ def _row_to_task(row: tuple[object, ...]) -> Task:
     assert isinstance(state, str)
     assert isinstance(needs_attention, int)
     assert result is None or isinstance(result, str)
+    assert result_payload_raw is None or isinstance(result_payload_raw, str)
     assert parent_task_id is None or isinstance(parent_task_id, str)
     assert isinstance(created_at, str)
     assert isinstance(updated_at, str)
@@ -499,6 +522,7 @@ def _row_to_task(row: tuple[object, ...]) -> Task:
     assert isinstance(lineage_raw, str)
     assert delivered_at_turn is None or isinstance(delivered_at_turn, int)
     lineage = _decode_lineage(lineage_raw)
+    result_payload = _decode_result_payload(result_payload_raw)
     # ``state`` is constrained by the SQL CHECK to the TaskState set — the
     # cast to the Literal alias is safe.
     return Task(
@@ -508,6 +532,7 @@ def _row_to_task(row: tuple[object, ...]) -> Task:
         state=state,  # type: ignore[arg-type]
         needs_attention=bool(needs_attention),
         result=result,
+        result_payload=result_payload,
         parent_task_id=parent_task_id,
         created_at=created_at,
         updated_at=updated_at,
@@ -533,6 +558,29 @@ def _decode_lineage(raw: str) -> list[str]:
     if not isinstance(decoded, list):
         return []
     return [item for item in decoded if isinstance(item, str)]
+
+
+def _decode_result_payload(raw: str | None) -> dict[str, object] | None:
+    """Decode the ``result_payload`` JSON-text column into a dict (or ``None``).
+
+    PRD 0008 / issue 0064. The column holds the structured deliverable
+    descriptor (``{"component": ..., "props": {...}}``) the sub-agent emitted
+    in ``done.ui_payload``. ``NULL`` (pre-0009 rows, summary-only tasks)
+    decodes to ``None`` so callers fall back to the ``result`` text. A
+    corrupted / non-object value also collapses to ``None`` — the descriptor
+    is a rendering hint, never load-bearing for the task-execution path, and
+    the spoken ``result`` string always survives independently.
+    """
+
+    if raw is None:
+        return None
+    try:
+        decoded = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(decoded, dict):
+        return None
+    return decoded
 
 
 # --- Singleton plumbing -------------------------------------------------------

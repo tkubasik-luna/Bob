@@ -104,9 +104,7 @@ async def test_show_task_result_returns_stored_markdown_ui() -> None:
     assert result.speech == "Tu m'avais demandé un focus sur le pizza day, voilà :"
     assert result.ui == {
         "component": "Markdown",
-        "props": {
-            "content": "# 🍕 Bitcoin Pizza Day\n\n10 000 BTC pour deux pizzas…"
-        },
+        "props": {"content": "# 🍕 Bitcoin Pizza Day\n\n10 000 BTC pour deux pizzas…"},
     }
     # Intro phrase landed in JarvisStore so the next user turn sees it.
     assert jarvis_store.history()[-1] == {
@@ -115,6 +113,48 @@ async def test_show_task_result_returns_stored_markdown_ui() -> None:
     }
     # Handler must NOT emit ``assistant_msg`` itself — same contract as ``say``.
     assert emitted == []
+
+
+@pytest.mark.asyncio
+async def test_show_task_result_recalls_structured_mail_descriptor() -> None:
+    """PRD 0008 / issue 0064 — when the matched task stored a structured Mail
+    descriptor, the recall path re-emits it VERBATIM (original ``component``)
+    instead of wrapping ``task.result`` as Markdown, so the Mail overlay
+    rebuilds on recall the same way it did on live completion."""
+
+    dispatcher, task_store, _jarvis_store, _emitted = _make_dispatcher()
+    task_id = task_store.create_task(title="dernier mail d'Holyana", goal="…")
+    task_store.update_state(task_id, "running")
+    task_store.update_state(task_id, "done")
+    mail_descriptor: dict[str, object] = {
+        "component": "Mail",
+        "props": {
+            "messageId": "msg-12345",
+            "subject": "Récap réunion produit",
+            "bodyPreview": "Hello Tom…",
+        },
+    }
+    # The spoken text stays in ``result``; the structured descriptor in
+    # ``result_payload`` (exactly what the runner persists for a Mail done).
+    task_store.set_result(
+        task_id,
+        "Mail de Holyana, sujet 'Récap réunion produit'",
+        result_payload=mail_descriptor,
+    )
+
+    result = await dispatcher.dispatch(
+        ToolCall(
+            id="call_mail_recall",
+            name="show_task_result",
+            arguments={"speech": "Tu m'avais demandé le mail d'Holyana :", "query": "Holyana"},
+        )
+    )
+
+    assert result.outcome == "ok"
+    # Re-emitted with the ORIGINAL Mail component + full props — NOT a Markdown
+    # wrap of the spoken result text.
+    assert result.ui == mail_descriptor
+    assert result.ui is not mail_descriptor  # defensive copy, not the stored ref
 
 
 @pytest.mark.asyncio
@@ -203,9 +243,7 @@ async def test_show_task_result_strips_whitespace_around_args() -> None:
     """Whitespace around ``speech`` / ``query`` is stripped before use."""
 
     dispatcher, task_store, jarvis_store, _emitted = _make_dispatcher()
-    _seed_done_task(
-        task_store, title="Pizza Day", goal="…", result="# OK"
-    )
+    _seed_done_task(task_store, title="Pizza Day", goal="…", result="# OK")
 
     result = await dispatcher.dispatch(
         ToolCall(

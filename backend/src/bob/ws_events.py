@@ -62,7 +62,7 @@ def remove_emitter(fn: Callable[[TaskEvent], Awaitable[None]]) -> None:
     remove_ws_emitter(fn)
 
 
-async def emit(event: TaskEvent) -> None:
+async def emit(event: TaskEvent, *, debug_event: TaskEvent | None = None) -> None:
     """Route ``event`` through the unified bus (issue 0052).
 
     Every emit now lands in the debug ring buffer AND is forwarded to
@@ -70,6 +70,13 @@ async def emit(event: TaskEvent) -> None:
     subscribes to the same ring buffer via
     :func:`bob.event_bus_v2.subscribe_for_task` so no parallel path is
     required.
+
+    Pass ``debug_event`` (PRD 0008 / issue 0064) with a redacted copy when
+    the chat frame carries fields the debug sinks must not see — e.g. the
+    ``task_result`` event ships the real Mail ``result_payload`` to the
+    overlay while only a scrubbed copy lands in the ring buffer / ``/ws/debug``
+    feed / JSONL sink. Defaults to ``event`` so existing callers are
+    unchanged.
     """
 
-    await emit_event(event)
+    await emit_event(event, debug_payload=debug_event)
