@@ -8,12 +8,21 @@ No per-call ``if backend == ...`` branching survives at the call site.
 The native function-calling codec
 (:class:`bob.llm.tooling.codec.NativeToolCodec`, issue 0058) and the
 Nous-Hermes ``<tool_call>`` codec (:class:`bob.llm.tooling.hermes.HermesToolCodec`,
-issue 0061) exist today. The guided-JSON codec (issue 0060) is *declared* in
-the :data:`ToolMode` literal and in :class:`BackendCapability` so the selection
-logic can already express the preference order, but selecting it raises a clear
-:class:`CodecNotAvailableError` until that issue lands. That keeps the seam
-honest (no dead code, no silent fallback to native when guided was explicitly
-requested) while leaving an obvious extension point.
+issue 0061) exist today. ``guided_json`` is *declared* in the :data:`ToolMode`
+literal and in :class:`BackendCapability` so the selection logic can already
+express the preference order.
+
+Note the two distinct guided-JSON surfaces: issue 0060 used the backend's
+constrained-decoding (``response_format: json_schema``) to gate the *sub-agent
+control envelope* directly through :meth:`bob.llm_client.LLMClient.chat`'s
+``schema=`` argument (see
+:func:`bob.sub_agent.actions.sub_agent_action_response_schema`) — that path does
+NOT go through this codec seam. A guided-JSON *tool-calling codec* (the
+``select_codec`` return value for the Jarvis ``complete`` path) is a separate,
+not-yet-built thing; selecting it still raises a clear
+:class:`CodecNotAvailableError`. That keeps the seam honest (no dead code, no
+silent fallback to native when guided was explicitly requested) while leaving an
+obvious extension point.
 """
 
 from __future__ import annotations
@@ -59,7 +68,11 @@ class BackendCapability:
       ``message.tool_calls`` surface. The most robust path when the provider
       implements it reliably (LM Studio does).
     - ``guided_json`` — the provider can be constrained to emit a JSON object
-      matching a schema (vLLM / llama.cpp grammar). Codec lands in issue 0060.
+      matching a schema (vLLM / llama.cpp grammar; LM Studio's
+      ``response_format: json_schema``). Issue 0060 uses this to gate the
+      sub-agent control envelope via :meth:`bob.llm_client.LLMClient.chat`'s
+      ``schema=`` arg; a guided-JSON *tool-calling codec* for ``select_codec``
+      is still future work.
     - ``hermes_tags`` — the model was trained on Hermes-style
       ``<tool_call>…</tool_call>`` tags. Codec lands in issue 0061.
     """
@@ -73,13 +86,22 @@ class BackendCapability:
 #: ``JARVIS_BACKEND`` / ``SUBAGENT_BACKEND`` string. LM Studio (and any
 #: OpenAI-compatible endpoint Bob points it at) exposes reliable native
 #: function calling — that is the path :class:`bob.llm_client.LMStudioClient`
-#: drives today. The Claude CLI has NO native tool-calling on the command line
-#: and no constrained decoding; issue 0061 routes it through the Nous-Hermes
-#: ``<tool_call>`` codec (:class:`bob.llm.tooling.hermes.HermesToolCodec`), so
-#: it declares ``hermes_tags`` and ``select_codec`` returns that codec under
-#: the default ``auto`` mode.
+#: drives for Jarvis tool calls today. It ALSO supports constrained decoding via
+#: ``response_format: {"type": "json_schema", …}`` (the structured-output
+#: feature), so it declares ``guided_json`` too — issue 0060 uses that to gate
+#: the sub-agent's control envelope (see
+#: :meth:`bob.llm_client.LMStudioClient.supports_guided_json` /
+#: :func:`bob.sub_agent.actions.sub_agent_action_response_schema`). The two
+#: capabilities are independent: ``select_codec`` still prefers native function
+#: calling for the Jarvis tool-calling path under ``auto`` (guided JSON is the
+#: envelope mechanism, not a Jarvis tool-call codec). The Claude CLI has NO
+#: native tool-calling on the command line and no constrained decoding; issue
+#: 0061 routes it through the Nous-Hermes ``<tool_call>`` codec
+#: (:class:`bob.llm.tooling.hermes.HermesToolCodec`), so it declares
+#: ``hermes_tags`` and ``select_codec`` returns that codec under the default
+#: ``auto`` mode.
 _BACKEND_CAPABILITIES: dict[str, BackendCapability] = {
-    "lm_studio": BackendCapability(native_function_calling=True),
+    "lm_studio": BackendCapability(native_function_calling=True, guided_json=True),
     "claude_cli": BackendCapability(hermes_tags=True),
 }
 

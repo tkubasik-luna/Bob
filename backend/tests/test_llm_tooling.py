@@ -116,7 +116,13 @@ def test_tool_spec_round_trips_to_tool_definition() -> None:
 
 
 def test_capability_defaults_per_backend() -> None:
-    assert capability_for_backend("lm_studio") == BackendCapability(native_function_calling=True)
+    # Issue 0060 — LM Studio declares ``guided_json`` too (its
+    # ``response_format: json_schema`` constrained decode), used to gate the
+    # sub-agent envelope. Native function calling stays declared so the Jarvis
+    # tool-calling path is unchanged.
+    assert capability_for_backend("lm_studio") == BackendCapability(
+        native_function_calling=True, guided_json=True
+    )
     assert capability_for_backend("claude_cli") == BackendCapability(hermes_tags=True)
     # Unknown backend → conservative all-off default.
     assert capability_for_backend("mystery") == BackendCapability()

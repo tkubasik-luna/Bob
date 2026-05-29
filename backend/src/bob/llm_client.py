@@ -173,6 +173,25 @@ def _strip_code_fence(text: str) -> str:
 class LLMClient(ABC):
     """Abstract interface for an OpenAI-compatible chat LLM."""
 
+    def supports_guided_json(self) -> bool:
+        """Whether ``chat(schema=…)`` TOKEN-GATES the output to the schema.
+
+        PRD 0008 / issue 0060. The sub-agent runner asks this to decide whether
+        to emit its control envelope under ``response_format`` guided decoding
+        (constrained output, valid by construction) or to fall back to the
+        tolerant ``json.loads``-then-``parse_action`` path. The distinction is
+        NOT "does ``chat`` accept a ``schema`` arg" — every client does — but
+        "does passing it actually constrain the decode". :class:`LMStudioClient`
+        sets ``response_format: {"type": "json_schema", …}`` (real grammar
+        gating) and overrides this to return its declared
+        :attr:`bob.llm.tooling.BackendCapability.guided_json`.
+        :class:`ClaudeCliClient` only appends the schema to the prompt as prose
+        (no gating), so it inherits the conservative ``False`` here and stays on
+        the tolerant envelope-parse path (Hermes codec + later self-correction).
+        """
+
+        return False
+
     @abstractmethod
     async def chat(
         self,
@@ -294,10 +313,23 @@ class LMStudioClient(LLMClient):
         # LM Studio declares native function calling; ``select_codec`` returns
         # the native codec under the default ``auto`` mode. Picked ONCE here so
         # there is no per-call format branching downstream.
+        self._capability = capability_for_backend("lm_studio")
         self._tool_codec: ToolCodec = select_codec(
-            capability_for_backend("lm_studio"),
+            self._capability,
             settings.LLM_TOOL_MODE,
         )
+
+    def supports_guided_json(self) -> bool:
+        """LM Studio gates ``chat(schema=…)`` via ``response_format`` (issue 0060).
+
+        Reads the declared :class:`bob.llm.tooling.BackendCapability` (single
+        source) rather than hard-coding ``True`` so a future capability change
+        flows through. When ``True`` the sub-agent runner constrains its
+        envelope under guided decoding; :meth:`chat` turns the ``schema`` into
+        ``response_format: {"type": "json_schema", …}`` below.
+        """
+
+        return self._capability.guided_json
 
     async def chat(
         self,

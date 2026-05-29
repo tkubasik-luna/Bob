@@ -114,6 +114,7 @@ from bob.sub_agent.actions import (
     SubAgentDoneStatus,
     ToolCallAction,
     parse_action,
+    sub_agent_action_response_schema,
 )
 from bob.sub_agent.addendum_queue import AddendumEntry, AddendumQueue
 from bob.sub_agent.policy import SubAgentPolicy, default_policy
@@ -460,6 +461,16 @@ class SubAgentRunner:
         self._client = subagent_client
         self._task_store = task_store
         self._explicit_bus = event_bus
+        # PRD 0008 / issue 0060 — on a backend that token-gates guided JSON
+        # (LM Studio's ``response_format``) we constrain the control envelope
+        # to the ``SubAgentAction`` schema so a fenced / prose-wrapped /
+        # ``json.loads``-failing envelope is impossible by construction. The
+        # schema is derived ONCE from the union (single source). Non-guided
+        # backends (Claude CLI) keep ``None`` and stay on the tolerant
+        # ``_normalise_payload`` parse path unchanged.
+        self._envelope_schema: dict[str, Any] | None = (
+            sub_agent_action_response_schema() if subagent_client.supports_guided_json() else None
+        )
         self._policy = policy or default_policy()
         self._tool_registry = tool_registry or build_default_subagent_registry()
         self._tool_dispatcher = SubAgentToolDispatcher(self._tool_registry)
@@ -647,7 +658,18 @@ class SubAgentRunner:
                 messages = [*messages, *validator_feedback]
 
             try:
-                raw = await self._client.chat(messages, session_id=task_id)
+                # Issue 0060 — pass the derived envelope schema ONLY on a
+                # guided backend (``self._envelope_schema`` is ``None``
+                # otherwise). On LM Studio this becomes a ``response_format``
+                # json_schema so the reply is clean ``{"action": …}`` JSON and
+                # the ``_normalise_payload`` fence/prose tolerance below is
+                # never the failure mode; on Claude CLI ``schema`` stays unset
+                # and the path is byte-for-byte unchanged.
+                raw = await self._client.chat(
+                    messages,
+                    schema=self._envelope_schema,
+                    session_id=task_id,
+                )
             except asyncio.CancelledError:
                 # Hard-kill from the scheduler. Mark the path so the
                 # terminal ``done`` records ``hard_killed``. Then convert

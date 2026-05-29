@@ -157,6 +157,102 @@ class SubAgentActionParseError(ValueError):
         self.message = message
 
 
+#: Name carried on the ``response_format`` JSON Schema wrapper (issue 0060).
+#: LM Studio echoes it back in errors; a stable name keeps those greppable.
+SUB_AGENT_ACTION_SCHEMA_NAME = "sub_agent_action"
+
+
+def sub_agent_action_response_schema() -> dict[str, Any]:
+    """Derive the guided-decoding envelope schema from :data:`SubAgentAction`.
+
+    Issue 0060 (PRD 0008). On a backend that declares ``guided_json`` (LM
+    Studio) the sub-agent's control envelope is emitted under
+    ``response_format: {"type": "json_schema", …}`` so a fenced / prose-wrapped
+    / ``json.loads``-failing envelope is impossible *by construction*. This
+    function produces the ``json_schema`` payload — the single source of truth
+    is the EXISTING :data:`SubAgentAction` union (``ProgressAction`` /
+    ``ToolCallAction`` / ``DoneAction``); we never hand-write a second copy.
+
+    Accommodation (minimal, NOT the general flattener — that is issue 0063):
+    Pydantic's ``model_json_schema`` for the discriminated union emits a
+    top-level ``oneOf`` + ``$ref`` + ``$defs`` shape, which local /
+    OpenAI-compatible guided decoders (vLLM / llama.cpp grammars, LM Studio)
+    reject. We therefore project the union onto a single FLAT top-level object
+    whose ``action`` property is the discriminator enum (the three literals,
+    read off the models themselves) and whose remaining properties are the
+    UNION of every branch's own properties. Only ``action`` is ``required`` at
+    the envelope level so a ``progress`` reply need not satisfy ``done``'s
+    ``status`` / ``reason_code``. The strict per-branch contract (``progress``
+    requires ``thought``; ``done`` requires ``status`` + ``reason_code``; the
+    closed status enum) is still enforced AFTER decode by :func:`parse_action`
+    against the real union — guided decoding gates the shape, ``parse_action``
+    gates the branch. This keeps the union the single source: adding a field to
+    any action model flows into the envelope here without a second edit.
+
+    One field, ``done.ui_payload``, is intentionally a loose ``dict | str |
+    None`` today (typing it as a ``Deliverable`` union is issue 0065) and its
+    Pydantic schema therefore carries an ``anyOf`` — which the guided decoder
+    rejects exactly like the top-level ``oneOf``. Rather than reproduce a
+    second hand-typed copy (forbidden) or pull in the general ``anyOf``
+    collapser (issue 0063), we DROP any merged field whose own schema contains
+    an ``anyOf`` / ``oneOf`` / ``$ref`` from the envelope's typed
+    ``properties``. Because ``additionalProperties`` stays ``True`` the field
+    is still ACCEPTED on the wire (a ``done`` may still emit ``ui_payload``);
+    it is simply not constrained by the grammar — which matches its
+    loosely-typed reality. ``parse_action`` then validates it against the real
+    union post-decode. When 0065 narrows ``ui_payload`` to a flat
+    ``Deliverable`` shape it will flow back into the typed envelope here
+    automatically.
+
+    ``additionalProperties`` stays ``True`` (mirrors the per-action models,
+    which carry ``schema_version`` with a default and permissive ``args`` /
+    ``cost`` bags) so the constrained decode does not strip a field the union
+    happily accepts.
+    """
+
+    action_literals: list[str] = []
+    merged_properties: dict[str, Any] = {}
+    for model in (ProgressAction, ToolCallAction, DoneAction):
+        model_schema = model.model_json_schema()
+        properties = model_schema.get("properties", {})
+        for field_name, field_schema in properties.items():
+            if field_name == "action":
+                # Read the discriminator literal off the model itself (``const``
+                # on Pydantic v2) so the enum cannot drift from the union.
+                literal = field_schema.get("const")
+                if isinstance(literal, str) and literal not in action_literals:
+                    action_literals.append(literal)
+                continue
+            # Drop fields whose own schema would re-introduce a construct the
+            # guided decoder rejects (``done.ui_payload`` is ``anyOf`` today).
+            # ``additionalProperties: True`` still admits them on the wire;
+            # ``parse_action`` validates them strictly post-decode. This is the
+            # minimal accommodation — the general collapser is issue 0063.
+            if any(key in field_schema for key in ("anyOf", "oneOf", "$ref")):
+                continue
+            # First writer wins for shared fields (e.g. ``schema_version``);
+            # the per-branch shapes that overlap are identical by construction.
+            merged_properties.setdefault(field_name, field_schema)
+
+    envelope_schema: dict[str, Any] = {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": action_literals,
+                "description": "Discriminator: which of the three actions this is.",
+            },
+            **merged_properties,
+        },
+        "required": ["action"],
+        "additionalProperties": True,
+    }
+    return {
+        "name": SUB_AGENT_ACTION_SCHEMA_NAME,
+        "schema": envelope_schema,
+    }
+
+
 def parse_action(payload: dict[str, Any]) -> ProgressAction | ToolCallAction | DoneAction:
     """Validate a raw action dict against the v1 schema.
 
@@ -178,6 +274,7 @@ def parse_action(payload: dict[str, Any]) -> ProgressAction | ToolCallAction | D
 
 
 __all__ = [
+    "SUB_AGENT_ACTION_SCHEMA_NAME",
     "SUB_AGENT_SCHEMA_VERSION",
     "DoneAction",
     "ProgressAction",
@@ -186,4 +283,5 @@ __all__ = [
     "SubAgentDoneStatus",
     "ToolCallAction",
     "parse_action",
+    "sub_agent_action_response_schema",
 ]

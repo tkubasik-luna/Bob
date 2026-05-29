@@ -50,6 +50,10 @@ from bob.sub_agent import (
     build_default_subagent_registry,
     parse_action,
 )
+from bob.sub_agent.actions import (
+    SUB_AGENT_ACTION_SCHEMA_NAME,
+    sub_agent_action_response_schema,
+)
 from bob.sub_agent.runner import _normalise_payload
 from bob.sub_agent.tool_registry import (
     WebSearchArgs,
@@ -71,6 +75,7 @@ class _ScriptedClient(LLMClient):
         chat_values: list[str] | None = None,
         chat_exc: BaseException | None = None,
         chat_callbacks: list[Any] | None = None,
+        guided: bool = False,
     ) -> None:
         self._chat_values = list(chat_values or [])
         self._chat_exc = chat_exc
@@ -78,7 +83,14 @@ class _ScriptedClient(LLMClient):
         # corresponding chat() returns. Used to simulate cooperative
         # cancel midway through the run.
         self._chat_callbacks = list(chat_callbacks or [])
+        # Issue 0060 — when True the client advertises guided-JSON support so
+        # the runner passes the ``SubAgentAction`` schema as ``response_format``
+        # on each ``chat`` call. Mirrors :class:`bob.llm_client.LMStudioClient`.
+        self._guided = guided
         self.calls: list[dict[str, Any]] = []
+
+    def supports_guided_json(self) -> bool:
+        return self._guided
 
     async def chat(
         self,
@@ -1063,3 +1075,297 @@ def test_golden_envelope_fixture_coverage() -> None:
 
     assert _ENVELOPE_PARSES, "expected at least one parsing envelope fixture"
     assert _ENVELOPE_FAILS, "expected at least one failing envelope fixture"
+
+
+# ---------------------------------------------------------------------------
+# Guided-JSON envelope (PRD 0008 / issue 0060).
+#
+# On a backend that token-gates guided JSON (LM Studio's
+# ``response_format: json_schema``) the sub-agent's control envelope is emitted
+# under constrained decoding derived from the ``SubAgentAction`` union, so a
+# fenced / prose-wrapped / ``json.loads``-failing envelope is impossible by
+# construction. These tests assert the WIRING (the ``response_format`` payload
+# handed to the client) and the constrained-reply PARSE — a live LM Studio
+# round-trip is a manual smoke gate, not reproducible here. The non-guided
+# (Claude CLI) envelope path stays on the tolerant ``_normalise_payload`` parse
+# and is asserted unchanged (``schema`` arg never set).
+# ---------------------------------------------------------------------------
+
+
+def test_response_schema_is_flat_and_derived_from_union() -> None:
+    """The guided ``response_format`` schema is derived from ``SubAgentAction``.
+
+    Single source: the discriminator enum and every branch field come off the
+    real action models, never a hand-written second copy. Accommodation: the
+    schema must be FLAT — local / OpenAI-compatible guided decoders reject the
+    top-level ``oneOf`` + ``$ref`` + ``$defs`` Pydantic emits for the union (and
+    the ``anyOf`` on ``done.ui_payload``). We assert none of those constructs
+    survive and that only ``action`` is required at the envelope level (so a
+    ``progress`` reply need not carry ``done``'s ``status`` / ``reason_code`` —
+    ``parse_action`` enforces the per-branch contract post-decode).
+    """
+
+    response_format = sub_agent_action_response_schema()
+    assert response_format["name"] == SUB_AGENT_ACTION_SCHEMA_NAME
+
+    schema = response_format["schema"]
+    blob = json.dumps(schema)
+    # No construct the guided decoder chokes on (this is the whole point — we do
+    # NOT build the general flattener here, just keep the envelope expressible).
+    for forbidden in ("oneOf", "anyOf", "$ref", "$defs"):
+        assert forbidden not in blob, f"guided schema must not contain {forbidden}"
+
+    # Discriminator enum read off the three action models (order-independent).
+    assert set(schema["properties"]["action"]["enum"]) == {"progress", "tool_call", "done"}
+    # Only the discriminator is required at the envelope level.
+    assert schema["required"] == ["action"]
+    # Permissive bag so the constrained decode keeps fields the union accepts
+    # (``schema_version`` default, ``ui_payload`` which is dropped from the typed
+    # grammar but still admitted on the wire — typed in issue 0065).
+    assert schema["additionalProperties"] is True
+    # Every flat branch field is merged in (the loose ``anyOf`` ui_payload is the
+    # one intentionally-dropped field; it still rides through ``additionalProperties``).
+    merged = set(schema["properties"])
+    assert {
+        "action",
+        "thought",
+        "name",
+        "args",
+        "result_summary",
+        "status",
+        "reason_code",
+        "cost",
+    } <= merged
+    assert "ui_payload" not in merged
+
+
+@pytest.mark.asyncio
+async def test_guided_backend_passes_response_format_schema() -> None:
+    """Acceptance: on a guided backend ``chat()`` receives the envelope schema.
+
+    The runner asks the client ``supports_guided_json()``; when True it passes
+    the ``SubAgentAction`` schema as ``chat(schema=…)`` on EVERY iteration —
+    which :class:`bob.llm_client.LMStudioClient` turns into ``response_format:
+    {"type": "json_schema", …}`` (constrained decode). Here we drive a
+    ``progress`` then ``done`` so two calls are made and assert BOTH carry the
+    schema (the constraint is per-call, not first-call-only).
+    """
+
+    store = _make_store()
+    task_id = _make_running_task(store)
+
+    client = _ScriptedClient(
+        chat_values=[_progress_payload("thinking"), _done_v2_payload(result_summary="ok")],
+        guided=True,
+    )
+    runner = SubAgentRunner(
+        subagent_client=client,
+        task_store=store,
+        event_bus=EventBus(),
+        policy=SubAgentPolicy(),
+        clock=_ControllableClock(),
+    )
+
+    await runner.run(task_id)
+
+    assert len(client.calls) == 2
+    expected = sub_agent_action_response_schema()
+    for call in client.calls:
+        assert call["schema"] == expected
+        # The exact payload that becomes ``response_format.json_schema`` on
+        # LM Studio carries the stable name + the flat envelope schema.
+        assert call["schema"]["name"] == SUB_AGENT_ACTION_SCHEMA_NAME
+
+    task = store.get_task(task_id)
+    assert task.state == "done"
+
+
+@pytest.mark.asyncio
+async def test_non_guided_backend_omits_response_format_schema() -> None:
+    """Acceptance: Claude CLI (non-guided) envelope path is unchanged.
+
+    A client that does not declare ``supports_guided_json`` must receive
+    ``schema=None`` so its behaviour is byte-for-byte the pre-0060 path (the CLI
+    only appends a schema to the prompt as prose anyway — no token gating — so it
+    stays on the tolerant ``_normalise_payload`` parse). This is the guard that
+    0060 is ADDITIVE and does not leak guided decoding onto non-guided backends.
+    """
+
+    store = _make_store()
+    task_id = _make_running_task(store)
+
+    client = _ScriptedClient(
+        chat_values=[_done_v2_payload(result_summary="ok")],
+        guided=False,
+    )
+    assert client.supports_guided_json() is False
+    runner = SubAgentRunner(
+        subagent_client=client,
+        task_store=store,
+        event_bus=EventBus(),
+        policy=SubAgentPolicy(),
+        clock=_ControllableClock(),
+    )
+
+    await runner.run(task_id)
+
+    assert len(client.calls) == 1
+    assert client.calls[0]["schema"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reply", "expected_state"),
+    [
+        # ``done`` — terminal, lands the task.
+        (
+            json.dumps(
+                {
+                    "action": "done",
+                    "result_summary": "all good",
+                    "ui_payload": None,
+                    "status": "complete",
+                    "reason_code": "ok",
+                    "cost": {},
+                }
+            ),
+            "done",
+        ),
+    ],
+)
+async def test_guided_clean_reply_parses_done(reply: str, expected_state: str) -> None:
+    """A constrained (clean-JSON) ``done`` reply parses + terminates the run.
+
+    Under guided decoding the reply is always a clean ``{"action": …}`` object,
+    so ``_normalise_payload`` → ``parse_action`` succeeds trivially. This is the
+    happy path the live LM Studio smoke exercises.
+    """
+
+    store = _make_store()
+    task_id = _make_running_task(store)
+
+    client = _ScriptedClient(chat_values=[reply], guided=True)
+    runner = SubAgentRunner(
+        subagent_client=client,
+        task_store=store,
+        event_bus=EventBus(),
+        policy=SubAgentPolicy(),
+        clock=_ControllableClock(),
+    )
+
+    await runner.run(task_id)
+
+    assert store.get_task(task_id).state == expected_state
+
+
+@pytest.mark.asyncio
+async def test_guided_progress_then_tool_call_then_done_all_parse() -> None:
+    """``progress`` / ``tool_call`` / ``done`` all parse on the guided path.
+
+    Exercises every envelope branch as a clean constrained reply through a full
+    run (with a stub tool so the ``tool_call`` dispatches), proving the guided
+    wiring carries the schema AND the three actions round-trip without touching
+    the fence/prose tolerance.
+    """
+
+    store = _make_store()
+    task_id = _make_running_task(store)
+
+    from pydantic import BaseModel
+
+    class _NoopArgs(BaseModel):
+        value: str
+
+    async def _handler(_ctx: Any, args: BaseModel) -> SubAgentToolHandlerOutcome:
+        assert isinstance(args, _NoopArgs)
+        return SubAgentToolHandlerOutcome(status="ok", result={"echo": args.value})
+
+    registry = SubAgentToolRegistry(
+        [
+            SubAgentToolDefinition(
+                name="noop",
+                version="v1",
+                description="stub",
+                args_model=_NoopArgs,
+                handler=_handler,
+            )
+        ]
+    )
+
+    client = _ScriptedClient(
+        chat_values=[
+            json.dumps({"action": "progress", "thought": "step 1"}),
+            json.dumps({"action": "tool_call", "name": "noop", "args": {"value": "hi"}}),
+            _done_v2_payload(result_summary="done"),
+        ],
+        guided=True,
+    )
+    runner = SubAgentRunner(
+        subagent_client=client,
+        task_store=store,
+        event_bus=EventBus(),
+        policy=SubAgentPolicy(),
+        tool_registry=registry,
+        clock=_ControllableClock(),
+    )
+
+    await runner.run(task_id)
+
+    task = store.get_task(task_id)
+    assert task.state == "done"
+    # All three calls carried the guided schema (per-call constraint).
+    assert len(client.calls) == 3
+    assert all(call["schema"] is not None for call in client.calls)
+    # The tool_call dispatched (its result round-tripped into the task log).
+    tool_msgs = [m for m in store.get_task_messages(task_id) if m.role == "tool"]
+    assert len(tool_msgs) == 1
+    assert "noop" in tool_msgs[0].content
+
+
+@pytest.mark.asyncio
+async def test_guided_path_avoids_fenced_envelope_failure_mode() -> None:
+    """The production failure (fenced ``progress`` → ``llm_failed``) is unreachable.
+
+    Regression for ``backend/logs/orchestration.jsonl`` (2026-05-28): a local
+    model emitted a markdown-fenced envelope, ``json.loads`` choked and the task
+    died ``llm_failed``. We reproduce the SHAPE of that win: the non-guided path
+    still FAILS on a fenced-with-trailing-prose envelope (the tolerant strip
+    can't save it), but the guided path never sees that shape — under constrained
+    decode the reply is clean JSON. We assert the contrast directly: the same
+    runner construction yields a parse failure off the raw fenced string via the
+    non-guided normaliser, while the guided run with a clean reply succeeds.
+    """
+
+    # The fenced-with-trailing-prose shape that defeats the non-guided strip
+    # (locked by the 0057 path-3 ``envelope/fenced-trailing-prose`` fixture).
+    fenced_with_prose = (
+        "```json\n" + json.dumps({"action": "progress", "thought": "x"}) + "\n```\nDone thinking."
+    )
+    # Non-guided normaliser still raises on it (unchanged fallback behaviour).
+    with pytest.raises(SubAgentActionParseError):
+        _normalise_payload(fenced_with_prose)
+
+    # Guided backend: the model is constrained, so the reply is clean JSON and
+    # the run completes — the fenced failure mode is simply not produced.
+    store = _make_store()
+    task_id = _make_running_task(store)
+    client = _ScriptedClient(
+        chat_values=[
+            json.dumps({"action": "progress", "thought": "x"}),
+            _done_v2_payload(result_summary="ok"),
+        ],
+        guided=True,
+    )
+    runner = SubAgentRunner(
+        subagent_client=client,
+        task_store=store,
+        event_bus=EventBus(),
+        policy=SubAgentPolicy(),
+        clock=_ControllableClock(),
+    )
+
+    await runner.run(task_id)
+
+    task = store.get_task(task_id)
+    # Completed cleanly — NOT the ``failed`` / ``llm_failed`` the bug produced.
+    assert task.state == "done"
