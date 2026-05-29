@@ -127,6 +127,7 @@ from bob.sub_agent.tool_registry import (
     build_default_subagent_registry,
 )
 from bob.task_store import Task, TaskStore, TaskStoreError
+from bob.ui_registry import ComponentDescriptor, validate_component_descriptor
 from bob.validation import (
     SUB_AGENT_DEFAULT_POLICY,
     CallEnvelope,
@@ -248,6 +249,26 @@ def _deliverable_text(ui_payload: dict[str, Any] | str | None) -> str | None:
             if isinstance(value, str) and value.strip():
                 return value.strip()
     return None
+
+
+def _validate_deliverable(ui_payload: ComponentDescriptor | str | None) -> str | None:
+    """Validate a ``done`` deliverable against the ``ui_registry`` schema.
+
+    PRD 0008 / issue 0065. A markdown-string deliverable (or ``None``) is
+    always valid — there is no structured contract to satisfy. A structured
+    :class:`bob.ui_registry.ComponentDescriptor` has its props validated
+    against the SINGLE ``ui_registry`` component schema — the same one the
+    ``say`` tool uses, so the deliverable and ``say`` UI can never drift.
+    Returns ``None`` when valid, else a single-line error string suitable for
+    ``system_validator`` self-correction feedback — mirroring the
+    ``tool_call.args`` seam so an invalid deliverable is corrected, never
+    silently dropped.
+    """
+
+    if not isinstance(ui_payload, ComponentDescriptor):
+        return None
+    errors = validate_component_descriptor(ui_payload.model_dump())
+    return "; ".join(errors) if errors else None
 
 
 # Issue 0056 — privacy redaction for the Mail ``ui_payload`` in debug events.
@@ -820,6 +841,47 @@ class SubAgentRunner:
             action = normalised.action
 
             if isinstance(action, DoneAction):
+                # Issue 0065 — validate the deliverable (the envelope's OUTPUT
+                # half) before finalising. A structured ComponentDescriptor
+                # whose props violate the single ui_registry schema is the
+                # model's mistake, not a result: route the correction under the
+                # ``system_validator`` role (NEVER ``tool`` — prompt-injection
+                # safety, PRD 0006), bounded by the same envelope retry budget
+                # as a parse failure. On exhaustion the shared handler forces a
+                # terminal done(failed, invalid_output) — never a silent drop.
+                deliverable_error = _validate_deliverable(action.ui_payload)
+                if deliverable_error is not None:
+                    policy = SUB_AGENT_DEFAULT_POLICY
+                    if validator_envelope.retries_used >= policy.max_retries:
+                        await self._on_validation_exhausted.on_validation_exhausted(
+                            ExhaustedContext(
+                                envelope=validator_envelope,
+                                last_error_message=deliverable_error,
+                                task_id=task_id,
+                            )
+                        )
+                        return
+                    validator_feedback.append(
+                        build_validator_message(
+                            render_feedback(
+                                error_message=(
+                                    "Ton livrable ``ui_payload`` est invalide "
+                                    f"({deliverable_error}). Ré-essaye en émettant "
+                                    "un objet {component, props} conforme au schéma "
+                                    "du composant, ou une chaîne Markdown."
+                                ),
+                                offending_raw=json.dumps(
+                                    action.ui_payload.model_dump()
+                                    if isinstance(action.ui_payload, ComponentDescriptor)
+                                    else action.ui_payload,
+                                    ensure_ascii=False,
+                                ),
+                            )
+                        )
+                    )
+                    validator_envelope.record_feedback(validator_feedback[-1]["content"])
+                    validator_envelope.increment(error_code=REASON_INVALID_OUTPUT)
+                    continue
                 await self._handle_done(task_id, action)
                 return
 
@@ -960,12 +1022,22 @@ class SubAgentRunner:
     async def _handle_done(self, task_id: str, action: DoneAction) -> None:
         """Persist a v2 ``done`` action coming from the LLM."""
 
+        # Issue 0065 — ``ui_payload`` is the typed Deliverable union. Normalise
+        # a validated ComponentDescriptor back to its plain dict form here so
+        # the persistence + transport path (0064) and the debug / redaction
+        # helpers keep operating on ``dict | str | None`` exactly as before.
+        deliverable = action.ui_payload
+        ui_payload: dict[str, Any] | str | None
+        if isinstance(deliverable, ComponentDescriptor):
+            ui_payload = deliverable.model_dump()
+        else:
+            ui_payload = deliverable
         await self._finalize_done(
             task_id,
             status=action.status,
             reason_code=action.reason_code,
             result_summary=action.result_summary,
-            ui_payload=action.ui_payload,
+            ui_payload=ui_payload,
             cost=action.cost,
         )
 

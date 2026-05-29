@@ -53,23 +53,62 @@ class UIRegistry:
 
     components: dict[str, UIComponent] = field(default_factory=dict)
 
+    def _component_schema(self, comp: UIComponent) -> dict[str, Any]:
+        """The canonical ``{component, props}`` sub-schema for one component.
+
+        Single builder reused by both :meth:`component_schemas` (the ``say``
+        tool's ``oneOf`` and the full ``{speech, ui}`` response) and
+        :meth:`validate_component_descriptor` (the sub-agent deliverable, issue
+        0065) — so the two surfaces can never drift to two Mail schemas.
+        """
+
+        return {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["component", "props"],
+            "properties": {
+                "component": {"type": "string", "const": comp.name},
+                "props": comp.props_schema,
+            },
+        }
+
     def component_schemas(self) -> list[dict[str, Any]]:
         """Return the per-component JSON sub-schemas used in the top-level ``oneOf``."""
 
-        schemas: list[dict[str, Any]] = []
-        for comp in self.components.values():
-            schemas.append(
-                {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "required": ["component", "props"],
-                    "properties": {
-                        "component": {"type": "string", "const": comp.name},
-                        "props": comp.props_schema,
-                    },
-                }
-            )
-        return schemas
+        return [self._component_schema(comp) for comp in self.components.values()]
+
+    def validate_component_descriptor(self, payload: Any) -> list[str]:
+        """Validate ONE ``{component, props}`` descriptor against the registry.
+
+        PRD 0008 / issue 0065. A sub-agent ``done.ui_payload`` may carry a
+        structured deliverable (e.g. a ``Mail`` overlay card). It must be
+        validated against the SAME per-component schema the ``say`` tool uses
+        (:meth:`_component_schema`) — never a second hand-written Mail schema —
+        so the two contracts cannot diverge. Returns a list of human-readable
+        error strings (empty == valid) so the runner can fold them into the
+        ``system_validator`` self-correction feedback.
+
+        ``format`` keywords (the ``email`` checker on ``Mail.from.email``) are
+        upgraded to hard constraints via :class:`FormatChecker`, matching
+        :meth:`validate_response`.
+        """
+
+        if not isinstance(payload, dict):
+            return [f"<root>: descriptor must be an object, got {type(payload).__name__}"]
+        name = payload.get("component")
+        comp = self.components.get(name) if isinstance(name, str) else None
+        if comp is None:
+            known = ", ".join(sorted(self.components)) or "<none>"
+            return [f"component: unknown component {name!r} (known: {known})"]
+        validator = Draft202012Validator(
+            self._component_schema(comp), format_checker=FormatChecker()
+        )
+        errors: list[ValidationError] = sorted(
+            validator.iter_errors(payload), key=lambda e: list(e.path)
+        )
+        return [
+            f"{'/'.join(str(p) for p in err.path) or '<root>'}: {err.message}" for err in errors
+        ]
 
     def response_schema(self) -> dict[str, Any]:
         """Build the JSON Schema for the full LLM response.
@@ -349,3 +388,13 @@ def validate_response(payload: dict[str, Any]) -> ParsedResponse:
     """Validate ``payload`` using the default registry."""
 
     return _DEFAULT_REGISTRY.validate_response(payload)
+
+
+def validate_component_descriptor(payload: Any) -> list[str]:
+    """Validate a single ``{component, props}`` descriptor with the default registry.
+
+    Issue 0065 — the sub-agent deliverable validation seam. Returns a list of
+    error strings (empty == valid).
+    """
+
+    return _DEFAULT_REGISTRY.validate_component_descriptor(payload)

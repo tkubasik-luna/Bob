@@ -281,3 +281,64 @@ def test_validate_response_rejects_mail_attachment_missing_size() -> None:
     }
     with pytest.raises(ResponseSchemaError):
         ui_registry.validate_response(payload)
+
+
+# ── validate_component_descriptor (issue 0065) ───────────────────────────────
+
+
+def test_validate_component_descriptor_accepts_valid_mail() -> None:
+    """A descriptor whose props satisfy the Mail schema is valid (empty errors).
+
+    This is the sub-agent ``done.ui_payload`` validation seam. It reuses the
+    SAME per-component schema the ``say`` tool's ``oneOf`` is built from, so a
+    Mail card accepted here is byte-for-byte the contract accepted by
+    :func:`validate_response`."""
+
+    errors = ui_registry.validate_component_descriptor(
+        {"component": "Mail", "props": _mail_fixture()}
+    )
+    assert errors == []
+
+
+def test_validate_component_descriptor_accepts_valid_markdown() -> None:
+    errors = ui_registry.validate_component_descriptor(
+        {"component": "Markdown", "props": {"content": "# Hi"}}
+    )
+    assert errors == []
+
+
+def test_validate_component_descriptor_rejects_invalid_props() -> None:
+    """A Mail descriptor missing a required prop yields a non-empty error list —
+    the runner folds these strings into ``system_validator`` self-correction."""
+
+    props = _mail_fixture()
+    del props["from"]
+    errors = ui_registry.validate_component_descriptor({"component": "Mail", "props": props})
+    assert errors
+    assert any("from" in e for e in errors)
+
+
+def test_validate_component_descriptor_rejects_bad_email_format() -> None:
+    """``format: email`` is enforced via ``FormatChecker`` — same as
+    :func:`validate_response` — so a malformed address is a hard error here too."""
+
+    props = _mail_fixture()
+    assert isinstance(props["from"], dict)
+    props["from"]["email"] = "not-an-email"
+    errors = ui_registry.validate_component_descriptor({"component": "Mail", "props": props})
+    assert errors
+
+
+def test_validate_component_descriptor_rejects_unknown_component() -> None:
+    errors = ui_registry.validate_component_descriptor({"component": "NotAComponent", "props": {}})
+    assert errors
+    assert any("unknown component" in e for e in errors)
+
+
+@pytest.mark.parametrize("payload", [None, "oops", 42, [], {"props": {"content": "x"}}])
+def test_validate_component_descriptor_rejects_bad_shapes(payload: object) -> None:
+    """A non-dict, or a dict without a ``component`` string, is rejected outright
+    rather than raising — the runner expects a list of error strings."""
+
+    errors = ui_registry.validate_component_descriptor(payload)
+    assert errors

@@ -36,9 +36,27 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field, ValidationError
 
+from bob.ui_registry import ComponentDescriptor
+
 #: Current schema version. Every action carries this on the wire so we
 #: can later route v1 vs v2 parsers without ambiguity. Bumped in PR.
-SUB_AGENT_SCHEMA_VERSION = 1
+#: v2 (issue 0065): ``done.ui_payload`` is now the typed :data:`Deliverable`
+#: union (markdown string or validated ``ComponentDescriptor``).
+SUB_AGENT_SCHEMA_VERSION = 2
+
+
+#: A document-class deliverable: the finished artefact as a plain markdown
+#: string (the shape the model naturally emits for an exposé / report /
+#: chronology). Kept as a bare ``str`` so the model is never forced into a
+#: wrapper object for what is conceptually just text.
+MarkdownDeliverable = str
+
+#: The validated output half of the sub-agent envelope (issue 0065). Either a
+#: :data:`MarkdownDeliverable` (markdown string) or a structured
+#: :class:`bob.ui_registry.ComponentDescriptor` (``{component, props}``) whose
+#: props are validated against the SINGLE ``ui_registry`` component schema by
+#: the runner — the same schema the ``say`` tool uses, so the two never drift.
+Deliverable = ComponentDescriptor | MarkdownDeliverable
 
 
 #: Closed set of terminal statuses the sub-agent can report on ``done``.
@@ -94,13 +112,16 @@ class DoneAction(BaseModel):
 
     - ``result_summary``: short prose, surfaced to Jarvis in the
       ``task_completed`` ContextEntry (0046 already wires this).
-    - ``ui_payload``: the deliverable surfaced in the markdown overlay.
-      A markdown string for document-class tasks (exposé, report,
-      chronology) or a free-form dict for structured payloads. ``None``
-      when the task has no rendered deliverable. Accepting a bare string
-      matches what the model naturally emits for a finished document —
-      forcing a dict here caused the envelope to fail validation and the
-      raw JSON to leak into the overlay.
+    - ``ui_payload``: the deliverable surfaced in the overlay, typed as the
+      :data:`Deliverable` union (issue 0065). A markdown string for
+      document-class tasks (exposé, report, chronology) or a structured
+      :class:`bob.ui_registry.ComponentDescriptor` (``{component, props}``)
+      for overlay-class tasks (e.g. a ``Mail`` card). ``None`` when the task
+      has no rendered deliverable. Accepting a bare string matches what the
+      model naturally emits for a finished document. A descriptor's props are
+      validated against the single ``ui_registry`` component schema by the
+      runner; an invalid descriptor is routed through the P5 self-correction
+      loop (NOT silently dropped).
     - ``status``: see :data:`SubAgentDoneStatus`.
     - ``reason_code``: short code drawn from the :mod:`bob.sub_agent.reason_codes`
       registry. Codes used at this slice are intentionally minimal —
@@ -115,7 +136,7 @@ class DoneAction(BaseModel):
 
     action: Literal["done"]
     result_summary: str = Field(default="")
-    ui_payload: dict[str, Any] | str | None = Field(default=None)
+    ui_payload: Deliverable | None = Field(default=None)
     status: SubAgentDoneStatus
     reason_code: str = Field(..., min_length=1)
     cost: dict[str, Any] = Field(default_factory=dict)
@@ -189,20 +210,21 @@ def sub_agent_action_response_schema() -> dict[str, Any]:
     gates the branch. This keeps the union the single source: adding a field to
     any action model flows into the envelope here without a second edit.
 
-    One field, ``done.ui_payload``, is intentionally a loose ``dict | str |
-    None`` today (typing it as a ``Deliverable`` union is issue 0065) and its
-    Pydantic schema therefore carries an ``anyOf`` — which the guided decoder
-    rejects exactly like the top-level ``oneOf``. Rather than reproduce a
-    second hand-typed copy (forbidden) or pull in the general ``anyOf``
-    collapser (issue 0063), we DROP any merged field whose own schema contains
-    an ``anyOf`` / ``oneOf`` / ``$ref`` from the envelope's typed
-    ``properties``. Because ``additionalProperties`` stays ``True`` the field
-    is still ACCEPTED on the wire (a ``done`` may still emit ``ui_payload``);
-    it is simply not constrained by the grammar — which matches its
-    loosely-typed reality. ``parse_action`` then validates it against the real
-    union post-decode. When 0065 narrows ``ui_payload`` to a flat
-    ``Deliverable`` shape it will flow back into the typed envelope here
-    automatically.
+    One field, ``done.ui_payload``, is the :data:`Deliverable` union (issue
+    0065: a markdown string OR a ``ComponentDescriptor``). A union is
+    inherently an ``anyOf`` (``+ $ref`` for the descriptor branch) — which the
+    guided decoder rejects exactly like the top-level ``oneOf`` — and a flat
+    single-object envelope cannot express "string OR object" for one property
+    without it. Rather than reproduce a second hand-typed copy (forbidden) or
+    narrow the union and lose the markdown-string variant, we DROP any merged
+    field whose own schema contains an ``anyOf`` / ``oneOf`` / ``$ref`` from
+    the envelope's typed ``properties``. Because ``additionalProperties`` stays
+    ``True`` the field is still ACCEPTED on the wire (a ``done`` may still emit
+    ``ui_payload``); it is simply not constrained by the grammar. The envelope
+    gates the action SHAPE; ``parse_action`` then validates ``ui_payload``
+    against the real :data:`Deliverable` union post-decode, and the runner
+    validates a descriptor's props against ``ui_registry`` — recovered and
+    self-corrected exactly like ``tool_call.args``.
 
     ``additionalProperties`` stays ``True`` (mirrors the per-action models,
     which carry ``schema_version`` with a default and permissive ``args`` /
@@ -276,7 +298,9 @@ def parse_action(payload: dict[str, Any]) -> ProgressAction | ToolCallAction | D
 __all__ = [
     "SUB_AGENT_ACTION_SCHEMA_NAME",
     "SUB_AGENT_SCHEMA_VERSION",
+    "Deliverable",
     "DoneAction",
+    "MarkdownDeliverable",
     "ProgressAction",
     "SubAgentAction",
     "SubAgentActionParseError",

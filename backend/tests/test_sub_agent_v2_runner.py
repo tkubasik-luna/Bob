@@ -62,6 +62,7 @@ from bob.sub_agent.tool_registry import (
     build_web_search_tool,
 )
 from bob.task_store import TaskStore
+from bob.ui_registry import ComponentDescriptor
 
 from .fixtures.tool_calling import ENVELOPE_FIXTURES, EnvelopeFixture
 
@@ -153,12 +154,13 @@ def _done_v2_payload(
     status: str = "complete",
     reason_code: str = "ok",
     cost: dict[str, Any] | None = None,
+    ui_payload: dict[str, Any] | str | None = None,
 ) -> str:
     return json.dumps(
         {
             "action": "done",
             "result_summary": result_summary,
-            "ui_payload": None,
+            "ui_payload": ui_payload,
             "status": status,
             "reason_code": reason_code,
             "cost": cost or {},
@@ -166,15 +168,31 @@ def _done_v2_payload(
     )
 
 
+def _valid_mail_props() -> dict[str, Any]:
+    """A Mail descriptor's props that satisfy the single ``ui_registry`` schema —
+    the shape a ``done`` deliverable carries for a mail-overlay task (issue 0065)."""
+
+    return {
+        "from": {"name": "Marie Lefèvre", "email": "marie@lunabee.com"},
+        "receivedAt": "2026-05-28T14:22:00Z",
+        "subject": "Q3 forecast",
+        "bodyPreview": "deck ready by Thursday?",
+        "threadId": "thread-001",
+        "messageId": "msg-001",
+        "gmailWebUrl": "https://mail.google.com/mail/u/0/#inbox/thread-001",
+    }
+
+
 # ---------------------------------------------------------------------------
 # Schema parsing
 # ---------------------------------------------------------------------------
 
 
-def test_schema_version_is_one() -> None:
-    """Acceptance: ``schema_version`` constant is 1."""
+def test_schema_version_is_two() -> None:
+    """Acceptance: ``schema_version`` constant is 2 (bumped in issue 0065 when
+    ``done.ui_payload`` became the typed ``Deliverable`` union)."""
 
-    assert SUB_AGENT_SCHEMA_VERSION == 1
+    assert SUB_AGENT_SCHEMA_VERSION == 2
 
 
 def test_parse_done_v2_carries_all_fields() -> None:
@@ -192,9 +210,12 @@ def test_parse_done_v2_carries_all_fields() -> None:
     assert action.status == "complete"
     assert action.reason_code == "ok"
     assert action.cost == {"tokens": 42}
-    assert action.ui_payload is not None
-    assert action.ui_payload["component"] == "Markdown"
-    assert action.schema_version == 1
+    # Issue 0065: a structured ui_payload is coerced to the typed
+    # ComponentDescriptor branch of the Deliverable union (parse_action gates
+    # the SHAPE; the runner gates the props against ui_registry).
+    assert isinstance(action.ui_payload, ComponentDescriptor)
+    assert action.ui_payload.component == "Markdown"
+    assert action.schema_version == 2
 
 
 def test_parse_progress_requires_thought() -> None:
@@ -1216,6 +1237,204 @@ async def test_validation_feedback_never_uses_tool_role() -> None:
         for m in call["messages"]:
             if m["role"] == "tool":
                 assert "invalid_args" not in m["content"]
+
+
+# ---------------------------------------------------------------------------
+# Deliverable union — typed + validated end-to-end (issue 0065)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("guided", [False, True])
+@pytest.mark.asyncio
+async def test_done_markdown_string_deliverable_finalises(guided: bool) -> None:
+    """Issue 0065: a markdown-string deliverable finalises as a text result on
+    BOTH backends (guided LM-Studio-style + non-guided Claude-CLI-style).
+
+    A bare string is the ``MarkdownDeliverable`` branch of the ``Deliverable``
+    union — the shape the model naturally emits for a document-class task. It
+    carries no structured contract, so it is always valid: it lands in
+    ``task.result`` and leaves ``task.result_payload`` empty (the legacy
+    text-only path, untouched by the typing change).
+    """
+
+    store = _make_store()
+    task_id = _make_running_task(store)
+    client = _ScriptedClient(
+        chat_values=[
+            _done_v2_payload(
+                result_summary="exposé prêt",
+                ui_payload="# Exposé\n\nLe corps du document.",
+            )
+        ],
+        guided=guided,
+    )
+    runner = SubAgentRunner(
+        subagent_client=client,
+        task_store=store,
+        event_bus=EventBus(),
+        policy=SubAgentPolicy(),
+        clock=_ControllableClock(),
+    )
+
+    await runner.run(task_id)
+
+    task = store.get_task(task_id)
+    assert task.state == "done"
+    assert task.result == "# Exposé\n\nLe corps du document."
+    # A document-class deliverable carries no structured descriptor.
+    assert task.result_payload is None
+    # No correction loop — a string deliverable is valid by construction.
+    assert len(client.calls) == 1
+    assert not any(
+        m["role"] == "system_validator" for call in client.calls for m in call["messages"]
+    )
+
+
+@pytest.mark.parametrize("guided", [False, True])
+@pytest.mark.asyncio
+async def test_done_component_descriptor_deliverable_finalises(guided: bool) -> None:
+    """Issue 0065: a valid ``{component, props}`` deliverable survives validation
+    and is carried STRUCTURED to the frontend on BOTH backends.
+
+    A descriptor whose props satisfy the single ``ui_registry`` schema is the
+    ``ComponentDescriptor`` branch of the union. The runner validates it, then
+    normalises it back to a plain dict so 0064's structured transport
+    (``task.result_payload`` + ``task_result`` WS event) carries it unflattened.
+    """
+
+    store = _make_store()
+    task_id = _make_running_task(store)
+    client = _ScriptedClient(
+        chat_values=[
+            _done_v2_payload(
+                result_summary="Mail de Marie, sujet 'Q3 forecast'.",
+                ui_payload={"component": "Mail", "props": _valid_mail_props()},
+            )
+        ],
+        guided=guided,
+    )
+    runner = SubAgentRunner(
+        subagent_client=client,
+        task_store=store,
+        event_bus=EventBus(),
+        policy=SubAgentPolicy(),
+        clock=_ControllableClock(),
+    )
+
+    await runner.run(task_id)
+
+    task = store.get_task(task_id)
+    assert task.state == "done"
+    # Structured descriptor carried via result_payload, NOT flattened to text.
+    assert task.result_payload == {"component": "Mail", "props": _valid_mail_props()}
+    # The spoken summary stays the text result (Mail props live in the payload).
+    assert task.result == "Mail de Marie, sujet 'Q3 forecast'."
+    # Valid descriptor → no correction loop.
+    assert len(client.calls) == 1
+    assert not any(
+        m["role"] == "system_validator" for call in client.calls for m in call["messages"]
+    )
+
+
+@pytest.mark.parametrize("guided", [False, True])
+@pytest.mark.asyncio
+async def test_done_invalid_descriptor_routes_under_system_validator(guided: bool) -> None:
+    """Issue 0065 acceptance: an invalid deliverable triggers the P5
+    self-correction loop, NOT a silent drop — on both backends.
+
+    The first ``done`` carries a Mail descriptor missing the required ``from``
+    field. The runner validates it against the single ``ui_registry`` schema,
+    rejects it, and feeds the correction back under the ``system_validator``
+    role (NEVER ``tool`` — PRD 0006 prompt-injection safety). The model then
+    emits a valid descriptor which finalises normally.
+    """
+
+    store = _make_store()
+    task_id = _make_running_task(store)
+    bad_props = _valid_mail_props()
+    del bad_props["from"]  # required → schema violation
+    client = _ScriptedClient(
+        chat_values=[
+            _done_v2_payload(
+                result_summary="here",
+                ui_payload={"component": "Mail", "props": bad_props},
+            ),
+            _done_v2_payload(
+                result_summary="Mail de Marie.",
+                ui_payload={"component": "Mail", "props": _valid_mail_props()},
+            ),
+        ],
+        guided=guided,
+    )
+    runner = SubAgentRunner(
+        subagent_client=client,
+        task_store=store,
+        event_bus=EventBus(),
+        policy=SubAgentPolicy(),
+        clock=_ControllableClock(),
+    )
+
+    await runner.run(task_id)
+
+    # Rejected once, corrected on the retry → exactly two LLM calls.
+    assert len(client.calls) == 2
+
+    # The correction rode the ``system_validator`` role on the retry call, and
+    # named the offending deliverable field + the escaped offending output.
+    validator_rows = [m for m in client.calls[1]["messages"] if m["role"] == "system_validator"]
+    assert len(validator_rows) == 1
+    assert "ui_payload" in validator_rows[0]["content"]
+    assert "[INVALID OUTPUT]:" in validator_rows[0]["content"]
+
+    # The invalid deliverable NEVER round-trips under the trusted ``tool`` role.
+    assert [m for m in store.get_task_messages(task_id) if m.role == "tool"] == []
+
+    # The corrected descriptor finalised the task with the structured payload.
+    task = store.get_task(task_id)
+    assert task.state == "done"
+    assert task.result_payload == {"component": "Mail", "props": _valid_mail_props()}
+
+
+@pytest.mark.asyncio
+async def test_done_invalid_descriptor_exhausts_to_forced_done() -> None:
+    """Issue 0065: a deliverable that stays invalid spends the retry budget and
+    forces an EXPLICIT ``done(failed, invalid_output)`` — never a silent drop.
+
+    Mirrors the ``tool_call.args`` exhaustion path (0062): the deliverable
+    validation rides the SAME envelope retry budget, so a second consecutive
+    invalid descriptor exhausts it and the shared handler forces a terminal
+    failure recorded as a ``system`` message.
+    """
+
+    store = _make_store()
+    task_id = _make_running_task(store)
+    bad_props = _valid_mail_props()
+    del bad_props["from"]
+    client = _ScriptedClient(
+        chat_values=[
+            _done_v2_payload(ui_payload={"component": "Mail", "props": bad_props}),
+            _done_v2_payload(ui_payload={"component": "Mail", "props": bad_props}),
+        ]
+    )
+    runner = SubAgentRunner(
+        subagent_client=client,
+        task_store=store,
+        event_bus=EventBus(),
+        policy=SubAgentPolicy(),
+        clock=_ControllableClock(),
+    )
+
+    await runner.run(task_id)
+
+    # Budget = 1 retry → exactly two calls, then forced failure.
+    assert len(client.calls) == 2
+    task = store.get_task(task_id)
+    assert task.state == "failed"
+    # The reason is recorded as a ``system`` message (failed rows keep no result).
+    system_msgs = [m for m in store.get_task_messages(task_id) if m.role == "system"]
+    assert any("invalid" in m.content.lower() for m in system_msgs)
+    # The invalid deliverable never round-tripped under the ``tool`` role.
+    assert [m for m in store.get_task_messages(task_id) if m.role == "tool"] == []
 
 
 # ---------------------------------------------------------------------------
