@@ -31,6 +31,7 @@ from bob.llm.tooling.codec import (
     ToolCodec,
 )
 from bob.llm.tooling.hermes import HermesToolCodec
+from bob.llm.tooling.schema import flatten_schema, order_specs
 from bob.llm.tooling.spec import ToolSpec
 
 __all__ = [
@@ -44,5 +45,7 @@ __all__ = [
     "ToolMode",
     "ToolSpec",
     "capability_for_backend",
+    "flatten_schema",
+    "order_specs",
     "select_codec",
 ]

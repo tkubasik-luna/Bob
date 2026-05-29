@@ -543,13 +543,15 @@ def test_default_subagent_registry_exposes_gmail_search() -> None:
 
 
 def test_subagent_tool_to_spec_derives_parameters_from_args_model() -> None:
-    """Issue 0059: ``SubAgentToolDefinition.to_spec()`` routes through ToolSpec.
+    """Issue 0059 + 0063: ``to_spec()`` derives + flattens the args schema.
 
-    The spec's ``parameters`` is the ``args_model`` JSON Schema verbatim (no
-    flattening at this slice — that is 0063) and the spec retains the model so
-    a later self-correction phase can re-validate against it. Name/description
-    pass through unchanged.
+    The spec's ``parameters`` is the ``args_model`` JSON Schema run through
+    :func:`flatten_schema` (0063) — equal to the flattened schema, NOT the raw
+    Pydantic output — and the spec retains the model so the self-correction
+    phase can re-validate against it. Name/description pass through unchanged.
     """
+
+    from bob.llm.tooling import flatten_schema
 
     definition = build_gmail_search_tool()
     spec = definition.to_spec()
@@ -557,11 +559,14 @@ def test_subagent_tool_to_spec_derives_parameters_from_args_model() -> None:
     assert spec.name == "gmail_search"
     assert spec.description == definition.description
     assert spec.args_model is GmailSearchArgs
-    # Parameters derived verbatim from the Pydantic model (0058 contract).
-    assert spec.parameters == GmailSearchArgs.model_json_schema()
+    # Parameters derived from the Pydantic model and flattened (0063 contract).
+    assert spec.parameters == flatten_schema(GmailSearchArgs.model_json_schema())
     assert spec.parameters["type"] == "object"
     # Every structured filter field is present in the derived schema.
     assert set(spec.parameters["properties"]) == set(GmailSearchArgs.model_fields)
+    # 0063: the ``Optional[...]`` fields no longer carry an ``anyOf`` — the
+    # flattener collapsed ``[{type}, {null}]`` to the single scalar branch.
+    assert all("anyOf" not in prop for prop in spec.parameters["properties"].values())
 
 
 def test_sub_agent_v2_prompt_documents_inbox_fallback() -> None:
@@ -569,20 +574,91 @@ def test_sub_agent_v2_prompt_documents_inbox_fallback() -> None:
 
     Task ``73146d06…`` ("Dernier mail reçu") looped 24 times because the LLM
     kept calling ``gmail_search`` with no filter and the validator rejected
-    every attempt with ``error_code: invalid_args``. The prompt now MUST
-    instruct the model to fall back to ``label="INBOX"`` (received) or
-    ``label="SENT"`` (sent) when the goal is generic, so a single rejected
-    call is impossible.
+    every attempt with ``error_code: invalid_args``. The recipe MUST instruct
+    the model to fall back to ``label="INBOX"`` (received) or ``label="SENT"``
+    (sent) when the goal is generic, so a single rejected call is impossible.
+
+    Issue 0063 moved the recipe out of the base prompt into the Gmail skill
+    pack — the fallback guidance lives there now (and is loaded for any
+    mail-shaped goal), so the regression assertion follows it to the pack.
     """
 
-    from bob.context.prompt_fragments import SUB_AGENT_V2_SYSTEM_PROMPT
+    from bob.context.prompt_fragments import GMAIL_SEARCH_SKILL_PACK
 
-    rendered = SUB_AGENT_V2_SYSTEM_PROMPT.render(goal="dummy")
+    rendered = GMAIL_SEARCH_SKILL_PACK.render()
     assert 'label="INBOX"' in rendered
     assert 'label="SENT"' in rendered
     # Must be framed as a fallback for the generic-goal branch, not as an
     # always-on default (the specific-filter happy path stays untouched).
     assert "Fallback" in rendered or "fallback" in rendered
+    # And the base contract no longer carries the recipe — it stays tool-agnostic.
+    from bob.context.prompt_fragments import SUB_AGENT_V2_SYSTEM_PROMPT
+
+    assert "gmail_search" not in SUB_AGENT_V2_SYSTEM_PROMPT.render(goal="dummy")
+
+
+def _make_prompt_runner(store: TaskStore) -> SubAgentRunner:
+    """A runner with an EMPTY tool registry — so the only source of recipe text
+    in the built system prompt is a loaded skill pack, never the tool catalogue.
+    ``chat()`` is never invoked, so the scripted client needs no canned values."""
+
+    runner = SubAgentRunner(
+        subagent_client=_ScriptedClient(),
+        task_store=store,
+        event_bus=EventBus(),
+        policy=SubAgentPolicy(max_iterations=1, wall_clock_seconds=999.0, token_cap=10_000),
+        clock=_ControllableClock(),
+    )
+    # Force an empty catalogue post-construction: an empty registry passed to the
+    # ctor is coerced away by ``tool_registry or build_default_subagent_registry()``
+    # (an empty registry is falsy via ``__len__``), which would re-introduce the
+    # gmail_search tool name and defeat the isolation this helper exists for.
+    runner._tool_registry = SubAgentToolRegistry()
+    return runner
+
+
+def test_build_messages_loads_gmail_skill_pack_for_mail_goal() -> None:
+    """Issue 0063: a mail-shaped goal pulls the Gmail skill pack into the system
+    prompt, so the recipe's INBOX/SENT fallback guidance is present at runtime."""
+
+    store = _make_store()
+    task_id = _make_running_task(store, goal="Trouve le dernier mail reçu de Paul")
+    runner = _make_prompt_runner(store)
+
+    messages = runner._build_messages(store.get_task(task_id), [])
+
+    assert messages[0]["role"] == "system"
+    system = messages[0]["content"]
+    assert "gmail_search" in system
+    assert 'label="INBOX"' in system
+
+
+def test_build_messages_omits_skill_pack_for_unrelated_goal() -> None:
+    """A goal with no mail trigger never pays for the Gmail recipe's tokens — the
+    base contract stays tool-agnostic (empty registry → no catalogue leak)."""
+
+    store = _make_store()
+    task_id = _make_running_task(store, goal="do the thing")  # no mail trigger
+    runner = _make_prompt_runner(store)
+
+    system = runner._build_messages(store.get_task(task_id), [])[0]["content"]
+
+    assert "gmail_search" not in system
+    assert 'label="INBOX"' not in system
+
+
+def test_select_skill_packs_matches_mail_goal_only() -> None:
+    """``select_skill_packs`` is the conditional-loading decision point: it
+    returns the Gmail pack for any mail-shaped goal and nothing otherwise."""
+
+    from bob.context.prompt_fragments import (
+        GMAIL_SEARCH_SKILL_PACK,
+        select_skill_packs,
+    )
+
+    assert select_skill_packs("Lis ma boîte mail") == [GMAIL_SEARCH_SKILL_PACK]
+    assert select_skill_packs("check my inbox please") == [GMAIL_SEARCH_SKILL_PACK]
+    assert select_skill_packs("refactor the JSON parser") == []
 
 
 def test_subagent_registry_disjoint_from_jarvis_registry() -> None:

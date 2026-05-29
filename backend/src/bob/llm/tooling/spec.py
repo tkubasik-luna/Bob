@@ -31,6 +31,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from bob.llm.tooling.schema import flatten_schema
 from bob.llm.types import ToolDefinition
 
 if TYPE_CHECKING:  # pragma: no cover — typing-only import.
@@ -69,21 +70,24 @@ class ToolSpec:
     ) -> ToolSpec:
         """Build a spec whose ``parameters`` is derived from ``args_model``.
 
-        ``parameters`` is the model's ``model_json_schema()`` verbatim — the
-        canonical derivation PRD 0008 mandates. Schema flattening (``$defs`` /
-        ``$ref`` inlining for models that choke on references) is deferred to
-        issue 0063; here we keep the Pydantic output as-is so behaviour is a
-        pure pass-through of what Pydantic already produces.
+        ``parameters`` is the model's ``model_json_schema()`` run once through
+        :func:`bob.llm.tooling.schema.flatten_schema` (issue 0063) — ``$ref`` /
+        ``$defs`` inlined, ``Optional`` / string-enum unions collapsed to flat
+        shapes, nesting capped — so the schema a picky local model or guided
+        decoder receives never carries a construct it would reject. Flattening
+        runs here, at the single point every sub-agent spec is derived, so the
+        whole tool surface is hygienic by construction. ``args_model`` is kept
+        intact for post-decode validation (the flat schema gates the wire, the
+        full model gates semantics).
 
-        This is the constructor the sub-agent registry will route through in
-        issue 0059. It is defined now so ``ToolSpec`` is provably derivable
-        from a Pydantic model.
+        This is the constructor the sub-agent registry routes through. It is
+        defined here so ``ToolSpec`` is provably derivable from a Pydantic model.
         """
 
         return cls(
             name=name,
             description=description,
-            parameters=args_model.model_json_schema(),
+            parameters=flatten_schema(args_model.model_json_schema()),
             args_model=args_model,
         )
 

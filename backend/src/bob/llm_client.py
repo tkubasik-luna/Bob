@@ -40,6 +40,7 @@ from bob.llm.tooling import (
     ToolCodec,
     ToolSpec,
     capability_for_backend,
+    order_specs,
     select_codec,
 )
 from bob.llm.types import LLMResponse, StreamChunk, ToolDefinition
@@ -511,7 +512,7 @@ class LMStudioClient(LLMClient):
         # Issue 0058 — tool advertisement is delegated to the codec. For the
         # native codec this is the OpenAI ``tools`` + ``tool_choice`` block.
         if tools:
-            specs = [ToolSpec.from_tool_definition(tool) for tool in tools]
+            specs = order_specs([ToolSpec.from_tool_definition(tool) for tool in tools])
             kwargs.update(self._tool_codec.inject(messages, specs))
 
         # Slice 0039: pair start / end debug events via a local correlation_id
@@ -733,7 +734,7 @@ class LMStudioClient(LLMClient):
         }
         # Issue 0058 — same codec injection as ``complete``.
         if tools:
-            specs = [ToolSpec.from_tool_definition(tool) for tool in tools]
+            specs = order_specs([ToolSpec.from_tool_definition(tool) for tool in tools])
             kwargs.update(self._tool_codec.inject(messages, specs))
 
         correlation_id = uuid4().hex
@@ -1272,7 +1273,7 @@ class ClaudeCliClient(LLMClient):
         # :meth:`chat` takes none.
         if tools:
             augmented: list[dict[str, Any]] = [dict(msg) for msg in messages]
-            specs = [ToolSpec.from_tool_definition(tool) for tool in tools]
+            specs = order_specs([ToolSpec.from_tool_definition(tool) for tool in tools])
             self._tool_codec.inject(augmented, specs)
         else:
             augmented = list(messages)

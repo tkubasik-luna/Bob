@@ -102,6 +102,7 @@ from bob import ws_events
 from bob.context.prompt_fragments import (
     SUB_AGENT_V2_ADDENDUM_TEMPLATE,
     SUB_AGENT_V2_SYSTEM_PROMPT,
+    select_skill_packs,
 )
 from bob.debug_log import current_task_id, emit_debug, start_task
 from bob.event_bus import EventBus, get_event_bus
@@ -419,12 +420,14 @@ def _render_tool_catalogue(registry: SubAgentToolRegistry) -> str:
 
     The schema is serialised with ``sort_keys=True`` and a fixed indent so the
     block is deterministic (stable across runs / Python dict-ordering) — the
-    0057 golden-prompt posture wants byte-stable prompts. Returns the empty
-    string for an empty registry so the caller can skip the section header.
+    0057 golden-prompt posture wants byte-stable prompts. Tools are emitted in
+    name-sorted order (issue 0063) so the prompt prefix stays byte-stable for
+    cache hits regardless of registration order. Returns the empty string for
+    an empty registry so the caller can skip the section header.
     """
 
     blocks: list[str] = []
-    for definition in registry:
+    for definition in sorted(registry, key=lambda d: d.name):
         spec = definition.to_spec()
         schema_json = json.dumps(spec.parameters, ensure_ascii=False, sort_keys=True, indent=2)
         blocks.append(
@@ -922,6 +925,11 @@ class SubAgentRunner:
 
         tool_catalogue = _render_tool_catalogue(self._tool_registry)
         system_prompt = SUB_AGENT_V2_SYSTEM_PROMPT.render(goal=task.goal)
+        # Issue 0063: append any goal-matching skill packs (the Gmail recipe
+        # today) so the base contract stays tool-agnostic and a non-matching
+        # goal never pays for an irrelevant recipe's tokens.
+        for pack in select_skill_packs(task.goal):
+            system_prompt += "\n\n" + pack.render()
         if tool_catalogue:
             system_prompt += "\n\nOutils disponibles :\n" + tool_catalogue
 

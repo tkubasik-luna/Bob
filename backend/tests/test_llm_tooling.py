@@ -21,6 +21,7 @@ data.
 
 from __future__ import annotations
 
+import copy
 from types import SimpleNamespace
 from typing import Any
 
@@ -36,6 +37,8 @@ from bob.llm.tooling import (
     ToolCodec,
     ToolSpec,
     capability_for_backend,
+    flatten_schema,
+    order_specs,
     select_codec,
 )
 from bob.llm.types import StreamChunk, ToolDefinition
@@ -73,7 +76,8 @@ def test_tool_spec_from_args_model_derives_parameters() -> None:
     assert spec.name == "sample"
     assert spec.description == "A sample tool."
     assert spec.args_model is _SampleArgs
-    # parameters is the model's JSON Schema verbatim (no flattening in 0058).
+    # 0063 flattens at derivation, but _SampleArgs is already flat (no Optional
+    # / $ref / nesting) so flattening is the identity here.
     assert spec.parameters == _SampleArgs.model_json_schema()
     assert spec.parameters["type"] == "object"
     assert set(spec.parameters["properties"]) == {"title", "count"}
@@ -603,3 +607,182 @@ def test_backend_swap_parity_plain_text_yields_no_calls() -> None:
 
     assert hermes.parse("just a sentence, no tool call") == []
     assert native.parse(SimpleNamespace(content="just a sentence", tool_calls=None)) == []
+
+
+# ---------------------------------------------------------------------------
+# Schema hygiene — flatten_schema / order_specs (issue 0063)
+# ---------------------------------------------------------------------------
+
+
+def _capture_warnings(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Swap the schema module logger for a recorder, returning the event list."""
+
+    events: list[str] = []
+    monkeypatch.setattr(
+        "bob.llm.tooling.schema._logger",
+        SimpleNamespace(warning=lambda event, **_kwargs: events.append(event)),
+    )
+    return events
+
+
+def test_flatten_schema_collapses_optional_anyof_to_single_branch() -> None:
+    """``Optional[str]`` (``anyOf: [str, null]``) collapses to the lone non-null
+    branch and carries the ``default`` / ``title`` / ``description`` siblings."""
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "note": {
+                "anyOf": [{"type": "string"}, {"type": "null"}],
+                "default": None,
+                "title": "Note",
+                "description": "An optional note.",
+            }
+        },
+    }
+
+    note = flatten_schema(schema)["properties"]["note"]
+
+    assert "anyOf" not in note
+    assert note == {
+        "type": "string",
+        "default": None,
+        "title": "Note",
+        "description": "An optional note.",
+    }
+
+
+def test_flatten_schema_inlines_ref_and_drops_defs() -> None:
+    """A ``$ref`` into ``$defs`` is inlined (sibling keys win) and the now-unused
+    ``$defs`` container is dropped."""
+
+    schema = {
+        "type": "object",
+        "properties": {"child": {"$ref": "#/$defs/Child", "description": "the child"}},
+        "$defs": {
+            "Child": {
+                "type": "object",
+                "properties": {"x": {"type": "integer"}},
+            }
+        },
+    }
+
+    flat = flatten_schema(schema)
+
+    assert "$defs" not in flat
+    child = flat["properties"]["child"]
+    assert "$ref" not in child
+    assert child["type"] == "object"
+    assert child["properties"]["x"] == {"type": "integer"}
+    assert child["description"] == "the child"
+
+
+def test_flatten_schema_collapses_string_const_union_to_enum() -> None:
+    """A union of pure string ``const`` branches becomes a flat ``str`` + ``enum``,
+    carrying the ``title`` sibling."""
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "mode": {
+                "anyOf": [
+                    {"const": "read", "type": "string"},
+                    {"const": "write", "type": "string"},
+                ],
+                "title": "Mode",
+            }
+        },
+    }
+
+    mode = flatten_schema(schema)["properties"]["mode"]
+
+    assert "anyOf" not in mode
+    assert mode == {"type": "string", "enum": ["read", "write"], "title": "Mode"}
+
+
+def test_flatten_schema_warns_and_narrows_heterogeneous_union(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A genuine ``str | int`` union cannot stay flat and complete: it is narrowed
+    to its first branch (never silently dropped) and a warning is emitted."""
+
+    events = _capture_warnings(monkeypatch)
+    schema = {
+        "type": "object",
+        "properties": {"val": {"anyOf": [{"type": "string"}, {"type": "integer"}]}},
+    }
+
+    val = flatten_schema(schema)["properties"]["val"]
+
+    assert val == {"type": "string"}  # first branch kept, not dropped to {}
+    assert "tool_schema.flatten.union_narrowed" in events
+
+
+def test_flatten_schema_caps_depth_and_warns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Nesting past ``max_depth`` is replaced with a permissive placeholder and
+    warned, rather than emitted deep enough to choke a grammar compiler."""
+
+    events = _capture_warnings(monkeypatch)
+    schema = {
+        "type": "object",
+        "properties": {
+            "a": {
+                "type": "object",
+                "properties": {
+                    "b": {
+                        "type": "object",
+                        "properties": {"c": {"type": "string"}},
+                    }
+                },
+            }
+        },
+    }
+
+    flat = flatten_schema(schema, max_depth=1)
+
+    # ``b`` sits at depth 2 > max_depth 1 → placeholder, its ``c`` child dropped.
+    assert flat["properties"]["a"]["properties"]["b"] == {"type": "object"}
+    assert "tool_schema.flatten.depth_capped" in events
+
+
+def test_flatten_schema_is_identity_on_flat_schema_and_never_mutates() -> None:
+    """An already-flat schema round-trips unchanged, the input is not mutated,
+    and flattening is idempotent."""
+
+    flat_input = {
+        "type": "object",
+        "properties": {
+            "title": {"type": "string"},
+            "count": {"type": "integer", "default": 1},
+        },
+        "required": ["title"],
+    }
+    original = copy.deepcopy(flat_input)
+
+    out = flatten_schema(flat_input)
+
+    assert out == flat_input
+    assert flat_input == original  # input untouched
+    assert flatten_schema(out) == out  # idempotent
+
+
+def test_order_specs_sorts_by_name() -> None:
+    specs = [
+        ToolSpec.from_args_model(name=name, description="", args_model=_SampleArgs)
+        for name in ("zeta", "alpha", "mike")
+    ]
+
+    assert [spec.name for spec in order_specs(specs)] == ["alpha", "mike", "zeta"]
+
+
+def test_order_specs_is_deterministic_regardless_of_input_order() -> None:
+    alpha = ToolSpec.from_args_model(name="alpha", description="", args_model=_SampleArgs)
+    mike = ToolSpec.from_args_model(name="mike", description="", args_model=_SampleArgs)
+    zeta = ToolSpec.from_args_model(name="zeta", description="", args_model=_SampleArgs)
+
+    one = [spec.name for spec in order_specs([zeta, alpha, mike])]
+    two = [spec.name for spec in order_specs([mike, zeta, alpha])]
+
+    assert one == two == ["alpha", "mike", "zeta"]
