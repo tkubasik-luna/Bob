@@ -133,6 +133,7 @@ from bob.validation import (
     OnValidationExhausted,
     SubAgentOnValidationExhausted,
     build_validator_message,
+    get_policy,
     render_feedback,
 )
 from bob.validation.reason_codes import (
@@ -796,10 +797,15 @@ class SubAgentRunner:
                 validator_envelope.increment(error_code=REASON_INVALID_OUTPUT)
                 continue
 
-            # Successful parse — drop any pending validator feedback so
-            # it doesn't bleed into the next iteration's prompt.
-            validator_feedback = []
-            validator_envelope = CallEnvelope(tool_name=None, actor="sub_agent")
+            # NOTE on the validator budget reset (issue 0048 + 0062): the
+            # buffer is dropped on a successful *outcome* (valid progress, a
+            # dispatched tool call, or a terminal done), NOT merely on a
+            # successful parse. A tool_call whose ARGS fail validation (0062)
+            # parses fine but is not a usable outcome — keeping the budget
+            # alive across those iterations is what bounds the arg-retry loop
+            # by the per-tool RetryPolicy below. Resetting here (on parse)
+            # would refresh the budget every iteration and the bound would
+            # never bite.
 
             if normalised.ask_user_question is not None:
                 # Legacy ask_user path — preserved until 0050 replaces it
@@ -816,6 +822,9 @@ class SubAgentRunner:
 
             if isinstance(action, ProgressAction):
                 iteration += 1
+                # Valid forward progress — clear any pending validator state.
+                validator_feedback = []
+                validator_envelope = CallEnvelope(tool_name=None, actor="sub_agent")
                 await self._handle_progress(task_id, action.thought)
                 continue
 
@@ -835,7 +844,52 @@ class SubAgentRunner:
                     )
                     return
                 iteration += 1
-                await self._handle_tool_call(task_id, action)
+                validation_error = await self._handle_tool_call(task_id, action)
+                if validation_error is not None:
+                    # Issue 0062 — a pre-dispatch arg-validation / unknown-tool
+                    # failure is the model's mistake, not a tool result. Route
+                    # the correction under the ``system_validator`` role (NEVER
+                    # ``tool`` — prompt-injection safety, PRD 0006), bounded by
+                    # the per-tool RetryPolicy. On exhaustion the shared
+                    # ``on_validation_exhausted`` handler forces a terminal
+                    # done(failed, invalid_output) — explicit, never a silent
+                    # drop and never an unbounded tool round-trip.
+                    policy = get_policy(action.name)
+                    if validator_envelope.retries_used >= policy.max_retries:
+                        await self._on_validation_exhausted.on_validation_exhausted(
+                            ExhaustedContext(
+                                envelope=validator_envelope,
+                                last_error_message=(
+                                    validation_error.error_message or "invalid tool arguments"
+                                ),
+                                task_id=task_id,
+                            )
+                        )
+                        return
+                    validator_feedback.append(
+                        build_validator_message(
+                            render_feedback(
+                                error_message=(
+                                    f"Ton appel à l'outil ``{action.name}`` est invalide "
+                                    f"({validation_error.error_code}): "
+                                    f"{validation_error.error_message}. Ré-essaye en émettant "
+                                    "des arguments conformes au schéma JSON de l'outil."
+                                ),
+                                offending_raw=json.dumps(
+                                    {"name": action.name, "args": action.args},
+                                    ensure_ascii=False,
+                                ),
+                            )
+                        )
+                    )
+                    validator_envelope.record_feedback(validator_feedback[-1]["content"])
+                    validator_envelope.tool_name = action.name
+                    validator_envelope.increment(error_code=validation_error.error_code)
+                    continue
+                # Valid tool call dispatched — clear any pending validator
+                # state so it does not bleed into the next iteration's prompt.
+                validator_feedback = []
+                validator_envelope = CallEnvelope(tool_name=None, actor="sub_agent")
                 continue
 
             # Defensive — the discriminated union has no other branches.
@@ -976,13 +1030,12 @@ class SubAgentRunner:
 
         Returns ``None`` when the args are valid (the caller dispatches
         normally). Returns a populated :class:`SubAgentToolDispatchResult`
-        (``error/unknown_tool`` or ``error/invalid_args``) when they are not —
-        the caller round-trips that result to the LLM as a ``tool`` message
-        without dispatching. Schema failures are funnelled through a raised
-        :class:`SubAgentToolArgsValidationError` (caught here) so the self-
-        correction loop (issue 0062) can later intercept that same exception
-        at this seam and route the message under the ``system_validator`` role
-        for a bounded retry instead of merely round-tripping it.
+        (``error/unknown_tool`` or ``error/invalid_args``) when they are not.
+        Schema failures are funnelled through a raised
+        :class:`SubAgentToolArgsValidationError` (caught here). Issue 0062 then
+        routes that structured error under the ``system_validator`` role for a
+        bounded retry (see :meth:`_run`) — NEVER as a ``tool`` message, which
+        would echo the model's own bad output back under a trusted role.
         """
 
         definition = self._tool_registry.get(action.name)
@@ -1013,20 +1066,24 @@ class SubAgentRunner:
             )
         return None
 
-    async def _handle_tool_call(self, task_id: str, action: ToolCallAction) -> None:
+    async def _handle_tool_call(
+        self, task_id: str, action: ToolCallAction
+    ) -> SubAgentToolDispatchResult | None:
         """Execute a sub-agent-side tool call and persist its outcome.
 
-        The dispatcher returns a structured result. We log the call as
-        an ``assistant`` message (the LLM's intent) and the result as a
-        ``tool`` message (the response, which round-trips into the next
-        iteration's prompt). 0048's retry policy will adjust this path
-        — today every dispatch error round-trips as a tool message so
-        the LLM can try again.
+        Returns ``None`` once a *dispatched* call's result (success or a
+        genuine runtime tool error) has been persisted as a ``tool`` message,
+        round-tripping into the next iteration's prompt exactly as before.
 
-        Issue 0059: ``action.args`` is validated against the tool's
-        ``args_model`` BEFORE dispatch (:meth:`_validate_tool_args`). Invalid
-        args (or an unknown tool) short-circuit to a structured error tool
-        message — the handler is never reached with a malformed payload.
+        Issue 0059 validated ``action.args`` against the tool's ``args_model``
+        BEFORE dispatch. Issue 0062 changes what happens on a validation
+        failure: instead of round-tripping the structured error as a ``tool``
+        message — feeding the model's own malformed output back under a role
+        it is trained to trust (a prompt-injection hazard, PRD 0006) — we
+        RETURN the :class:`SubAgentToolDispatchResult` to :meth:`_run`, which
+        injects the correction under the ``system_validator`` role bounded by
+        the per-tool :class:`RetryPolicy`. A *runtime* tool error (the handler
+        ran and failed) is a legitimate tool result and stays on ``tool``.
         """
 
         call_payload = json.dumps({"action": "tool_call", "name": action.name, "args": action.args})
@@ -1038,7 +1095,7 @@ class SubAgentRunner:
             )
         except TaskStoreError:
             _logger.exception("sub_agent_runner.persist_tool_call_failed", task_id=task_id)
-            return
+            return None
 
         # Issue 0052: emit a ``tool_invoke`` reflection BEFORE the
         # dispatch so the overlay can show "calling X..." while the
@@ -1056,24 +1113,27 @@ class SubAgentRunner:
             },
         )
 
-        # Issue 0059 — pre-dispatch schema validation. On failure we surface a
-        # structured error (no blind dispatch, no silent drop) that round-trips
-        # to the LLM exactly like a handler-reported error would.
-        result = self._validate_tool_args(action)
-        if result is not None:
+        # Issue 0059 — pre-dispatch schema validation. Issue 0062 — a failure
+        # here is the model's mistake, not a tool result: return it so the
+        # caller routes the correction under ``system_validator`` (bounded
+        # retry). No blind dispatch, no silent drop, and crucially no ``tool``
+        # message echoing the bad output back under a trusted role.
+        validation_error = self._validate_tool_args(action)
+        if validation_error is not None:
             _logger.warning(
                 "sub_agent_runner.tool_args_invalid",
                 task_id=task_id,
                 tool=action.name,
-                error_code=result.error_code,
-                error_message=result.error_message,
+                error_code=validation_error.error_code,
+                error_message=validation_error.error_message,
             )
-        else:
-            result = await self._tool_dispatcher.dispatch(
-                name=action.name,
-                arguments=action.args,
-                context=_RuntimeToolContext(task_id=task_id),
-            )
+            return validation_error
+
+        result = await self._tool_dispatcher.dispatch(
+            name=action.name,
+            arguments=action.args,
+            context=_RuntimeToolContext(task_id=task_id),
+        )
 
         body: dict[str, Any]
         if result.ok:
@@ -1092,7 +1152,7 @@ class SubAgentRunner:
             )
         except TaskStoreError:
             _logger.exception("sub_agent_runner.persist_tool_result_failed", task_id=task_id)
-            return
+            return None
 
         emit_debug(
             category="task",
@@ -1108,6 +1168,7 @@ class SubAgentRunner:
                 "kind": "tool_result",
             },
         )
+        return None
 
     async def _handle_ask_user(self, task_id: str, question: str) -> None:
         """Legacy ``ask_user`` flow preserved until 0050 replaces it."""

@@ -767,13 +767,16 @@ async def test_prompt_injects_tool_arg_schema() -> None:
 
 
 @pytest.mark.asyncio
-async def test_tool_call_invalid_args_produces_structured_error_without_dispatch() -> None:
-    """Issue 0059: args violating the schema short-circuit to a structured error.
+async def test_tool_call_invalid_args_routes_under_system_validator_not_tool() -> None:
+    """Issue 0062: invalid args feed back under ``system_validator``, not ``tool``.
 
-    The handler MUST NOT run with a malformed payload (no blind dispatch); the
-    failure round-trips to the LLM as a ``tool`` message with
-    ``error_code="invalid_args"`` (no silent drop). Here ``value`` is required
-    but omitted — pre-dispatch validation rejects it before the handler.
+    The handler MUST NOT run with a malformed payload (no blind dispatch). The
+    pre-0062 path round-tripped the structured error as a ``tool`` message —
+    echoing the model's own bad output back under a role it is trained to
+    trust. 0062 routes the correction under the ``system_validator`` role
+    instead (PRD 0006 prompt-injection safety), bounded by the per-tool
+    RetryPolicy. Here ``value`` is required but omitted; the model retries and
+    the scripted ``done`` ends the task.
     """
 
     store = _make_store()
@@ -806,9 +809,7 @@ async def test_tool_call_invalid_args_produces_structured_error_without_dispatch
         chat_values=[
             # ``value`` missing → schema violation.
             json.dumps({"action": "tool_call", "name": "strict", "args": {}}),
-            _done_v2_payload(
-                result_summary="gave up", status="failed", reason_code="invalid_output"
-            ),
+            _done_v2_payload(result_summary="ok now", status="complete", reason_code="ok"),
         ]
     )
     runner = SubAgentRunner(
@@ -825,24 +826,30 @@ async def test_tool_call_invalid_args_produces_structured_error_without_dispatch
     # Handler never saw the malformed payload.
     assert handler_calls == []
 
-    # A structured error tool-message round-tripped to the LLM (no silent drop).
+    # No ``tool`` message carries the validation error — it never round-trips
+    # under the trusted ``tool`` role (the core 0062 security change).
     tool_msgs = [m for m in store.get_task_messages(task_id) if m.role == "tool"]
-    assert len(tool_msgs) == 1
-    body = json.loads(tool_msgs[0].content)
-    assert body["tool"] == "strict"
-    assert body["status"] == "error"
-    assert body["error_code"] == "invalid_args"
-    # The message names the offending field so the model can self-correct.
-    assert "value" in body["error_message"]
+    assert tool_msgs == []
+
+    # The correction was injected under ``system_validator`` on the retry call.
+    assert len(client.calls) == 2
+    retry_messages = client.calls[1]["messages"]
+    validator_rows = [m for m in retry_messages if m["role"] == "system_validator"]
+    assert len(validator_rows) == 1
+    # Names the offending field + carries the escaped offending output.
+    assert "value" in validator_rows[0]["content"]
+    assert "invalid_args" in validator_rows[0]["content"]
+    assert "[INVALID OUTPUT]:" in validator_rows[0]["content"]
 
 
 @pytest.mark.asyncio
-async def test_tool_call_unknown_tool_produces_structured_error() -> None:
-    """Issue 0059: an unknown tool name surfaces a structured ``unknown_tool``.
+async def test_tool_call_unknown_tool_routes_under_system_validator() -> None:
+    """Issue 0062: an unknown tool name feeds back under ``system_validator``.
 
     Validation resolves the tool by name BEFORE dispatch; a name not in the
-    registry is reported as a structured error rather than reaching (or
-    crashing) the dispatch path.
+    registry is an ``unknown_tool`` mistake by the model. Like invalid args
+    (0062), the correction rides the ``system_validator`` role — never the
+    ``tool`` role — bounded by the RetryPolicy.
     """
 
     store = _make_store()
@@ -885,12 +892,16 @@ async def test_tool_call_unknown_tool_produces_structured_error() -> None:
 
     await runner.run(task_id)
 
+    # Never round-trips under the ``tool`` role.
     tool_msgs = [m for m in store.get_task_messages(task_id) if m.role == "tool"]
-    assert len(tool_msgs) == 1
-    body = json.loads(tool_msgs[0].content)
-    assert body["tool"] == "ghost"
-    assert body["status"] == "error"
-    assert body["error_code"] == "unknown_tool"
+    assert tool_msgs == []
+
+    # Correction injected under ``system_validator`` on the retry call.
+    assert len(client.calls) == 2
+    validator_rows = [m for m in client.calls[1]["messages"] if m["role"] == "system_validator"]
+    assert len(validator_rows) == 1
+    assert "unknown_tool" in validator_rows[0]["content"]
+    assert "ghost" in validator_rows[0]["content"]
 
 
 @pytest.mark.asyncio
@@ -952,6 +963,183 @@ async def test_tool_call_valid_args_reach_handler() -> None:
     body = json.loads(tool_msgs[0].content)
     assert body["status"] == "ok"
     assert body["result"] == {"echo": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Self-correction loop for tool-arg validation (issue 0062)
+# ---------------------------------------------------------------------------
+
+
+def _strict_value_registry(handler_calls: list[Any]) -> SubAgentToolRegistry:
+    """A one-tool registry whose ``strict`` tool requires a string ``value``."""
+
+    from pydantic import BaseModel
+
+    class _StrictArgs(BaseModel):
+        value: str
+
+    async def _handler(_ctx: Any, args: BaseModel) -> SubAgentToolHandlerOutcome:
+        handler_calls.append(args)
+        return SubAgentToolHandlerOutcome(status="ok", result={"echo": args.model_dump()["value"]})
+
+    return SubAgentToolRegistry(
+        [
+            SubAgentToolDefinition(
+                name="strict",
+                version="v1",
+                description="needs value",
+                args_model=_StrictArgs,
+                handler=_handler,
+            )
+        ]
+    )
+
+
+@pytest.mark.asyncio
+async def test_invalid_tool_args_recover_on_retry() -> None:
+    """Issue 0062: a bad call corrected on the retry dispatches normally.
+
+    The model emits ``strict`` with no ``value`` (rejected), gets the
+    ``system_validator`` correction, then emits a valid call which dispatches
+    to the handler. The retry budget then RESETS — proving a recovered call is
+    not penalised for the earlier mistake.
+    """
+
+    store = _make_store()
+    task_id = _make_running_task(store)
+    handler_calls: list[Any] = []
+    registry = _strict_value_registry(handler_calls)
+
+    client = _ScriptedClient(
+        chat_values=[
+            json.dumps({"action": "tool_call", "name": "strict", "args": {}}),  # invalid
+            json.dumps(
+                {"action": "tool_call", "name": "strict", "args": {"value": "ok"}}
+            ),  # corrected
+            _done_v2_payload(result_summary="done"),
+        ]
+    )
+    runner = SubAgentRunner(
+        subagent_client=client,
+        task_store=store,
+        event_bus=EventBus(),
+        policy=SubAgentPolicy(),
+        tool_registry=registry,
+        clock=_ControllableClock(),
+    )
+
+    await runner.run(task_id)
+
+    # The handler ran exactly once — with the corrected args.
+    assert len(handler_calls) == 1
+    assert handler_calls[0].model_dump()["value"] == "ok"
+
+    # Exactly one tool message — the SUCCESSFUL dispatch, not the rejection.
+    tool_msgs = [m for m in store.get_task_messages(task_id) if m.role == "tool"]
+    assert len(tool_msgs) == 1
+    assert json.loads(tool_msgs[0].content)["status"] == "ok"
+
+    # Validator feedback rode the retry (call index 1) but was dropped after
+    # the successful dispatch, so the done call (index 2) carries none.
+    assert any(m["role"] == "system_validator" for m in client.calls[1]["messages"])
+    assert not any(m["role"] == "system_validator" for m in client.calls[2]["messages"])
+
+    assert store.get_task(task_id).state == "done"
+
+
+@pytest.mark.asyncio
+async def test_invalid_tool_args_exhaust_to_forced_done() -> None:
+    """Issue 0062: repeated invalid args exhaust the budget → forced done(failed).
+
+    With the default per-tool policy (``max_retries=1``) a second consecutive
+    invalid call spends the budget. The exhaustion path is EXPLICIT — a forced
+    ``done(failed, invalid_output)`` — never a silent drop and never an
+    unbounded round-trip.
+    """
+
+    store = _make_store()
+    task_id = _make_running_task(store)
+    handler_calls: list[Any] = []
+    registry = _strict_value_registry(handler_calls)
+
+    client = _ScriptedClient(
+        chat_values=[
+            json.dumps({"action": "tool_call", "name": "strict", "args": {}}),
+            json.dumps({"action": "tool_call", "name": "strict", "args": {}}),
+        ]
+    )
+    runner = SubAgentRunner(
+        subagent_client=client,
+        task_store=store,
+        event_bus=EventBus(),
+        policy=SubAgentPolicy(),
+        tool_registry=registry,
+        clock=_ControllableClock(),
+    )
+
+    await runner.run(task_id)
+
+    # Budget = 1 retry → exactly 2 LLM calls, then forced failure.
+    assert len(client.calls) == 2
+    assert handler_calls == []
+
+    task = store.get_task(task_id)
+    assert task.state == "failed"
+    # Forced done(failed, invalid_output) records the reason as a ``system``
+    # message (failed rows keep ``task.result`` None by design).
+    system_msgs = [m for m in store.get_task_messages(task_id) if m.role == "system"]
+    assert any("invalid" in m.content.lower() for m in system_msgs)
+
+
+@pytest.mark.asyncio
+async def test_validation_feedback_never_uses_tool_role() -> None:
+    """Issue 0062 security: arg-validation feedback NEVER uses the ``tool`` role.
+
+    PRD 0006 forbids echoing the model's own malformed output back under a
+    role it is trained to trust. This locks the invariant across the whole run:
+    the only validation feedback role is ``system_validator``, and not a single
+    ``tool`` message is persisted when every call is rejected pre-dispatch. The
+    escaped ``[INVALID OUTPUT]:`` marker confirms the offending payload is
+    neutralised before re-injection.
+    """
+
+    store = _make_store()
+    task_id = _make_running_task(store)
+    handler_calls: list[Any] = []
+    registry = _strict_value_registry(handler_calls)
+
+    client = _ScriptedClient(
+        chat_values=[
+            json.dumps({"action": "tool_call", "name": "strict", "args": {}}),
+            json.dumps({"action": "tool_call", "name": "strict", "args": {}}),
+        ]
+    )
+    runner = SubAgentRunner(
+        subagent_client=client,
+        task_store=store,
+        event_bus=EventBus(),
+        policy=SubAgentPolicy(),
+        tool_registry=registry,
+        clock=_ControllableClock(),
+    )
+
+    await runner.run(task_id)
+
+    # No persisted ``tool`` message — validation errors never round-trip there.
+    assert [m for m in store.get_task_messages(task_id) if m.role == "tool"] == []
+
+    # Across every LLM call, validation feedback used ``system_validator`` only.
+    validator_rows = [
+        m for call in client.calls for m in call["messages"] if m["role"] == "system_validator"
+    ]
+    assert validator_rows  # at least one correction was injected
+    assert all("[INVALID OUTPUT]:" in row["content"] for row in validator_rows)
+    # Nothing in any injected message claims the ``tool`` role as a carrier for
+    # the rejection text.
+    for call in client.calls:
+        for m in call["messages"]:
+            if m["role"] == "tool":
+                assert "invalid_args" not in m["content"]
 
 
 # ---------------------------------------------------------------------------

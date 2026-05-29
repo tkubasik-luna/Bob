@@ -464,14 +464,16 @@ async def test_api_unreachable_handler_classifies_http_error_directly(
 async def test_validation_branch_roundtrips_invalid_args_without_crashing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """No-arg ``gmail_search()`` → ``error/invalid_args``; task does NOT crash.
+    """No-arg ``gmail_search()`` → ``system_validator`` feedback; no crash.
 
     The model occasionally calls a tool with the empty args object. Per
-    the v2 contract the dispatcher folds that into a structured error
-    message which is round-tripped to the LLM via a ``tool`` message —
-    the runner keeps looping rather than terminating the task on the
-    first validation failure. The LLM can then either retry with a
-    proper filter or emit a final ``done(failed)``.
+    the 0062 self-correction contract the arg-validation failure is fed
+    back to the LLM under the ``system_validator`` role — NEVER the
+    trusted ``tool`` role — so a malformed call cannot smuggle content in
+    as if it were a real tool result. The runner keeps looping rather
+    than terminating on the first validation failure: the LLM gets a
+    second turn and can either retry with a proper filter or surrender
+    with a final ``done(failed)``.
     """
 
     clear()
@@ -491,8 +493,8 @@ async def test_validation_branch_roundtrips_invalid_args_without_crashing(
 
     # First call: no-args (validation fails). Second call: surrender with
     # a clean done(failed). The point of the test is that the runner did
-    # NOT crash between turn 1 and turn 2 — the validation error
-    # round-tripped through a tool message and the LLM got a second turn.
+    # NOT crash between turn 1 and turn 2 — the validation error was fed
+    # back under ``system_validator`` and the LLM got a second turn.
     script = [
         json.dumps({"action": "tool_call", "name": "gmail_search", "args": {}}),
         json.dumps(
@@ -532,18 +534,24 @@ async def test_validation_branch_roundtrips_invalid_args_without_crashing(
     task = store.get_task(task_id)
     assert task.state == "failed"
 
+    # The validation error did NOT round-trip under the trusted ``tool``
+    # role — that is the core 0062 security guarantee.
     tool_msgs = [m for m in store.get_task_messages(task_id) if m.role == "tool"]
-    assert tool_msgs
-    body = json.loads(tool_msgs[0].content)
-    # The empty-args call surfaced as the dispatcher's ``invalid_args``
-    # code — Pydantic's at-least-one-filter rule fired.
-    assert body["status"] == "error"
-    assert body["error_code"] == "invalid_args"
-    # The error message references the missing filter rule so the LLM
-    # knows how to recover on retry.
-    assert "filter" in (body.get("error_message") or "").lower() or "filtre" in (
-        body.get("error_message") or ""
-    )
+    assert tool_msgs == []
+
+    # The correction was injected under ``system_validator`` on the retry
+    # (second) call, naming the offending tool + the ``invalid_args`` code
+    # and carrying the escaped offending-output marker.
+    retry_messages = client.calls[1]["messages"]
+    validator_rows = [m for m in retry_messages if m["role"] == "system_validator"]
+    assert len(validator_rows) == 1
+    feedback = validator_rows[0]["content"]
+    assert "gmail_search" in feedback
+    assert "invalid_args" in feedback
+    assert "[INVALID OUTPUT]:" in feedback
+    # The message references the missing filter rule so the LLM knows how
+    # to recover on retry (Pydantic's at-least-one-filter rule fired).
+    assert "filter" in feedback.lower() or "filtre" in feedback
 
 
 @pytest.mark.asyncio
