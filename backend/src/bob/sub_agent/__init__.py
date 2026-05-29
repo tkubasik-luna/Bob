@@ -10,10 +10,12 @@ Public surface other slices depend on:
   :mod:`.addendum_queue`. Per-task ``asyncio.Queue`` drained only at
   iteration boundaries (0050 fills the producer side).
 - :class:`SubAgentToolRegistry`, :class:`SubAgentToolDefinition`,
-  :class:`SubAgentToolDispatcher`,
+  :class:`SubAgentToolDispatcher`, :class:`SubAgentToolDispatchResult`,
+  :class:`SubAgentToolArgsValidationError`,
   :func:`build_default_subagent_registry` — re-exports from
   :mod:`.tool_registry`. Disjoint from :mod:`bob.tools` (Jarvis-side
-  registry).
+  registry). :meth:`SubAgentToolDefinition.to_spec` (issue 0059) projects a
+  tool to the canonical :class:`bob.llm.tooling.ToolSpec`.
 - :class:`SubAgentAction`, :class:`ProgressAction`,
   :class:`ToolCallAction`, :class:`DoneAction`,
   :data:`SUB_AGENT_SCHEMA_VERSION`, :func:`parse_action`,
@@ -48,8 +50,10 @@ from bob.sub_agent.runner import (
 )
 from bob.sub_agent.tool_registry import (
     GmailSearchArgs,
+    SubAgentToolArgsValidationError,
     SubAgentToolDefinition,
     SubAgentToolDispatcher,
+    SubAgentToolDispatchResult,
     SubAgentToolHandlerContext,
     SubAgentToolHandlerOutcome,
     SubAgentToolRegistry,
@@ -82,7 +86,9 @@ __all__ = [
     "SubAgentDoneStatus",
     "SubAgentPolicy",
     "SubAgentRunner",
+    "SubAgentToolArgsValidationError",
     "SubAgentToolDefinition",
+    "SubAgentToolDispatchResult",
     "SubAgentToolDispatcher",
     "SubAgentToolHandlerContext",
     "SubAgentToolHandlerOutcome",

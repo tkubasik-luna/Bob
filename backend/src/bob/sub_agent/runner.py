@@ -96,6 +96,7 @@ from dataclasses import dataclass
 from typing import Any, TypeGuard
 
 import structlog
+from pydantic import ValidationError
 
 from bob import ws_events
 from bob.context.prompt_fragments import (
@@ -117,7 +118,9 @@ from bob.sub_agent.actions import (
 from bob.sub_agent.addendum_queue import AddendumEntry, AddendumQueue
 from bob.sub_agent.policy import SubAgentPolicy, default_policy
 from bob.sub_agent.tool_registry import (
+    SubAgentToolArgsValidationError,
     SubAgentToolDispatcher,
+    SubAgentToolDispatchResult,
     SubAgentToolRegistry,
     build_default_subagent_registry,
 )
@@ -398,6 +401,35 @@ def _normalise_payload(raw: str) -> _NormalisedPayload:
 
     parsed = parse_action(payload)
     return _NormalisedPayload(action=parsed)
+
+
+def _render_tool_catalogue(registry: SubAgentToolRegistry) -> str:
+    """Render the per-tool argument JSON Schema block for the system prompt.
+
+    Issue 0059 (PRD 0008). Replaces the former name+description-only listing
+    (``- `name` : description``) — which forced the model to *guess* argument
+    names from the prose recipe — with each tool's real argument JSON Schema,
+    derived from its Pydantic ``args_model`` via
+    :meth:`SubAgentToolDefinition.to_spec`. The description is kept as a one-
+    line header (it carries the operational "when to use this" guidance the
+    model still needs); the schema is appended verbatim so the model can read
+    the exact field names, types and which are required.
+
+    The schema is serialised with ``sort_keys=True`` and a fixed indent so the
+    block is deterministic (stable across runs / Python dict-ordering) — the
+    0057 golden-prompt posture wants byte-stable prompts. Returns the empty
+    string for an empty registry so the caller can skip the section header.
+    """
+
+    blocks: list[str] = []
+    for definition in registry:
+        spec = definition.to_spec()
+        schema_json = json.dumps(spec.parameters, ensure_ascii=False, sort_keys=True, indent=2)
+        blocks.append(
+            f"- ``{spec.name}`` : {spec.description}\n"
+            f"  Arguments (JSON Schema) :\n```json\n{schema_json}\n```"
+        )
+    return "\n".join(blocks)
 
 
 class SubAgentRunner:
@@ -812,13 +844,10 @@ class SubAgentRunner:
     ) -> list[dict[str, Any]]:
         """Build the LLM message list including history + drained addenda."""
 
-        tool_lines = "\n".join(
-            f"- ``{definition.name}`` : {definition.description}"
-            for definition in self._tool_registry
-        )
+        tool_catalogue = _render_tool_catalogue(self._tool_registry)
         system_prompt = SUB_AGENT_V2_SYSTEM_PROMPT.render(goal=task.goal)
-        if tool_lines:
-            system_prompt += "\n\nOutils disponibles :\n" + tool_lines
+        if tool_catalogue:
+            system_prompt += "\n\nOutils disponibles :\n" + tool_catalogue
 
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_prompt},
@@ -911,6 +940,57 @@ class SubAgentRunner:
             },
         )
 
+    def _validate_tool_args(self, action: ToolCallAction) -> SubAgentToolDispatchResult | None:
+        """Validate ``action.args`` against the tool's ``args_model`` pre-dispatch.
+
+        Issue 0059 (PRD 0008). The sub-agent model used to guess argument
+        names from prose; now the prompt advertises each tool's real argument
+        JSON Schema (see :func:`_render_tool_catalogue`) and we validate the
+        emitted ``args`` against the *same* Pydantic ``args_model`` BEFORE
+        dispatching. This closes the "blind dispatch / silent drop" gap: an
+        unknown tool name or a payload that violates the schema produces a
+        STRUCTURED error result here instead of reaching the handler with
+        garbage.
+
+        Returns ``None`` when the args are valid (the caller dispatches
+        normally). Returns a populated :class:`SubAgentToolDispatchResult`
+        (``error/unknown_tool`` or ``error/invalid_args``) when they are not —
+        the caller round-trips that result to the LLM as a ``tool`` message
+        without dispatching. Schema failures are funnelled through a raised
+        :class:`SubAgentToolArgsValidationError` (caught here) so the self-
+        correction loop (issue 0062) can later intercept that same exception
+        at this seam and route the message under the ``system_validator`` role
+        for a bounded retry instead of merely round-tripping it.
+        """
+
+        definition = self._tool_registry.get(action.name)
+        if definition is None:
+            return SubAgentToolDispatchResult(
+                outcome="error",
+                tool_name=action.name,
+                tool_version=None,
+                error_code="unknown_tool",
+                error_message=f"unknown sub-agent tool: {action.name}",
+            )
+
+        try:
+            try:
+                definition.args_model.model_validate(action.args)
+            except ValidationError as exc:
+                raise SubAgentToolArgsValidationError(
+                    tool_name=definition.name,
+                    message=str(exc),
+                ) from exc
+        except SubAgentToolArgsValidationError as exc:
+            return SubAgentToolDispatchResult(
+                outcome="error",
+                tool_name=exc.tool_name,
+                tool_version=definition.version,
+                error_code="invalid_args",
+                error_message=exc.message,
+            )
+        return None
+
     async def _handle_tool_call(self, task_id: str, action: ToolCallAction) -> None:
         """Execute a sub-agent-side tool call and persist its outcome.
 
@@ -920,6 +1000,11 @@ class SubAgentRunner:
         iteration's prompt). 0048's retry policy will adjust this path
         — today every dispatch error round-trips as a tool message so
         the LLM can try again.
+
+        Issue 0059: ``action.args`` is validated against the tool's
+        ``args_model`` BEFORE dispatch (:meth:`_validate_tool_args`). Invalid
+        args (or an unknown tool) short-circuit to a structured error tool
+        message — the handler is never reached with a malformed payload.
         """
 
         call_payload = json.dumps({"action": "tool_call", "name": action.name, "args": action.args})
@@ -949,11 +1034,24 @@ class SubAgentRunner:
             },
         )
 
-        result = await self._tool_dispatcher.dispatch(
-            name=action.name,
-            arguments=action.args,
-            context=_RuntimeToolContext(task_id=task_id),
-        )
+        # Issue 0059 — pre-dispatch schema validation. On failure we surface a
+        # structured error (no blind dispatch, no silent drop) that round-trips
+        # to the LLM exactly like a handler-reported error would.
+        result = self._validate_tool_args(action)
+        if result is not None:
+            _logger.warning(
+                "sub_agent_runner.tool_args_invalid",
+                task_id=task_id,
+                tool=action.name,
+                error_code=result.error_code,
+                error_message=result.error_message,
+            )
+        else:
+            result = await self._tool_dispatcher.dispatch(
+                name=action.name,
+                arguments=action.args,
+                context=_RuntimeToolContext(task_id=task_id),
+            )
 
         body: dict[str, Any]
         if result.ok:

@@ -42,6 +42,8 @@ from typing import Any, Literal, Protocol
 import structlog
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
+from bob.llm.tooling import ToolSpec
+
 _logger = structlog.get_logger(__name__)
 
 
@@ -105,6 +107,26 @@ class SubAgentToolDefinition:
         """Return the canonical ``"v1.web_search"`` identifier."""
 
         return f"{self.version}.{self.name}"
+
+    def to_spec(self) -> ToolSpec:
+        """Project to the canonical :class:`bob.llm.tooling.ToolSpec`.
+
+        Issue 0059 (PRD 0008). The sub-agent's argument surface is the
+        single source of truth on ``args_model``; this routes it through
+        :meth:`ToolSpec.from_args_model` so the prompt builder advertises
+        the *real* argument JSON Schema (derived from Pydantic) instead of
+        the legacy name+description-only line, and so a later self-
+        correction phase (0062) can re-validate against ``spec.args_model``
+        without re-plumbing the model. ``parameters`` is the model's
+        ``model_json_schema()`` verbatim — schema flattening (``$defs`` /
+        ``$ref`` inlining) is deferred to issue 0063.
+        """
+
+        return ToolSpec.from_args_model(
+            name=self.name,
+            description=self.description,
+            args_model=self.args_model,
+        )
 
 
 class SubAgentToolRegistry:

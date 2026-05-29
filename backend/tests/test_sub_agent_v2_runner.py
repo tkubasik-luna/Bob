@@ -39,6 +39,7 @@ from bob.sub_agent import (
     SUB_AGENT_SCHEMA_VERSION,
     AddendumQueue,
     DoneAction,
+    GmailSearchArgs,
     SubAgentActionParseError,
     SubAgentPolicy,
     SubAgentRunner,
@@ -52,6 +53,7 @@ from bob.sub_agent import (
 from bob.sub_agent.runner import _normalise_payload
 from bob.sub_agent.tool_registry import (
     WebSearchArgs,
+    build_gmail_search_tool,
     build_web_fetch_tool,
     build_web_search_tool,
 )
@@ -528,6 +530,28 @@ def test_default_subagent_registry_exposes_gmail_search() -> None:
     assert build_web_fetch_tool().name == "web_fetch"
 
 
+def test_subagent_tool_to_spec_derives_parameters_from_args_model() -> None:
+    """Issue 0059: ``SubAgentToolDefinition.to_spec()`` routes through ToolSpec.
+
+    The spec's ``parameters`` is the ``args_model`` JSON Schema verbatim (no
+    flattening at this slice — that is 0063) and the spec retains the model so
+    a later self-correction phase can re-validate against it. Name/description
+    pass through unchanged.
+    """
+
+    definition = build_gmail_search_tool()
+    spec = definition.to_spec()
+
+    assert spec.name == "gmail_search"
+    assert spec.description == definition.description
+    assert spec.args_model is GmailSearchArgs
+    # Parameters derived verbatim from the Pydantic model (0058 contract).
+    assert spec.parameters == GmailSearchArgs.model_json_schema()
+    assert spec.parameters["type"] == "object"
+    # Every structured filter field is present in the derived schema.
+    assert set(spec.parameters["properties"]) == set(GmailSearchArgs.model_fields)
+
+
 def test_sub_agent_v2_prompt_documents_inbox_fallback() -> None:
     """Regression for the 2026-05-28 12:24 ``iteration_cap`` post-mortem.
 
@@ -620,6 +644,302 @@ async def test_tool_call_dispatches_through_subagent_registry() -> None:
     assert len(tool_msgs) == 1
     assert "noop" in tool_msgs[0].content
     assert "hi" in tool_msgs[0].content
+
+
+# ---------------------------------------------------------------------------
+# Tool argument schema injection + pre-dispatch validation (issue 0059)
+# ---------------------------------------------------------------------------
+
+
+def test_validate_tool_args_is_the_predispatch_seam() -> None:
+    """Issue 0059: ``_validate_tool_args`` is the structured pre-dispatch gate.
+
+    White-box lock on the seam the self-correction loop (0062) will hook:
+
+    - valid args → ``None`` (caller proceeds to dispatch);
+    - unknown tool → structured ``unknown_tool`` (never reaches dispatch);
+    - schema-invalid args → structured ``invalid_args`` naming the field.
+
+    Exercising the method directly (not via a full run) proves the validation
+    happens BEFORE dispatch — independent of the dispatcher's own re-validation.
+    """
+
+    from pydantic import BaseModel
+
+    class _StrictArgs(BaseModel):
+        value: str
+
+    async def _handler(_ctx: Any, _args: BaseModel) -> SubAgentToolHandlerOutcome:
+        return SubAgentToolHandlerOutcome(status="ok", result={})
+
+    registry = SubAgentToolRegistry(
+        [
+            SubAgentToolDefinition(
+                name="strict",
+                version="v1",
+                description="needs value",
+                args_model=_StrictArgs,
+                handler=_handler,
+            )
+        ]
+    )
+    runner = SubAgentRunner(
+        subagent_client=_ScriptedClient(chat_values=[]),
+        task_store=_make_store(),
+        event_bus=EventBus(),
+        policy=SubAgentPolicy(),
+        tool_registry=registry,
+        clock=_ControllableClock(),
+    )
+
+    # Valid → None (dispatch proceeds).
+    assert (
+        runner._validate_tool_args(
+            ToolCallAction(action="tool_call", name="strict", args={"value": "ok"})
+        )
+        is None
+    )
+
+    # Unknown tool → structured unknown_tool error.
+    unknown = runner._validate_tool_args(ToolCallAction(action="tool_call", name="ghost", args={}))
+    assert unknown is not None
+    assert unknown.outcome == "error"
+    assert unknown.error_code == "unknown_tool"
+
+    # Schema violation → structured invalid_args error naming the field.
+    invalid = runner._validate_tool_args(ToolCallAction(action="tool_call", name="strict", args={}))
+    assert invalid is not None
+    assert invalid.outcome == "error"
+    assert invalid.error_code == "invalid_args"
+    assert invalid.tool_name == "strict"
+    assert invalid.tool_version == "v1"
+    assert "value" in (invalid.error_message or "")
+
+
+@pytest.mark.asyncio
+async def test_prompt_injects_tool_arg_schema() -> None:
+    """Issue 0059: the system prompt advertises each tool's argument JSON Schema.
+
+    Replaces the former name+description-only listing — the model used to
+    guess argument names from the prose recipe. The system message now MUST
+    carry the real ``gmail_search`` argument schema (every field name + a JSON
+    Schema marker) so the model fills ``args`` from the schema, not a guess.
+    """
+
+    store = _make_store()
+    task_id = _make_running_task(store)
+
+    client = _ScriptedClient(chat_values=[_done_v2_payload(result_summary="done")])
+    runner = SubAgentRunner(
+        subagent_client=client,
+        task_store=store,
+        event_bus=EventBus(),
+        policy=SubAgentPolicy(),
+        tool_registry=build_default_subagent_registry(),
+        clock=_ControllableClock(),
+    )
+
+    await runner.run(task_id)
+
+    system_prompt = client.calls[0]["messages"][0]["content"]
+    assert client.calls[0]["messages"][0]["role"] == "system"
+    # Section header + a JSON-Schema fence (not the old "- name : desc" only).
+    assert "Outils disponibles" in system_prompt
+    assert "JSON Schema" in system_prompt
+    assert '"type": "object"' in system_prompt
+    # Every real gmail_search field name is now visible to the model.
+    for field_name in GmailSearchArgs.model_fields:
+        assert field_name in system_prompt
+    # Constraints survive too (max_results is clamped 1..5).
+    assert '"maximum": 5' in system_prompt
+
+
+@pytest.mark.asyncio
+async def test_tool_call_invalid_args_produces_structured_error_without_dispatch() -> None:
+    """Issue 0059: args violating the schema short-circuit to a structured error.
+
+    The handler MUST NOT run with a malformed payload (no blind dispatch); the
+    failure round-trips to the LLM as a ``tool`` message with
+    ``error_code="invalid_args"`` (no silent drop). Here ``value`` is required
+    but omitted — pre-dispatch validation rejects it before the handler.
+    """
+
+    store = _make_store()
+    task_id = _make_running_task(store)
+
+    from pydantic import BaseModel
+
+    class _StrictArgs(BaseModel):
+        value: str
+
+    handler_calls: list[BaseModel] = []
+
+    async def _handler(_ctx: Any, args: BaseModel) -> SubAgentToolHandlerOutcome:
+        handler_calls.append(args)
+        return SubAgentToolHandlerOutcome(status="ok", result={})
+
+    registry = SubAgentToolRegistry(
+        [
+            SubAgentToolDefinition(
+                name="strict",
+                version="v1",
+                description="needs value",
+                args_model=_StrictArgs,
+                handler=_handler,
+            )
+        ]
+    )
+
+    client = _ScriptedClient(
+        chat_values=[
+            # ``value`` missing → schema violation.
+            json.dumps({"action": "tool_call", "name": "strict", "args": {}}),
+            _done_v2_payload(
+                result_summary="gave up", status="failed", reason_code="invalid_output"
+            ),
+        ]
+    )
+    runner = SubAgentRunner(
+        subagent_client=client,
+        task_store=store,
+        event_bus=EventBus(),
+        policy=SubAgentPolicy(),
+        tool_registry=registry,
+        clock=_ControllableClock(),
+    )
+
+    await runner.run(task_id)
+
+    # Handler never saw the malformed payload.
+    assert handler_calls == []
+
+    # A structured error tool-message round-tripped to the LLM (no silent drop).
+    tool_msgs = [m for m in store.get_task_messages(task_id) if m.role == "tool"]
+    assert len(tool_msgs) == 1
+    body = json.loads(tool_msgs[0].content)
+    assert body["tool"] == "strict"
+    assert body["status"] == "error"
+    assert body["error_code"] == "invalid_args"
+    # The message names the offending field so the model can self-correct.
+    assert "value" in body["error_message"]
+
+
+@pytest.mark.asyncio
+async def test_tool_call_unknown_tool_produces_structured_error() -> None:
+    """Issue 0059: an unknown tool name surfaces a structured ``unknown_tool``.
+
+    Validation resolves the tool by name BEFORE dispatch; a name not in the
+    registry is reported as a structured error rather than reaching (or
+    crashing) the dispatch path.
+    """
+
+    store = _make_store()
+    task_id = _make_running_task(store)
+
+    from pydantic import BaseModel
+
+    class _NoopArgs(BaseModel):
+        pass
+
+    async def _handler(_ctx: Any, _args: BaseModel) -> SubAgentToolHandlerOutcome:
+        return SubAgentToolHandlerOutcome(status="ok", result={})
+
+    registry = SubAgentToolRegistry(
+        [
+            SubAgentToolDefinition(
+                name="noop",
+                version="v1",
+                description="stub",
+                args_model=_NoopArgs,
+                handler=_handler,
+            )
+        ]
+    )
+
+    client = _ScriptedClient(
+        chat_values=[
+            json.dumps({"action": "tool_call", "name": "ghost", "args": {}}),
+            _done_v2_payload(result_summary="done"),
+        ]
+    )
+    runner = SubAgentRunner(
+        subagent_client=client,
+        task_store=store,
+        event_bus=EventBus(),
+        policy=SubAgentPolicy(),
+        tool_registry=registry,
+        clock=_ControllableClock(),
+    )
+
+    await runner.run(task_id)
+
+    tool_msgs = [m for m in store.get_task_messages(task_id) if m.role == "tool"]
+    assert len(tool_msgs) == 1
+    body = json.loads(tool_msgs[0].content)
+    assert body["tool"] == "ghost"
+    assert body["status"] == "error"
+    assert body["error_code"] == "unknown_tool"
+
+
+@pytest.mark.asyncio
+async def test_tool_call_valid_args_reach_handler() -> None:
+    """Issue 0059: schema-valid args pass validation and reach the handler.
+
+    The companion to the invalid-args test — confirms the pre-dispatch gate is
+    not over-eager: a payload that satisfies the ``args_model`` dispatches
+    normally and the handler observes the validated model.
+    """
+
+    store = _make_store()
+    task_id = _make_running_task(store)
+
+    from pydantic import BaseModel
+
+    class _StrictArgs(BaseModel):
+        value: str
+
+    seen: list[str] = []
+
+    async def _handler(_ctx: Any, args: BaseModel) -> SubAgentToolHandlerOutcome:
+        assert isinstance(args, _StrictArgs)
+        seen.append(args.value)
+        return SubAgentToolHandlerOutcome(status="ok", result={"echo": args.value})
+
+    registry = SubAgentToolRegistry(
+        [
+            SubAgentToolDefinition(
+                name="strict",
+                version="v1",
+                description="needs value",
+                args_model=_StrictArgs,
+                handler=_handler,
+            )
+        ]
+    )
+
+    client = _ScriptedClient(
+        chat_values=[
+            json.dumps({"action": "tool_call", "name": "strict", "args": {"value": "ok"}}),
+            _done_v2_payload(result_summary="done"),
+        ]
+    )
+    runner = SubAgentRunner(
+        subagent_client=client,
+        task_store=store,
+        event_bus=EventBus(),
+        policy=SubAgentPolicy(),
+        tool_registry=registry,
+        clock=_ControllableClock(),
+    )
+
+    await runner.run(task_id)
+
+    assert seen == ["ok"]
+    tool_msgs = [m for m in store.get_task_messages(task_id) if m.role == "tool"]
+    assert len(tool_msgs) == 1
+    body = json.loads(tool_msgs[0].content)
+    assert body["status"] == "ok"
+    assert body["result"] == {"echo": "ok"}
 
 
 # ---------------------------------------------------------------------------
