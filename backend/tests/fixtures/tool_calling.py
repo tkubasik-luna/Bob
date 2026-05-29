@@ -13,23 +13,43 @@ The three paths, and where each is asserted:
 
 1. **Jarvis + LM Studio native** — ``LMStudioClient.complete`` reads
    ``message.tool_calls`` and ``json.loads`` the ``function.arguments`` string.
+   Asserted in ``tests/test_llm_client.py``. UNCHANGED across all 0008 phases.
+2. **Jarvis + Claude CLI Hermes tags** — ``ClaudeCliClient.complete`` advertises
+   the tools as a ``<tools>`` block (Nous-Hermes ChatML) and parses the model's
+   ``<tool_call>{…}</tool_call>`` replies through the
+   :class:`bob.llm.tooling.hermes.HermesToolCodec` tolerant chain
+   (``json → ast.literal_eval → fenced-JSON``, NO brace counting).
    Asserted in ``tests/test_llm_client.py``.
-2. **Jarvis + Claude CLI prompt-based** — ``ClaudeCliClient.complete`` asks the
-   model for ``{"tool_calls":[…]}`` in the system prompt, then parses with
-   ``raw_decode`` + a brace-repair salvage pass (``_repair_json_braces``).
-   Asserted in ``tests/test_llm_client.py``.
+
+   **Issue 0061 changed this path.** Before 0061 the CLI hand-wrote a
+   ``{"tool_calls":[…]}`` blob and salvaged miscounted braces with
+   ``_repair_json_braces``; that fragile wire format + the brace-repair
+   primitive are deleted. The fixtures below now describe the Hermes wire
+   format and the tolerant-chain recovery. The old top-level "broken-brace"
+   inputs are no longer *produced* by Hermes, so they are not reproduced as
+   recoverable cases — a garbled span the chain cannot decode degrades to text
+   (``[]``); bounded-retry-with-error-echo is the self-correction loop's job
+   (issue 0062), not the codec's.
 3. **Sub-agent action envelope** — ``runner._normalise_payload`` strips a code
    fence then ``json.loads`` the ``{"action":…}`` envelope and validates it via
    ``actions.parse_action``. Asserted in ``tests/test_sub_agent_v2_runner.py``.
+   UNCHANGED by issue 0061.
 
 Each fixture is a frozen dataclass carrying a stable ``id`` so failures name the
-exact case. ``MalformedRepairFixture`` additionally records what the salvage
-pass currently recovers; ``EnvelopeFixture.parses`` records whether the
-sub-agent envelope path accepts the raw string TODAY.
+exact case. ``HermesToleranceFixture`` records, for one ``<tool_call>`` reply,
+the calls the tolerant chain decodes (empty tuple → degrades to text);
+``EnvelopeFixture.parses`` records whether the sub-agent envelope path accepts
+the raw string TODAY.
 
 IMPORTANT current-behaviour notes captured here (verified against the code, not
-assumed — the issue text predates a couple of these):
+assumed):
 
+- The Hermes path wraps the reply in ``<root>`` and extracts every
+  ``<tool_call>`` span (real XML parse, regex fallback when the JSON body has
+  XML-illegal ``&`` / ``<`` chars), decoding each via ``json → ast.literal_eval
+  → fenced-JSON``. Prose around the tags, single-quoted Python dicts, fenced
+  bodies, and XML-illegal characters all recover; a reply with no
+  ``<tool_call>`` tag (or a body none of the rungs decode) yields ``[]``.
 - The sub-agent path *does* strip a leading ```` ```json ```` / bare ```` ``` ````
   fence before ``json.loads`` (``_normalise_payload`` calls ``_strip_code_fence``
   first), so a cleanly-fenced envelope **parses** today. The live failure mode
@@ -66,11 +86,13 @@ class NativeToolCallFixture:
 
 
 @dataclass(frozen=True)
-class ClaudeToolCallFixture:
-    """A Claude-CLI prompt-based tool-call reply (well-formed or prose-trailing).
+class HermesToolCallFixture:
+    """A well-formed Claude-CLI Hermes ``<tool_call>`` reply.
 
-    ``raw`` is the full string the CLI returns; ``expected_calls`` is the list
-    of ``(name, arguments)`` tuples ``ClaudeCliClient.complete`` parses out.
+    ``raw`` is the full string the CLI returns (one or more ``<tool_call>``
+    blocks, optionally wrapped in prose / a fence); ``expected_calls`` is the
+    list of ``(name, arguments)`` tuples the
+    :class:`bob.llm.tooling.hermes.HermesToolCodec` parses out, in order.
     """
 
     id: str
@@ -79,20 +101,20 @@ class ClaudeToolCallFixture:
 
 
 @dataclass(frozen=True)
-class MalformedRepairFixture:
-    """A broken-brace tool-call string the Claude CLI salvage pass repairs.
+class HermesToleranceFixture:
+    """A garbled / non-strict ``<tool_call>`` reply + what the chain recovers.
 
-    ``raw`` is the structurally-broken string the model emitted.
-    ``repairs_to_valid_json`` records whether ``_repair_json_braces`` currently
-    returns a string that ``json.loads`` accepts (``None`` return → unrepairable).
-    ``expected_arguments`` (when repairable) is the ``arguments`` dict the
-    repaired-then-parsed first tool call yields.
+    ``raw`` is the string the model emitted. ``expected_calls`` is what the
+    tolerant chain (``json → ast.literal_eval → fenced-JSON``) decodes — an
+    **empty tuple** means the reply degrades to plain text (the Hermes path
+    yields no calls; recovery of a still-malformed call is issue 0062's
+    self-correction loop, not the codec). This replaces the old
+    ``MalformedRepairFixture`` (the brace-repair primitive is deleted in 0061).
     """
 
     id: str
     raw: str
-    repairs_to_valid_json: bool
-    expected_arguments: dict[str, Any] | None = None
+    expected_calls: tuple[tuple[str, dict[str, Any]], ...]
 
 
 @dataclass(frozen=True)
@@ -159,91 +181,142 @@ NATIVE_MALFORMED_ARGUMENTS_RAW: str = "this-is-not-json"
 
 
 # ---------------------------------------------------------------------------
-# Path 2 — Jarvis + Claude CLI prompt-based ({"tool_calls":[…]})
+# Path 2 — Jarvis + Claude CLI Hermes tags (<tool_call>{…}</tool_call>)
 # ---------------------------------------------------------------------------
 
-#: Well-formed Claude-CLI replies. The second carries trailing prose after the
-#: JSON object — ``raw_decode`` recognises the leading object and the prose is
-#: ignored (a documented real-world shape: the model confirms in natural
-#: language after emitting the call).
-CLAUDE_WELL_FORMED: tuple[ClaudeToolCallFixture, ...] = (
-    ClaudeToolCallFixture(
-        id="claude/clean",
-        raw=json.dumps(
-            {
-                "tool_calls": [
-                    {"id": "call_99", "name": "spawn_subtask", "arguments": {"title": "buy milk"}}
-                ]
-            }
-        ),
+
+def _tool_call_tag(name: str, arguments: dict[str, Any], *, call_id: str | None = None) -> str:
+    """Wrap a call as a Nous-Hermes ``<tool_call>{…}</tool_call>`` block."""
+
+    body: dict[str, Any] = {"name": name, "arguments": arguments}
+    if call_id is not None:
+        body = {"id": call_id, **body}
+    return f"<tool_call>{json.dumps(body, ensure_ascii=False)}</tool_call>"
+
+
+#: Well-formed Hermes ``<tool_call>`` replies the codec parses byte-for-byte.
+#: ``hermes/trailing-prose`` carries a confirmation sentence after the block
+#: (the model often narrates after the call) — the ``<root>`` wrap + span
+#: extraction ignore the surrounding prose. ``hermes/multiple`` emits two
+#: blocks (Hermes allows several calls per turn). ``hermes/nested-args`` is the
+#: deeply-nested ``say`` shape that used to trip the brace-repair pass — under
+#: Hermes it is just well-formed JSON inside the tags.
+CLAUDE_WELL_FORMED: tuple[HermesToolCallFixture, ...] = (
+    HermesToolCallFixture(
+        id="hermes/clean",
+        raw=_tool_call_tag("spawn_subtask", {"title": "buy milk"}, call_id="call_99"),
         expected_calls=(("spawn_subtask", {"title": "buy milk"}),),
     ),
-    ClaudeToolCallFixture(
-        id="claude/trailing-prose",
+    HermesToolCallFixture(
+        id="hermes/trailing-prose",
         raw=(
-            '{"tool_calls": [{"id": "call_1", "name": "spawn_subtask", '
-            '"arguments": {"title": "Draft email", "goal": "Write three variants."}}]}'
-            "\n\nTâche lancée. Résultat dans quelques instants."
+            _tool_call_tag(
+                "spawn_subtask",
+                {"title": "Draft email", "goal": "Write three variants."},
+                call_id="call_1",
+            )
+            + "\n\nTâche lancée. Résultat dans quelques instants."
         ),
         expected_calls=(
             ("spawn_subtask", {"title": "Draft email", "goal": "Write three variants."}),
         ),
     ),
+    HermesToolCallFixture(
+        id="hermes/multiple",
+        raw=(
+            _tool_call_tag("spawn_subtask", {"title": "a"})
+            + "\n"
+            + _tool_call_tag("spawn_subtask", {"title": "b"})
+        ),
+        expected_calls=(
+            ("spawn_subtask", {"title": "a"}),
+            ("spawn_subtask", {"title": "b"}),
+        ),
+    ),
+    HermesToolCallFixture(
+        id="hermes/nested-args",
+        # The old ``repair/extra-brace-wrong-closer`` payload, now well-formed
+        # inside <tool_call> tags — Hermes has no brace-counting to break.
+        raw=_tool_call_tag(
+            "say",
+            {
+                "speech": "Bitcoin, en bref",
+                "ui": {"component": "Markdown", "props": {"content": "rare et cher"}},
+            },
+        ),
+        expected_calls=(
+            (
+                "say",
+                {
+                    "speech": "Bitcoin, en bref",
+                    "ui": {"component": "Markdown", "props": {"content": "rare et cher"}},
+                },
+            ),
+        ),
+    ),
 )
 
-#: A well-formed Claude reply wrapped in a ```` ```json ```` fence. The CLI path
-#: calls ``_strip_code_fence`` before parsing, so the fence is removed and the
-#: call parses. (Contrast with the sub-agent path, which also strips a clean
-#: fence — see ``ENVELOPE_FIXTURES``.)
-CLAUDE_FENCED: ClaudeToolCallFixture = ClaudeToolCallFixture(
-    id="claude/fenced-json",
-    raw=('```json\n{"tool_calls": [{"id": "c1", "name": "spawn_subtask", "arguments": {}}]}\n```'),
+#: A Hermes reply whose ``<tool_call>`` body is wrapped in a ```` ```json ````
+#: fence. The codec's fence rung (``_strip_code_fence``) unwraps it before
+#: decoding. (Contrast the sub-agent path, which strips a clean fence too — see
+#: ``ENVELOPE_FIXTURES``.)
+CLAUDE_FENCED: HermesToolCallFixture = HermesToolCallFixture(
+    id="hermes/fenced-body",
+    raw=(
+        "<tool_call>\n```json\n"
+        + json.dumps({"id": "c1", "name": "spawn_subtask", "arguments": {}})
+        + "\n```\n</tool_call>"
+    ),
     expected_calls=(("spawn_subtask", {}),),
 )
 
-#: Broken-brace cases the Claude CLI salvage pass (``_repair_json_braces``)
-#: handles. Each is a string ``raw_decode`` rejects; the repair pass rebuilds the
-#: closers from the open-stack. The ``unrepairable`` case has no opener so the
-#: repair returns ``None`` and the call is dropped (response falls back to text).
-CLAUDE_MALFORMED_REPAIR: tuple[MalformedRepairFixture, ...] = (
-    MalformedRepairFixture(
-        # Observed in production: a ``say`` with a nested ``ui.props.content``
-        # block; the model emitted ``}}}}}]`` where ``}}}}]}`` was needed.
-        id="repair/extra-brace-wrong-closer",
+#: Tolerant-chain cases: non-strict ``<tool_call>`` bodies + what the chain
+#: recovers (empty tuple → degrades to plain text). These exercise the
+#: ``json → ast.literal_eval → fenced-JSON`` ladder and the XML-illegal-char
+#: regex fallback that REPLACE the deleted brace-repair primitive.
+CLAUDE_TOLERANCE: tuple[HermesToleranceFixture, ...] = (
+    HermesToleranceFixture(
+        # Single-quoted Python-dict body → recovered via ``ast.literal_eval``.
+        id="tolerance/py-dict-single-quotes",
+        raw="<tool_call>{'name': 'say', 'arguments': {'speech': 'hi'}}</tool_call>",
+        expected_calls=(("say", {"speech": "hi"}),),
+    ),
+    HermesToleranceFixture(
+        # XML-illegal ``&`` / ``<`` in the JSON body → the ``<root>`` XML parse
+        # fails and the DOTALL regex fallback extracts the span; the body is
+        # still valid JSON so it decodes.
+        id="tolerance/xml-illegal-chars",
         raw=(
-            '{"tool_calls": [{"id": "call_1", "name": "say", "arguments": '
-            '{"speech": "Bitcoin, en bref", "ui": {"component": "Markdown", '
-            '"props": {"content": "rare et cher"}}}}}]'
+            '<tool_call>{"name": "say", "arguments": '
+            '{"speech": "Tom & Jerry < Batman"}}</tool_call>'
         ),
-        repairs_to_valid_json=True,
-        expected_arguments={
-            "speech": "Bitcoin, en bref",
-            "ui": {"component": "Markdown", "props": {"content": "rare et cher"}},
-        },
+        expected_calls=(("say", {"speech": "Tom & Jerry < Batman"}),),
     ),
-    MalformedRepairFixture(
-        # Truncated tail: the model stopped emitting before closing the
-        # containers. The repair closes everything still open at EOF.
-        id="repair/truncated-tail",
-        raw='{"tool_calls": [{"name": "say", "arguments": {"speech": "hi"',
-        repairs_to_valid_json=True,
-        expected_arguments={"speech": "hi"},
+    HermesToleranceFixture(
+        # Prose BEFORE the block too (not just after) → span extraction still
+        # finds the call regardless of surrounding narration.
+        id="tolerance/prose-prefix-and-suffix",
+        raw=(
+            "Sure, let me do that.\n"
+            + _tool_call_tag("spawn_subtask", {"title": "x"})
+            + "\nDone — running now."
+        ),
+        expected_calls=(("spawn_subtask", {"title": "x"}),),
     ),
-    MalformedRepairFixture(
-        # Braces inside a string literal must NOT be counted as structure, and
-        # trailing extra braces are trimmed once the top-level value balances.
-        id="repair/braces-inside-strings",
-        raw='{"a": "x}y{z", "b": 1}}}',
-        repairs_to_valid_json=True,
-        expected_arguments=None,  # not a tool_calls payload; asserted via _repair only
+    HermesToleranceFixture(
+        # No ``<tool_call>`` tag at all → plain text → no calls. (The old
+        # ``repair/unrepairable-prose`` case; same observable outcome.)
+        id="tolerance/no-tags-degrades-to-text",
+        raw="just prose, no tool call here",
+        expected_calls=(),
     ),
-    MalformedRepairFixture(
-        # No opener at all → ``_repair_json_braces`` returns ``None`` → the CLI
-        # path treats the reply as plain text (no tool call salvaged).
-        id="repair/unrepairable-prose",
-        raw="just prose, no json",
-        repairs_to_valid_json=False,
-        expected_arguments=None,
+    HermesToleranceFixture(
+        # A ``<tool_call>`` whose body none of the rungs can decode (truncated
+        # mid-key, not valid JSON or a Python literal) → span skipped → text.
+        # Recovery of this is the self-correction loop's job (issue 0062).
+        id="tolerance/undecodable-body-degrades-to-text",
+        raw='<tool_call>{"name": "say", "arg</tool_call>',
+        expected_calls=(),
     ),
 )
 

@@ -1,6 +1,6 @@
-"""Unit tests for the tool-calling codec layer (PRD 0008 / issue 0058).
+"""Unit tests for the tool-calling codec layer (PRD 0008 / issues 0058 + 0061).
 
-Covers the three new seams in isolation:
+Covers the codec seams in isolation:
 
 - :class:`bob.llm.tooling.ToolSpec` derivation (from a Pydantic ``args_model``
   and from a legacy :class:`bob.llm.types.ToolDefinition`).
@@ -8,9 +8,15 @@ Covers the three new seams in isolation:
   capability defaults + the ``LLM_TOOL_MODE`` override.
 - :class:`bob.llm.tooling.NativeToolCodec` ``inject`` / ``parse`` /
   ``stream_parser``.
+- :class:`bob.llm.tooling.HermesToolCodec` (issue 0061) ``inject`` / ``parse``
+  tolerant chain / streaming progressive view, plus a backend-swap parity check
+  asserting Hermes (claude_cli) and Native (lm_studio) decode to the same
+  :class:`bob.llm.types.ToolCall` for a clean call, a recovered single-quoted
+  py-dict call, and plain text.
 
-The native parse cases reuse the 0057 golden fixtures so this module and the
-end-to-end ``test_llm_client.py`` assertions stay anchored to the same data.
+The native + Hermes parse cases reuse the 0057 golden fixtures so this module
+and the end-to-end ``test_llm_client.py`` assertions stay anchored to the same
+data.
 """
 
 from __future__ import annotations
@@ -24,6 +30,7 @@ from pydantic import BaseModel, Field
 from bob.llm.tooling import (
     BackendCapability,
     CodecNotAvailableError,
+    HermesToolCodec,
     NativeToolCallParseError,
     NativeToolCodec,
     ToolCodec,
@@ -34,8 +41,13 @@ from bob.llm.tooling import (
 from bob.llm.types import StreamChunk, ToolDefinition
 
 from .fixtures.tool_calling import (
+    CLAUDE_FENCED,
+    CLAUDE_TOLERANCE,
+    CLAUDE_WELL_FORMED,
     NATIVE_MALFORMED_ARGUMENTS_RAW,
     NATIVE_WELL_FORMED,
+    HermesToleranceFixture,
+    HermesToolCallFixture,
     NativeToolCallFixture,
 )
 
@@ -132,13 +144,20 @@ def test_select_codec_auto_raises_when_no_format_supported() -> None:
         select_codec(BackendCapability(), "auto")
 
 
-@pytest.mark.parametrize("mode", ["guided", "hermes"])
-def test_select_codec_unimplemented_modes_raise(mode: str) -> None:
-    # Declared-but-unimplemented: the capability supports it, but the codec
-    # lands in a later issue, so selection raises a clear not-implemented error.
+def test_select_codec_guided_mode_raises_not_implemented() -> None:
+    # Declared-but-unimplemented: the capability supports guided JSON, but its
+    # codec lands in issue 0060, so selection raises a clear not-implemented error.
     capability = BackendCapability(guided_json=True, hermes_tags=True)
     with pytest.raises(CodecNotAvailableError, match="not implemented yet"):
-        select_codec(capability, mode)  # type: ignore[arg-type]
+        select_codec(capability, "guided")
+
+
+def test_select_codec_hermes_mode_returns_hermes() -> None:
+    # Issue 0061 implemented the Hermes codec: an explicit hermes mode against a
+    # hermes-capable backend now returns it (no longer the not-implemented raise).
+    codec = select_codec(BackendCapability(hermes_tags=True), "hermes")
+    assert isinstance(codec, HermesToolCodec)
+    assert isinstance(codec, ToolCodec)
 
 
 @pytest.mark.parametrize("mode", ["guided", "hermes"])
@@ -152,6 +171,12 @@ def test_select_codec_explicit_mode_raises_when_capability_missing(mode: str) ->
 def test_select_codec_auto_guided_only_backend_raises_not_implemented() -> None:
     with pytest.raises(CodecNotAvailableError, match="0060"):
         select_codec(BackendCapability(guided_json=True), "auto")
+
+
+def test_select_codec_auto_hermes_only_backend_returns_hermes() -> None:
+    # The claude_cli capability shape: hermes-only → auto resolves to Hermes.
+    codec = select_codec(capability_for_backend("claude_cli"), "auto")
+    assert isinstance(codec, HermesToolCodec)
 
 
 # ---------------------------------------------------------------------------
@@ -337,3 +362,238 @@ def test_native_stream_log_calls_shape() -> None:
     # log_calls keeps arguments as the accumulated STRING (not parsed) —
     # matches the core's raw-for-log reconstruction.
     assert parser.log_calls == [{"id": "c1", "name": "say", "arguments": '{"speech": "hi"}'}]
+
+
+# ---------------------------------------------------------------------------
+# HermesToolCodec.inject (issue 0061)
+# ---------------------------------------------------------------------------
+
+
+def _hermes_spec(name: str = "spawn_subtask") -> ToolSpec:
+    return ToolSpec(
+        name=name,
+        description=f"Tool {name}.",
+        parameters={"type": "object", "properties": {"title": {"type": "string"}}},
+    )
+
+
+def test_hermes_inject_empty_specs_returns_empty_no_block() -> None:
+    messages = [{"role": "system", "content": "you are bob"}]
+    assert HermesToolCodec().inject(messages, []) == {}
+    # No specs → message left untouched (pure passthrough, matches the old guard).
+    assert messages == [{"role": "system", "content": "you are bob"}]
+
+
+def test_hermes_inject_appends_block_to_existing_system_message() -> None:
+    messages = [
+        {"role": "system", "content": "you are bob"},
+        {"role": "user", "content": "hi"},
+    ]
+    kwargs = HermesToolCodec().inject(messages, [_hermes_spec()])
+
+    # Prompt is the whole contract → no per-call request kwargs.
+    assert kwargs == {}
+    system = messages[0]["content"]
+    assert system.startswith("you are bob")
+    assert "<tools>" in system and "</tools>" in system
+    # The emission protocol + the OpenAI-style function entry are present.
+    assert "<tool_call>" in system
+    assert '"name": "spawn_subtask"' in system
+    # The user message is untouched.
+    assert messages[1] == {"role": "user", "content": "hi"}
+
+
+def test_hermes_inject_prepends_system_message_when_none() -> None:
+    messages = [{"role": "user", "content": "hi"}]
+    HermesToolCodec().inject(messages, [_hermes_spec()])
+
+    assert messages[0]["role"] == "system"
+    # Prepended block is lstripped (no leading blank lines on a fresh system msg).
+    assert messages[0]["content"].startswith("You are a function-calling AI model")
+    assert messages[1] == {"role": "user", "content": "hi"}
+
+
+def test_hermes_inject_preserves_tool_order() -> None:
+    messages: list[dict[str, Any]] = []
+    HermesToolCodec().inject(messages, [_hermes_spec("a"), _hermes_spec("b")])
+    block = messages[0]["content"]
+    # Registration order in == lines out (ordering hygiene is issue 0063).
+    assert block.index('"name": "a"') < block.index('"name": "b"')
+
+
+# ---------------------------------------------------------------------------
+# HermesToolCodec.parse — reuses the 0057 path-2 fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("fx", CLAUDE_WELL_FORMED, ids=lambda fx: fx.id)
+def test_hermes_parse_well_formed(fx: HermesToolCallFixture) -> None:
+    calls = HermesToolCodec().parse(fx.raw)
+    assert tuple((c.name, c.arguments) for c in calls) == fx.expected_calls
+
+
+def test_hermes_parse_fenced_body_strips_fence() -> None:
+    calls = HermesToolCodec().parse(CLAUDE_FENCED.raw)
+    assert tuple((c.name, c.arguments) for c in calls) == CLAUDE_FENCED.expected_calls
+
+
+@pytest.mark.parametrize("fx", CLAUDE_TOLERANCE, ids=lambda fx: fx.id)
+def test_hermes_parse_tolerant_chain(fx: HermesToleranceFixture) -> None:
+    # expected_calls == () means the reply degrades to plain text (no calls).
+    calls = HermesToolCodec().parse(fx.raw)
+    assert tuple((c.name, c.arguments) for c in calls) == fx.expected_calls
+
+
+def test_hermes_parse_generates_call_id_when_missing() -> None:
+    # The clean fixture body carries no id → placeholder minted (native scheme).
+    [call] = HermesToolCodec().parse(
+        '<tool_call>{"name": "say", "arguments": {"speech": "hi"}}</tool_call>'
+    )
+    assert call.id.startswith("call_")
+
+
+def test_hermes_parse_keeps_supplied_call_id() -> None:
+    [call] = HermesToolCodec().parse(CLAUDE_WELL_FORMED[0].raw)
+    # hermes/clean carries call_99 in the body — preserved, not regenerated.
+    assert call.id == "call_99"
+
+
+def test_hermes_parse_nameless_span_skipped() -> None:
+    # A decodable object with no name is not a dispatchable call → skipped.
+    assert HermesToolCodec().parse('<tool_call>{"arguments": {"x": 1}}</tool_call>') == []
+
+
+def test_hermes_parse_non_object_arguments_coerced_to_empty() -> None:
+    # The tolerant chain favours recovering *something*: a non-object arguments
+    # is coerced to {} rather than raising (strict re-validation is issue 0062).
+    [call] = HermesToolCodec().parse('<tool_call>{"name": "say", "arguments": [1, 2]}</tool_call>')
+    assert (call.name, call.arguments) == ("say", {})
+
+
+# ---------------------------------------------------------------------------
+# HermesToolCodec.stream_parser — progressive view + truncation salvage
+# ---------------------------------------------------------------------------
+
+
+def _text_delta(content: str) -> Any:
+    """A provider delta carrying plain-text content (Hermes streams as text)."""
+
+    return SimpleNamespace(content=content)
+
+
+def test_hermes_stream_progressive_lifecycle() -> None:
+    parser = HermesToolCodec().stream_parser()
+    chunks: list[StreamChunk] = []
+    # A single closed call delivered across three text deltas.
+    chunks += list(parser.feed(_text_delta('<tool_call>{"name": "say", ')))
+    chunks += list(parser.feed(_text_delta('"arguments": {"speech": "hello ')))
+    chunks += list(parser.feed(_text_delta('world"}}</tool_call>')))
+    chunks += list(parser.finish())
+
+    kinds = [c.kind for c in chunks]
+    assert kinds[0] == "tool_call_start"
+    assert kinds[-1] == "tool_call_end"
+    assert "tool_call_args_delta" in kinds
+    assert chunks[0].name == "say"
+    # The args deltas reassemble to the full serialised arguments (the
+    # speech_delta contract: PartialJsonParser sees a growing JSON object).
+    reassembled = "".join(c.args_delta or "" for c in chunks if c.kind == "tool_call_args_delta")
+    assert reassembled == '{"speech": "hello world"}'
+    end = next(c for c in chunks if c.kind == "tool_call_end")
+    assert end.final_arguments == {"speech": "hello world"}
+
+
+def test_hermes_stream_salvages_unterminated_trailing_call() -> None:
+    parser = HermesToolCodec().stream_parser()
+    chunks: list[StreamChunk] = []
+    # Stream truncates: the body decodes (raw_decode tolerates the missing
+    # close tag) but </tool_call> never arrives.
+    chunks += list(parser.feed(_text_delta('<tool_call>{"name": "say", ')))
+    chunks += list(parser.feed(_text_delta('"arguments": {"speech": "hi"}}')))
+    chunks += list(parser.finish())
+
+    kinds = [c.kind for c in chunks]
+    assert "tool_call_start" in kinds
+    assert kinds[-1] == "tool_call_end"
+    end = next(c for c in chunks if c.kind == "tool_call_end")
+    assert end.final_arguments == {"speech": "hi"}
+
+
+def test_hermes_stream_no_tags_emits_nothing() -> None:
+    parser = HermesToolCodec().stream_parser()
+    assert list(parser.feed(_text_delta("just prose, no call"))) == []
+    assert list(parser.finish()) == []
+    assert parser.log_calls == []
+
+
+def test_hermes_stream_log_calls_shape() -> None:
+    parser = HermesToolCodec().stream_parser()
+    list(parser.feed(_text_delta('<tool_call>{"name": "say", "arguments": {"speech": "hi"}}')))
+    [logged] = parser.log_calls
+    # Mirrors the native parser: arguments serialised to a STRING for logging.
+    assert logged["name"] == "say"
+    assert logged["arguments"] == '{"speech": "hi"}'
+    assert str(logged["id"]).startswith("call_")
+
+
+# ---------------------------------------------------------------------------
+# Backend-swap parity — Hermes (claude_cli) vs Native (lm_studio)
+# ---------------------------------------------------------------------------
+
+
+def _native_one(name: str, arguments_raw: str) -> Any:
+    return SimpleNamespace(
+        content=None,
+        tool_calls=[
+            SimpleNamespace(
+                id="call_x",
+                type="function",
+                function=SimpleNamespace(name=name, arguments=arguments_raw),
+            )
+        ],
+    )
+
+
+def test_backend_swap_parity_well_formed_call() -> None:
+    """A well-formed call decodes to the same (name, arguments) on both seams."""
+
+    hermes = select_codec(capability_for_backend("claude_cli"), "auto")
+    native = select_codec(capability_for_backend("lm_studio"), "auto")
+
+    hermes_calls = hermes.parse(
+        '<tool_call>{"name": "say", "arguments": {"speech": "hi"}}</tool_call>'
+    )
+    native_calls = native.parse(_native_one("say", '{"speech": "hi"}'))
+
+    assert [(c.name, c.arguments) for c in hermes_calls] == [("say", {"speech": "hi"})]
+    assert [(c.name, c.arguments) for c in hermes_calls] == [
+        (c.name, c.arguments) for c in native_calls
+    ]
+
+
+def test_backend_swap_parity_recovered_py_dict_call() -> None:
+    """A single-quoted py-dict body the Hermes chain recovers via ast.literal_eval
+    matches what Native decodes from the equivalent JSON-string arguments."""
+
+    hermes = select_codec(capability_for_backend("claude_cli"), "auto")
+    native = select_codec(capability_for_backend("lm_studio"), "auto")
+
+    hermes_calls = hermes.parse(
+        "<tool_call>{'name': 'say', 'arguments': {'speech': 'hi'}}</tool_call>"
+    )
+    native_calls = native.parse(_native_one("say", '{"speech": "hi"}'))
+
+    assert [(c.name, c.arguments) for c in hermes_calls] == [
+        (c.name, c.arguments) for c in native_calls
+    ]
+
+
+def test_backend_swap_parity_plain_text_yields_no_calls() -> None:
+    """Plain text → ``[]`` on both seams (Native sees no tool_calls field;
+    Hermes finds no <tool_call> tag)."""
+
+    hermes = select_codec(capability_for_backend("claude_cli"), "auto")
+    native = select_codec(capability_for_backend("lm_studio"), "auto")
+
+    assert hermes.parse("just a sentence, no tool call") == []
+    assert native.parse(SimpleNamespace(content="just a sentence", tool_calls=None)) == []

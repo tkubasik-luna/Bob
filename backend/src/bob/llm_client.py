@@ -42,7 +42,7 @@ from bob.llm.tooling import (
     capability_for_backend,
     select_codec,
 )
-from bob.llm.types import LLMResponse, StreamChunk, ToolCall, ToolDefinition
+from bob.llm.types import LLMResponse, StreamChunk, ToolDefinition
 from bob.logging_setup import log_llm_call
 from bob.validation.system_validator import (
     FALLBACK_VALIDATOR_PREFIX,
@@ -168,72 +168,6 @@ def _strip_code_fence(text: str) -> str:
     if lines[-1].strip().startswith("```"):
         body_end -= 1
     return "\n".join(lines[1:body_end]).strip()
-
-
-def _repair_json_braces(text: str) -> str | None:
-    """Best-effort repair of structurally-broken JSON closers.
-
-    ``claude -p`` hand-writes tool-call JSON (there is no native tool-calling on
-    the CLI) and miscounts closing braces on deeply-nested payloads — e.g. a
-    ``say`` call carrying a ``ui.props.content`` markdown block nests six
-    containers deep, and the model routinely emits the wrong closer type and/or
-    an extra/missing brace at the tail (observed: ``}}}}}]`` where ``}}}}]}``
-    was needed). The OPENING sequence is reliable, so we rebuild the closers
-    from the open-stack: every ``}``/``]`` seen outside a string is replaced by
-    the closer matching the most-recent unclosed ``{``/``[``, stray closers are
-    dropped, trailing junk after the top-level value is trimmed, and any
-    still-open containers are closed at EOF. String contents (respecting
-    backslash escapes) are copied verbatim so braces inside ``content`` never
-    count toward the structure.
-
-    Returns the repaired string, or ``None`` when there was no structure to
-    balance (no opener seen) — the caller treats ``None`` as unrepairable.
-    """
-
-    out: list[str] = []
-    stack: list[str] = []
-    saw_open = False
-    in_string = False
-    escape = False
-    for ch in text:
-        if in_string:
-            out.append(ch)
-            if escape:
-                escape = False
-            elif ch == "\\":
-                escape = True
-            elif ch == '"':
-                in_string = False
-            continue
-        if ch == '"':
-            in_string = True
-            out.append(ch)
-            continue
-        if ch in "{[":
-            saw_open = True
-            stack.append(ch)
-            out.append(ch)
-            continue
-        if ch in "}]":
-            if not stack:
-                # Stray closer with nothing open — drop it.
-                continue
-            opener = stack.pop()
-            out.append("}" if opener == "{" else "]")
-            if not stack:
-                # Top-level value balanced — stop, ignoring any trailing
-                # extra braces / prose the model appended.
-                break
-            continue
-        out.append(ch)
-
-    if not saw_open:
-        return None
-    # Close anything the model left open (truncated tail).
-    while stack:
-        opener = stack.pop()
-        out.append("}" if opener == "{" else "]")
-    return "".join(out)
 
 
 class LLMClient(ABC):
@@ -958,10 +892,27 @@ class ClaudeCliClient(LLMClient):
     instruction (the CLI's ``--json-schema`` flag only validates and silently
     drops invalid output, which would defeat the response-parser retry loop).
     Tools are disabled (``--tools ""``) since Bob only needs the chat reply.
+
+    PRD 0008 / issue 0061 — tool calling goes through the
+    :class:`bob.llm.tooling.hermes.HermesToolCodec`. The CLI has no native
+    function calling and no constrained decoding, so the codec advertises the
+    tools as a Nous-Hermes ``<tools>`` block in the system prompt and parses
+    the model's ``<tool_call>`` replies through a tolerant chain
+    (``json → ast.literal_eval → fenced-JSON``). The fragile hand-written
+    ``{"tool_calls":[…]}`` addendum + brace-repair salvage that lived here are
+    gone — only the wire format died; the Claude CLI stays first-class.
     """
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
+        # Issue 0061 — pick the codec ONCE (mirrors ``LMStudioClient``). The
+        # ``claude_cli`` capability declares ``hermes_tags``; ``select_codec``
+        # returns the Hermes codec under the default ``auto`` mode (or explicit
+        # ``hermes``). No per-call format branching survives downstream.
+        self._tool_codec: ToolCodec = select_codec(
+            capability_for_backend("claude_cli"),
+            settings.LLM_TOOL_MODE,
+        )
 
     def _isolation_args(self) -> list[str]:
         """Extra argv that quarantine the CLI from the user's ``~/.claude``.
@@ -1275,54 +1226,22 @@ class ClaudeCliClient(LLMClient):
                     break
         return result, tokens_in, tokens_out, bool(payload.get("is_error"))
 
-    @staticmethod
-    def _build_tools_system_addendum(tools: list[ToolDefinition]) -> str:
-        """Build a system-prompt addendum describing the available tools.
-
-        Asks Claude to emit a JSON object with a ``tool_calls`` array when it
-        wants to invoke a tool, and plain text otherwise. The CLI doesn't
-        expose Anthropic-format tool-calling on the command line for arbitrary
-        tools, so we route through structured text instead.
-        """
-
-        tool_blocks: list[str] = []
-        for tool in tools:
-            schema = json.dumps(tool.parameters, ensure_ascii=False)
-            tool_blocks.append(
-                f"- name: {tool.name}\n"
-                f"  description: {tool.description}\n"
-                f"  parameters (JSON Schema): {schema}"
-            )
-        joined = "\n".join(tool_blocks)
-        return (
-            "\n\nYou have access to the following tools. To use one, respond "
-            "with ONLY a JSON object on a single line, with no surrounding text "
-            "and no markdown code fence:\n"
-            '{"tool_calls": [{"id": "call_1", "name": "<name>", "arguments": {...}}]}\n'
-            "You may include multiple entries in the ``tool_calls`` array to "
-            "request several tool invocations at once. If you do NOT need a "
-            "tool, respond with plain text (NO json wrapper).\n\n"
-            f"Tools:\n{joined}"
-        )
-
     async def complete(
         self,
         messages: list[dict[str, Any]],
         tools: list[ToolDefinition] | None = None,
         session_id: str | None = None,
     ) -> LLMResponse:
+        # Issue 0061 — tool advertisement is delegated to the codec. The Hermes
+        # codec appends a ``<tools>`` block to the system message *in place*, so
+        # we hand it a shallow copy of the message dicts to avoid mutating the
+        # caller's list. ``inject`` returns ``{}`` for the CLI (the contract is
+        # the prompt, not per-call kwargs) — we ignore the kwargs since
+        # :meth:`chat` takes none.
         if tools:
-            addendum = self._build_tools_system_addendum(tools)
-            augmented: list[dict[str, Any]] = []
-            injected = False
-            for msg in messages:
-                if msg.get("role") == "system" and not injected:
-                    augmented.append({**msg, "content": str(msg.get("content", "")) + addendum})
-                    injected = True
-                else:
-                    augmented.append(msg)
-            if not injected:
-                augmented.insert(0, {"role": "system", "content": addendum.lstrip()})
+            augmented: list[dict[str, Any]] = [dict(msg) for msg in messages]
+            specs = [ToolSpec.from_tool_definition(tool) for tool in tools]
+            self._tool_codec.inject(augmented, specs)
         else:
             augmented = list(messages)
 
@@ -1331,83 +1250,12 @@ class ClaudeCliClient(LLMClient):
         if not tools:
             return LLMResponse(text=raw, tool_calls=[])
 
-        stripped = _strip_code_fence(raw).strip()
-        if not stripped.startswith("{"):
-            return LLMResponse(text=raw, tool_calls=[])
-
-        # Use ``raw_decode`` so a leading JSON object is recognised even when
-        # Claude appends prose after it (observed in practice — the model
-        # emits ``{"tool_calls": [...]}`` followed by a confirmation
-        # sentence). Strict ``json.loads`` on the full string would fail and
-        # the tool call would be silently lost.
-        try:
-            payload, _consumed = json.JSONDecoder().raw_decode(stripped)
-        except json.JSONDecodeError:
-            # claude -p hand-writes JSON and miscounts braces on deeply-nested
-            # tool calls (notably ``say`` + ``ui.props.content`` markdown).
-            # Try to salvage the call by rebuilding the closers from the
-            # open-stack before giving up — otherwise a valid-intent tool call
-            # is lost and the orchestrator degrades to "Désolé, peux-tu
-            # reformuler ?".
-            repaired = _repair_json_braces(stripped)
-            if repaired is None:
-                return LLMResponse(text=raw, tool_calls=[])
-            try:
-                payload, _consumed = json.JSONDecoder().raw_decode(repaired)
-            except json.JSONDecodeError:
-                emit_debug(
-                    category="llm",
-                    severity="warn",
-                    source="bob.llm_client.complete",
-                    summary="Tool-call JSON irréparable (accolades cassées)",
-                    payload={"raw": raw[:800], "session_id": session_id},
-                )
-                return LLMResponse(text=raw, tool_calls=[])
-            emit_debug(
-                category="llm",
-                severity="warn",
-                source="bob.llm_client.complete",
-                summary="Tool-call JSON réparé (accolades rééquilibrées)",
-                payload={"raw": raw[:800], "session_id": session_id},
-            )
-
-        if not isinstance(payload, dict) or "tool_calls" not in payload:
-            return LLMResponse(text=raw, tool_calls=[])
-
-        raw_calls = payload.get("tool_calls")
-        if not isinstance(raw_calls, list):
-            raise LLMClientError(
-                f"Claude CLI returned malformed tool call: 'tool_calls' is not a list "
-                f"({type(raw_calls).__name__})"
-            )
-
-        tool_calls: list[ToolCall] = []
-        for entry in raw_calls:
-            if not isinstance(entry, dict):
-                raise LLMClientError(
-                    f"Claude CLI returned malformed tool call: entry is not an object "
-                    f"({type(entry).__name__})"
-                )
-            name = entry.get("name")
-            if not isinstance(name, str) or not name:
-                raise LLMClientError("Claude CLI returned malformed tool call: missing 'name'")
-            arguments = entry.get("arguments", {})
-            if not isinstance(arguments, dict):
-                raise LLMClientError(
-                    f"Claude CLI returned malformed tool call: 'arguments' is not an "
-                    f"object ({type(arguments).__name__})"
-                )
-            raw_id = entry.get("id")
-            call_id = raw_id if isinstance(raw_id, str) and raw_id else f"call_{uuid4().hex[:8]}"
-            tool_calls.append(
-                ToolCall(
-                    id=call_id,
-                    name=name,
-                    arguments=cast(dict[str, Any], arguments),
-                )
-            )
-
+        # Issue 0061 — parsing the ``<tool_call>`` reply is the codec's job. Its
+        # tolerant chain (``json → ast.literal_eval → fenced-JSON``, no brace
+        # counting) recovers the common garbled shapes; an unrecoverable reply
+        # yields no calls and we fall back to plain text. Bounded-retry with
+        # error echo for a still-malformed call is issue 0062, not here.
+        tool_calls = self._tool_codec.parse(raw)
         if not tool_calls:
             return LLMResponse(text=raw, tool_calls=[])
-
         return LLMResponse(text=None, tool_calls=tool_calls)

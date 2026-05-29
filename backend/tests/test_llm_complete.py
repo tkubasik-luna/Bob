@@ -10,7 +10,6 @@ Both backends are exercised against mocks:
 
 from __future__ import annotations
 
-import json
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -23,7 +22,6 @@ from bob.llm_client import (
     ClaudeCliClient,
     LLMClientError,
     LMStudioClient,
-    _repair_json_braces,
 )
 
 
@@ -252,17 +250,17 @@ async def test_lm_studio_complete_generates_id_when_provider_omits_it() -> None:
 async def test_claude_cli_complete_parses_tool_call_json(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Issue 0061 — the CLI parses a Nous-Hermes ``<tool_call>`` reply.
+
+    Also asserts the codec injected a ``<tools>`` block into the system
+    message (the trained advertisement format) — the old hand-written
+    ``{"tool_calls":[…]}`` addendum is gone.
+    """
+
     client = ClaudeCliClient(_claude_settings())
-    raw_reply = json.dumps(
-        {
-            "tool_calls": [
-                {
-                    "id": "call_99",
-                    "name": "spawn_subtask",
-                    "arguments": {"title": "buy milk"},
-                }
-            ]
-        }
+    raw_reply = (
+        '<tool_call>{"id": "call_99", "name": "spawn_subtask", '
+        '"arguments": {"title": "buy milk"}}</tool_call>'
     )
     captured_messages: dict[str, Any] = {}
 
@@ -295,26 +293,55 @@ async def test_claude_cli_complete_parses_tool_call_json(
     ]
     sent_system = captured_messages["messages"][0]
     assert sent_system["role"] == "system"
+    # Hermes <tools> block advertises the tool; emission protocol uses
+    # <tool_call> tags (not the deleted "tool_calls" JSON wrapper).
     assert "spawn_subtask" in sent_system["content"]
-    assert "tool_calls" in sent_system["content"]
+    assert "<tools>" in sent_system["content"]
+    assert "<tool_call>" in sent_system["content"]
+    # The original system text is preserved (block is appended, not replaced).
+    assert sent_system["content"].startswith("you are bob")
+
+
+@pytest.mark.asyncio
+async def test_claude_cli_complete_does_not_mutate_caller_messages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Hermes inject works on a copy — the caller's list is untouched."""
+
+    client = ClaudeCliClient(_claude_settings())
+
+    async def _fake_chat(
+        messages: list[dict[str, Any]],
+        schema: dict[str, Any] | None = None,
+        session_id: str | None = None,
+    ) -> str:
+        return "plain text"
+
+    monkeypatch.setattr(client, "chat", _fake_chat)
+
+    original = [{"role": "system", "content": "you are bob"}, {"role": "user", "content": "go"}]
+    await client.complete(messages=original, tools=[_spawn_tool()])
+
+    # Caller's system message must not have grown a <tools> block.
+    assert original[0]["content"] == "you are bob"
+    assert "<tools>" not in original[0]["content"]
 
 
 @pytest.mark.asyncio
 async def test_claude_cli_complete_parses_tool_call_with_trailing_prose(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Claude often appends a confirmation sentence after the tool-call JSON.
+    """Claude often appends a confirmation sentence after the tool-call block.
 
-    Regression for slice #0003: ``json.loads`` on the full reply fails when
-    Claude tacks on natural-language text after the closing brace, which
-    caused the tool call to be silently dropped and the orchestrator to fall
-    through to the structured-output text path (no task spawned).
+    The ``<root>`` wrap + ``<tool_call>`` span extraction recover the call
+    regardless of the surrounding narration, so the tool call is not dropped
+    (the failure that pre-0061 forced a fall-through to the text path).
     """
 
     client = ClaudeCliClient(_claude_settings())
     payload = (
-        '{"tool_calls": [{"id": "call_1", "name": "spawn_subtask", '
-        '"arguments": {"title": "Draft email", "goal": "Write three variants."}}]}'
+        '<tool_call>{"id": "call_1", "name": "spawn_subtask", '
+        '"arguments": {"title": "Draft email", "goal": "Write three variants."}}</tool_call>'
         "\n\nTâche lancée. Résultat dans quelques instants."
     )
 
@@ -341,33 +368,29 @@ async def test_claude_cli_complete_parses_tool_call_with_trailing_prose(
 
 
 @pytest.mark.asyncio
-async def test_claude_cli_complete_repairs_malformed_braces(
+async def test_claude_cli_complete_recovers_single_quoted_py_dict(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Regression: ``claude -p`` miscounts braces on deeply-nested ``say`` calls.
+    """Issue 0061 — a Python-dict (single-quoted) body recovers via ast.literal_eval.
 
-    Observed in production — a ``say`` carrying a ``ui.props.content`` markdown
-    block nests six containers deep and the CLI emits a broken closer sequence
-    (``}}}}}]`` instead of ``}}}}]}``), so strict ``raw_decode`` failed, the
-    tool call was dropped, and the orchestrator degraded to "Désolé, peux-tu
-    reformuler ?". The brace-repair pass must salvage the call.
+    Replaces the pre-0061 brace-repair regression: the tolerant chain's
+    ``ast.literal_eval`` rung decodes a body the strict JSON rung rejects,
+    so a deeply-nested ``say`` still resolves without any brace counting.
     """
 
     client = ClaudeCliClient(_claude_settings())
-    # Valid tail would be ``}}}}]}``; the model emitted ``}}}}}]`` (extra brace,
-    # wrong array closer, missing root close).
-    broken = (
-        '{"tool_calls": [{"id": "call_1", "name": "say", "arguments": '
-        '{"speech": "Bitcoin, en bref", "ui": {"component": "Markdown", '
-        '"props": {"content": "rare et cher"}}}}}]'
+    body = (
+        "{'name': 'say', 'arguments': {'speech': 'Bitcoin, en bref', "
+        "'ui': {'component': 'Markdown', 'props': {'content': 'rare et cher'}}}}"
     )
+    reply = f"<tool_call>{body}</tool_call>"
 
     async def _fake_chat(
         messages: list[dict[str, Any]],
         schema: dict[str, Any] | None = None,
         session_id: str | None = None,
     ) -> str:
-        return broken
+        return reply
 
     monkeypatch.setattr(client, "chat", _fake_chat)
 
@@ -382,29 +405,6 @@ async def test_claude_cli_complete_repairs_malformed_braces(
     assert call.name == "say"
     assert call.arguments["speech"] == "Bitcoin, en bref"
     assert call.arguments["ui"]["props"]["content"] == "rare et cher"
-
-
-def test_repair_json_braces_rebuilds_closers() -> None:
-    broken = (
-        '{"tool_calls": [{"name": "say", "arguments": '
-        '{"speech": "x", "ui": {"props": {"content": "y"}}}}}]'
-    )
-    repaired = _repair_json_braces(broken)
-    assert repaired is not None
-    parsed = json.loads(repaired)
-    assert parsed["tool_calls"][0]["arguments"]["ui"]["props"]["content"] == "y"
-
-
-def test_repair_json_braces_ignores_braces_inside_strings() -> None:
-    # A ``}`` inside a string literal must not be counted as a closer, and
-    # trailing extra braces are trimmed once the top-level value balances.
-    repaired = _repair_json_braces('{"a": "x}y{z", "b": 1}}}')
-    assert repaired is not None
-    assert json.loads(repaired) == {"a": "x}y{z", "b": 1}
-
-
-def test_repair_json_braces_returns_none_without_structure() -> None:
-    assert _repair_json_braces("just prose, no json") is None
 
 
 @pytest.mark.asyncio
@@ -436,9 +436,11 @@ async def test_claude_cli_complete_returns_text_when_model_skips_tool(
 async def test_claude_cli_complete_strips_markdown_fence_around_tool_calls(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Issue 0061 — a ```` ```json ```` fence INSIDE the ``<tool_call>`` body unwraps."""
+
     client = ClaudeCliClient(_claude_settings())
-    payload = '{"tool_calls": [{"id": "c1", "name": "spawn_subtask", "arguments": {}}]}'
-    fenced = f"```json\n{payload}\n```"
+    body = '{"id": "c1", "name": "spawn_subtask", "arguments": {}}'
+    fenced = f"<tool_call>\n```json\n{body}\n```\n</tool_call>"
 
     async def _fake_chat(
         messages: list[dict[str, Any]],
@@ -459,47 +461,69 @@ async def test_claude_cli_complete_strips_markdown_fence_around_tool_calls(
 
 
 @pytest.mark.asyncio
-async def test_claude_cli_complete_raises_on_malformed_tool_calls(
+async def test_claude_cli_complete_garbled_tool_call_degrades_to_text(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Issue 0061 — a ``<tool_call>`` the chain cannot decode degrades to text.
+
+    Pre-0061 a non-list / nameless ``{"tool_calls":…}`` raised
+    ``LLMClientError``. Under Hermes a span none of the tolerant rungs decode
+    is simply skipped, the reply is surfaced as plain text, and recovery of a
+    still-malformed call is deferred to the self-correction loop (issue 0062).
+    """
+
     client = ClaudeCliClient(_claude_settings())
+    garbled = '<tool_call>{"name": "say", "arg</tool_call>'
 
     async def _fake_chat(
         messages: list[dict[str, Any]],
         schema: dict[str, Any] | None = None,
         session_id: str | None = None,
     ) -> str:
-        return json.dumps({"tool_calls": "not-a-list"})
+        return garbled
 
     monkeypatch.setattr(client, "chat", _fake_chat)
 
-    with pytest.raises(LLMClientError, match="malformed tool call"):
-        await client.complete(
-            messages=[{"role": "user", "content": "go"}],
-            tools=[_spawn_tool()],
-        )
+    response = await client.complete(
+        messages=[{"role": "user", "content": "go"}],
+        tools=[_spawn_tool()],
+    )
+
+    assert response.is_tool_call is False
+    assert response.tool_calls == []
+    assert response.text == garbled
 
 
 @pytest.mark.asyncio
-async def test_claude_cli_complete_raises_when_entry_missing_name(
+async def test_claude_cli_complete_nameless_tool_call_skipped(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A decodable ``<tool_call>`` body with no ``name`` is not a dispatchable call.
+
+    The span decodes (valid JSON) but carries no ``name``; the codec skips it,
+    so the reply degrades to text rather than raising (pre-0061 this raised
+    ``missing 'name'``).
+    """
+
     client = ClaudeCliClient(_claude_settings())
+    nameless = '<tool_call>{"arguments": {}}</tool_call>'
 
     async def _fake_chat(
         messages: list[dict[str, Any]],
         schema: dict[str, Any] | None = None,
         session_id: str | None = None,
     ) -> str:
-        return json.dumps({"tool_calls": [{"arguments": {}}]})
+        return nameless
 
     monkeypatch.setattr(client, "chat", _fake_chat)
 
-    with pytest.raises(LLMClientError, match="missing 'name'"):
-        await client.complete(
-            messages=[{"role": "user", "content": "go"}],
-            tools=[_spawn_tool()],
-        )
+    response = await client.complete(
+        messages=[{"role": "user", "content": "go"}],
+        tools=[_spawn_tool()],
+    )
+
+    assert response.is_tool_call is False
+    assert response.tool_calls == []
 
 
 @pytest.mark.asyncio
@@ -513,7 +537,7 @@ async def test_claude_cli_complete_generates_id_when_missing(
         schema: dict[str, Any] | None = None,
         session_id: str | None = None,
     ) -> str:
-        return json.dumps({"tool_calls": [{"name": "spawn_subtask", "arguments": {"title": "x"}}]})
+        return '<tool_call>{"name": "spawn_subtask", "arguments": {"title": "x"}}</tool_call>'
 
     monkeypatch.setattr(client, "chat", _fake_chat)
 
@@ -541,9 +565,9 @@ async def test_claude_cli_complete_without_tools_returns_text(
         session_id: str | None = None,
     ) -> str:
         captured_messages["messages"] = messages
-        # Even if the model happens to return a tool-call-shaped JSON, we
+        # Even if the model happens to return a tool-call-shaped reply, we
         # don't ask for tools so we should pass it through as text.
-        return '{"tool_calls": [{"name": "x", "arguments": {}}]}'
+        return '<tool_call>{"name": "x", "arguments": {}}</tool_call>'
 
     monkeypatch.setattr(client, "chat", _fake_chat)
 
@@ -552,16 +576,30 @@ async def test_claude_cli_complete_without_tools_returns_text(
     assert response.is_tool_call is False
     assert response.text is not None
     assert response.tool_calls == []
-    # No system addendum injected when tools is None.
+    # No <tools> block injected when tools is None.
     assert captured_messages["messages"] == [{"role": "user", "content": "hi"}]
 
 
-def test_claude_cli_build_tools_system_addendum_contains_schema() -> None:
-    addendum = ClaudeCliClient._build_tools_system_addendum([_spawn_tool()])
-    assert "spawn_subtask" in addendum
-    assert "Spawn a background subtask." in addendum
-    assert '"required": ["title"]' in addendum
-    assert "tool_calls" in addendum
+def test_claude_cli_inject_builds_tools_block_with_schema() -> None:
+    """The Hermes codec advertises the tool's schema in a ``<tools>`` block.
+
+    Replaces the deleted ``_build_tools_system_addendum`` unit test — the
+    injected block carries the name, description and JSON Schema and tells the
+    model to emit ``<tool_call>`` tags.
+    """
+
+    from bob.llm.tooling import ToolSpec
+
+    messages: list[dict[str, Any]] = [{"role": "system", "content": "base"}]
+    client = ClaudeCliClient(_claude_settings())
+    client._tool_codec.inject(messages, [ToolSpec.from_tool_definition(_spawn_tool())])
+
+    system = messages[0]["content"]
+    assert "spawn_subtask" in system
+    assert "Spawn a background subtask." in system
+    assert '"required": ["title"]' in system
+    assert "<tools>" in system and "</tools>" in system
+    assert "<tool_call>" in system
 
 
 # ---------------------------------------------------------------------------

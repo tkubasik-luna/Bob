@@ -5,14 +5,15 @@ the call site declares *what a backend can do* (a :class:`BackendCapability`)
 and asks :func:`select_codec` for the most robust codec that backend supports.
 No per-call ``if backend == ...`` branching survives at the call site.
 
-Today only the native function-calling codec exists
-(:class:`bob.llm.tooling.codec.NativeToolCodec`). The guided-JSON codec
-(issue 0060) and the Hermes-tag codec (issue 0061) are *declared* in the
-:data:`ToolMode` literal and in :class:`BackendCapability` so the selection
-logic can already express the preference order, but selecting them raises a
-clear :class:`CodecNotAvailableError` until those issues land. That keeps the
-seam honest (no dead code, no silent fallback to native when guided/hermes was
-explicitly requested) while leaving an obvious extension point.
+The native function-calling codec
+(:class:`bob.llm.tooling.codec.NativeToolCodec`, issue 0058) and the
+Nous-Hermes ``<tool_call>`` codec (:class:`bob.llm.tooling.hermes.HermesToolCodec`,
+issue 0061) exist today. The guided-JSON codec (issue 0060) is *declared* in
+the :data:`ToolMode` literal and in :class:`BackendCapability` so the selection
+logic can already express the preference order, but selecting it raises a clear
+:class:`CodecNotAvailableError` until that issue lands. That keeps the seam
+honest (no dead code, no silent fallback to native when guided was explicitly
+requested) while leaving an obvious extension point.
 """
 
 from __future__ import annotations
@@ -73,10 +74,10 @@ class BackendCapability:
 #: OpenAI-compatible endpoint Bob points it at) exposes reliable native
 #: function calling — that is the path :class:`bob.llm_client.LMStudioClient`
 #: drives today. The Claude CLI has NO native tool-calling on the command line
-#: (it hand-writes a ``{"tool_calls":[…]}`` JSON blob in the system prompt);
-#: that prompt-based path is its own thing today and is slated to become the
-#: Hermes codec in issue 0061, so we declare ``hermes_tags`` for it now but the
-#: CLI client keeps its current bespoke path untouched in this issue.
+#: and no constrained decoding; issue 0061 routes it through the Nous-Hermes
+#: ``<tool_call>`` codec (:class:`bob.llm.tooling.hermes.HermesToolCodec`), so
+#: it declares ``hermes_tags`` and ``select_codec`` returns that codec under
+#: the default ``auto`` mode.
 _BACKEND_CAPABILITIES: dict[str, BackendCapability] = {
     "lm_studio": BackendCapability(native_function_calling=True),
     "claude_cli": BackendCapability(hermes_tags=True),
@@ -107,14 +108,16 @@ def select_codec(capability: BackendCapability, mode: ToolMode = "auto") -> Tool
       capability declares support for it; otherwise raise
       :class:`CodecNotAvailableError` so the misconfiguration is loud.
 
-    Only :class:`bob.llm.tooling.codec.NativeToolCodec` exists in issue 0058.
-    The guided / Hermes branches raise until issues 0060 / 0061 implement them
-    — they are real (reachable) extension points, not dead code.
+    :class:`bob.llm.tooling.codec.NativeToolCodec` (issue 0058) and
+    :class:`bob.llm.tooling.hermes.HermesToolCodec` (issue 0061) exist today.
+    The guided branch raises until issue 0060 implements it — a real
+    (reachable) extension point, not dead code.
     """
 
     # Local import avoids a module-import cycle: ``codec`` imports ``spec``,
     # and a future codec may want the capability types.
     from bob.llm.tooling.codec import NativeToolCodec
+    from bob.llm.tooling.hermes import HermesToolCodec
 
     if mode == "native":
         if not capability.native_function_calling:
@@ -136,9 +139,7 @@ def select_codec(capability: BackendCapability, mode: ToolMode = "auto") -> Tool
             raise CodecNotAvailableError(
                 "LLM_TOOL_MODE=hermes but the backend does not declare hermes_tags support."
             )
-        raise CodecNotAvailableError(
-            "Hermes-tag codec is not implemented yet (lands in issue 0061)."
-        )
+        return HermesToolCodec()
 
     # mode == "auto": most-robust-first.
     if capability.native_function_calling:
@@ -149,10 +150,7 @@ def select_codec(capability: BackendCapability, mode: ToolMode = "auto") -> Tool
             "implemented yet (lands in issue 0060)."
         )
     if capability.hermes_tags:
-        raise CodecNotAvailableError(
-            "Backend declares hermes_tags but the Hermes-tag codec is not "
-            "implemented yet (lands in issue 0061)."
-        )
+        return HermesToolCodec()
     raise CodecNotAvailableError(
         "No tool-calling codec available: the backend declares no supported "
         "wire format (native_function_calling / guided_json / hermes_tags all False)."

@@ -15,17 +15,16 @@ from bob.llm_client import (
     ClaudeCliClient,
     LLMClientError,
     LMStudioClient,
-    _repair_json_braces,
 )
 
 from .fixtures.tool_calling import (
     CLAUDE_FENCED,
-    CLAUDE_MALFORMED_REPAIR,
+    CLAUDE_TOLERANCE,
     CLAUDE_WELL_FORMED,
     NATIVE_MALFORMED_ARGUMENTS_RAW,
     NATIVE_WELL_FORMED,
-    ClaudeToolCallFixture,
-    MalformedRepairFixture,
+    HermesToleranceFixture,
+    HermesToolCallFixture,
     NativeToolCallFixture,
 )
 
@@ -508,7 +507,16 @@ async def test_golden_native_malformed_arguments_raise() -> None:
         )
 
 
-# --- Path 2: Jarvis + Claude CLI prompt-based ({"tool_calls":[…]}) ----------
+# --- Path 2: Jarvis + Claude CLI Hermes tags (<tool_call>{…}</tool_call>) ----
+#
+# Issue 0061 replaced the CLI's hand-written ``{"tool_calls":[…]}`` wire format
+# (+ the ``_repair_json_braces`` salvage primitive, now deleted) with the
+# Nous-Hermes ``<tool_call>`` codec. These cases lock the Hermes path: the codec
+# advertises a ``<tools>`` block and parses ``<tool_call>`` replies through the
+# tolerant ``json → ast.literal_eval → fenced-JSON`` chain. The old broken-brace
+# inputs are no longer produced by Hermes; the chain instead recovers
+# single-quoted dicts / XML-illegal-char bodies and degrades an undecodable span
+# to plain text (recovery of a still-malformed call is issue 0062, not here).
 
 
 def _patch_claude_chat(client: ClaudeCliClient, raw: str) -> None:
@@ -524,11 +532,13 @@ def _patch_claude_chat(client: ClaudeCliClient, raw: str) -> None:
 
 @pytest.mark.parametrize("fx", CLAUDE_WELL_FORMED, ids=lambda fx: fx.id)
 @pytest.mark.asyncio
-async def test_golden_claude_well_formed_tool_call(fx: ClaudeToolCallFixture) -> None:
-    """Claude CLI path: ``{"tool_calls":[…]}`` (clean or trailing-prose) parses.
+async def test_golden_claude_well_formed_tool_call(fx: HermesToolCallFixture) -> None:
+    """Claude CLI Hermes path: ``<tool_call>{…}</tool_call>`` replies parse.
 
-    ``raw_decode`` recognises the leading JSON object even when the model
-    appends a confirmation sentence after the closing brace.
+    Covers clean, trailing-prose, multiple-call, and deeply-nested-``say``
+    shapes. The ``<root>`` wrap + span extraction ignore surrounding prose and
+    handle several blocks; the nested ``say`` is just well-formed JSON inside
+    the tags (no brace-counting to break).
     """
 
     client = ClaudeCliClient(_claude_settings())
@@ -547,7 +557,7 @@ async def test_golden_claude_well_formed_tool_call(fx: ClaudeToolCallFixture) ->
 
 @pytest.mark.asyncio
 async def test_golden_claude_fenced_tool_call_strips_fence() -> None:
-    """Claude CLI path strips a ```` ```json ```` fence before parsing."""
+    """Claude CLI Hermes path unwraps a ```` ```json ```` fence inside the tags."""
 
     client = ClaudeCliClient(_claude_settings())
     _patch_claude_chat(client, CLAUDE_FENCED.raw)
@@ -562,25 +572,24 @@ async def test_golden_claude_fenced_tool_call_strips_fence() -> None:
     assert parsed == CLAUDE_FENCED.expected_calls
 
 
-#: The repair fixtures that, once salvaged, yield a ``tool_calls`` payload with
-#: a recoverable first-call ``arguments`` dict (drives the end-to-end CLI test).
-_CLAUDE_SALVAGEABLE_CALLS = tuple(
-    fx for fx in CLAUDE_MALFORMED_REPAIR if fx.repairs_to_valid_json and fx.expected_arguments
-)
+#: The tolerance fixtures that recover at least one call (drive the end-to-end
+#: "tolerant chain salvages it" assertion).
+_CLAUDE_RECOVERED_CALLS = tuple(fx for fx in CLAUDE_TOLERANCE if fx.expected_calls)
+#: The tolerance fixtures that degrade to plain text (no call recovered).
+_CLAUDE_DEGRADES_TO_TEXT = tuple(fx for fx in CLAUDE_TOLERANCE if not fx.expected_calls)
 
 
-@pytest.mark.parametrize("fx", _CLAUDE_SALVAGEABLE_CALLS, ids=lambda fx: fx.id)
+@pytest.mark.parametrize("fx", _CLAUDE_RECOVERED_CALLS, ids=lambda fx: fx.id)
 @pytest.mark.asyncio
-async def test_golden_claude_broken_braces_salvaged(fx: MalformedRepairFixture) -> None:
-    """Claude CLI path salvages broken-brace tool calls via ``_repair_json_braces``.
+async def test_golden_claude_tolerant_chain_recovers(fx: HermesToleranceFixture) -> None:
+    """Claude CLI Hermes path recovers non-strict ``<tool_call>`` bodies.
 
-    These ``raw_decode``-rejected strings are rebuilt from the open-stack and
-    the tool call survives — without the repair the call would be dropped and
-    the orchestrator would degrade to a "reformulate" fallback.
+    The ``json → ast.literal_eval → fenced-JSON`` chain (+ the XML-illegal-char
+    regex fallback) recovers single-quoted Python dicts, bodies with raw
+    ``&``/``<`` characters, and prose-wrapped blocks — the robustness that
+    REPLACES the deleted brace-repair pass.
     """
 
-    assert fx.repairs_to_valid_json is True
-    assert fx.expected_arguments is not None
     client = ClaudeCliClient(_claude_settings())
     _patch_claude_chat(client, fx.raw)
 
@@ -590,24 +599,28 @@ async def test_golden_claude_broken_braces_salvaged(fx: MalformedRepairFixture) 
     )
 
     assert response.is_tool_call is True
-    assert len(response.tool_calls) == 1
-    assert response.tool_calls[0].arguments == fx.expected_arguments
+    parsed = tuple((c.name, c.arguments) for c in response.tool_calls)
+    assert parsed == fx.expected_calls
 
 
-@pytest.mark.parametrize("fx", CLAUDE_MALFORMED_REPAIR, ids=lambda fx: fx.id)
-def test_golden_repair_json_braces_behaviour(fx: MalformedRepairFixture) -> None:
-    """Lock ``_repair_json_braces`` output per fixture (the salvage primitive).
+@pytest.mark.parametrize("fx", _CLAUDE_DEGRADES_TO_TEXT, ids=lambda fx: fx.id)
+@pytest.mark.asyncio
+async def test_golden_claude_undecodable_degrades_to_text(fx: HermesToleranceFixture) -> None:
+    """A reply the tolerant chain cannot decode degrades to plain text (no calls).
 
-    ``repairs_to_valid_json`` records whether the repair returns a
-    ``json.loads``-able string (vs ``None`` for the no-opener case). This is the
-    unit the Claude CLI ``complete`` salvage branch is built on.
+    No ``<tool_call>`` tag, or a body none of the rungs decode, yields ``[]`` —
+    the response is surfaced as text and bounded-retry-with-error-echo is left
+    to the self-correction loop (issue 0062), not the codec.
     """
 
-    repaired = _repair_json_braces(fx.raw)
-    if not fx.repairs_to_valid_json:
-        assert repaired is None
-        return
-    assert repaired is not None
-    parsed = json.loads(repaired)
-    if fx.expected_arguments is not None:
-        assert parsed["tool_calls"][0]["arguments"] == fx.expected_arguments
+    client = ClaudeCliClient(_claude_settings())
+    _patch_claude_chat(client, fx.raw)
+
+    response = await client.complete(
+        messages=[{"role": "user", "content": "go"}],
+        tools=[_golden_tool()],
+    )
+
+    assert response.is_tool_call is False
+    assert response.tool_calls == []
+    assert response.text == fx.raw

@@ -6,11 +6,13 @@ that lets every tool-calling call site speak in one canonical
 :class:`ToolCodec` selected by :func:`select_codec` from a
 :class:`BackendCapability`.
 
-Issue 0058 ships only the native function-calling codec
+Issue 0058 shipped the native function-calling codec
 (:class:`NativeToolCodec`), extracted behaviour-identically from
-:class:`bob.llm_client.LMStudioClient`. Guided-JSON (0060) and Hermes (0061)
-codecs implement the same protocol later; the selection logic already names
-them as reachable extension points.
+:class:`bob.llm_client.LMStudioClient`. Issue 0061 adds
+:class:`HermesToolCodec` — the Nous-Hermes ``<tool_call>`` tag format that
+backs the Claude CLI (and a future Hermes/vLLM endpoint). Guided-JSON (0060)
+implements the same protocol later; the selection logic already names it as a
+reachable extension point.
 """
 
 from __future__ import annotations
@@ -28,11 +30,13 @@ from bob.llm.tooling.codec import (
     ToolCallStreamParser,
     ToolCodec,
 )
+from bob.llm.tooling.hermes import HermesToolCodec
 from bob.llm.tooling.spec import ToolSpec
 
 __all__ = [
     "BackendCapability",
     "CodecNotAvailableError",
+    "HermesToolCodec",
     "NativeToolCallParseError",
     "NativeToolCodec",
     "ToolCallStreamParser",
