@@ -2949,3 +2949,134 @@ def test_p6_gmail_pack_drops_hand_built_descriptor_and_empty_branch() -> None:
     assert 'label="SENT"' in rendered
     assert "result_ref" in rendered
     assert "python -m bob.connectors.gmail.auth" in rendered
+
+
+# ---------------------------------------------------------------------------
+# PRD 0009 P9 — review hardening (deliverable precedence + projector safety)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_p9_resolved_result_ref_to_empty_does_not_ship_other_card() -> None:
+    """PRD 0009 P9 — a RESOLVED result_ref is authoritative. If the model
+    references a stored result that has NO card (an empty search), the runner
+    must NOT substitute a different (later) tool result's card via last(). The
+    answer is "no card", honouring the model's explicit choice."""
+
+    mail = _valid_mail_props()
+    calls = {"n": 0}
+
+    async def _handler(_ctx: Any, _args: Any) -> SubAgentToolHandlerOutcome:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # First call: empty result → gmail_search#1 has no deliverable.
+            return SubAgentToolHandlerOutcome(
+                status="ok", result={"query": "from:nobody", "count": 0, "messages": []}
+            )
+        # Second call: a card → gmail_search#2 (this becomes last()).
+        return SubAgentToolHandlerOutcome(
+            status="ok", result={"query": "label:INBOX", "count": 1, "messages": [mail]}
+        )
+
+    registry = SubAgentToolRegistry(
+        [
+            SubAgentToolDefinition(
+                name="gmail_search",
+                version="v1",
+                description="mail",
+                args_model=GmailSearchArgs,
+                handler=_handler,
+                result_projector=project_gmail_search,
+            )
+        ]
+    )
+    client = _ScriptedClient(
+        chat_values=[
+            _tool_call_payload("gmail_search", {"from_email": "nobody@example.com"}),
+            _tool_call_payload("gmail_search", {"label": "INBOX", "max_results": 1}),
+            # The model references the EMPTY result #1, not the card #2.
+            json.dumps(
+                {
+                    "action": "done",
+                    "result_summary": "rien",
+                    "status": "complete",
+                    "reason_code": "ok",
+                    "result_ref": "gmail_search#1",
+                }
+            ),
+        ]
+    )
+    store = _make_store()
+    task_id = _make_running_task(store)
+    runner = SubAgentRunner(
+        subagent_client=client,
+        task_store=store,
+        event_bus=EventBus(),
+        policy=_no_converge_policy(),
+        tool_registry=registry,
+        clock=_ControllableClock(),
+    )
+
+    await runner.run(task_id)
+
+    task = store.get_task(task_id)
+    assert task.state == "done"
+    # The referenced result had no card → no card shipped (NOT #2's card).
+    assert task.result_payload is None
+
+
+@pytest.mark.asyncio
+async def test_p9_invalid_projector_card_is_dropped_keeping_text() -> None:
+    """PRD 0009 P9 — defensive guard: the convergence path builds the card from
+    the projector and bypasses the up-front deliverable validation. A projector
+    that emits an INVALID card (missing required Mail props) must not reach the
+    frontend: the runner drops the structured payload and keeps the text."""
+
+    from bob.sub_agent.result_store import ProjectedResult
+
+    def _bad_projector(_result: dict[str, Any]) -> ProjectedResult:
+        return ProjectedResult(
+            digest={"count": 1},
+            # Invalid Mail props (missing from/receivedAt/threadId/… ).
+            deliverable={"component": "Mail", "props": {"subject": "only a subject"}},
+            summary="un mail trouvé",
+            terminal=True,
+        )
+
+    async def _handler(_ctx: Any, _args: Any) -> SubAgentToolHandlerOutcome:
+        return SubAgentToolHandlerOutcome(status="ok", result={"count": 1})
+
+    registry = SubAgentToolRegistry(
+        [
+            SubAgentToolDefinition(
+                name="gmail_search",
+                version="v1",
+                description="mail",
+                args_model=GmailSearchArgs,
+                handler=_handler,
+                result_projector=_bad_projector,
+            )
+        ]
+    )
+    client = _ScriptedClient(
+        chat_values=[_tool_call_payload("gmail_search", {"label": "INBOX", "max_results": 1})]
+    )
+    store = _make_store()
+    task_id = _make_running_task(store)
+    runner = SubAgentRunner(
+        subagent_client=client,
+        task_store=store,
+        event_bus=EventBus(),
+        policy=SubAgentPolicy(),  # converge ON: builds the (bad) card from the projector
+        tool_registry=registry,
+        clock=_ControllableClock(),
+    )
+
+    await runner.run(task_id)
+
+    task = store.get_task(task_id)
+    assert task.state == "done"
+    # The invalid card was dropped — the frontend never receives bad props …
+    assert task.result_payload is None
+    # … but the deterministic text summary survives.
+    assert task.result == "un mail trouvé"

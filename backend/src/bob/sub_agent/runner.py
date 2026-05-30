@@ -818,6 +818,15 @@ class SubAgentRunner:
 
             elapsed = self._clock() - started_at
             if elapsed >= self._policy.wall_clock_seconds:
+                # NOTE (PRD 0009): unlike the iteration / token caps (status
+                # ``degraded`` → ``done`` → persists ``result_payload``), a
+                # wall-clock timeout is ``status="timeout"`` → ``failed``, and the
+                # failed path deliberately does not persist ``result_payload``
+                # (legacy ``_fail`` semantics, asserted by tests). So we do NOT
+                # thread the store here: it would attach a card to the live WS
+                # frame but not the DB, an inconsistency worse than the status
+                # quo. Treating a timeout-with-data as ``degraded`` (so the card
+                # persists) is a deliberate semantic change left as a follow-up.
                 await self._emit_terminal_done(
                     task_id,
                     status="timeout",
@@ -1462,24 +1471,38 @@ class SubAgentRunner:
             respect it (covers document tasks and a model that did build a card);
         (c) no usable model payload, but a tool result with a deliverable is on
             the blackboard → build the card from the last stored result (the
-            2026-05-30 RC1 case: the model finally emits a *bare* ``done``);
+            2026-05-30 RC1 case: the model finally emits a *bare* ``done``).
+            Skipped when an explicit ``result_ref`` already RESOLVED — see below;
         (d) nothing structured anywhere → keep whatever the model gave (``None``
             or a non-renderable bag), unchanged from pre-0009.
+
+        A RESOLVED ``result_ref`` is authoritative: the model chose THAT result,
+        so we never substitute a different (e.g. a later, different-tool) card
+        for it. If the referenced result has a deliverable we use it (a); if it
+        resolved but has none — an empty search — we respect "no card" and fall
+        to the model's own payload (b) only, NOT to ``last()`` (c). A ref that
+        does NOT resolve (a typo) is ignored and we proceed as if none was given.
 
         In (a)/(c) a non-empty model ``result_summary`` wins over the projection
         summary (the model may have written better prose); otherwise the
         deterministic projection summary fills it in.
         """
 
+        ref_resolved = False
         if result_ref:
             stored = result_store.get(result_ref)
-            if stored is not None and stored.projection.deliverable is not None:
-                return stored.projection.deliverable, (result_summary or stored.projection.summary)
+            if stored is not None:
+                ref_resolved = True
+                if stored.projection.deliverable is not None:
+                    return stored.projection.deliverable, (
+                        result_summary or stored.projection.summary
+                    )
         if _is_component_descriptor(model_payload) or _deliverable_text(model_payload):
             return model_payload, result_summary
-        stored = result_store.last()
-        if stored is not None and stored.projection.deliverable is not None:
-            return stored.projection.deliverable, (result_summary or stored.projection.summary)
+        if not ref_resolved:
+            stored = result_store.last()
+            if stored is not None and stored.projection.deliverable is not None:
+                return stored.projection.deliverable, (result_summary or stored.projection.summary)
         return model_payload, result_summary
 
     async def _handle_progress(self, task_id: str, thought: str) -> None:
@@ -1877,6 +1900,26 @@ class SubAgentRunner:
         structured_payload: dict[str, Any] | None = (
             ui_payload if _is_component_descriptor(ui_payload) else None
         )
+        # PRD 0009 — defensive guard. The model-driven ``done`` path validates
+        # the deliverable against the ui_registry schema up front (issue 0065)
+        # and routes a bad one through self-correction. But the DETERMINISTIC
+        # paths (convergence / forced stall / cap) build the card from a tool's
+        # projector and call ``_finalize_done`` directly, bypassing that gate. A
+        # buggy projector must never ship invalid props to the frontend, so we
+        # re-validate here and drop the structured payload (keeping the text
+        # result) on failure rather than rendering a malformed card. Idempotent
+        # for the model path (already validated by the same validator), so no
+        # valid card is ever dropped.
+        if structured_payload is not None:
+            descriptor_errors = validate_component_descriptor(structured_payload)
+            if descriptor_errors:
+                _logger.warning(
+                    "sub_agent_runner.invalid_deliverable_dropped",
+                    task_id=task_id,
+                    component=structured_payload.get("component"),
+                    errors=descriptor_errors,
+                )
+                structured_payload = None
         if status in ("complete", "degraded"):
             store_state = "done"
             # The overlay renders ``task.result`` as markdown when no structured
