@@ -75,8 +75,7 @@ def test_last_returns_most_recent_across_tools() -> None:
     store.put(tool_name="gmail_search", tool_version="v1", result={"count": 1})
     last = store.put(tool_name="web_search", tool_version="v1", result={"hits": 2})
     assert store.last() is last
-    assert store.last() is not None
-    assert store.last().ref == "web_search#1"
+    assert last.ref == "web_search#1"
 
 
 def test_custom_projector_is_used() -> None:

@@ -2551,7 +2551,7 @@ def _no_converge_policy(**overrides: Any) -> SubAgentPolicy:
     """Policy with convergence OFF so a terminal result still reaches the
     stall / cap / model-done paths these tests exercise (P5 adds convergence)."""
 
-    base = {
+    base: dict[str, Any] = {
         "max_iterations": 99,
         "wall_clock_seconds": 999.0,
         "token_cap": 10_000_000,
@@ -2758,7 +2758,9 @@ async def test_p4_model_authored_descriptor_is_respected_over_store() -> None:
     task = store.get_task(task_id)
     assert task.state == "done"
     assert task.result_payload is not None
-    assert task.result_payload["props"]["subject"] == "Model-authored subject"
+    props = task.result_payload["props"]
+    assert isinstance(props, dict)
+    assert props["subject"] == "Model-authored subject"
 
 
 # ---------------------------------------------------------------------------
