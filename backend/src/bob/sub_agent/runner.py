@@ -128,7 +128,11 @@ from bob.sub_agent.tool_registry import (
     build_default_subagent_registry,
 )
 from bob.task_store import Task, TaskStore, TaskStoreError
-from bob.ui_registry import ComponentDescriptor, validate_component_descriptor
+from bob.ui_registry import (
+    ComponentDescriptor,
+    validate_component_descriptor,
+    validate_sections,
+)
 from bob.validation import (
     SUB_AGENT_DEFAULT_POLICY,
     CallEnvelope,
@@ -508,28 +512,25 @@ def _validate_sections(
 
     PRD 0010 robustness invariant. The deterministic paths (convergence /
     forced stall / cap) build sections from a tool projector and bypass the
-    model-path validator (issue 0065), so this is their safety net. Each
-    descriptor's props are validated against the SINGLE ui_registry schema; a
-    section that fails is DROPPED (per-section, never crashing the whole list)
-    and logged. Idempotent for the already-validated model path. Returns the
+    model-path validator (issue 0065), so this is their safety net. Delegates
+    to the section-by-section ``ui_registry.validate_sections`` (issue 0068):
+    a section with an unknown component or props that fail the registry schema
+    is DROPPED (never crashing the whole list) and logged; valid sections are
+    kept in order. Idempotent for the already-validated model path. Returns the
     surviving sections (possibly empty); the caller collapses an empty list to
     ``None``.
     """
 
     if not sections:
         return []
-    kept: list[dict[str, Any]] = []
-    for section in sections:
-        errors = validate_component_descriptor(section)
-        if errors:
-            _logger.warning(
-                "sub_agent_runner.invalid_section_dropped",
-                task_id=task_id,
-                component=section.get("component") if isinstance(section, dict) else None,
-                errors=errors,
-            )
-            continue
-        kept.append(section)
+    kept, errors = validate_sections(sections)
+    if errors:
+        _logger.warning(
+            "sub_agent_runner.invalid_section_dropped",
+            task_id=task_id,
+            dropped=len(sections) - len(kept),
+            errors=errors,
+        )
     return kept
 
 

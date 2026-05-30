@@ -110,6 +110,39 @@ class UIRegistry:
             f"{'/'.join(str(p) for p in err.path) or '<root>'}: {err.message}" for err in errors
         ]
 
+    def validate_sections(
+        self, sections: list[Any] | None
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        """Validate a list of section descriptors SECTION BY SECTION (issue 0068).
+
+        PRD 0010 robustness invariant: a single malformed section must NEVER
+        blank the whole view. Each section is validated against the SAME
+        per-component ``oneOf`` schema as :meth:`validate_component_descriptor`
+        (no new schema) — a section with an unknown component or props that fail
+        the registry schema is DROPPED, valid sections are KEPT in their
+        original order. The dropped sections' errors are returned so the
+        self-correction loop can still surface them.
+
+        Returns ``(kept_sections, errors)`` where ``errors`` is a flat list of
+        per-section error strings using the SAME string shape as
+        :meth:`validate_component_descriptor` (each prefixed with the section
+        index, e.g. ``"sections[2]: component: unknown component ..."``) so the
+        ``system_validator`` self-correction loop consumes them unchanged. An
+        empty / ``None`` input yields ``([], [])``.
+        """
+
+        if not sections:
+            return [], []
+        kept: list[dict[str, Any]] = []
+        errors: list[str] = []
+        for index, section in enumerate(sections):
+            section_errors = self.validate_component_descriptor(section)
+            if section_errors:
+                errors.extend(f"sections[{index}]: {err}" for err in section_errors)
+                continue
+            kept.append(section)
+        return kept, errors
+
     def response_schema(self) -> dict[str, Any]:
         """Build the JSON Schema for the full LLM response.
 
@@ -398,3 +431,18 @@ def validate_component_descriptor(payload: Any) -> list[str]:
     """
 
     return _DEFAULT_REGISTRY.validate_component_descriptor(payload)
+
+
+def validate_sections(
+    sections: list[Any] | None,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Validate a list of section descriptors with the default registry (issue 0068).
+
+    Returns ``(kept_sections, errors)`` — see
+    :meth:`UIRegistry.validate_sections`. Invalid sections are dropped per
+    section (never blanking the whole list); the dropped errors use the same
+    string shape as :func:`validate_component_descriptor` so the runner can
+    fold them into the ``system_validator`` self-correction feedback.
+    """
+
+    return _DEFAULT_REGISTRY.validate_sections(sections)

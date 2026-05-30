@@ -342,3 +342,80 @@ def test_validate_component_descriptor_rejects_bad_shapes(payload: object) -> No
 
     errors = ui_registry.validate_component_descriptor(payload)
     assert errors
+
+
+# --- Issue 0068: per-section drop validation ---------------------------------
+
+
+def _markdown_section(text: str) -> dict[str, object]:
+    return {"component": "Markdown", "props": {"content": text}}
+
+
+def test_validate_sections_all_valid_passthrough_in_order() -> None:
+    sections = [
+        _markdown_section("# A"),
+        {"component": "ChatMessage", "props": {"role": "assistant", "content": "B"}},
+        _markdown_section("# C"),
+    ]
+    kept, errors = ui_registry.validate_sections(sections)
+    assert errors == []
+    assert kept == sections  # intact and in original order
+
+
+def test_validate_sections_drops_bad_props_keeps_valid_siblings() -> None:
+    good_a = _markdown_section("# A")
+    bad = {"component": "Markdown", "props": {}}  # missing required `content`
+    good_b = _markdown_section("# C")
+    kept, errors = ui_registry.validate_sections([good_a, bad, good_b])
+    assert kept == [good_a, good_b]  # siblings kept, bad one dropped
+    assert errors  # the dropped section is reported
+    assert any(e.startswith("sections[1]:") for e in errors)
+
+
+def test_validate_sections_drops_unknown_component_and_reports() -> None:
+    good = _markdown_section("# A")
+    unknown = {"component": "NotAComponent", "props": {}}
+    kept, errors = ui_registry.validate_sections([good, unknown])
+    assert kept == [good]
+    assert any("unknown component" in e for e in errors)
+    assert any(e.startswith("sections[1]:") for e in errors)
+
+
+def test_validate_sections_empty_list_yields_empty_no_error() -> None:
+    kept, errors = ui_registry.validate_sections([])
+    assert kept == []
+    assert errors == []
+
+
+def test_validate_sections_none_yields_empty_no_error() -> None:
+    kept, errors = ui_registry.validate_sections(None)
+    assert kept == []
+    assert errors == []
+
+
+def test_validate_sections_error_shape_matches_component_descriptor() -> None:
+    """Dropped-section errors reuse the per-component error string shape so the
+    self-correction loop consumes them unchanged (only an index prefix added)."""
+
+    bad = {"component": "Markdown", "props": {}}
+    _, section_errors = ui_registry.validate_sections([bad])
+    descriptor_errors = ui_registry.validate_component_descriptor(bad)
+    assert descriptor_errors  # the per-component validator flags it
+    # Each reported section error embeds the underlying per-component message.
+    assert section_errors == [f"sections[0]: {e}" for e in descriptor_errors]
+
+
+def test_validate_sections_one_bad_among_valid_still_yields_valid_sections() -> None:
+    """End-to-end robustness: a single invalid section never blanks the view —
+    the valid sections survive so the overlay still renders them."""
+
+    sections = [
+        _markdown_section("# Intro"),
+        {"component": "Mail", "props": {"subject": "incomplete"}},  # missing required
+        _markdown_section("# Outro"),
+    ]
+    kept, errors = ui_registry.validate_sections(sections)
+    assert [s["component"] for s in kept] == ["Markdown", "Markdown"]
+    assert kept[0]["props"]["content"] == "# Intro"
+    assert kept[1]["props"]["content"] == "# Outro"
+    assert errors  # bad Mail section reported for self-correction
