@@ -162,7 +162,7 @@ describe("SphereUI — overlay auto-trigger integration", () => {
     vi.restoreAllMocks();
   });
 
-  test("an overlay-worthy assistant message opens the MarkdownOverlay", () => {
+  test("an overlay-worthy assistant message opens the SectionsOverlay", () => {
     const { container } = render(<SphereUI />);
     // No overlay until an assistant message appears.
     expect(container.querySelector(".overlay-card")).toBeNull();
@@ -355,24 +355,28 @@ describe("SphereUI — overlay auto-trigger integration", () => {
         tasks: {
           t1: {
             ...makeDoneTask("t1", "Mail de Marie, sujet 'Q3 forecast'"),
-            resultPayload: {
-              component: "Mail",
-              props: {
-                from: {
-                  name: "Marie Lefèvre",
-                  email: "marie.lefevre@lunabee.com",
-                  role: "CFO · Lunabee",
+            // PRD 0010 / issue 0066 — resultPayload is now a LIST of sections;
+            // a single Mail card is a list-of-one and still routes to MailOverlay.
+            resultPayload: [
+              {
+                component: "Mail",
+                props: {
+                  from: {
+                    name: "Marie Lefèvre",
+                    email: "marie.lefevre@lunabee.com",
+                    role: "CFO · Lunabee",
+                  },
+                  receivedAt: "2026-05-28T14:22:00Z",
+                  subject: "Q3 forecast — final review before Thursday",
+                  bodyPreview: "Bob, can you have the deck ready by Thursday afternoon?",
+                  flags: ["priority"],
+                  attachments: [],
+                  threadId: "thread-xyz-001",
+                  messageId: "msg-xyz-001",
+                  gmailWebUrl: "https://mail.google.com/mail/u/0/#inbox/thread-xyz-001",
                 },
-                receivedAt: "2026-05-28T14:22:00Z",
-                subject: "Q3 forecast — final review before Thursday",
-                bodyPreview: "Bob, can you have the deck ready by Thursday afternoon?",
-                flags: ["priority"],
-                attachments: [],
-                threadId: "thread-xyz-001",
-                messageId: "msg-xyz-001",
-                gmailWebUrl: "https://mail.google.com/mail/u/0/#inbox/thread-xyz-001",
               },
-            },
+            ],
           },
         },
       });
@@ -382,6 +386,47 @@ describe("SphereUI — overlay auto-trigger integration", () => {
     expect(container.querySelector(".overlay-card.surface-email")).not.toBeNull();
     expect(container.querySelector(".overlay-card.surface-notes")).toBeNull();
     expect(container.querySelector(".ov-email-name")?.textContent).toBe("Marie Lefèvre");
+  });
+
+  test("a text-only Markdown section list applies the text heuristic — long content opens", () => {
+    // PRD 0010 / issue 0066 — auto-open dispatch: a text-only list (Markdown
+    // only) defers to `shouldOverlayResponse` on the section content. A long,
+    // structured Markdown body passes the heuristic and opens the SectionsOverlay.
+    const { container } = render(<SphereUI />);
+    act(() => {
+      useChatStore.setState({
+        tasks: {
+          t1: {
+            ...makeDoneTask("t1", "short spoken summary"),
+            resultPayload: [
+              {
+                component: "Markdown",
+                props: { content: "# Rapport\n\n- a\n- b\n- c\n- d" },
+              },
+            ],
+          },
+        },
+      });
+    });
+    expect(container.querySelector(".overlay-card.surface-notes")).not.toBeNull();
+    expect(container.querySelector(".ov-section .md-h1")?.textContent).toBe("Rapport");
+  });
+
+  test("a text-only Markdown section list with trivial content does NOT open (heuristic)", () => {
+    // The flip side: a short, unstructured Markdown body fails the heuristic so
+    // the overlay stays closed (the spoken summary carries it instead).
+    const { container } = render(<SphereUI />);
+    act(() => {
+      useChatStore.setState({
+        tasks: {
+          t1: {
+            ...makeDoneTask("t1", "ok"),
+            resultPayload: [{ component: "Markdown", props: { content: "ok" } }],
+          },
+        },
+      });
+    });
+    expect(container.querySelector(".overlay-card")).toBeNull();
   });
 
   test("dismissed task-result overlay does not reopen on same task", () => {
@@ -495,9 +540,9 @@ describe("SphereUI — overlay auto-trigger integration", () => {
     expect(container.querySelector(".ov-email-name")?.textContent).toBe("Marie Lefèvre");
   });
 
-  test("dispatches a Markdown assistant_msg.ui to MarkdownOverlay (issue 0053 regression)", () => {
+  test("dispatches a Markdown assistant_msg.ui to SectionsOverlay (issue 0053 regression)", () => {
     // Companion to the Mail dispatch test: a "Markdown" descriptor must
-    // still route to the markdown surface after the dispatcher refactor.
+    // still route to the sections surface after the dispatcher refactor.
     const { container } = render(<SphereUI />);
 
     act(() => {

@@ -31,9 +31,10 @@ def test_migration_adds_result_payload_column() -> None:
     assert "result_payload" in _columns(conn, "tasks")
 
 
-def test_pre_0009_row_reads_result_payload_none() -> None:
-    """A task row written before 0009 must surface ``result_payload=None``
-    (the column is nullable and additive — no back-fill UPDATE needed)."""
+def test_pre_0009_row_reads_result_payload_empty_list() -> None:
+    """A task row written before 0009 must surface ``result_payload=[]``
+    (PRD 0010 / issue 0066 — a ``NULL`` column defensively decodes to the empty
+    list; the column is nullable and additive — no back-fill UPDATE needed)."""
 
     conn = sqlite3.connect(":memory:")
 
@@ -69,7 +70,7 @@ def test_pre_0009_row_reads_result_payload_none() -> None:
     store = TaskStore(conn)
     task = store.get_task("legacy-1")
     assert task.result == "legacy markdown result"
-    assert task.result_payload is None
+    assert task.result_payload == []
 
 
 def test_migration_is_idempotent() -> None:

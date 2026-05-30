@@ -306,62 +306,79 @@ def test_set_result_unknown_task_raises(fresh_task_store: TaskStore) -> None:
         fresh_task_store.set_result("missing-id", "X")
 
 
-def test_set_result_defaults_result_payload_to_none(
+def test_set_result_defaults_result_payload_to_empty_list(
     fresh_task_store: TaskStore,
 ) -> None:
-    """PRD 0008 / issue 0064 — no descriptor → ``result_payload`` stays ``None``."""
+    """PRD 0010 / issue 0066 — no sections → ``result_payload`` is the empty list."""
 
     task_id = fresh_task_store.create_task(title="T", goal="g")
     fresh_task_store.set_result(task_id, "plain markdown deliverable")
     task = fresh_task_store.get_task(task_id)
     assert task.result == "plain markdown deliverable"
-    assert task.result_payload is None
+    assert task.result_payload == []
 
 
-def test_set_result_round_trips_structured_payload(
+def test_set_result_round_trips_section_list(
     fresh_task_store: TaskStore,
 ) -> None:
-    """PRD 0008 / issue 0064 — a ``{component, props}`` descriptor survives a
-    set/get round-trip as a Python dict (JSON-text column under the hood)."""
+    """PRD 0010 / issue 0066 — a LIST of section descriptors survives a set/get
+    round-trip as a Python list (JSON-array TEXT column under the hood)."""
 
     task_id = fresh_task_store.create_task(title="T", goal="g")
-    descriptor: dict[str, object] = {
-        "component": "Mail",
-        "props": {"messageId": "msg-1", "subject": "Récap réunion produit"},
-    }
-    fresh_task_store.set_result(task_id, "spoken summary", result_payload=descriptor)
+    sections: list[dict[str, object]] = [
+        {
+            "component": "Mail",
+            "props": {"messageId": "msg-1", "subject": "Récap réunion produit"},
+        }
+    ]
+    fresh_task_store.set_result(task_id, "spoken summary", result_payload=sections)
     task = fresh_task_store.get_task(task_id)
     assert task.result == "spoken summary"
-    assert task.result_payload == descriptor
+    assert task.result_payload == sections
     # list_tasks goes through the same SELECT / decode path.
     listed = {t.id: t for t in fresh_task_store.list_tasks()}
-    assert listed[task_id].result_payload == descriptor
+    assert listed[task_id].result_payload == sections
 
 
 def test_set_result_clears_stale_payload(fresh_task_store: TaskStore) -> None:
-    """Passing ``result_payload=None`` overwrites a previously stored descriptor
-    so a stale Mail card never lingers under a later summary-only result."""
+    """Passing ``result_payload=None`` / an empty list overwrites a previously
+    stored section list so a stale card never lingers under a later
+    summary-only result."""
 
     task_id = fresh_task_store.create_task(title="T", goal="g")
     fresh_task_store.set_result(
         task_id,
         "first",
-        result_payload={"component": "Mail", "props": {"messageId": "m"}},
+        result_payload=[{"component": "Mail", "props": {"messageId": "m"}}],
     )
-    assert fresh_task_store.get_task(task_id).result_payload is not None
+    assert fresh_task_store.get_task(task_id).result_payload != []
     fresh_task_store.set_result(task_id, "second")
-    assert fresh_task_store.get_task(task_id).result_payload is None
+    assert fresh_task_store.get_task(task_id).result_payload == []
 
 
 def test_decode_result_payload_robustness() -> None:
-    """The decoder collapses NULL / corrupt / non-object JSON to ``None`` — the
-    descriptor is a rendering hint, never load-bearing for task execution."""
+    """The defensive decoder (PRD 0010 / issue 0066) returns the empty list for
+    every non-list value (NULL / corrupt / legacy single object / null / scalar)
+    and a list of dicts for a JSON array — it never raises and never returns a
+    non-list. The section list is a rendering hint, never load-bearing."""
 
-    assert _decode_result_payload(None) is None
-    assert _decode_result_payload("not json {{{") is None
-    assert _decode_result_payload("[1, 2, 3]") is None  # JSON array, not object
-    assert _decode_result_payload('"a string"') is None
-    assert _decode_result_payload('{"component": "Mail"}') == {"component": "Mail"}
+    # Non-list shapes all collapse to the empty list.
+    assert _decode_result_payload(None) == []
+    assert _decode_result_payload("not json {{{") == []
+    assert _decode_result_payload('"a string"') == []
+    assert _decode_result_payload("42") == []
+    assert _decode_result_payload("null") == []
+    # A LEGACY single object (issue 0064 wrote this before 0066) → empty list.
+    assert _decode_result_payload('{"component": "Mail"}') == []
+    # A JSON array of descriptors round-trips; stray non-dict items are dropped.
+    assert _decode_result_payload('[{"component": "Mail", "props": {}}]') == [
+        {"component": "Mail", "props": {}}
+    ]
+    assert _decode_result_payload('[{"component": "Markdown"}, 1, "x", null]') == [
+        {"component": "Markdown"}
+    ]
+    # Empty array stays empty.
+    assert _decode_result_payload("[]") == []
 
 
 def test_append_message_returns_increasing_ids(fresh_task_store: TaskStore) -> None:

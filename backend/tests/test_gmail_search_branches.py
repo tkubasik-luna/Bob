@@ -741,10 +741,12 @@ async def test_subject_and_snippet_never_leak_into_debug_or_info_logs(
     ]
     assert status_changes
     final = status_changes[-1]
+    # PRD 0010 / issue 0066 — the deliverable is a LIST of section descriptors.
     ui_payload = final["payload"].get("ui_payload")
-    assert isinstance(ui_payload, dict)
-    assert ui_payload.get("component") == "Mail"
-    redacted_props = ui_payload.get("props") or {}
+    assert isinstance(ui_payload, list)
+    section = ui_payload[0]
+    assert section.get("component") == "Mail"
+    redacted_props = section.get("props") or {}
     assert redacted_props.get("messageId") == "msg-privacy-1"
     assert redacted_props.get("threadId") == "thread-privacy"
     assert redacted_props.get("from", {}).get("email") == "cfo@example.com"

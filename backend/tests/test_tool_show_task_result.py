@@ -134,12 +134,13 @@ async def test_show_task_result_recalls_structured_mail_descriptor() -> None:
             "bodyPreview": "Hello Tom…",
         },
     }
-    # The spoken text stays in ``result``; the structured descriptor in
-    # ``result_payload`` (exactly what the runner persists for a Mail done).
+    # The spoken text stays in ``result``; the structured section list in
+    # ``result_payload`` (exactly what the runner persists for a Mail done —
+    # PRD 0010 / issue 0066, a single card is a list-of-one).
     task_store.set_result(
         task_id,
         "Mail de Holyana, sujet 'Récap réunion produit'",
-        result_payload=mail_descriptor,
+        result_payload=[mail_descriptor],
     )
 
     result = await dispatcher.dispatch(

@@ -2,7 +2,7 @@ import { useEffect } from "react";
 import { useTaskEvents } from "../../hooks/useTaskEvents";
 import type { Task } from "../../types/ws";
 import type { DebugEvent } from "../../types/ws-debug";
-import { MarkdownOverlay } from "./MarkdownOverlay";
+import { SectionsOverlay } from "./SectionsOverlay";
 
 type TaskOverlayProps = {
   /** Task to render. `null` keeps the overlay closed. */
@@ -21,9 +21,9 @@ type TaskOverlayProps = {
  *   `/ws/task/{task.id}` via `useTaskEvents` and renders the reflection
  *   timeline live. Snapshot-then-tail is handled inside the hook.
  * - **Finished with result** (`state in {done, failed}` and `task.result`
- *   non-empty): renders the result as Markdown via the existing
- *   `MarkdownOverlay` — the same component the sphere auto-opens for
- *   surfacing-class assistant responses.
+ *   non-empty): renders the result text as a list-of-one Markdown section via
+ *   the `SectionsOverlay` — the same shell the sphere auto-opens for
+ *   surfacing-class assistant responses (PRD 0010 / issue 0066).
  * - **Finished without result**: renders a clear empty-state overlay so the
  *   user is not confused by a blank card. Per the PRD: "clicking a finished
  *   task with no `ui_payload` opens an empty-state overlay (clear, not
@@ -42,7 +42,7 @@ export function TaskOverlay({ task, onClose }: TaskOverlayProps) {
     (task.state === "running" || task.state === "pending" || task.state === "waiting_input");
   const { events, ready } = useTaskEvents(isRunning && task ? task.id : null);
 
-  // Global Esc listener — symmetric with MarkdownOverlay's behaviour so the
+  // Global Esc listener — symmetric with SectionsOverlay's behaviour so the
   // user has a consistent dismiss path across all overlay modes.
   useEffect(() => {
     if (task === null) return;
@@ -62,7 +62,12 @@ export function TaskOverlay({ task, onClose }: TaskOverlayProps) {
   // Finished — done or failed.
   const result = typeof task.result === "string" && task.result.length > 0 ? task.result : null;
   if (result !== null) {
-    return <MarkdownOverlay content={result} onClose={onClose} />;
+    return (
+      <SectionsOverlay
+        sections={[{ component: "Markdown", props: { content: result } }]}
+        onClose={onClose}
+      />
+    );
   }
   return <TaskOverlayEmptyState task={task} onClose={onClose} />;
 }

@@ -57,7 +57,11 @@ from bob.sub_agent.actions import (
     SUB_AGENT_ACTION_SCHEMA_NAME,
     sub_agent_action_response_schema,
 )
-from bob.sub_agent.runner import _normalise_payload
+from bob.sub_agent.runner import (
+    _model_payload_to_sections,
+    _normalise_payload,
+    _resolve_terminal_deliverable,
+)
 from bob.sub_agent.tool_registry import (
     WebSearchArgs,
     build_gmail_search_tool,
@@ -1252,14 +1256,16 @@ async def test_validation_feedback_never_uses_tool_role() -> None:
 @pytest.mark.parametrize("guided", [False, True])
 @pytest.mark.asyncio
 async def test_done_markdown_string_deliverable_finalises(guided: bool) -> None:
-    """Issue 0065: a markdown-string deliverable finalises as a text result on
-    BOTH backends (guided LM-Studio-style + non-guided Claude-CLI-style).
+    """Issue 0065 + 0066: a markdown-string deliverable finalises on BOTH
+    backends (guided LM-Studio-style + non-guided Claude-CLI-style).
 
     A bare string is the ``MarkdownDeliverable`` branch of the ``Deliverable``
     union — the shape the model naturally emits for a document-class task. It
-    carries no structured contract, so it is always valid: it lands in
-    ``task.result`` and leaves ``task.result_payload`` empty (the legacy
-    text-only path, untouched by the typing change).
+    carries no structured contract, so it is always valid. PRD 0010 / issue
+    0066 — it now travels as a list-of-one ``Markdown`` section in
+    ``task.result_payload`` (so the SectionsOverlay renders it through the
+    registry), while the markdown text still lands in ``task.result`` for the
+    text fallback / recall path.
     """
 
     store = _make_store()
@@ -1286,8 +1292,11 @@ async def test_done_markdown_string_deliverable_finalises(guided: bool) -> None:
     task = store.get_task(task_id)
     assert task.state == "done"
     assert task.result == "# Exposé\n\nLe corps du document."
-    # A document-class deliverable carries no structured descriptor.
-    assert task.result_payload is None
+    # PRD 0010 / issue 0066 — a document-class deliverable travels as a
+    # list-of-one Markdown section so the SectionsOverlay renders it.
+    assert task.result_payload == [
+        {"component": "Markdown", "props": {"content": "# Exposé\n\nLe corps du document."}}
+    ]
     # No correction loop — a string deliverable is valid by construction.
     assert len(client.calls) == 1
     assert not any(
@@ -1331,7 +1340,7 @@ async def test_done_component_descriptor_deliverable_finalises(guided: bool) -> 
     task = store.get_task(task_id)
     assert task.state == "done"
     # Structured descriptor carried via result_payload, NOT flattened to text.
-    assert task.result_payload == {"component": "Mail", "props": _valid_mail_props()}
+    assert task.result_payload == [{"component": "Mail", "props": _valid_mail_props()}]
     # The spoken summary stays the text result (Mail props live in the payload).
     assert task.result == "Mail de Marie, sujet 'Q3 forecast'."
     # Valid descriptor → no correction loop.
@@ -1397,7 +1406,7 @@ async def test_done_invalid_descriptor_routes_under_system_validator(guided: boo
     # The corrected descriptor finalised the task with the structured payload.
     task = store.get_task(task_id)
     assert task.state == "done"
-    assert task.result_payload == {"component": "Mail", "props": _valid_mail_props()}
+    assert task.result_payload == [{"component": "Mail", "props": _valid_mail_props()}]
 
 
 @pytest.mark.asyncio
@@ -2601,7 +2610,7 @@ async def test_p4_stall_after_gmail_search_keeps_mail_deliverable() -> None:
     assert task.state == "done"
     assert state_changes[-1]["reason_code"] == REASON_STALLED
     # THE FIX: the structured Mail card survives the forced stall.
-    assert task.result_payload == {"component": "Mail", "props": mail}
+    assert task.result_payload == [{"component": "Mail", "props": mail}]
     assert handler_calls  # the search did run
 
 
@@ -2638,7 +2647,7 @@ async def test_p4_iteration_cap_after_gmail_search_keeps_mail_deliverable() -> N
     task = store.get_task(task_id)
     assert task.state == "done"
     assert state_changes[-1]["reason_code"] == REASON_ITERATION_CAP
-    assert task.result_payload == {"component": "Mail", "props": mail}
+    assert task.result_payload == [{"component": "Mail", "props": mail}]
 
 
 @pytest.mark.asyncio
@@ -2681,7 +2690,7 @@ async def test_p4_done_by_result_ref_builds_card_from_store() -> None:
 
     task = store.get_task(task_id)
     assert task.state == "done"
-    assert task.result_payload == {"component": "Mail", "props": mail}
+    assert task.result_payload == [{"component": "Mail", "props": mail}]
     # The model's own prose summary is kept (not overwritten by the projection).
     assert task.result == "Voici le dernier mail."
 
@@ -2717,7 +2726,7 @@ async def test_p4_bare_done_with_stored_result_builds_card() -> None:
 
     task = store.get_task(task_id)
     assert task.state == "done"
-    assert task.result_payload == {"component": "Mail", "props": mail}
+    assert task.result_payload == [{"component": "Mail", "props": mail}]
 
 
 @pytest.mark.asyncio
@@ -2758,7 +2767,7 @@ async def test_p4_model_authored_descriptor_is_respected_over_store() -> None:
     task = store.get_task(task_id)
     assert task.state == "done"
     assert task.result_payload is not None
-    props = task.result_payload["props"]
+    props = task.result_payload[0]["props"]
     assert isinstance(props, dict)
     assert props["subject"] == "Model-authored subject"
 
@@ -2807,7 +2816,7 @@ async def test_p5_terminal_result_converges_immediately() -> None:
     assert task.state == "done"
     assert state_changes[-1]["status"] == "complete"
     assert state_changes[-1]["reason_code"] == REASON_OK
-    assert task.result_payload == {"component": "Mail", "props": mail}
+    assert task.result_payload == [{"component": "Mail", "props": mail}]
     # The spoken summary is the deterministic projection, not empty.
     assert task.result and "1 email" in task.result
 
@@ -2839,7 +2848,7 @@ async def test_p5_empty_terminal_result_converges_without_card() -> None:
     assert len(client.calls) == 1
     task = store.get_task(task_id)
     assert task.state == "done"
-    assert task.result_payload is None
+    assert task.result_payload == []
     assert task.result is not None
     assert "Aucun email" in task.result
 
@@ -2876,7 +2885,7 @@ async def test_p5_convergence_disabled_waits_for_model_done() -> None:
     task = store.get_task(task_id)
     assert task.state == "done"
     # The bare done still got the card from the store (P4 precedence c).
-    assert task.result_payload == {"component": "Mail", "props": mail}
+    assert task.result_payload == [{"component": "Mail", "props": mail}]
 
 
 @pytest.mark.asyncio
@@ -3022,7 +3031,7 @@ async def test_p9_resolved_result_ref_to_empty_does_not_ship_other_card() -> Non
     task = store.get_task(task_id)
     assert task.state == "done"
     # The referenced result had no card → no card shipped (NOT #2's card).
-    assert task.result_payload is None
+    assert task.result_payload == []
 
 
 @pytest.mark.asyncio
@@ -3038,7 +3047,7 @@ async def test_p9_invalid_projector_card_is_dropped_keeping_text() -> None:
         return ProjectedResult(
             digest={"count": 1},
             # Invalid Mail props (missing from/receivedAt/threadId/… ).
-            deliverable={"component": "Mail", "props": {"subject": "only a subject"}},
+            deliverable=[{"component": "Mail", "props": {"subject": "only a subject"}}],
             summary="un mail trouvé",
             terminal=True,
         )
@@ -3077,6 +3086,67 @@ async def test_p9_invalid_projector_card_is_dropped_keeping_text() -> None:
     task = store.get_task(task_id)
     assert task.state == "done"
     # The invalid card was dropped — the frontend never receives bad props …
-    assert task.result_payload is None
+    assert task.result_payload == []
     # … but the deterministic text summary survives.
     assert task.result == "un mail trouvé"
+
+
+# --- PRD 0010 / issue 0066 — sections-list pipeline unit tests ---------------
+
+
+def test_model_payload_to_sections_markdown_string_becomes_one_markdown_section() -> None:
+    """A document-class markdown string lifts onto a list-of-one Markdown section."""
+
+    sections = _model_payload_to_sections("# Titre\n\ncorps")
+    assert sections == [{"component": "Markdown", "props": {"content": "# Titre\n\ncorps"}}]
+
+
+def test_model_payload_to_sections_descriptor_becomes_one_section() -> None:
+    """A hand-built ``{component, props}`` descriptor becomes a list-of-one."""
+
+    descriptor = {"component": "Mail", "props": {"messageId": "m"}}
+    assert _model_payload_to_sections(descriptor) == [descriptor]
+
+
+def test_model_payload_to_sections_returns_none_for_empty_or_unrenderable() -> None:
+    """Nothing renderable → ``None`` so the caller falls through to the store path."""
+
+    assert _model_payload_to_sections(None) is None
+    assert _model_payload_to_sections("") is None
+    assert _model_payload_to_sections("   ") is None
+    # A bag with no renderable text key and no component discriminator.
+    assert _model_payload_to_sections({"foo": "bar"}) is None
+
+
+def test_resolve_terminal_deliverable_returns_section_list_from_store() -> None:
+    """The resolver returns the projection's section list + summary (PRD 0010)."""
+
+    from bob.sub_agent.result_store import ProjectedResult, ToolResultStore
+
+    def _projector(_result: dict[str, Any]) -> ProjectedResult:
+        return ProjectedResult(
+            deliverable=[{"component": "Mail", "props": {"messageId": "m"}}],
+            summary="un mail",
+            terminal=True,
+        )
+
+    store = ToolResultStore()
+    store.put(
+        tool_name="gmail_search",
+        tool_version="v1",
+        result={"count": 1},
+        projector=_projector,
+    )
+    sections, summary = _resolve_terminal_deliverable(store)
+    assert sections == [{"component": "Mail", "props": {"messageId": "m"}}]
+    assert summary == "un mail"
+
+
+def test_resolve_terminal_deliverable_none_when_store_empty() -> None:
+    """No stored result → ``(None, None)`` so a terminal exit ships no card."""
+
+    from bob.sub_agent.result_store import ToolResultStore
+
+    sections, summary = _resolve_terminal_deliverable(ToolResultStore())
+    assert sections is None
+    assert summary is None

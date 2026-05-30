@@ -38,12 +38,15 @@ def test_non_empty_result_builds_valid_mail_deliverable() -> None:
     result = {"query": "label:INBOX", "count": 1, "messages": [_mail_props()]}
     proj = project_gmail_search(result)
 
-    assert proj.deliverable == {"component": "Mail", "props": _mail_props()}
+    # PRD 0010 / issue 0066 — the deliverable is a LIST of section descriptors
+    # (a single Mail card is a list-of-one).
+    assert proj.deliverable == [{"component": "Mail", "props": _mail_props()}]
     assert proj.terminal is True
     # The decisive cross-check: the card the runner will ship validates against
     # the SAME ui_registry schema the `say` tool uses — no drift, no second
     # hand-written Mail schema.
-    assert validate_component_descriptor(proj.deliverable) == []
+    assert proj.deliverable is not None
+    assert validate_component_descriptor(proj.deliverable[0]) == []
     # Summary is deterministic and mentions the count + subject.
     assert "1 email" in proj.summary
     assert "KiLi DEV 2.9.0" in proj.summary
@@ -67,7 +70,7 @@ def test_digest_is_compact_and_body_free() -> None:
     assert proj.digest["query"] == "label:INBOX"
     # The body is NOT lost — it is retained in the deliverable (server-side).
     assert proj.deliverable is not None
-    assert proj.deliverable["props"]["bodyPreview"].startswith("KiLi DEV 2.9.0")
+    assert proj.deliverable[0]["props"]["bodyPreview"].startswith("KiLi DEV 2.9.0")
 
 
 def test_digest_caps_message_count() -> None:

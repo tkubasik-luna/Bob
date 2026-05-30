@@ -82,7 +82,8 @@ def test_custom_projector_is_used() -> None:
     def projector(result: dict[str, object]) -> ProjectedResult:
         return ProjectedResult(
             digest={"count": result["count"]},
-            deliverable={"component": "Mail", "props": {"subject": "x"}},
+            # PRD 0010 / issue 0066 — deliverable is a LIST of section descriptors.
+            deliverable=[{"component": "Mail", "props": {"subject": "x"}}],
             summary="one mail",
             terminal=True,
         )
@@ -98,7 +99,7 @@ def test_custom_projector_is_used() -> None:
     assert "bodyPreview" in stored.result["messages"][0]
     # … but the digest the projector chose is compact and body-free.
     assert stored.projection.digest == {"count": 1}
-    assert stored.projection.deliverable == {"component": "Mail", "props": {"subject": "x"}}
+    assert stored.projection.deliverable == [{"component": "Mail", "props": {"subject": "x"}}]
     assert stored.projection.terminal is True
 
 
@@ -113,6 +114,17 @@ def test_raising_projector_falls_back_to_default() -> None:
     assert stored.projection.digest == result
     assert stored.projection.deliverable is None
     assert stored.projection.terminal is False
+
+
+def test_projected_result_normalises_empty_deliverable_list_to_none() -> None:
+    # PRD 0010 / issue 0066 — an empty section list has a single canonical
+    # representation: ``None`` (so "nothing to render" is unambiguous).
+    assert ProjectedResult(deliverable=[]).deliverable is None
+    # A non-empty list is preserved verbatim.
+    one = [{"component": "Markdown", "props": {"content": "hi"}}]
+    assert ProjectedResult(deliverable=one).deliverable == one
+    # The default is ``None``.
+    assert ProjectedResult().deliverable is None
 
 
 def test_stored_result_carries_tool_identity() -> None:

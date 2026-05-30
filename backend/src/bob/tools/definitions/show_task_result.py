@@ -65,20 +65,28 @@ class ShowTaskResultArgs(BaseModel):
     )
 
 
-def _is_renderable_descriptor(payload: dict[str, object] | None) -> bool:
-    """True when ``payload`` is a structured ``{component, props}`` descriptor.
+def _first_renderable_descriptor(
+    payload: list[dict[str, object]] | None,
+) -> dict[str, object] | None:
+    """Return the first structured ``{component, props}`` section, else ``None``.
 
-    PRD 0008 / issue 0064. Guards the recall path so a stored descriptor
-    (Mail, Markdown, future surfaces) is re-emitted verbatim with its original
-    ``component``. ``None`` (summary-only tasks) and any malformed value fall
-    through to the legacy Markdown wrap of ``task.result``.
+    PRD 0008 / issue 0064 (recall path); PRD 0010 / issue 0066 made the stored
+    deliverable a LIST of section descriptors. The recall surface (the Jarvis
+    ``say.ui`` slot) still re-emits a single descriptor, so we take the first
+    renderable section here. An empty list / no structured section falls through
+    to the legacy Markdown wrap of ``task.result``.
     """
 
-    return (
-        isinstance(payload, dict)
-        and isinstance(payload.get("component"), str)
-        and bool(payload.get("component"))
-    )
+    if not payload:
+        return None
+    for section in payload:
+        if (
+            isinstance(section, dict)
+            and isinstance(section.get("component"), str)
+            and bool(section.get("component"))
+        ):
+            return section
+    return None
 
 
 _DESCRIPTION = (
@@ -182,9 +190,9 @@ async def _show_task_result_handler(ctx: ToolHandlerContext, args: BaseModel) ->
     # Tasks with no structured deliverable (plain documents / summaries) keep
     # the Markdown wrap of the stored ``task.result`` text — unchanged.
     ui: dict[str, Any]
-    if _is_renderable_descriptor(task.result_payload):
-        assert task.result_payload is not None  # narrowed by the guard above
-        ui = dict(task.result_payload)
+    first_section = _first_renderable_descriptor(task.result_payload)
+    if first_section is not None:
+        ui = dict(first_section)
     else:
         ui = {
             "component": "Markdown",

@@ -61,9 +61,12 @@ class ProjectedResult:
     - ``digest`` — the compact form injected into the ``tool`` transcript
       message (context saver). Must omit anything large or privacy-sensitive
       (e.g. a Gmail ``bodyPreview``). Defaults to the empty dict.
-    - ``deliverable`` — the ``{component, props}`` UI descriptor, or ``None``
-      when the result has nothing to render (e.g. an empty search). Validated
-      against ``ui_registry`` by the runner before it is shipped.
+    - ``deliverable`` — a **list** of ``{component, props}`` UI descriptors
+      (PRD 0010 / issue 0066), or ``None`` when the result has nothing to render
+      (e.g. an empty search). A single card is a list-of-one. Each descriptor is
+      validated against ``ui_registry`` by the runner before it is shipped. An
+      empty list is normalised to ``None`` by :meth:`__post_init__` so "nothing
+      to render" has exactly one representation.
     - ``summary`` — a deterministic, human-facing summary used for the spoken
       ``result_summary`` when the runner finalises from the store.
     - ``terminal`` — ``True`` when this result is a complete answer, so the
@@ -73,9 +76,16 @@ class ProjectedResult:
     """
 
     digest: dict[str, Any] = field(default_factory=dict)
-    deliverable: dict[str, Any] | None = None
+    deliverable: list[dict[str, Any]] | None = None
     summary: str = ""
     terminal: bool = False
+
+    def __post_init__(self) -> None:
+        # Normalise an empty list to ``None`` so "no deliverable" has a single
+        # canonical representation across the whole pipeline (PRD 0010 / 0066).
+        # ``object.__setattr__`` because the dataclass is frozen.
+        if self.deliverable is not None and len(self.deliverable) == 0:
+            object.__setattr__(self, "deliverable", None)
 
 
 #: A projector turns a raw tool-result dict into its :class:`ProjectedResult`.

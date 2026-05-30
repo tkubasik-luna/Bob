@@ -1236,6 +1236,16 @@ body {
   background: var(--hud-rule);
 }
 
+/* ── SECTIONS (PRD 0010 / issue 0066) ──
+ * A vertical stack of section cards inside the single SectionsOverlay shell.
+ * Each `.ov-section` is one registry-rendered descriptor; the gap separates
+ * stacked sections without per-section chrome. */
+.ov-sections {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
 /* ── FOOTER ── */
 .ov-footer {
   display: flex;

@@ -298,20 +298,21 @@ async def _replay_active_tasks(websocket: WebSocket) -> None:
             }
         )
         if task.result is not None:
-            # PRD 0008 / issue 0064 — carry the structured deliverable
-            # descriptor on the replayed completion event so a reconnecting /
-            # reloading client rebuilds the matching overlay (Mail → MailOverlay)
+            # PRD 0008 / issue 0064; PRD 0010 / issue 0066 — carry the structured
+            # deliverable section LIST on the replayed completion event so a
+            # reconnecting / reloading client rebuilds the SectionsOverlay
             # instead of treating the stored result purely as Markdown. This
             # frame is sent straight to the chat socket (not via the unified
             # bus), so it never lands in the debug ring buffer — no redaction is
-            # needed here. Omitted for summary-only / plain-Markdown tasks.
+            # needed here. Omitted (empty list) for summary-only tasks so older
+            # clients keep rendering off ``result``.
             task_result_frame: dict[str, Any] = {
                 "type": "task_result",
                 "task_id": task.id,
                 "result": task.result,
                 "replayed": True,
             }
-            if task.result_payload is not None:
+            if task.result_payload:
                 task_result_frame["result_payload"] = task.result_payload
             await websocket.send_json(task_result_frame)
 

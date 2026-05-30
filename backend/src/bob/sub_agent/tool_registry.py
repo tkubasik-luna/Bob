@@ -604,9 +604,11 @@ def project_gmail_search(result: dict[str, Any]) -> ProjectedResult:
     - **digest** (→ transcript): ``count`` + ``query`` + a body-free, capped
       list of ``{subject, from, receivedAt}`` — no ``bodyPreview`` (0056) and
       a fraction of the full blob's size (PRD 0009 context saving);
-    - **deliverable** (→ overlay): ``{"component":"Mail", "props": messages[0]}``
-      when ``count > 0`` (``messages[0]`` already matches the ``Mail`` props
-      schema via ``to_mail_props``), else ``None``;
+    - **deliverable** (→ overlay): a **list-of-one** ``[{"component":"Mail",
+      "props": messages[0]}]`` when ``count > 0`` (``messages[0]`` already
+      matches the ``Mail`` props schema via ``to_mail_props``), else ``None``
+      (PRD 0010 / issue 0066 — the deliverable is now a list of sections;
+      multi-mail is issue 0067);
     - **summary** (→ spoken ``result_summary``): a deterministic French line;
     - **terminal**: always ``True`` — a mail lookup is single-shot, so the
       runner may converge on the first result (empty or not) instead of waiting
@@ -643,7 +645,7 @@ def project_gmail_search(result: dict[str, Any]) -> ProjectedResult:
         )
         return ProjectedResult(
             digest=digest,
-            deliverable={"component": "Mail", "props": first},
+            deliverable=[{"component": "Mail", "props": first}],
             summary=summary,
             terminal=True,
         )

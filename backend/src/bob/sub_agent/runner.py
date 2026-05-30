@@ -304,19 +304,19 @@ def _salvage_tool_result_text(tool_name: str | None, result: dict[str, Any] | No
 
 def _resolve_terminal_deliverable(
     result_store: ToolResultStore, result_ref: str | None = None
-) -> tuple[dict[str, Any] | None, str | None]:
-    """Resolve the deterministic deliverable + summary for a terminal exit (PRD 0009).
+) -> tuple[list[dict[str, Any]] | None, str | None]:
+    """Resolve the deterministic deliverable + summary for a terminal exit (PRD 0009/0010).
 
     Prefers the result the model explicitly referenced via ``result_ref``; falls
-    back to the most recent stored result. Returns the projected
-    ``{component, props}`` deliverable (``None`` when the result has nothing to
-    render — e.g. an empty search) and the projection's deterministic summary
-    (``None`` when empty). This is the SINGLE place the structured deliverable
-    is rebuilt on a forced or clean exit, so a Mail card survives a stall / cap
-    / bare ``done`` instead of depending on the weak model emitting a perfect
-    ``ui_payload`` (the 2026-05-30 empty-overlay bug). A ``result_ref`` that
-    does not resolve degrades to ``last()`` — the best available guess — rather
-    than dropping the deliverable.
+    back to the most recent stored result. Returns the projected deliverable as a
+    **list of section descriptors** (``list[ComponentDescriptor] | None``; PRD
+    0010 / issue 0066 — a single card is a list-of-one, an empty result is
+    ``None``) plus the projection's deterministic summary (``None`` when empty).
+    This is the SINGLE place the structured deliverable is rebuilt on a forced or
+    clean exit, so a card survives a stall / cap / bare ``done`` instead of
+    depending on the weak model emitting a perfect ``ui_payload`` (the 2026-05-30
+    empty-overlay bug). A ``result_ref`` that does not resolve degrades to
+    ``last()`` — the best available guess — rather than dropping the deliverable.
     """
 
     stored = result_store.get(result_ref) or result_store.last()
@@ -395,6 +395,34 @@ def _deliverable_text(ui_payload: dict[str, Any] | str | None) -> str | None:
     return None
 
 
+def _model_payload_to_sections(
+    model_payload: dict[str, Any] | str | None,
+) -> list[dict[str, Any]] | None:
+    """Normalise a model-emitted ``done.ui_payload`` into a section list (issue 0066).
+
+    PRD 0010 — the deliverable contract is a **list** of ``{component, props}``
+    section descriptors. The sub-agent may still emit its deliverable two legacy
+    ways, which we lift onto the new shape here:
+
+    - a structured ``{component, props}`` descriptor (a hand-built Mail / Markdown
+      card) → a list-of-one ``[descriptor]``;
+    - a document-class markdown string (or a ``{markdown/content/text}`` bag) →
+      a single ``Markdown`` section ``[{"component": "Markdown", "props":
+      {"content": <text>}}]`` so a plain text deliverable travels through the
+      same SectionsOverlay registry as everything else.
+
+    Returns ``None`` when the payload carries nothing renderable, so the caller
+    falls through to the store / no-card paths.
+    """
+
+    if _is_component_descriptor(model_payload):
+        return [model_payload]
+    text = _deliverable_text(model_payload)
+    if text is not None:
+        return [{"component": "Markdown", "props": {"content": text}}]
+    return None
+
+
 def _validate_deliverable(ui_payload: ComponentDescriptor | str | None) -> str | None:
     """Validate a ``done`` deliverable against the ``ui_registry`` schema.
 
@@ -468,6 +496,95 @@ def _redact_ui_payload_for_debug(
             redacted_props[field_name] = _MAIL_REDACTED_PLACEHOLDER
     redacted_payload["props"] = redacted_props
     return redacted_payload
+
+
+def _validate_sections(
+    sections: list[dict[str, Any]] | None, *, task_id: str
+) -> list[dict[str, Any]]:
+    """Validate each section descriptor against the ui_registry schema (issue 0066).
+
+    PRD 0010 robustness invariant. The deterministic paths (convergence /
+    forced stall / cap) build sections from a tool projector and bypass the
+    model-path validator (issue 0065), so this is their safety net. Each
+    descriptor's props are validated against the SINGLE ui_registry schema; a
+    section that fails is DROPPED (per-section, never crashing the whole list)
+    and logged. Idempotent for the already-validated model path. Returns the
+    surviving sections (possibly empty); the caller collapses an empty list to
+    ``None``.
+    """
+
+    if not sections:
+        return []
+    kept: list[dict[str, Any]] = []
+    for section in sections:
+        errors = validate_component_descriptor(section)
+        if errors:
+            _logger.warning(
+                "sub_agent_runner.invalid_section_dropped",
+                task_id=task_id,
+                component=section.get("component") if isinstance(section, dict) else None,
+                errors=errors,
+            )
+            continue
+        kept.append(section)
+    return kept
+
+
+def _sections_markdown_text(sections: list[dict[str, Any]] | None) -> str | None:
+    """Markdown text of the FIRST renderable Markdown section, else ``None`` (issue 0066).
+
+    Drives the ``task.result`` fallback text: a document-class deliverable now
+    travels as a single ``Markdown`` section, so the renderable string lives in
+    ``props.content`` (or a ``markdown`` / ``text`` key). A Mail-only list yields
+    ``None`` — its content lives in ``result_payload`` and the spoken
+    ``result_summary`` becomes the ``task.result`` text instead.
+    """
+
+    if not sections:
+        return None
+    for section in sections:
+        if not isinstance(section, dict):
+            continue
+        if section.get("component") != "Markdown":
+            continue
+        text = _deliverable_text(section.get("props"))
+        if text is not None:
+            return text
+    return None
+
+
+def _redact_sections_for_debug(
+    sections: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]] | None:
+    """Per-section email-field redaction for debug sinks (issue 0056 + 0066).
+
+    Maps :func:`_redact_ui_payload_for_debug` over each section so a Mail
+    section's subject / body is scrubbed before the list lands in the debug ring
+    buffer / ``/ws/debug`` feed / JSONL sink. Non-Mail sections pass through
+    untouched. ``None`` in → ``None`` out.
+    """
+
+    if sections is None:
+        return None
+    redacted: list[dict[str, Any]] = []
+    for section in sections:
+        scrubbed = _redact_ui_payload_for_debug(section)
+        # Sections are always ``{component, props}`` dicts (validated upstream),
+        # so the redactor returns a dict here; the ``str | None`` arm of its
+        # signature only fires for the legacy raw-string ``ui_payload`` caller.
+        if isinstance(scrubbed, dict):
+            redacted.append(scrubbed)
+    return redacted
+
+
+def _sections_contain_mail(sections: list[dict[str, Any]] | None) -> bool:
+    """True when any section is a ``Mail`` descriptor (drives debug ``result`` elision)."""
+
+    if not sections:
+        return False
+    return any(
+        isinstance(section, dict) and section.get("component") == "Mail" for section in sections
+    )
 
 
 def _salvage_display(raw: str) -> str:
@@ -1005,7 +1122,7 @@ class SubAgentRunner:
                             status="degraded",
                             reason_code=REASON_INVALID_OUTPUT,
                             result_summary=salvaged,
-                            ui_payload=None,
+                            sections=None,
                             cost=self._build_cost(
                                 started_at=started_at,
                                 iterations=iteration,
@@ -1291,7 +1408,7 @@ class SubAgentRunner:
                             status="complete",
                             reason_code=REASON_OK,
                             result_summary=projection.summary,
-                            ui_payload=projection.deliverable,
+                            sections=projection.deliverable,
                             cost=self._build_cost(
                                 started_at=started_at,
                                 iterations=iteration,
@@ -1436,7 +1553,7 @@ class SubAgentRunner:
         else:
             model_payload = deliverable
 
-        ui_payload, result_summary = self._select_done_deliverable(
+        sections, result_summary = self._select_done_deliverable(
             result_store,
             result_ref=action.result_ref,
             model_payload=model_payload,
@@ -1447,7 +1564,7 @@ class SubAgentRunner:
             status=action.status,
             reason_code=action.reason_code,
             result_summary=result_summary,
-            ui_payload=ui_payload,
+            sections=sections,
             cost=action.cost,
         )
 
@@ -1458,23 +1575,27 @@ class SubAgentRunner:
         result_ref: str | None,
         model_payload: dict[str, Any] | str | None,
         result_summary: str,
-    ) -> tuple[dict[str, Any] | str | None, str]:
-        """Pick the ``done`` deliverable + summary, preferring the store (PRD 0009).
+    ) -> tuple[list[dict[str, Any]] | None, str]:
+        """Pick the ``done`` deliverable sections + summary (PRD 0009 / 0010).
+
+        Returns a **list of section descriptors** (``list[ComponentDescriptor] |
+        None`` — issue 0066; a single card is a list-of-one) plus the summary.
 
         Precedence:
 
         (a) the model referenced a stored result (``result_ref``) whose
-            projection has a deliverable → build the card from it (the
+            projection has a deliverable → build the sections from it (the
             "pass the data id" path — the model never copies the payload);
         (b) the model emitted its OWN renderable payload — a document-class
             markdown string or a hand-built ``{component, props}`` descriptor →
-            respect it (covers document tasks and a model that did build a card);
+            respect it, normalised to a list-of-one section (covers document
+            tasks and a model that did build a card);
         (c) no usable model payload, but a tool result with a deliverable is on
-            the blackboard → build the card from the last stored result (the
+            the blackboard → build the sections from the last stored result (the
             2026-05-30 RC1 case: the model finally emits a *bare* ``done``).
             Skipped when an explicit ``result_ref`` already RESOLVED — see below;
-        (d) nothing structured anywhere → keep whatever the model gave (``None``
-            or a non-renderable bag), unchanged from pre-0009.
+        (d) nothing structured anywhere → ``None`` (the ``result`` text remains
+            the rendering source), unchanged from pre-0010 behaviour.
 
         A RESOLVED ``result_ref`` is authoritative: the model chose THAT result,
         so we never substitute a different (e.g. a later, different-tool) card
@@ -1497,13 +1618,14 @@ class SubAgentRunner:
                     return stored.projection.deliverable, (
                         result_summary or stored.projection.summary
                     )
-        if _is_component_descriptor(model_payload) or _deliverable_text(model_payload):
-            return model_payload, result_summary
+        model_sections = _model_payload_to_sections(model_payload)
+        if model_sections is not None:
+            return model_sections, result_summary
         if not ref_resolved:
             stored = result_store.last()
             if stored is not None and stored.projection.deliverable is not None:
                 return stored.projection.deliverable, (result_summary or stored.projection.summary)
-        return model_payload, result_summary
+        return None, result_summary
 
     async def _handle_progress(self, task_id: str, thought: str) -> None:
         """Persist a v2 ``progress`` thought, leave state ``running``."""
@@ -1830,7 +1952,7 @@ class SubAgentRunner:
             status="failed",
             reason_code=REASON_INVALID_OUTPUT,
             result_summary=f"sub-agent response invalid: {error_message}",
-            ui_payload=None,
+            sections=None,
             cost={},
         )
 
@@ -1841,12 +1963,20 @@ class SubAgentRunner:
         status: SubAgentDoneStatus,
         reason_code: str,
         result_summary: str,
-        ui_payload: dict[str, Any] | str | None,
+        sections: list[dict[str, Any]] | None,
         cost: dict[str, Any],
         redact_result_in_debug: bool = False,
         persist_result_on_failure: bool = False,
     ) -> None:
         """Persist the terminal state + emit WS / bus events.
+
+        PRD 0010 / issue 0066 — the structured deliverable is a **list** of
+        ``{component, props}`` section descriptors (``sections``). A single card
+        is a list-of-one; ``None`` (or an empty list) means "no structured
+        deliverable" so the ``result`` text remains the rendering source. The
+        list is persisted as ``task.result_payload`` (a JSON array) and shipped
+        on the ``task_result`` WS event so the frontend ``SectionsOverlay``
+        rebuilds itself.
 
         ``status in {complete, degraded}`` → task row state ``done`` with
         ``result_summary`` recorded as ``task.result``.
@@ -1890,45 +2020,28 @@ class SubAgentRunner:
             return
 
         store_state: str
-        # PRD 0008 / issue 0064 — a structured ``{component, props}`` descriptor
-        # (Mail today, more later) is carried to the frontend STRUCTURED via
-        # ``task.result_payload`` + the ``task_result`` WS event so the matching
-        # overlay rebuilds itself. It is NOT flattened to text (the bug this
-        # fixes). A plain-markdown ``ui_payload`` (exposé / report string, or a
-        # ``{markdown/content/text}`` bag) keeps the legacy text-only path —
-        # ``result_payload`` stays ``None`` so nothing changes for those tasks.
-        structured_payload: dict[str, Any] | None = (
-            ui_payload if _is_component_descriptor(ui_payload) else None
-        )
-        # PRD 0009 — defensive guard. The model-driven ``done`` path validates
-        # the deliverable against the ui_registry schema up front (issue 0065)
-        # and routes a bad one through self-correction. But the DETERMINISTIC
-        # paths (convergence / forced stall / cap) build the card from a tool's
-        # projector and call ``_finalize_done`` directly, bypassing that gate. A
-        # buggy projector must never ship invalid props to the frontend, so we
-        # re-validate here and drop the structured payload (keeping the text
-        # result) on failure rather than rendering a malformed card. Idempotent
-        # for the model path (already validated by the same validator), so no
-        # valid card is ever dropped.
-        if structured_payload is not None:
-            descriptor_errors = validate_component_descriptor(structured_payload)
-            if descriptor_errors:
-                _logger.warning(
-                    "sub_agent_runner.invalid_deliverable_dropped",
-                    task_id=task_id,
-                    component=structured_payload.get("component"),
-                    errors=descriptor_errors,
-                )
-                structured_payload = None
+        # PRD 0010 / issue 0066 — the deliverable is a LIST of section
+        # descriptors carried to the frontend STRUCTURED via
+        # ``task.result_payload`` (a JSON array) + the ``task_result`` WS event
+        # so the ``SectionsOverlay`` rebuilds itself. Each section is validated
+        # against the single ui_registry schema; a buggy / malformed section is
+        # DROPPED here (per-section, never crashing the whole list) rather than
+        # shipped. The DETERMINISTIC paths (convergence / forced stall / cap)
+        # build sections from a tool projector and call ``_finalize_done``
+        # directly, bypassing the model-path validator (issue 0065) — so this
+        # re-validation is the safety net for them. Idempotent for the model
+        # path (already validated by the same validator), so no valid section is
+        # ever dropped. An all-dropped / empty list collapses to ``None``.
+        validated_sections = _validate_sections(sections, task_id=task_id)
+        structured_payload: list[dict[str, Any]] | None = validated_sections or None
         if status in ("complete", "degraded"):
             store_state = "done"
             # The overlay renders ``task.result`` as markdown when no structured
-            # descriptor is present. Prefer the full markdown deliverable from
-            # ``ui_payload`` (the exposé / report the sub-agent produced); fall
-            # back to the short ``result_summary`` (also the spoken text for a
-            # Mail descriptor, whose renderable content lives in
-            # ``result_payload`` instead).
-            persisted_result = _deliverable_text(ui_payload) or result_summary
+            # section is present. Prefer the markdown text of a single Markdown
+            # section (the exposé / report the sub-agent produced); fall back to
+            # the short ``result_summary`` (also the spoken text for a Mail
+            # section, whose renderable content lives in ``result_payload``).
+            persisted_result = _sections_markdown_text(structured_payload) or result_summary
         else:
             store_state = "failed"
             persisted_result = result_summary or reason_code
@@ -1976,22 +2089,22 @@ class SubAgentRunner:
             _logger.exception("sub_agent_runner.finalize_reload_done_failed", task_id=task_id)
             return
 
-        # Issue 0056 — scrub the Mail subject / bodyPreview / snippet before
-        # the payload lands in the debug ring buffer + WS / file sinks. The
-        # original ``ui_payload`` continues to flow through ``task.result`` /
-        # ``task_result`` WS event / LLM context unchanged; only the debug
-        # envelope sees the redacted copy. Non-Mail payloads round-trip
-        # untouched so Markdown deliverables stay intact.
-        debug_ui_payload = _redact_ui_payload_for_debug(ui_payload)
+        # Issue 0056 — scrub the Mail subject / bodyPreview / snippet of EACH
+        # section before the payload lands in the debug ring buffer + WS / file
+        # sinks. The original sections continue to flow through
+        # ``task.result_payload`` / the ``task_result`` WS event unchanged; only
+        # the debug envelope sees the redacted copy. Non-Mail sections round-trip
+        # untouched so Markdown sections stay intact.
+        debug_sections = _redact_sections_for_debug(structured_payload)
         # The ``result`` field of the debug payload also carries the LLM's
         # spoken ``result_summary`` which for Mail responses typically
         # contains the subject ("Mail de X, sujet '<subject>', ..."). The
         # frontend already gets that string via the ``task_result`` WS
         # event; duplicating it into the debug envelope only widens the
-        # privacy surface for no observability gain. When the payload is
+        # privacy surface for no observability gain. When any section is
         # a Mail descriptor we elide ``result`` and let the per-task
         # overlay derive the summary from ``task.result`` itself.
-        is_mail_payload = isinstance(ui_payload, dict) and ui_payload.get("component") == "Mail"
+        is_mail_payload = _sections_contain_mail(structured_payload)
         debug_result_field: str | None = (
             None
             if store_state != "done" or is_mail_payload or redact_result_in_debug
@@ -2017,7 +2130,7 @@ class SubAgentRunner:
                 "reason": reason_code if store_state != "done" else None,
                 "status": status,
                 "reason_code": reason_code,
-                "ui_payload": debug_ui_payload,
+                "ui_payload": debug_sections,
                 "cost": cost,
                 # Issue 0052: status_change reflection so the overlay
                 # can render a terminal pill in the timeline.
@@ -2075,7 +2188,7 @@ class SubAgentRunner:
                 "result": (
                     None if (is_mail_payload or redact_result_in_debug) else persisted_result
                 ),
-                "result_payload": _redact_ui_payload_for_debug(structured_payload),
+                "result_payload": debug_sections,
             }
         elif redact_result_in_debug:
             # RC2 salvage with no structured payload — keep the salvaged text
@@ -2243,21 +2356,22 @@ class SubAgentRunner:
     ) -> None:
         """Convenience wrapper around :meth:`_finalize_done` for cap / forced paths.
 
-        PRD 0009 — when ``result_store`` is supplied (the cap and stall paths
-        that retained data), the structured deliverable is rebuilt from the
-        store's last projection and attached as ``ui_payload`` so a Mail card
-        survives a degraded exit (the 2026-05-30 fix). The projection's summary
-        backfills ``result_summary`` only when the caller passed none — the
-        caller's salvaged text (which carries the degraded "[résultat partiel]"
-        framing) still wins when present. Paths with no retained data (cancel /
-        wall-clock / hard-kill) pass no store and are byte-identical to before.
+        PRD 0009 / 0010 — when ``result_store`` is supplied (the cap and stall
+        paths that retained data), the deliverable is rebuilt from the store's
+        last projection as a list of section descriptors and attached as
+        ``sections`` so a card survives a degraded exit (the 2026-05-30 fix). The
+        projection's summary backfills ``result_summary`` only when the caller
+        passed none — the caller's salvaged text (which carries the degraded
+        "[résultat partiel]" framing) still wins when present. Paths with no
+        retained data (cancel / wall-clock / hard-kill) pass no store and are
+        byte-identical to before.
         """
 
-        ui_payload: dict[str, Any] | None = None
+        sections: list[dict[str, Any]] | None = None
         if result_store is not None:
             deliverable, summary = _resolve_terminal_deliverable(result_store)
             if deliverable is not None:
-                ui_payload = deliverable
+                sections = deliverable
             if not result_summary and summary:
                 result_summary = summary
 
@@ -2266,7 +2380,7 @@ class SubAgentRunner:
             status=status,
             reason_code=reason_code,
             result_summary=result_summary,
-            ui_payload=ui_payload,
+            sections=sections,
             cost=cost,
             redact_result_in_debug=redact_result_in_debug,
             persist_result_on_failure=persist_result_on_failure,

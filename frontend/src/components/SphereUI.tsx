@@ -11,10 +11,11 @@ import { DevControls } from "./sphere/DevControls";
 import { HudTasks } from "./sphere/HudTasks";
 import { InputField } from "./sphere/InputField";
 import { MailOverlay } from "./sphere/MailOverlay";
-import { MarkdownOverlay } from "./sphere/MarkdownOverlay";
 import { MuteToggle } from "./sphere/MuteToggle";
+import { SectionsOverlay } from "./sphere/SectionsOverlay";
 import { TaskOverlay } from "./sphere/TaskOverlay";
 import { TranscriptLine } from "./sphere/TranscriptLine";
+import { sectionRegistry } from "./sphere/sectionRegistry";
 import { SphereWsContext } from "./sphere/sphereWsContext";
 
 /** Cmd+Shift+D toggles the dedicated debug window (PRD 0005). The listener
@@ -91,13 +92,14 @@ export function SphereUI() {
   // `ui` so the overlay opens "while Jarvis is still talking" rather than
   // at the very end of the turn.
   const streamingUi = useChatStore((s) => s.streamingAssistant?.ui ?? null);
-  const [overlayContent, setOverlayContent] = useState<string | null>(null);
-  // Issue 0053 — parallel state for the Mail overlay. Kept separate from
-  // `overlayContent` so each surface owns its own open/close lifecycle and
-  // the existing markdown effects don't need to learn about the new union.
-  // The dispatcher below routes a descriptor to whichever setter matches
-  // `component`; unknown components silently no-op so the registry can
-  // grow without breaking older frontends.
+  // PRD 0010 / issue 0066 — a single overlay state holding the list of section
+  // descriptors the SectionsOverlay renders (Markdown today, more later). The
+  // standalone MarkdownOverlay is gone; a text-only result now travels as a
+  // list-of-one Markdown section.
+  const [overlaySections, setOverlaySections] = useState<ComponentDescriptor[] | null>(null);
+  // Issue 0053 — parallel state for the Mail overlay, kept until issue 0067
+  // folds Mail into the SectionsOverlay registry. A Mail descriptor in a result
+  // list is still routed here so the existing MailOverlay keeps working.
   const [overlayMail, setOverlayMail] = useState<MailProps | null>(null);
   // Issue 0052 — per-task overlay state. Clicking a task in `HudTasks`
   // sets this; the overlay subscribes to the task's live reflections
@@ -143,37 +145,56 @@ export function SphereUI() {
   useEffect(() => {
     openTaskIdRef.current = openTaskId;
   }, [openTaskId]);
-  // Issue 0053 — single dispatch point for a `ComponentDescriptor` -> overlay
-  // setter. Both the streaming `ui_payload` path and the final
-  // `assistant_msg.ui` fallback funnel through this so adding a new surface
-  // (Map, Doc, Contact, …) only requires extending the switch. Unknown
-  // components return `false` silently so the registry can grow without
-  // crashing older frontends that don't know about them yet.
+  // PRD 0010 / issue 0066 — single dispatch point for a LIST of section
+  // descriptors. The streaming `ui_payload` path and the final `assistant_msg.ui`
+  // fallback both funnel a `ComponentDescriptor[]` through here.
   //
-  // Wrapped in `useCallback` with an empty dep array — both setters are
-  // stable across renders, so the dispatcher identity stays stable too and
-  // the effects below can list it as a dep without re-running each render.
-  const openOverlayFromDescriptor = useCallback(
-    (descriptor: ComponentDescriptor | null): boolean => {
-      if (!descriptor) return false;
-      if (descriptor.component === "Markdown") {
-        const content = descriptor.props?.content;
-        if (typeof content !== "string" || content.length === 0) return false;
-        setOverlayContent(content);
-        return true;
-      }
-      if (descriptor.component === "Mail") {
-        // The Mail props are validated server-side via the JSON schema, so a
-        // descriptor that reaches the frontend should already be well-formed.
-        // We still check that `messageId` looks like a string before calling
-        // `setOverlayMail` — a defensive cast keeps a malformed payload from
-        // crashing the React render.
-        const props = descriptor.props as Partial<MailProps> | undefined;
+  // Routing:
+  //   - a Mail descriptor still opens the standalone MailOverlay (kept working
+  //     until issue 0067 folds Mail into the SectionsOverlay registry);
+  //   - every other section (Markdown today, unknown → NotImplemented) opens
+  //     the SectionsOverlay as an ordered list.
+  //
+  // Auto-open weight: a list with ≥1 `structured` section (per the section
+  // registry, or a Mail card) opens unconditionally; a text-only list (Markdown
+  // only) defers to the caller's `shouldOverlayResponse` heuristic on the text
+  // (the caller passes `applyTextHeuristic`). Returns `true` when it opened an
+  // overlay so the caller can record the source as evaluated.
+  //
+  // Wrapped in `useCallback` with an empty dep array — the setters are stable
+  // across renders, so the dispatcher identity stays stable too and the effects
+  // below can list it as a dep without re-running each render.
+  const openOverlayFromSections = useCallback(
+    (sections: ComponentDescriptor[] | null, applyTextHeuristic = false): boolean => {
+      if (!sections || sections.length === 0) return false;
+
+      // A single Mail descriptor routes to the legacy MailOverlay (issue 0067
+      // removes this branch and renders Mail through the SectionsOverlay
+      // registry instead). Guard `messageId` defensively so a malformed payload
+      // never crashes the render.
+      if (sections.length === 1 && sections[0].component === "Mail") {
+        const props = sections[0].props as Partial<MailProps> | undefined;
         if (!props || typeof props.messageId !== "string") return false;
         setOverlayMail(props as MailProps);
         return true;
       }
-      return false;
+
+      // Otherwise open the SectionsOverlay. Decide auto-open: any structured
+      // section (or a Mail mixed into a larger list) opens unconditionally; a
+      // text-only list defers to the text heuristic on the concatenated
+      // Markdown content when the caller asked for it.
+      const hasStructured = sections.some(
+        (s) => s.component === "Mail" || sectionRegistry[s.component]?.structured === true,
+      );
+      if (applyTextHeuristic && !hasStructured) {
+        const text = sections
+          .map((s) => (typeof s.props?.content === "string" ? (s.props.content as string) : ""))
+          .join("\n\n")
+          .trim();
+        if (text.length === 0 || !shouldOverlayResponse(text)) return false;
+      }
+      setOverlaySections(sections);
+      return true;
     },
     [],
   );
@@ -190,8 +211,9 @@ export function SphereUI() {
     if (msgId === null) return;
     if (evaluatedStreamUiRef.current.has(msgId)) return;
     evaluatedStreamUiRef.current.add(msgId);
-    openOverlayFromDescriptor(streamingUi);
-  }, [streamingUi, openOverlayFromDescriptor]);
+    // The streamed `ui` is a single descriptor — lift it onto a list-of-one.
+    openOverlayFromSections([streamingUi]);
+  }, [streamingUi, openOverlayFromSections]);
   // Fallback for the streamed `ui_payload` path: open the overlay from the
   // FINAL `assistant_msg`'s `ui` field. The streamed `ui_payload` frame is
   // routed through the single process-wide ws emitter (last-connected window
@@ -211,10 +233,14 @@ export function SphereUI() {
     }
     if (lastAssistant === null) return;
     if (evaluatedStreamUiRef.current.has(lastAssistant.id)) return;
-    const descriptor = lastAssistant.ui?.[0] ?? null;
-    if (!openOverlayFromDescriptor(descriptor)) return;
+    // `assistant_msg.ui` is already a `ComponentDescriptor[]` (the Jarvis say.ui
+    // contract) — open the whole list of sections at once. A text-only list
+    // (Markdown) defers to the `shouldOverlayResponse` heuristic; a structured
+    // section opens unconditionally.
+    const sections = lastAssistant.ui ?? null;
+    if (!openOverlayFromSections(sections, true)) return;
     evaluatedStreamUiRef.current.add(lastAssistant.id);
-  }, [messages, openOverlayFromDescriptor]);
+  }, [messages, openOverlayFromSections]);
   useEffect(() => {
     // Walk back to the most recent non-empty assistant message; older entries
     // are uninteresting because the heuristic is evaluated per *latest* turn.
@@ -234,7 +260,9 @@ export function SphereUI() {
     if (lastEvaluatedMsgIdRef.current === lastAssistant.id) return;
     lastEvaluatedMsgIdRef.current = lastAssistant.id;
     if (!shouldOverlayResponse(lastAssistant.content)) return;
-    setOverlayContent(lastAssistant.content);
+    // A heuristic-triggered text bubble travels as a list-of-one Markdown
+    // section through the same SectionsOverlay registry.
+    setOverlaySections([{ component: "Markdown", props: { content: lastAssistant.content } }]);
   }, [messages]);
   useEffect(() => {
     // Sub-task results land on `tasks[id].result` (not on the main `messages`
@@ -252,24 +280,28 @@ export function SphereUI() {
     // Already showing this task in the per-task overlay? It renders the result
     // itself on completion — don't also pop the standalone overlay.
     if (openTaskIdRef.current === latest.id) return;
-    // PRD 0008 / issue 0064 — when the sub-agent produced a STRUCTURED
-    // deliverable (e.g. a Mail card), `resultPayload` carries the original
-    // `{ component, props }` descriptor. Dispatch on it so the matching
-    // overlay rebuilds itself (Mail → MailOverlay) instead of wrapping the
-    // spoken result text as Markdown — the bug this fixes was the Mail card
-    // never appearing because this effect always called `setOverlayContent`.
-    // The dispatcher returns `false` for an unknown / malformed descriptor; in
-    // that case we fall through to the legacy Markdown path on `result`.
-    if (latest.resultPayload && openOverlayFromDescriptor(latest.resultPayload)) {
+    // PRD 0010 / issue 0066 — when the sub-agent produced a STRUCTURED
+    // deliverable, `resultPayload` carries the ordered list of section
+    // descriptors. Open it through the single dispatcher so the SectionsOverlay
+    // rebuilds itself (a Mail section still routes to MailOverlay until 0067).
+    // The dispatcher returns `false` for an empty / malformed list; in that
+    // case we fall through to the legacy Markdown path on the `result` text,
+    // wrapped as a list-of-one Markdown section.
+    if (
+      latest.resultPayload &&
+      latest.resultPayload.length > 0 &&
+      openOverlayFromSections(latest.resultPayload, true)
+    ) {
       return;
     }
     const result = latest.result;
     if (typeof result !== "string") return;
     if (!shouldOverlayResponse(result)) return;
-    setOverlayContent(result);
-  }, [tasks, openOverlayFromDescriptor]);
+    setOverlaySections([{ component: "Markdown", props: { content: result } }]);
+  }, [tasks, openOverlayFromSections]);
 
-  const overlayOpen = overlayContent !== null || overlayMail !== null;
+  const overlayOpen =
+    (overlaySections !== null && overlaySections.length > 0) || overlayMail !== null;
   return (
     <SphereWsContext.Provider value={send}>
       <div
@@ -292,18 +324,25 @@ export function SphereUI() {
           audioLevelRef={audioLevelRef}
         />
         <div className="hud-zone tr">
-          <HudTasks onOpenResult={setOverlayContent} onOpenTask={(t) => setOpenTaskId(t.id)} />
+          <HudTasks
+            onOpenResult={(content) =>
+              setOverlaySections([{ component: "Markdown", props: { content } }])
+            }
+            onOpenTask={(t) => setOpenTaskId(t.id)}
+          />
         </div>
         <div className="hud-zone b">
           <TranscriptLine state={transcriptState} hidden={overlayOpen} />
           <InputField />
         </div>
-        <MarkdownOverlay content={overlayContent} onClose={() => setOverlayContent(null)} />
-        {/* Mail overlay (issue 0053) — opens via the say-tool dispatcher
-         * above when a Mail descriptor lands. Kept independent from
-         * MarkdownOverlay so each surface owns its own open/close
-         * lifecycle; the Esc / backdrop / DISMISS paths are scoped to
-         * whichever card is mounted. */}
+        {/* PRD 0010 / issue 0066 — the single sections overlay shell. Replaces
+         * the standalone MarkdownOverlay; a text-only result is a list-of-one
+         * Markdown section here. */}
+        <SectionsOverlay sections={overlaySections} onClose={() => setOverlaySections(null)} />
+        {/* Mail overlay (issue 0053) — opens via the dispatcher above when a
+         * single Mail descriptor lands. Kept independent until issue 0067 folds
+         * Mail into the SectionsOverlay registry; the Esc / backdrop / DISMISS
+         * paths are scoped to whichever card is mounted. */}
         <MailOverlay mail={overlayMail} onClose={() => setOverlayMail(null)} />
         {/* Per-task overlay (issue 0052) — opens on row click in HudTasks.
          * Kept mutually exclusive with the standalone MarkdownOverlay above:

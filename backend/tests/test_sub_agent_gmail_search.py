@@ -253,9 +253,10 @@ async def test_gmail_search_runner_e2e(monkeypatch: pytest.MonkeyPatch) -> None:
     ]
     assert status_change_events
     final_payload = status_change_events[-1]["payload"]
-    assert isinstance(final_payload.get("ui_payload"), dict)
-    assert final_payload["ui_payload"]["component"] == "Mail"
-    mail_props = final_payload["ui_payload"]["props"]
+    # PRD 0010 / issue 0066 — the deliverable is a LIST of section descriptors.
+    assert isinstance(final_payload.get("ui_payload"), list)
+    assert final_payload["ui_payload"][0]["component"] == "Mail"
+    mail_props = final_payload["ui_payload"][0]["props"]
     # Metadata stays in clear — needed to route the event downstream.
     assert mail_props["from"]["name"] == "Holyana Callejon"
     assert mail_props["from"]["email"] == "holyana@example.com"
@@ -270,8 +271,8 @@ async def test_gmail_search_runner_e2e(monkeypatch: pytest.MonkeyPatch) -> None:
     #    props}`` shape with the REAL (unredacted) subject so the recall path
     #    (``show_task_result``) and a reconnect replay can rebuild the overlay.
     assert task.result_payload is not None
-    assert task.result_payload["component"] == "Mail"
-    persisted_props = task.result_payload["props"]
+    assert task.result_payload[0]["component"] == "Mail"
+    persisted_props = task.result_payload[0]["props"]
     assert isinstance(persisted_props, dict)
     assert persisted_props["messageId"] == "msg-12345"
     assert persisted_props["subject"] == "Récap réunion produit"
@@ -285,8 +286,8 @@ async def test_gmail_search_runner_e2e(monkeypatch: pytest.MonkeyPatch) -> None:
     ws_result = ws_task_results[-1]
     assert ws_result["task_id"] == task_id
     assert "result_payload" in ws_result
-    assert ws_result["result_payload"]["component"] == "Mail"
-    ws_props = ws_result["result_payload"]["props"]
+    assert ws_result["result_payload"][0]["component"] == "Mail"
+    ws_props = ws_result["result_payload"][0]["props"]
     assert ws_props["subject"] == "Récap réunion produit"
     assert ws_props["bodyPreview"] == expected_props["bodyPreview"]
 
@@ -302,8 +303,8 @@ async def test_gmail_search_runner_e2e(monkeypatch: pytest.MonkeyPatch) -> None:
     ]
     assert debug_task_results
     debug_ws_event = debug_task_results[-1]["payload"]["ws_event"]
-    assert debug_ws_event["result_payload"]["component"] == "Mail"
-    debug_props = debug_ws_event["result_payload"]["props"]
+    assert debug_ws_event["result_payload"][0]["component"] == "Mail"
+    debug_props = debug_ws_event["result_payload"][0]["props"]
     assert debug_props["subject"] == "<redacted-for-privacy>"
     assert debug_props["bodyPreview"] == "<redacted-for-privacy>"
     # Metadata still flows (needed to route / identify the mail downstream).
@@ -382,8 +383,8 @@ async def test_gmail_search_runner_e2e_converges(
     assert task.state == "done"
     # The Mail card was built deterministically from the stored result.
     assert task.result_payload is not None
-    assert task.result_payload["component"] == "Mail"
-    assert task.result_payload["props"] == expected_props
+    assert task.result_payload[0]["component"] == "Mail"
+    assert task.result_payload[0]["props"] == expected_props
     # Spoken summary is the deterministic projection.
     assert task.result is not None
     assert "Holyana Callejon" in task.result
@@ -391,7 +392,7 @@ async def test_gmail_search_runner_e2e_converges(
     # The chat WS frame carries the REAL props for the overlay …
     ws_task_results = [f for f in ws_frames if f.get("type") == "task_result"]
     assert ws_task_results
-    assert ws_task_results[-1]["result_payload"]["props"]["subject"] == "Récap réunion produit"
+    assert ws_task_results[-1]["result_payload"][0]["props"]["subject"] == "Récap réunion produit"
 
     # … while the debug ring buffer copy redacts subject / bodyPreview (0056).
     captured_events = [event.to_dict() for event in snapshot_for_task(task_id)]
@@ -402,7 +403,7 @@ async def test_gmail_search_runner_e2e_converges(
         and ev.get("payload", {}).get("new_state") == "done"
     ]
     assert status_change_events
-    redacted = status_change_events[-1]["payload"]["ui_payload"]["props"]
+    redacted = status_change_events[-1]["payload"]["ui_payload"][0]["props"]
     assert redacted["subject"] == "<redacted-for-privacy>"
     assert redacted["bodyPreview"] == "<redacted-for-privacy>"
     # Metadata still flows for routing.

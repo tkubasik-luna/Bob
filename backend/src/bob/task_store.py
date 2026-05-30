@@ -77,14 +77,17 @@ class Task:
     created_at: str
     updated_at: str
     dismissed: bool
-    #: Structured deliverable descriptor persisted alongside the spoken /
-    #: markdown ``result`` text (PRD 0008 / issue 0064). Holds the full
-    #: ``{"component": ..., "props": {...}}`` shape the sub-agent emitted in
-    #: ``done.ui_payload`` so the frontend can reconstruct the matching overlay
-    #: (Mail, Markdown, future surfaces) on the completion event and on recall.
-    #: ``None`` for tasks with no structured deliverable (summary-only / cap
-    #: paths) — the ``result`` text remains the rendering source in that case.
-    result_payload: dict[str, object] | None = None
+    #: Structured deliverable persisted alongside the spoken / markdown
+    #: ``result`` text (PRD 0008 / issue 0064; PRD 0010 / issue 0066 made it a
+    #: LIST). Holds a list of ``{"component": ..., "props": {...}}`` section
+    #: descriptors the sub-agent's terminal deliverable resolved to, so the
+    #: frontend can reconstruct the matching sections overlay (Markdown, Mail,
+    #: future surfaces) on the completion event and on recall. The empty list
+    #: means "no structured deliverable" (summary-only / cap paths) — the
+    #: ``result`` text remains the rendering source in that case. Decoding is
+    #: defensive: any legacy single-object / corrupt / ``null`` column value is
+    #: read back as the empty list and never raises (issue 0066).
+    result_payload: list[dict[str, object]] = field(default_factory=list)
     lineage: list[str] = field(default_factory=list)
     #: Turn index at which Jarvis delivered this task's result to the user.
     #:
@@ -344,25 +347,27 @@ class TaskStore:
         task_id: str,
         result: str,
         *,
-        result_payload: dict[str, object] | None = None,
+        result_payload: list[dict[str, object]] | None = None,
     ) -> None:
-        """Store a task's final result text + optional structured descriptor.
+        """Store a task's final result text + optional list of section descriptors.
 
         ``result`` is the spoken / markdown text (the source of truth for the
         ``task_result`` WS string and ``show_task_result`` recall). PRD 0008 /
-        issue 0064 adds ``result_payload``: when the sub-agent emitted a
-        structured ``{"component": ..., "props": {...}}`` deliverable in
-        ``done.ui_payload`` the runner passes it here so the descriptor
-        survives to the frontend and can rebuild the matching overlay (Mail,
-        Markdown, …). Pass ``None`` (the default) for summary-only / cap
-        results — the column is cleared so a stale descriptor never lingers.
+        issue 0064 added a structured ``result_payload``; PRD 0010 / issue 0066
+        made it a **list** of ``{"component": ..., "props": {...}}`` section
+        descriptors (a single card is a list-of-one). When the sub-agent's
+        terminal deliverable resolved to a non-empty list the runner passes it
+        here so the sections survive to the frontend and rebuild the matching
+        overlay (Markdown, Mail, …). Pass ``None`` or an empty list (the
+        default) for summary-only / cap results — the column is stored as a
+        ``NULL`` so a stale descriptor never lingers.
 
         Does NOT change state — transitions go through :meth:`update_state` so
         the orchestrator keeps full control over when (e.g.) ``done`` is
         recorded.
         """
 
-        payload_json = json.dumps(result_payload) if result_payload is not None else None
+        payload_json = json.dumps(result_payload) if result_payload else None
         with self._lock, self._conn:
             cursor = self._conn.execute(
                 "UPDATE tasks SET result = ?, result_payload = ?,"
@@ -560,27 +565,34 @@ def _decode_lineage(raw: str) -> list[str]:
     return [item for item in decoded if isinstance(item, str)]
 
 
-def _decode_result_payload(raw: str | None) -> dict[str, object] | None:
-    """Decode the ``result_payload`` JSON-text column into a dict (or ``None``).
+def _decode_result_payload(raw: str | None) -> list[dict[str, object]]:
+    """Decode the ``result_payload`` JSON-text column into a list of descriptors.
 
-    PRD 0008 / issue 0064. The column holds the structured deliverable
-    descriptor (``{"component": ..., "props": {...}}``) the sub-agent emitted
-    in ``done.ui_payload``. ``NULL`` (pre-0009 rows, summary-only tasks)
-    decodes to ``None`` so callers fall back to the ``result`` text. A
-    corrupted / non-object value also collapses to ``None`` — the descriptor
-    is a rendering hint, never load-bearing for the task-execution path, and
-    the spoken ``result`` string always survives independently.
+    PRD 0008 / issue 0064 introduced the column; PRD 0010 / issue 0066 made the
+    contract a **list** of ``{"component": ..., "props": {...}}`` section
+    descriptors. Decoding is DEFENSIVE — it is an invariant, never a back-fill:
+
+    - ``NULL`` (pre-0064 rows, summary-only tasks) → ``[]``;
+    - a JSON array → the list, keeping only dict items (a stray non-object
+      element is dropped, never crashes the render);
+    - a legacy single object (``{"component": ...}`` written by issue 0064
+      before this change), ``null``, a number/string, or corrupt JSON → ``[]``.
+
+    It NEVER raises and NEVER returns a non-list — old rows are not migrated,
+    just rendered harmless. The descriptor list is a rendering hint, never
+    load-bearing for the task-execution path; the spoken ``result`` string
+    always survives independently.
     """
 
     if raw is None:
-        return None
+        return []
     try:
         decoded = json.loads(raw)
     except json.JSONDecodeError:
-        return None
-    if not isinstance(decoded, dict):
-        return None
-    return decoded
+        return []
+    if not isinstance(decoded, list):
+        return []
+    return [item for item in decoded if isinstance(item, dict)]
 
 
 # --- Singleton plumbing -------------------------------------------------------
