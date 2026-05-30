@@ -96,6 +96,25 @@ payload is *populated* on more paths.
 - **The loop-convergence guards stay as a safety net.** Stall force / dedup /
   control-char rejection still bound pathological loops, but convergence
   short-circuits the common case so they rarely fire.
+- **Two robustness guards from the review pass.** (1) A *resolved* `result_ref`
+  is authoritative — the runner never substitutes a different (later) tool's
+  card for an explicitly-referenced result that happens to have none. (2)
+  `_finalize_done` re-validates a structured deliverable against `ui_registry`
+  and drops it (keeping the text) if invalid, so a buggy projector cannot ship
+  malformed props to the frontend on the deterministic paths (convergence /
+  stall / cap) that bypass the up-front 0065 validation.
+
+## Known follow-ups
+
+- **Wall-clock timeout does not persist the card.** A `timeout` maps to the
+  `failed` task state, which by design does not persist `result_payload` (legacy
+  `_fail` semantics). So a task cut off by the 30-min wall-clock budget loses its
+  structured card on a reconnect (the iteration / token caps, which are
+  `degraded` → `done`, keep it). Treating a timeout-with-data as `degraded` so
+  the card persists is a deliberate semantic change, left as a follow-up.
+- **Larger-model live smoke.** `scripts/live_smoke_result_store.py` is verified
+  on `gemma-4-e4b`; re-run it with a 24B/35B model pre-loaded in LM Studio to
+  extend the evidence table.
 
 ## Issues / phases
 
