@@ -43,6 +43,7 @@ import structlog
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from bob.llm.tooling import ToolSpec
+from bob.sub_agent.result_store import ProjectedResult, ToolResultProjector
 
 _logger = structlog.get_logger(__name__)
 
@@ -101,6 +102,13 @@ class SubAgentToolDefinition:
     description: str
     args_model: type[BaseModel]
     handler: SubAgentToolHandler
+    #: PRD 0009 — pure ``result -> ProjectedResult`` hook owning how this
+    #: tool's result becomes a compact transcript digest, a structured UI
+    #: deliverable, a spoken summary, and whether it is a terminal answer.
+    #: ``None`` (the default) routes the result through
+    #: :func:`bob.sub_agent.result_store.default_projector`, i.e. pre-0009
+    #: behaviour (full result in transcript, no card, never converges).
+    result_projector: ToolResultProjector | None = None
 
     @property
     def qualified_name(self) -> str:
@@ -572,6 +580,82 @@ def _is_api_unreachable_exception(exc: BaseException) -> bool:
     return isinstance(exc, TimeoutError | ConnectionError)
 
 
+#: Per-message digest fields kept in the transcript. Deliberately EXCLUDES
+#: ``bodyPreview`` (0056 privacy + PRD 0009 context-saving) and the heavy
+#: ``attachments`` / id / url fields — the model only needs enough to know a
+#: result exists and to write a one-line summary if convergence is off. The
+#: full props (including ``bodyPreview``) live server-side in the store and are
+#: rebuilt into the deliverable by code, never re-sent to the model.
+_GMAIL_DIGEST_MESSAGE_FIELDS = ("subject", "receivedAt")
+#: Cap on messages echoed into the digest so a ``max_results=5`` (or larger,
+#: future) search cannot bloat the transcript. The deliverable always uses the
+#: first message regardless.
+_GMAIL_DIGEST_MAX_MESSAGES = 5
+
+
+def project_gmail_search(result: dict[str, Any]) -> ProjectedResult:
+    """Project a ``gmail_search`` result into its transcript / UI / summary forms.
+
+    PRD 0009. This is the deterministic replacement for the old prose recipe
+    that asked the model to hand-build ``{"component":"Mail", props}`` — the
+    exact step a weak local model failed to perform (2026-05-30 RC1). The card
+    is now built here, from the data the search already returned:
+
+    - **digest** (→ transcript): ``count`` + ``query`` + a body-free, capped
+      list of ``{subject, from, receivedAt}`` — no ``bodyPreview`` (0056) and
+      a fraction of the full blob's size (PRD 0009 context saving);
+    - **deliverable** (→ overlay): ``{"component":"Mail", "props": messages[0]}``
+      when ``count > 0`` (``messages[0]`` already matches the ``Mail`` props
+      schema via ``to_mail_props``), else ``None``;
+    - **summary** (→ spoken ``result_summary``): a deterministic French line;
+    - **terminal**: always ``True`` — a mail lookup is single-shot, so the
+      runner may converge on the first result (empty or not) instead of waiting
+      for the model to emit ``done`` (2026-05-30 fix #2).
+    """
+
+    count = int(result.get("count") or 0)
+    messages = result.get("messages")
+    messages = messages if isinstance(messages, list) else []
+
+    digest_messages: list[dict[str, Any]] = []
+    for msg in messages[:_GMAIL_DIGEST_MAX_MESSAGES]:
+        if not isinstance(msg, dict):
+            continue
+        entry: dict[str, Any] = {key: msg.get(key) for key in _GMAIL_DIGEST_MESSAGE_FIELDS}
+        sender = msg.get("from")
+        entry["from"] = sender.get("name") if isinstance(sender, dict) else None
+        digest_messages.append(entry)
+    digest: dict[str, Any] = {
+        "count": count,
+        "query": result.get("query"),
+        "messages": digest_messages,
+    }
+
+    if count > 0 and messages and isinstance(messages[0], dict):
+        first = messages[0]
+        subject = first.get("subject") or "(sans objet)"
+        sender = first.get("from")
+        sender_name = sender.get("name") if isinstance(sender, dict) else None
+        summary = (
+            f"{count} email(s) trouvé(s). Dernier : « {subject} »"
+            + (f" de {sender_name}" if sender_name else "")
+            + "."
+        )
+        return ProjectedResult(
+            digest=digest,
+            deliverable={"component": "Mail", "props": first},
+            summary=summary,
+            terminal=True,
+        )
+
+    return ProjectedResult(
+        digest=digest,
+        deliverable=None,
+        summary="Aucun email ne correspond à cette recherche.",
+        terminal=True,
+    )
+
+
 def build_gmail_search_tool() -> SubAgentToolDefinition:
     """Construct the registry entry for ``gmail_search`` (v1).
 
@@ -592,6 +676,9 @@ def build_gmail_search_tool() -> SubAgentToolDefinition:
         ),
         args_model=GmailSearchArgs,
         handler=_gmail_search_handler,
+        # PRD 0009 — the runner builds the Mail card + spoken summary from this
+        # projection deterministically; the model no longer hand-builds it.
+        result_projector=project_gmail_search,
     )
 
 
@@ -628,4 +715,5 @@ __all__ = [
     "build_gmail_search_tool",
     "build_web_fetch_tool",
     "build_web_search_tool",
+    "project_gmail_search",
 ]
