@@ -1,5 +1,6 @@
 import { render } from "@testing-library/react";
 import { describe, expect, test } from "vitest";
+import { MailCard } from "./MailCard";
 import { MarkdownSection } from "./MarkdownSection";
 import { NotImplementedSection } from "./NotImplementedSection";
 import { sectionRegistry } from "./sectionRegistry";
@@ -11,6 +12,15 @@ describe("sectionRegistry", () => {
     expect(entry.Component).toBe(MarkdownSection);
     // The `structured` flag drives auto-open; Markdown is text → false.
     expect(entry.structured).toBe(false);
+  });
+
+  test("maps `Mail` to the MailCard renderer as a structured section (issue 0067)", () => {
+    const entry = sectionRegistry.Mail;
+    expect(entry).toBeDefined();
+    expect(entry.Component).toBe(MailCard);
+    // `structured: true` is what makes a list containing a Mail auto-open the
+    // overlay unconditionally, regardless of the text heuristic.
+    expect(entry.structured).toBe(true);
   });
 
   test("an unknown component name is absent from the registry", () => {

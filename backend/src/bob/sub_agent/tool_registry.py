@@ -588,8 +588,8 @@ def _is_api_unreachable_exception(exc: BaseException) -> bool:
 #: rebuilt into the deliverable by code, never re-sent to the model.
 _GMAIL_DIGEST_MESSAGE_FIELDS = ("subject", "receivedAt")
 #: Cap on messages echoed into the digest so a ``max_results=5`` (or larger,
-#: future) search cannot bloat the transcript. The deliverable always uses the
-#: first message regardless.
+#: future) search cannot bloat the transcript. The deliverable carries one Mail
+#: section per returned message regardless of this digest cap (issue 0067).
 _GMAIL_DIGEST_MAX_MESSAGES = 5
 
 
@@ -604,11 +604,13 @@ def project_gmail_search(result: dict[str, Any]) -> ProjectedResult:
     - **digest** (→ transcript): ``count`` + ``query`` + a body-free, capped
       list of ``{subject, from, receivedAt}`` — no ``bodyPreview`` (0056) and
       a fraction of the full blob's size (PRD 0009 context saving);
-    - **deliverable** (→ overlay): a **list-of-one** ``[{"component":"Mail",
-      "props": messages[0]}]`` when ``count > 0`` (``messages[0]`` already
+    - **deliverable** (→ overlay): **one ``{"component":"Mail", "props": msg}``
+      section per returned message, in result order** (each ``msg`` already
       matches the ``Mail`` props schema via ``to_mail_props``), else ``None``
-      (PRD 0010 / issue 0066 — the deliverable is now a list of sections;
-      multi-mail is issue 0067);
+      when no usable message is present (PRD 0010 / issue 0067 — every matched
+      mail surfaces as its own card so "3 derniers mails" renders three cards,
+      fixing the mono-card bug; only ``dict`` messages contribute a section, so
+      a stray non-dict in the list is skipped rather than crashing);
     - **summary** (→ spoken ``result_summary``): a deterministic French line;
     - **terminal**: always ``True`` — a mail lookup is single-shot, so the
       runner may converge on the first result (empty or not) instead of waiting
@@ -633,11 +635,22 @@ def project_gmail_search(result: dict[str, Any]) -> ProjectedResult:
         "messages": digest_messages,
     }
 
-    if count > 0 and messages and isinstance(messages[0], dict):
-        first = messages[0]
+    # One Mail section per usable message, preserving result order (issue 0067).
+    # Non-dict entries are skipped — a malformed item must never crash the
+    # projection nor poison the section list.
+    usable: list[dict[str, Any]] = [msg for msg in messages if isinstance(msg, dict)]
+    sections: list[dict[str, Any]] = [
+        {"component": "Mail", "props": msg} for msg in usable
+    ]
+
+    if count > 0 and usable:
+        first = usable[0]
         subject = first.get("subject") or "(sans objet)"
         sender = first.get("from")
         sender_name = sender.get("name") if isinstance(sender, dict) else None
+        # The spoken summary is unchanged from issue 0066: count + the first
+        # ("Dernier") message's subject/sender. It deliberately does NOT
+        # enumerate every mail — the cards carry the per-message detail.
         summary = (
             f"{count} email(s) trouvé(s). Dernier : « {subject} »"
             + (f" de {sender_name}" if sender_name else "")
@@ -645,7 +658,7 @@ def project_gmail_search(result: dict[str, Any]) -> ProjectedResult:
         )
         return ProjectedResult(
             digest=digest,
-            deliverable=[{"component": "Mail", "props": first}],
+            deliverable=sections,
             summary=summary,
             terminal=True,
         )

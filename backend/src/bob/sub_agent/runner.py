@@ -310,8 +310,11 @@ def _resolve_terminal_deliverable(
     Prefers the result the model explicitly referenced via ``result_ref``; falls
     back to the most recent stored result. Returns the projected deliverable as a
     **list of section descriptors** (``list[ComponentDescriptor] | None``; PRD
-    0010 / issue 0066 — a single card is a list-of-one, an empty result is
+    0010 — a Gmail search expands here to one Mail section per returned message
+    in order (issue 0067), a single result is a list-of-one, an empty result is
     ``None``) plus the projection's deterministic summary (``None`` when empty).
+    A single ``result_ref`` in a ``done`` action therefore fans out to the full
+    projected section list without the model ever enumerating the messages.
     This is the SINGLE place the structured deliverable is rebuilt on a forced or
     clean exit, so a card survives a stall / cap / bare ``done`` instead of
     depending on the weak model emitting a perfect ``ui_payload`` (the 2026-05-30

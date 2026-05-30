@@ -2696,6 +2696,54 @@ async def test_p4_done_by_result_ref_builds_card_from_store() -> None:
 
 
 @pytest.mark.asyncio
+async def test_p4_single_result_ref_expands_to_full_multi_mail_section_list() -> None:
+    """PRD 0010 / issue 0067 — a single ``result_ref`` in ``done`` expands to the
+    FULL projected section list: one Mail section per returned message, in order.
+    The model references one stored result and never enumerates the messages."""
+
+    mails = [
+        {**_valid_mail_props(), "subject": "mail A", "messageId": "m-a", "threadId": "t-a"},
+        {**_valid_mail_props(), "subject": "mail B", "messageId": "m-b", "threadId": "t-b"},
+        {**_valid_mail_props(), "subject": "mail C", "messageId": "m-c", "threadId": "t-c"},
+    ]
+    result = {"query": "label:INBOX", "count": 3, "messages": mails}
+    store = _make_store()
+    task_id = _make_running_task(store)
+    registry, _ = _make_gmail_projector_registry(result)
+    done_with_ref = json.dumps(
+        {
+            "action": "done",
+            "result_summary": "Voici tes 3 derniers mails.",
+            "status": "complete",
+            "reason_code": "ok",
+            "result_ref": "gmail_search#1",
+        }
+    )
+    client = _ScriptedClient(
+        chat_values=[
+            _tool_call_payload("gmail_search", {"label": "INBOX", "max_results": 3}),
+            done_with_ref,
+        ]
+    )
+    runner = SubAgentRunner(
+        subagent_client=client,
+        task_store=store,
+        event_bus=EventBus(),
+        policy=_no_converge_policy(),
+        tool_registry=registry,
+        clock=_ControllableClock(),
+    )
+
+    await runner.run(task_id)
+
+    task = store.get_task(task_id)
+    assert task.state == "done"
+    assert task.result_payload is not None
+    assert [s["component"] for s in task.result_payload] == ["Mail", "Mail", "Mail"]
+    assert [s["props"]["subject"] for s in task.result_payload] == ["mail A", "mail B", "mail C"]
+
+
+@pytest.mark.asyncio
 async def test_p4_bare_done_with_stored_result_builds_card() -> None:
     """PRD 0009 P4 — the 2026-05-30 RC1 case: the model finally emits a BARE
     ``done`` (no ui_payload, no result_ref) with a usable result on the

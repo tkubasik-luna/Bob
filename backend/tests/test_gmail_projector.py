@@ -52,6 +52,50 @@ def test_non_empty_result_builds_valid_mail_deliverable() -> None:
     assert "KiLi DEV 2.9.0" in proj.summary
 
 
+def test_multi_message_result_emits_one_section_per_message_in_order() -> None:
+    # PRD 0010 / issue 0067 — the "3 derniers mails" bug: every matched message
+    # must surface as its own Mail section, preserving result order.
+    msgs = [
+        _mail_props(subject="mail A", sender="Alice"),
+        _mail_props(subject="mail B", sender="Bob"),
+        _mail_props(subject="mail C", sender="Carol"),
+    ]
+    proj = project_gmail_search({"query": "label:INBOX", "count": 3, "messages": msgs})
+
+    assert proj.deliverable is not None
+    assert len(proj.deliverable) == 3
+    # One Mail section per message, in the SAME order the search returned them.
+    assert [s["component"] for s in proj.deliverable] == ["Mail", "Mail", "Mail"]
+    assert [s["props"]["subject"] for s in proj.deliverable] == ["mail A", "mail B", "mail C"]
+    # Every section validates against the single ui_registry Mail schema.
+    for section in proj.deliverable:
+        assert validate_component_descriptor(section) == []
+    assert proj.terminal is True
+
+
+def test_multi_message_summary_is_unchanged_count_plus_first() -> None:
+    # The deterministic spoken summary is NOT changed by multi-mail: it still
+    # reports the count + the first ("Dernier") message, never enumerating each.
+    msgs = [
+        _mail_props(subject="mail A", sender="Alice"),
+        _mail_props(subject="mail B", sender="Bob"),
+    ]
+    proj = project_gmail_search({"query": "x", "count": 2, "messages": msgs})
+    assert proj.summary == "2 email(s) trouvé(s). Dernier : « mail A » de Alice."
+    # The digest is also unchanged in shape: count + query + capped light rows.
+    assert proj.digest["count"] == 2
+    assert [m["subject"] for m in proj.digest["messages"]] == ["mail A", "mail B"]
+
+
+def test_multi_message_skips_non_dict_entries() -> None:
+    # A stray non-dict entry must be skipped, never crash, and never become a
+    # section — the remaining valid messages still surface in order.
+    msgs = [_mail_props(subject="ok 1"), "garbage", _mail_props(subject="ok 2")]
+    proj = project_gmail_search({"query": "x", "count": 3, "messages": msgs})
+    assert proj.deliverable is not None
+    assert [s["props"]["subject"] for s in proj.deliverable] == ["ok 1", "ok 2"]
+
+
 def test_digest_is_compact_and_body_free() -> None:
     result = {"query": "label:INBOX", "count": 1, "messages": [_mail_props()]}
     proj = project_gmail_search(result)

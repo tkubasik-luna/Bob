@@ -1417,6 +1417,23 @@ body {
   letter-spacing: 0.06em;
 }
 
+/* Per-card inline actions (issue 0067) — OPEN / READ ALOUD live on the MailCard
+ * itself now, not the overlay footer, so each mail in a stack is independently
+ * actionable. Reuses the `.ov-action` button styling. */
+.ov-email-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 12px;
+  flex-wrap: wrap;
+}
+
+/* A MailCard stacked under another gets a separating rule + spacing so the
+ * vertical stack of cards reads as distinct messages inside the one overlay. */
+.ov-section + .ov-section .ov-email {
+  border-top: 1px solid var(--hud-rule);
+  padding-top: 16px;
+}
+
 /* ────────── IMAGE ────────── */
 .ov-image {
   display: flex;

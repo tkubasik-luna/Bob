@@ -225,8 +225,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
               createdAt: new Date().toISOString(),
               result: msg.result,
               // PRD 0008 / issue 0064 — keep the structured deliverable
-              // descriptor so the task-result effect can rebuild the matching
-              // overlay (Mail → MailOverlay) instead of wrapping as Markdown.
+              // descriptors so the task-result effect can rebuild the matching
+              // sections (Mail → MailCard in SectionsOverlay) instead of
+              // wrapping as Markdown.
               resultPayload: msg.result_payload,
             },
           },

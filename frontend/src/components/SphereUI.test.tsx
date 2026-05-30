@@ -338,15 +338,13 @@ describe("SphereUI — overlay auto-trigger integration", () => {
     expect(container.querySelector(".overlay-card")).not.toBeNull();
   });
 
-  test("subtask done with Mail resultPayload opens the MailOverlay (issue 0064)", () => {
-    // PRD 0008 / issue 0064 — a sub-agent that produced a STRUCTURED Mail
-    // deliverable carries it on `tasks[id].resultPayload` (alongside the
-    // spoken `result` text). The task-result effect must dispatch on the
-    // descriptor's `component` so the Mail card lands in the MailOverlay
-    // (`.surface-email`) — NOT wrap the spoken result text as Markdown
-    // (`.surface-notes`). This was the bug: the Mail overlay never appeared
-    // on a recalled / completed sub-task because the effect always called
-    // `setOverlayContent`.
+  test("subtask done with Mail resultPayload opens a Mail card in SectionsOverlay (issue 0067)", () => {
+    // PRD 0010 / issue 0067 — a sub-agent that produced a STRUCTURED Mail
+    // deliverable carries it on `tasks[id].resultPayload` (a LIST of section
+    // descriptors). The task-result effect routes it through the unified
+    // SectionsOverlay (`.surface-notes`); `Mail` is a `structured` section so
+    // the overlay auto-opens unconditionally and renders the `MailCard` body.
+    // The standalone MailOverlay is gone.
     const { container } = render(<SphereUI />);
     expect(container.querySelector(".overlay-card")).toBeNull();
 
@@ -355,8 +353,6 @@ describe("SphereUI — overlay auto-trigger integration", () => {
         tasks: {
           t1: {
             ...makeDoneTask("t1", "Mail de Marie, sujet 'Q3 forecast'"),
-            // PRD 0010 / issue 0066 — resultPayload is now a LIST of sections;
-            // a single Mail card is a list-of-one and still routes to MailOverlay.
             resultPayload: [
               {
                 component: "Mail",
@@ -382,10 +378,55 @@ describe("SphereUI — overlay auto-trigger integration", () => {
       });
     });
 
-    // The Mail card surfaces; the Markdown surface must stay closed.
-    expect(container.querySelector(".overlay-card.surface-email")).not.toBeNull();
-    expect(container.querySelector(".overlay-card.surface-notes")).toBeNull();
+    // The unified SectionsOverlay surfaces with the Mail card inside it.
+    expect(container.querySelector(".overlay-card.surface-notes")).not.toBeNull();
+    expect(container.querySelector(".ov-section .ov-email")).not.toBeNull();
     expect(container.querySelector(".ov-email-name")?.textContent).toBe("Marie Lefèvre");
+  });
+
+  test("'3 derniers mails' renders 3 stacked Mail cards in SectionsOverlay (issue 0067)", () => {
+    // PRD 0010 / issue 0067 acceptance — the core bug fix: a multi-mail
+    // resultPayload (one Mail section per message) renders as a vertical STACK
+    // of MailCards inside the single SectionsOverlay, not just the first one.
+    const mail = (subject: string, name: string, id: string) => ({
+      component: "Mail" as const,
+      props: {
+        from: { name, email: `${name.toLowerCase()}@lunabee.com` },
+        receivedAt: "2026-05-28T14:22:00Z",
+        subject,
+        bodyPreview: `Body of ${subject}`,
+        flags: [],
+        attachments: [],
+        threadId: id,
+        messageId: id,
+        gmailWebUrl: `https://mail.google.com/mail/u/0/#inbox/${id}`,
+      },
+    });
+    const { container } = render(<SphereUI />);
+
+    act(() => {
+      useChatStore.setState({
+        tasks: {
+          t1: {
+            ...makeDoneTask("t1", "3 email(s) trouvé(s). Dernier : « mail A » de Alice."),
+            resultPayload: [
+              mail("mail A", "Alice", "m-a"),
+              mail("mail B", "Bob", "m-b"),
+              mail("mail C", "Carol", "m-c"),
+            ],
+          },
+        },
+      });
+    });
+
+    // One overlay shell, three Mail cards stacked inside it, in order.
+    expect(container.querySelectorAll(".overlay-card").length).toBe(1);
+    const cards = container.querySelectorAll(".ov-section .ov-email");
+    expect(cards.length).toBe(3);
+    const subjects = Array.from(container.querySelectorAll(".ov-section .ov-email-subject")).map(
+      (el) => el.textContent,
+    );
+    expect(subjects).toEqual(["mail A", "mail B", "mail C"]);
   });
 
   test("a text-only Markdown section list applies the text heuristic — long content opens", () => {
@@ -486,11 +527,11 @@ describe("SphereUI — overlay auto-trigger integration", () => {
     expect(container.querySelector(".overlay-card")).not.toBeNull();
   });
 
-  test("dispatches a Mail assistant_msg.ui to MailOverlay (issue 0053)", () => {
-    // The dispatcher routes on `component`: a "Mail" descriptor should land
-    // in the MailOverlay (`.surface-email`), not the MarkdownOverlay
-    // (`.surface-notes`). Same trigger path as the Markdown regression
-    // above, swapped to the new component.
+  test("dispatches a Mail assistant_msg.ui to a Mail card in SectionsOverlay (issue 0067)", () => {
+    // A "Mail" descriptor in `assistant_msg.ui` renders as a `MailCard` inside
+    // the unified SectionsOverlay (`.surface-notes`). `Mail` is `structured`, so
+    // the overlay auto-opens regardless of the text heuristic. The standalone
+    // MailOverlay (`.surface-email`) is gone.
     const { container } = render(<SphereUI />);
     expect(container.querySelector(".overlay-card")).toBeNull();
 
@@ -532,10 +573,9 @@ describe("SphereUI — overlay auto-trigger integration", () => {
       });
     });
 
-    // The MailOverlay's `.surface-email` card must be mounted; the
-    // MarkdownOverlay's `.surface-notes` must NOT.
-    expect(container.querySelector(".overlay-card.surface-email")).not.toBeNull();
-    expect(container.querySelector(".overlay-card.surface-notes")).toBeNull();
+    // The unified SectionsOverlay (`.surface-notes`) mounts with the Mail card.
+    expect(container.querySelector(".overlay-card.surface-notes")).not.toBeNull();
+    expect(container.querySelector(".ov-section .ov-email")).not.toBeNull();
     // Body content matches the fixture.
     expect(container.querySelector(".ov-email-name")?.textContent).toBe("Marie Lefèvre");
   });
@@ -566,13 +606,14 @@ describe("SphereUI — overlay auto-trigger integration", () => {
     });
 
     expect(container.querySelector(".overlay-card.surface-notes")).not.toBeNull();
-    expect(container.querySelector(".overlay-card.surface-email")).toBeNull();
+    // A text-only Markdown list carries no Mail card.
+    expect(container.querySelector(".ov-section .ov-email")).toBeNull();
   });
 
-  test("dispatches a streaming Mail ui_payload to MailOverlay (issue 0053)", () => {
+  test("dispatches a streaming Mail ui_payload to a Mail card in SectionsOverlay (issue 0067)", () => {
     // Streaming `ui_payload` path: the `streamingAssistant.ui` field on the
     // chat store carries the descriptor mid-turn (before the closing
-    // `assistant_msg`). The dispatcher must route Mail here too.
+    // `assistant_msg`). It must surface as a MailCard in SectionsOverlay too.
     const { container } = render(<SphereUI />);
     expect(container.querySelector(".overlay-card")).toBeNull();
 
@@ -599,7 +640,8 @@ describe("SphereUI — overlay auto-trigger integration", () => {
       });
     });
 
-    expect(container.querySelector(".overlay-card.surface-email")).not.toBeNull();
+    expect(container.querySelector(".overlay-card.surface-notes")).not.toBeNull();
+    expect(container.querySelector(".ov-section .ov-email")).not.toBeNull();
     expect(container.querySelector(".ov-email-name")?.textContent).toBe("Marie Lefèvre");
   });
 
