@@ -14,3 +14,4 @@ Personal AI assistant. Tauri + React frontend, FastAPI backend, LM Studio (or an
 - [0008 Gmail Connector & Mail Overlay](docs/features/0008-gmail-mail-overlay.md) — Read-only Gmail search via sub-task + dedicated Mail HUD overlay.
 - [0009 Tool-Calling Unification](docs/features/0009-tool-calling-unification.md) — One canonical codec layer (native/Hermes/guided) + self-correction + typed deliverable.
 - [0010 Tool Result Store](docs/features/0010-tool-result-store.md) — Per-run blackboard of tool results: compact transcript digest, deterministic deliverable projection on every exit path, convergence on terminal results. Fixes empty-overlay-on-stall; robust on weak local models.
+- [0011 Adaptive Composite UI](docs/features/0010-adaptive-composite-ui.md) — Stacked-sections overlay: deliverable is `ComponentDescriptor[]`, multi-mail cards, per-section drop validation, defensive payload codec.
