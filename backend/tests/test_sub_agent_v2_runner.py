@@ -34,6 +34,7 @@ from bob.llm_client import LLMClient
 from bob.sub_agent import (
     REASON_HARD_KILLED,
     REASON_ITERATION_CAP,
+    REASON_OK,
     REASON_STALLED,
     REASON_TOKEN_CAP,
     REASON_USER_CANCELLED,
@@ -2758,3 +2759,151 @@ async def test_p4_model_authored_descriptor_is_respected_over_store() -> None:
     assert task.state == "done"
     assert task.result_payload is not None
     assert task.result_payload["props"]["subject"] == "Model-authored subject"
+
+
+# ---------------------------------------------------------------------------
+# PRD 0009 P5 — convergence on a terminal tool result
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_p5_terminal_result_converges_immediately() -> None:
+    """PRD 0009 P5 — a terminal projection (gmail_search count>0) finalises
+    ``done(complete)`` deterministically right after dispatch: ONE LLM call, the
+    Mail card built from the store, no progress/done round-trips. The weak model
+    is removed from the happy path."""
+
+    mail = _valid_mail_props()
+    result = {"query": "label:INBOX", "count": 1, "messages": [mail]}
+    store = _make_store()
+    task_id = _make_running_task(store)
+    bus = EventBus()
+    state_changes = await _collect_state_changes(bus)
+    registry, handler_calls = _make_gmail_projector_registry(result)
+    client = _ScriptedClient(
+        # Only the tool_call is scripted — convergence ends the run, so a second
+        # scripted reply would be UNUSED (and _ScriptedClient only raises when it
+        # runs OUT, so an unused tail is fine — but we provide none to prove it).
+        chat_values=[_tool_call_payload("gmail_search", {"label": "INBOX", "max_results": 1})]
+    )
+    runner = SubAgentRunner(
+        subagent_client=client,
+        task_store=store,
+        event_bus=bus,
+        policy=SubAgentPolicy(),  # converge_on_terminal_result defaults True
+        tool_registry=registry,
+        clock=_ControllableClock(),
+    )
+
+    await runner.run(task_id)
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    assert handler_calls and len(handler_calls) == 1
+    assert len(client.calls) == 1  # converged without a second LLM turn
+    task = store.get_task(task_id)
+    assert task.state == "done"
+    assert state_changes[-1]["status"] == "complete"
+    assert state_changes[-1]["reason_code"] == REASON_OK
+    assert task.result_payload == {"component": "Mail", "props": mail}
+    # The spoken summary is the deterministic projection, not empty.
+    assert task.result and "1 email" in task.result
+
+
+@pytest.mark.asyncio
+async def test_p5_empty_terminal_result_converges_without_card() -> None:
+    """PRD 0009 P5 — an empty search is ALSO terminal (nothing more to do): it
+    converges to ``done(complete)`` with no card and the deterministic
+    "aucun email" summary, in one LLM call."""
+
+    result = {"query": "from:nobody", "count": 0, "messages": []}
+    store = _make_store()
+    task_id = _make_running_task(store)
+    registry, _ = _make_gmail_projector_registry(result)
+    client = _ScriptedClient(
+        chat_values=[_tool_call_payload("gmail_search", {"from_email": "nobody@example.com"})]
+    )
+    runner = SubAgentRunner(
+        subagent_client=client,
+        task_store=store,
+        event_bus=EventBus(),
+        policy=SubAgentPolicy(),
+        tool_registry=registry,
+        clock=_ControllableClock(),
+    )
+
+    await runner.run(task_id)
+
+    assert len(client.calls) == 1
+    task = store.get_task(task_id)
+    assert task.state == "done"
+    assert task.result_payload is None
+    assert task.result is not None
+    assert "Aucun email" in task.result
+
+
+@pytest.mark.asyncio
+async def test_p5_convergence_disabled_waits_for_model_done() -> None:
+    """PRD 0009 P5 — with convergence disabled, a terminal result does NOT
+    short-circuit: the runner waits for the model's own ``done`` (two LLM
+    calls). The flag is the operator / multi-step escape hatch."""
+
+    mail = _valid_mail_props()
+    result = {"query": "label:INBOX", "count": 1, "messages": [mail]}
+    store = _make_store()
+    task_id = _make_running_task(store)
+    registry, _ = _make_gmail_projector_registry(result)
+    client = _ScriptedClient(
+        chat_values=[
+            _tool_call_payload("gmail_search", {"label": "INBOX", "max_results": 1}),
+            _done_v2_payload(result_summary="fini", status="complete", reason_code="ok"),
+        ]
+    )
+    runner = SubAgentRunner(
+        subagent_client=client,
+        task_store=store,
+        event_bus=EventBus(),
+        policy=_no_converge_policy(),
+        tool_registry=registry,
+        clock=_ControllableClock(),
+    )
+
+    await runner.run(task_id)
+
+    assert len(client.calls) == 2  # did NOT converge; consumed the model's done
+    task = store.get_task(task_id)
+    assert task.state == "done"
+    # The bare done still got the card from the store (P4 precedence c).
+    assert task.result_payload == {"component": "Mail", "props": mail}
+
+
+@pytest.mark.asyncio
+async def test_p5_nonterminal_tool_does_not_converge() -> None:
+    """PRD 0009 P5 — a tool whose projection is NOT terminal (the default
+    projector: any un-projected tool) does not converge; the runner waits for
+    the model to conclude."""
+
+    store = _make_store()
+    task_id = _make_running_task(store)
+    registry, _ = _make_echo_registry()  # no projector → terminal=False
+    client = _ScriptedClient(
+        chat_values=[
+            _tool_call_payload("echo", {"q": "x"}),
+            _done_v2_payload(result_summary="done", status="complete", reason_code="ok"),
+        ]
+    )
+    runner = SubAgentRunner(
+        subagent_client=client,
+        task_store=store,
+        event_bus=EventBus(),
+        policy=SubAgentPolicy(),  # converge default True, but echo is non-terminal
+        tool_registry=registry,
+        clock=_ControllableClock(),
+    )
+
+    await runner.run(task_id)
+
+    assert len(client.calls) == 2  # waited for the model's done
+    task = store.get_task(task_id)
+    assert task.state == "done"
+    assert task.result == "done"

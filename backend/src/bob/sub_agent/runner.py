@@ -1258,6 +1258,38 @@ class SubAgentRunner:
                     stall_count = 0
                     validator_feedback = []
                     validator_envelope = CallEnvelope(tool_name=None, actor="sub_agent")
+                    # PRD 0009 P5 — CONVERGE. A terminal projection (a single-shot
+                    # answer like a mail lookup, ``project_gmail_search`` marks
+                    # ``terminal=True``) lets the runner finalise ``done`` NOW,
+                    # deterministically, from the store — instead of waiting for a
+                    # weak model to emit ``done`` (which it routinely fails to do:
+                    # it spins filler ``progress`` until the stall guard fires,
+                    # 2026-05-30 RC1). This removes the stall window on the happy
+                    # path entirely and saves ~3 wasted LLM calls. The deliverable
+                    # + spoken summary come from the projection; privacy redaction
+                    # of the Mail descriptor in debug sinks is handled by
+                    # ``_finalize_done`` as on any other done. Multi-step tools mark
+                    # their projection non-terminal and never converge here; the
+                    # flag also lets an operator disable it wholesale.
+                    if (
+                        self._policy.converge_on_terminal_result
+                        and step.stored is not None
+                        and step.stored.projection.terminal
+                    ):
+                        projection = step.stored.projection
+                        await self._finalize_done(
+                            task_id,
+                            status="complete",
+                            reason_code=REASON_OK,
+                            result_summary=projection.summary,
+                            ui_payload=projection.deliverable,
+                            cost=self._build_cost(
+                                started_at=started_at,
+                                iterations=iteration,
+                                tokens_used=tokens_used,
+                            ),
+                        )
+                        return
                     continue
                 if step.dispatched is not None and not step.dispatched.ok:
                     # Trou B (mail-tool-loop) — the handler RAN and FAILED (e.g.

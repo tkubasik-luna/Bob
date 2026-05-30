@@ -170,11 +170,20 @@ async def test_gmail_search_runner_e2e(monkeypatch: pytest.MonkeyPatch) -> None:
     store = _make_store()
     task_id = _make_running_task(store)
 
+    # This test exercises the full MODEL-DRIVEN flow (progress → tool_call →
+    # progress → done) through the real connector boundary, so convergence is
+    # disabled here; the deterministic-convergence happy path is covered by
+    # ``test_gmail_search_runner_e2e_converges`` below (PRD 0009 P5).
     runner = SubAgentRunner(
         subagent_client=client,
         task_store=store,
         event_bus=EventBus(),
-        policy=SubAgentPolicy(max_iterations=10, wall_clock_seconds=999.0, token_cap=999_999),
+        policy=SubAgentPolicy(
+            max_iterations=10,
+            wall_clock_seconds=999.0,
+            token_cap=999_999,
+            converge_on_terminal_result=False,
+        ),
         tool_registry=build_default_subagent_registry(),
     )
 
@@ -302,6 +311,102 @@ async def test_gmail_search_runner_e2e(monkeypatch: pytest.MonkeyPatch) -> None:
     # For a Mail payload the redacted ``result`` text is elided entirely
     # (it typically embeds the subject) — matching the status_change posture.
     assert debug_ws_event["result"] is None
+
+
+@pytest.mark.asyncio
+async def test_gmail_search_runner_e2e_converges(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PRD 0009 P5 — the DEFAULT happy path through the real connector: a single
+    ``gmail_search`` tool call CONVERGES deterministically to ``done(complete)``
+    with the Mail card built from the stored result. No progress/done
+    round-trips, and the model never hand-builds the descriptor — yet the
+    overlay still renders and the 0056 redaction posture holds."""
+
+    def _fake_get_credentials() -> object:
+        return object()
+
+    class _FakeClient:
+        def __init__(self, _credentials: Any) -> None:
+            pass
+
+        def search_messages(self, query: str, max_results: int = 1) -> list[EmailMessage]:
+            return [_CANONICAL_MESSAGE]
+
+    monkeypatch.setattr("bob.connectors.gmail.auth.get_credentials", _fake_get_credentials)
+    monkeypatch.setattr("bob.connectors.gmail.GmailClient", _FakeClient)
+
+    expected_props = to_mail_props(_CANONICAL_MESSAGE)
+
+    # ONLY the tool call is scripted — convergence ends the run before the model
+    # would emit progress/done. A second scripted reply would be unused.
+    script = [
+        json.dumps(
+            {
+                "action": "tool_call",
+                "name": "gmail_search",
+                "args": {"from_name": "Holyana Callejon", "max_results": 1},
+            }
+        ),
+    ]
+    client = _ScriptedClient(chat_values=script)
+    store = _make_store()
+    task_id = _make_running_task(store)
+
+    runner = SubAgentRunner(
+        subagent_client=client,
+        task_store=store,
+        event_bus=EventBus(),
+        # Default policy: converge_on_terminal_result is True.
+        policy=SubAgentPolicy(max_iterations=10, wall_clock_seconds=999.0, token_cap=999_999),
+        tool_registry=build_default_subagent_registry(),
+    )
+
+    ws_frames: list[dict[str, Any]] = []
+
+    async def _capture_ws(event: dict[str, Any]) -> None:
+        ws_frames.append(event)
+
+    ws_events.set_emitter(_capture_ws)
+    try:
+        await runner.run(task_id)
+        for _ in range(5):
+            await asyncio.sleep(0)
+    finally:
+        ws_events.set_emitter(None)
+
+    # Converged in ONE LLM call (the tool_call); no second turn was needed.
+    assert len(client.calls) == 1
+
+    task = store.get_task(task_id)
+    assert task.state == "done"
+    # The Mail card was built deterministically from the stored result.
+    assert task.result_payload is not None
+    assert task.result_payload["component"] == "Mail"
+    assert task.result_payload["props"] == expected_props
+    # Spoken summary is the deterministic projection.
+    assert task.result is not None
+    assert "Holyana Callejon" in task.result
+
+    # The chat WS frame carries the REAL props for the overlay …
+    ws_task_results = [f for f in ws_frames if f.get("type") == "task_result"]
+    assert ws_task_results
+    assert ws_task_results[-1]["result_payload"]["props"]["subject"] == "Récap réunion produit"
+
+    # … while the debug ring buffer copy redacts subject / bodyPreview (0056).
+    captured_events = [event.to_dict() for event in snapshot_for_task(task_id)]
+    status_change_events = [
+        ev
+        for ev in captured_events
+        if ev.get("payload", {}).get("kind") == "status_change"
+        and ev.get("payload", {}).get("new_state") == "done"
+    ]
+    assert status_change_events
+    redacted = status_change_events[-1]["payload"]["ui_payload"]["props"]
+    assert redacted["subject"] == "<redacted-for-privacy>"
+    assert redacted["bodyPreview"] == "<redacted-for-privacy>"
+    # Metadata still flows for routing.
+    assert redacted["messageId"] == "msg-12345"
 
 
 @pytest.mark.asyncio
