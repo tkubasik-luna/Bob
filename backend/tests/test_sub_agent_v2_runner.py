@@ -191,11 +191,12 @@ def _valid_mail_props() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def test_schema_version_is_two() -> None:
-    """Acceptance: ``schema_version`` constant is 2 (bumped in issue 0065 when
-    ``done.ui_payload`` became the typed ``Deliverable`` union)."""
+def test_schema_version_is_three() -> None:
+    """Acceptance: ``schema_version`` constant is 3 (bumped in PRD 0009 when
+    ``done`` gained the optional ``result_ref`` store handle; was 2 in issue
+    0065 for the typed ``Deliverable`` union)."""
 
-    assert SUB_AGENT_SCHEMA_VERSION == 2
+    assert SUB_AGENT_SCHEMA_VERSION == 3
 
 
 def test_parse_done_v2_carries_all_fields() -> None:
@@ -218,7 +219,7 @@ def test_parse_done_v2_carries_all_fields() -> None:
     # the SHAPE; the runner gates the props against ui_registry).
     assert isinstance(action.ui_payload, ComponentDescriptor)
     assert action.ui_payload.component == "Markdown"
-    assert action.schema_version == 2
+    assert action.schema_version == 3
 
 
 def test_parse_progress_requires_thought() -> None:
@@ -2512,3 +2513,248 @@ async def test_p3_unprojected_tool_keeps_full_result_in_transcript() -> None:
     assert body["result"] == {"hits": ["a", "b"], "meta": {"k": "v"}}
     # But it still gets a ref handle on the blackboard.
     assert body["result_ref"] == "web_search#1"
+
+
+# ---------------------------------------------------------------------------
+# PRD 0009 P4 — deterministic terminal deliverable from the store
+# ---------------------------------------------------------------------------
+
+
+def _make_gmail_projector_registry(
+    result: dict[str, Any],
+) -> tuple[SubAgentToolRegistry, list[Any]]:
+    """A ``gmail_search`` tool wired with the real projector, returning ``result``."""
+
+    handler_calls: list[Any] = []
+
+    async def _handler(_ctx: Any, args: Any) -> SubAgentToolHandlerOutcome:
+        handler_calls.append(args)
+        return SubAgentToolHandlerOutcome(status="ok", result=result)
+
+    registry = SubAgentToolRegistry(
+        [
+            SubAgentToolDefinition(
+                name="gmail_search",
+                version="v1",
+                description="mail",
+                args_model=GmailSearchArgs,
+                handler=_handler,
+                result_projector=project_gmail_search,
+            )
+        ]
+    )
+    return registry, handler_calls
+
+
+def _no_converge_policy(**overrides: Any) -> SubAgentPolicy:
+    """Policy with convergence OFF so a terminal result still reaches the
+    stall / cap / model-done paths these tests exercise (P5 adds convergence)."""
+
+    base = {
+        "max_iterations": 99,
+        "wall_clock_seconds": 999.0,
+        "token_cap": 10_000_000,
+        "converge_on_terminal_result": False,
+    }
+    base.update(overrides)
+    return SubAgentPolicy(**base)
+
+
+@pytest.mark.asyncio
+async def test_p4_stall_after_gmail_search_keeps_mail_deliverable() -> None:
+    """PRD 0009 P4 — THE decisive 2026-05-30 regression. A stall AFTER a
+    successful gmail_search force-terminates ``degraded``, and the Mail card is
+    rebuilt from the stored result, so ``task.result_payload`` is the descriptor
+    — NOT ``None`` (the empty-overlay bug). The model never emitted a ``done``."""
+
+    mail = _valid_mail_props()
+    result = {"query": "label:INBOX", "count": 1, "messages": [mail]}
+    store = _make_store()
+    task_id = _make_running_task(store)
+    bus = EventBus()
+    state_changes = await _collect_state_changes(bus)
+    registry, handler_calls = _make_gmail_projector_registry(result)
+    client = _ScriptedClient(
+        chat_values=[
+            _tool_call_payload("gmail_search", {"label": "INBOX", "max_results": 1}),
+            _progress_payload("j'attends la réponse de l'outil"),
+            _progress_payload("j'attends la réponse de l'outil"),
+            _progress_payload("j'attends la réponse de l'outil"),
+            _progress_payload("j'attends la réponse de l'outil"),
+        ]
+    )
+    runner = SubAgentRunner(
+        subagent_client=client,
+        task_store=store,
+        event_bus=bus,
+        policy=_no_converge_policy(),
+        tool_registry=registry,
+        clock=_ControllableClock(),
+    )
+
+    await runner.run(task_id)
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    task = store.get_task(task_id)
+    assert task.state == "done"
+    assert state_changes[-1]["reason_code"] == REASON_STALLED
+    # THE FIX: the structured Mail card survives the forced stall.
+    assert task.result_payload == {"component": "Mail", "props": mail}
+    assert handler_calls  # the search did run
+
+
+@pytest.mark.asyncio
+async def test_p4_iteration_cap_after_gmail_search_keeps_mail_deliverable() -> None:
+    """PRD 0009 P4 — the cap paths also rebuild the deliverable from the store,
+    not just the salvaged text. A degraded iteration-cap exit carries the Mail
+    card."""
+
+    mail = _valid_mail_props()
+    result = {"query": "label:INBOX", "count": 1, "messages": [mail]}
+    store = _make_store()
+    task_id = _make_running_task(store)
+    bus = EventBus()
+    state_changes = await _collect_state_changes(bus)
+    registry, _ = _make_gmail_projector_registry(result)
+    client = _ScriptedClient(
+        chat_values=[_tool_call_payload("gmail_search", {"label": "INBOX", "max_results": 1})]
+    )
+    runner = SubAgentRunner(
+        subagent_client=client,
+        task_store=store,
+        event_bus=bus,
+        # cap fires on the loop turn after the single tool_call increments iteration.
+        policy=_no_converge_policy(max_iterations=1),
+        tool_registry=registry,
+        clock=_ControllableClock(),
+    )
+
+    await runner.run(task_id)
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    task = store.get_task(task_id)
+    assert task.state == "done"
+    assert state_changes[-1]["reason_code"] == REASON_ITERATION_CAP
+    assert task.result_payload == {"component": "Mail", "props": mail}
+
+
+@pytest.mark.asyncio
+async def test_p4_done_by_result_ref_builds_card_from_store() -> None:
+    """PRD 0009 P4 — the model finishes by REFERENCING the stored result
+    (result_ref) and emits NO ui_payload; the runner builds the Mail card from
+    the store. This is the "pass the data id" path — the model never copies the
+    descriptor."""
+
+    mail = _valid_mail_props()
+    result = {"query": "label:INBOX", "count": 1, "messages": [mail]}
+    store = _make_store()
+    task_id = _make_running_task(store)
+    registry, _ = _make_gmail_projector_registry(result)
+    done_with_ref = json.dumps(
+        {
+            "action": "done",
+            "result_summary": "Voici le dernier mail.",
+            "status": "complete",
+            "reason_code": "ok",
+            "result_ref": "gmail_search#1",
+        }
+    )
+    client = _ScriptedClient(
+        chat_values=[
+            _tool_call_payload("gmail_search", {"label": "INBOX", "max_results": 1}),
+            done_with_ref,
+        ]
+    )
+    runner = SubAgentRunner(
+        subagent_client=client,
+        task_store=store,
+        event_bus=EventBus(),
+        policy=_no_converge_policy(),
+        tool_registry=registry,
+        clock=_ControllableClock(),
+    )
+
+    await runner.run(task_id)
+
+    task = store.get_task(task_id)
+    assert task.state == "done"
+    assert task.result_payload == {"component": "Mail", "props": mail}
+    # The model's own prose summary is kept (not overwritten by the projection).
+    assert task.result == "Voici le dernier mail."
+
+
+@pytest.mark.asyncio
+async def test_p4_bare_done_with_stored_result_builds_card() -> None:
+    """PRD 0009 P4 — the 2026-05-30 RC1 case: the model finally emits a BARE
+    ``done`` (no ui_payload, no result_ref) with a usable result on the
+    blackboard. The runner still rebuilds the card from the last stored
+    result."""
+
+    mail = _valid_mail_props()
+    result = {"query": "label:INBOX", "count": 1, "messages": [mail]}
+    store = _make_store()
+    task_id = _make_running_task(store)
+    registry, _ = _make_gmail_projector_registry(result)
+    client = _ScriptedClient(
+        chat_values=[
+            _tool_call_payload("gmail_search", {"label": "INBOX", "max_results": 1}),
+            _done_v2_payload(result_summary="fini", status="complete", reason_code="ok"),
+        ]
+    )
+    runner = SubAgentRunner(
+        subagent_client=client,
+        task_store=store,
+        event_bus=EventBus(),
+        policy=_no_converge_policy(),
+        tool_registry=registry,
+        clock=_ControllableClock(),
+    )
+
+    await runner.run(task_id)
+
+    task = store.get_task(task_id)
+    assert task.state == "done"
+    assert task.result_payload == {"component": "Mail", "props": mail}
+
+
+@pytest.mark.asyncio
+async def test_p4_model_authored_descriptor_is_respected_over_store() -> None:
+    """PRD 0009 P4 — a model that DOES hand-build a valid descriptor keeps
+    authority (precedence b): its descriptor is used, not the store fallback.
+    Model agency is preserved for the cases where it wants it."""
+
+    stored_mail = _valid_mail_props()
+    result = {"query": "label:INBOX", "count": 1, "messages": [stored_mail]}
+    authored = dict(_valid_mail_props())
+    authored["subject"] = "Model-authored subject"
+    store = _make_store()
+    task_id = _make_running_task(store)
+    registry, _ = _make_gmail_projector_registry(result)
+    client = _ScriptedClient(
+        chat_values=[
+            _tool_call_payload("gmail_search", {"label": "INBOX", "max_results": 1}),
+            _done_v2_payload(
+                result_summary="fini",
+                status="complete",
+                reason_code="ok",
+                ui_payload={"component": "Mail", "props": authored},
+            ),
+        ]
+    )
+    runner = SubAgentRunner(
+        subagent_client=client,
+        task_store=store,
+        event_bus=EventBus(),
+        policy=_no_converge_policy(),
+        tool_registry=registry,
+        clock=_ControllableClock(),
+    )
+
+    await runner.run(task_id)
+
+    task = store.get_task(task_id)
+    assert task.state == "done"
+    assert task.result_payload is not None
+    assert task.result_payload["props"]["subject"] == "Model-authored subject"

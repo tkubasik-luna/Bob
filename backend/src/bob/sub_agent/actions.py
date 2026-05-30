@@ -39,10 +39,13 @@ from pydantic import BaseModel, Field, ValidationError
 from bob.ui_registry import ComponentDescriptor
 
 #: Current schema version. Every action carries this on the wire so we
-#: can later route v1 vs v2 parsers without ambiguity. Bumped in PR.
-#: v2 (issue 0065): ``done.ui_payload`` is now the typed :data:`Deliverable`
+#: can later route parsers without ambiguity. Bumped in PR.
+#: v2 (issue 0065): ``done.ui_payload`` is the typed :data:`Deliverable`
 #: union (markdown string or validated ``ComponentDescriptor``).
-SUB_AGENT_SCHEMA_VERSION = 2
+#: v3 (PRD 0009): ``done`` gains optional ``result_ref`` — the model may
+#: finish by *referencing* a stored tool result instead of copying its data
+#: into ``ui_payload`` (the runner rebuilds the deliverable from the store).
+SUB_AGENT_SCHEMA_VERSION = 3
 
 
 #: A document-class deliverable: the finished artefact as a plain markdown
@@ -137,6 +140,14 @@ class DoneAction(BaseModel):
     action: Literal["done"]
     result_summary: str = Field(default="")
     ui_payload: Deliverable | None = Field(default=None)
+    #: PRD 0009 — optional handle to a stored tool result
+    #: (``"gmail_search#1"``, shown in the ``tool`` response's ``result_ref``).
+    #: When set, the runner rebuilds the deliverable from that stored result's
+    #: deterministic projection instead of from ``ui_payload`` — so a weak model
+    #: can finish a mail task by *referencing* the data ("done, result_ref=…")
+    #: rather than re-emitting the whole Mail descriptor (the step it failed at,
+    #: 2026-05-30 RC1). ``None`` keeps the legacy ``ui_payload``-driven path.
+    result_ref: str | None = Field(default=None)
     status: SubAgentDoneStatus
     reason_code: str = Field(..., min_length=1)
     cost: dict[str, Any] = Field(default_factory=dict)

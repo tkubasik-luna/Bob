@@ -302,6 +302,30 @@ def _salvage_tool_result_text(tool_name: str | None, result: dict[str, Any] | No
     return f"[résultat partiel — limite atteinte] dernier résultat de {label} : {body}"
 
 
+def _resolve_terminal_deliverable(
+    result_store: ToolResultStore, result_ref: str | None = None
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Resolve the deterministic deliverable + summary for a terminal exit (PRD 0009).
+
+    Prefers the result the model explicitly referenced via ``result_ref``; falls
+    back to the most recent stored result. Returns the projected
+    ``{component, props}`` deliverable (``None`` when the result has nothing to
+    render — e.g. an empty search) and the projection's deterministic summary
+    (``None`` when empty). This is the SINGLE place the structured deliverable
+    is rebuilt on a forced or clean exit, so a Mail card survives a stall / cap
+    / bare ``done`` instead of depending on the weak model emitting a perfect
+    ``ui_payload`` (the 2026-05-30 empty-overlay bug). A ``result_ref`` that
+    does not resolve degrades to ``last()`` — the best available guess — rather
+    than dropping the deliverable.
+    """
+
+    stored = result_store.get(result_ref) or result_store.last()
+    if stored is None:
+        return None, None
+    projection = stored.projection
+    return projection.deliverable, (projection.summary or None)
+
+
 def _strip_code_fence(text: str) -> str:
     """Strip a leading/trailing markdown code fence around a JSON payload."""
 
@@ -785,6 +809,9 @@ class SubAgentRunner:
                         iterations=iteration,
                         tokens_used=tokens_used,
                     ),
+                    # PRD 0009 — also rebuild the structured deliverable (the
+                    # Mail card) from the store so the overlay is not empty.
+                    result_store=result_store,
                     redact_result_in_debug=True,
                 )
                 return
@@ -816,6 +843,8 @@ class SubAgentRunner:
                         iterations=iteration,
                         tokens_used=tokens_used,
                     ),
+                    # PRD 0009 — rebuild the structured deliverable from the store.
+                    result_store=result_store,
                     redact_result_in_debug=True,
                 )
                 return
@@ -1060,7 +1089,7 @@ class SubAgentRunner:
                     validator_envelope.record_feedback(validator_feedback[-1]["content"])
                     validator_envelope.increment(error_code=REASON_INVALID_OUTPUT)
                     continue
-                await self._handle_done(task_id, action)
+                await self._handle_done(task_id, action, result_store)
                 return
 
             if isinstance(action, ProgressAction):
@@ -1085,6 +1114,7 @@ class SubAgentRunner:
                         last_tool_result=last_tool_result,
                         last_tool_name=last_tool_name,
                         last_tool_error=last_tool_error,
+                        result_store=result_store,
                         started_at=started_at,
                         iteration=iteration,
                         tokens_used=tokens_used,
@@ -1150,6 +1180,7 @@ class SubAgentRunner:
                             last_tool_result=last_tool_result,
                             last_tool_name=last_tool_name,
                             last_tool_error=last_tool_error,
+                            result_store=result_store,
                             started_at=started_at,
                             iteration=iteration,
                             tokens_used=tokens_used,
@@ -1248,6 +1279,7 @@ class SubAgentRunner:
                             last_tool_result=last_tool_result,
                             last_tool_name=last_tool_name,
                             last_tool_error=last_tool_error,
+                            result_store=result_store,
                             started_at=started_at,
                             iteration=iteration,
                             tokens_used=tokens_used,
@@ -1338,27 +1370,85 @@ class SubAgentRunner:
 
     # --- Action handlers -----------------------------------------------------
 
-    async def _handle_done(self, task_id: str, action: DoneAction) -> None:
-        """Persist a v2 ``done`` action coming from the LLM."""
+    async def _handle_done(
+        self, task_id: str, action: DoneAction, result_store: ToolResultStore
+    ) -> None:
+        """Persist a ``done`` action coming from the LLM.
+
+        PRD 0009 — the terminal deliverable is, by preference, a deterministic
+        projection of a stored tool result (resolved by ``action.result_ref``
+        or, for a bare ``done`` emitted with a result in hand, the last stored
+        result), so a Mail card no longer depends on the weak model reproducing
+        it. A model-provided ``ui_payload`` (a document-class markdown string or
+        a hand-built descriptor) is still honoured when there is no usable stored
+        result to prefer (see :meth:`_select_done_deliverable`).
+        """
 
         # Issue 0065 — ``ui_payload`` is the typed Deliverable union. Normalise
         # a validated ComponentDescriptor back to its plain dict form here so
         # the persistence + transport path (0064) and the debug / redaction
         # helpers keep operating on ``dict | str | None`` exactly as before.
         deliverable = action.ui_payload
-        ui_payload: dict[str, Any] | str | None
+        model_payload: dict[str, Any] | str | None
         if isinstance(deliverable, ComponentDescriptor):
-            ui_payload = deliverable.model_dump()
+            model_payload = deliverable.model_dump()
         else:
-            ui_payload = deliverable
+            model_payload = deliverable
+
+        ui_payload, result_summary = self._select_done_deliverable(
+            result_store,
+            result_ref=action.result_ref,
+            model_payload=model_payload,
+            result_summary=action.result_summary,
+        )
         await self._finalize_done(
             task_id,
             status=action.status,
             reason_code=action.reason_code,
-            result_summary=action.result_summary,
+            result_summary=result_summary,
             ui_payload=ui_payload,
             cost=action.cost,
         )
+
+    @staticmethod
+    def _select_done_deliverable(
+        result_store: ToolResultStore,
+        *,
+        result_ref: str | None,
+        model_payload: dict[str, Any] | str | None,
+        result_summary: str,
+    ) -> tuple[dict[str, Any] | str | None, str]:
+        """Pick the ``done`` deliverable + summary, preferring the store (PRD 0009).
+
+        Precedence:
+
+        (a) the model referenced a stored result (``result_ref``) whose
+            projection has a deliverable → build the card from it (the
+            "pass the data id" path — the model never copies the payload);
+        (b) the model emitted its OWN renderable payload — a document-class
+            markdown string or a hand-built ``{component, props}`` descriptor →
+            respect it (covers document tasks and a model that did build a card);
+        (c) no usable model payload, but a tool result with a deliverable is on
+            the blackboard → build the card from the last stored result (the
+            2026-05-30 RC1 case: the model finally emits a *bare* ``done``);
+        (d) nothing structured anywhere → keep whatever the model gave (``None``
+            or a non-renderable bag), unchanged from pre-0009.
+
+        In (a)/(c) a non-empty model ``result_summary`` wins over the projection
+        summary (the model may have written better prose); otherwise the
+        deterministic projection summary fills it in.
+        """
+
+        if result_ref:
+            stored = result_store.get(result_ref)
+            if stored is not None and stored.projection.deliverable is not None:
+                return stored.projection.deliverable, (result_summary or stored.projection.summary)
+        if _is_component_descriptor(model_payload) or _deliverable_text(model_payload):
+            return model_payload, result_summary
+        stored = result_store.last()
+        if stored is not None and stored.projection.deliverable is not None:
+            return stored.projection.deliverable, (result_summary or stored.projection.summary)
+        return model_payload, result_summary
 
     async def _handle_progress(self, task_id: str, thought: str) -> None:
         """Persist a v2 ``progress`` thought, leave state ``running``."""
@@ -2000,6 +2090,7 @@ class SubAgentRunner:
         last_tool_result: dict[str, Any] | None,
         last_tool_name: str | None,
         last_tool_error: SubAgentToolDispatchResult | None,
+        result_store: ToolResultStore,
         started_at: float,
         iteration: int,
         tokens_used: int,
@@ -2024,12 +2115,17 @@ class SubAgentRunner:
             tokens_used=tokens_used,
         )
         if last_tool_result is not None:
+            # PRD 0009 — pass the store so the projected deliverable (the Mail
+            # card) rides the degraded done; the salvaged text still carries the
+            # "[résultat partiel]" framing for Jarvis. This is the 2026-05-30 fix:
+            # the overlay is no longer empty when the data exists.
             await self._emit_terminal_done(
                 task_id,
                 status="degraded",
                 reason_code=REASON_STALLED,
                 result_summary=_salvage_tool_result_text(last_tool_name, last_tool_result),
                 cost=cost,
+                result_store=result_store,
                 redact_result_in_debug=True,
             )
             return
@@ -2066,17 +2162,36 @@ class SubAgentRunner:
         reason_code: str,
         result_summary: str,
         cost: dict[str, Any],
+        result_store: ToolResultStore | None = None,
         redact_result_in_debug: bool = False,
         persist_result_on_failure: bool = False,
     ) -> None:
-        """Convenience wrapper around :meth:`_finalize_done` for cap paths."""
+        """Convenience wrapper around :meth:`_finalize_done` for cap / forced paths.
+
+        PRD 0009 — when ``result_store`` is supplied (the cap and stall paths
+        that retained data), the structured deliverable is rebuilt from the
+        store's last projection and attached as ``ui_payload`` so a Mail card
+        survives a degraded exit (the 2026-05-30 fix). The projection's summary
+        backfills ``result_summary`` only when the caller passed none — the
+        caller's salvaged text (which carries the degraded "[résultat partiel]"
+        framing) still wins when present. Paths with no retained data (cancel /
+        wall-clock / hard-kill) pass no store and are byte-identical to before.
+        """
+
+        ui_payload: dict[str, Any] | None = None
+        if result_store is not None:
+            deliverable, summary = _resolve_terminal_deliverable(result_store)
+            if deliverable is not None:
+                ui_payload = deliverable
+            if not result_summary and summary:
+                result_summary = summary
 
         await self._finalize_done(
             task_id,
             status=status,
             reason_code=reason_code,
             result_summary=result_summary,
-            ui_payload=None,
+            ui_payload=ui_payload,
             cost=cost,
             redact_result_in_debug=redact_result_in_debug,
             persist_result_on_failure=persist_result_on_failure,
