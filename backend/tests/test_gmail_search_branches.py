@@ -154,9 +154,11 @@ async def test_empty_result_branch_emits_no_mail_overlay(
     """Empty list result → ``done(complete, ui_payload=null)``; no Mail event.
 
     Pinning the contract that an empty inbox result does NOT open the Mail
-    overlay. The sub-agent ``done`` carries ``ui_payload=None`` and the
-    HudTasks subscriber sees no Mail ``component`` descriptor in any
-    captured debug event.
+    overlay. PRD 0009: an empty search is a *terminal* projection, so the
+    runner CONVERGES to ``done(complete)`` deterministically — ``ui_payload``
+    is ``None`` (no Mail descriptor in any debug event) and the spoken summary
+    is the projector's deterministic "aucun email" line rather than a
+    model-authored sentence.
     """
 
     clear()
@@ -234,10 +236,10 @@ async def test_empty_result_branch_emits_no_mail_overlay(
     for ev in status_changes:
         assert ev["payload"].get("ui_payload") is None, ev
 
-    # The persisted task.result text is the "Aucun mail récent..." speech —
-    # the user gets that string, not a Mail card.
+    # The persisted task.result text is the deterministic "aucun email" speech
+    # built by the projector on convergence — the user gets that, not a card.
     assert task.result is not None
-    assert "Aucun mail récent" in task.result
+    assert "Aucun email" in task.result
 
 
 # --- Branch 2: auth expired / bootstrap required ----------------------------

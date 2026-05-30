@@ -2907,3 +2907,43 @@ async def test_p5_nonterminal_tool_does_not_converge() -> None:
     task = store.get_task(task_id)
     assert task.state == "done"
     assert task.result == "done"
+
+
+# ---------------------------------------------------------------------------
+# PRD 0009 P6 — prompt: result_ref guidance + slimmed Gmail skill pack
+# ---------------------------------------------------------------------------
+
+
+def test_p6_base_prompt_teaches_result_ref_without_naming_a_tool() -> None:
+    """PRD 0009 P6 — the base contract teaches the ``result_ref`` finishing path
+    (reference a stored result instead of copying it into ui_payload), with a
+    GENERIC example so it stays tool-agnostic."""
+
+    from bob.context.prompt_fragments import SUB_AGENT_V2_SYSTEM_PROMPT
+
+    rendered = SUB_AGENT_V2_SYSTEM_PROMPT.render(goal="dummy")
+    assert "result_ref" in rendered
+    assert "outil#1" in rendered  # generic example
+    # Stays tool-agnostic — no specific tool leaks into the base contract.
+    assert "gmail_search" not in rendered
+
+
+def test_p6_gmail_pack_drops_hand_built_descriptor_and_empty_branch() -> None:
+    """PRD 0009 P6 — the slimmed Gmail pack no longer asks the model to
+    hand-build the Mail descriptor or handle the empty result (the runner does
+    both via convergence), but keeps the search filters/fallback and the
+    tool-ERROR branches."""
+
+    from bob.context.prompt_fragments import GMAIL_SEARCH_SKILL_PACK
+
+    rendered = GMAIL_SEARCH_SKILL_PACK.render()
+    # Happy-path descriptor construction is gone (now automatic).
+    assert '{"component": "Mail"' not in rendered
+    assert "lecture du mail" not in rendered
+    # The mail-build no longer asks for a count:0 model speech.
+    assert "Aucun mail récent" not in rendered
+    # Kept: search construction + fallback + result_ref mention + error speeches.
+    assert 'label="INBOX"' in rendered
+    assert 'label="SENT"' in rendered
+    assert "result_ref" in rendered
+    assert "python -m bob.connectors.gmail.auth" in rendered
