@@ -119,6 +119,7 @@ from bob.sub_agent.actions import (
 )
 from bob.sub_agent.addendum_queue import AddendumEntry, AddendumQueue
 from bob.sub_agent.policy import SubAgentPolicy, default_policy
+from bob.sub_agent.result_store import StoredResult, ToolResultStore
 from bob.sub_agent.tool_registry import (
     SubAgentToolArgsValidationError,
     SubAgentToolDispatcher,
@@ -498,10 +499,16 @@ class _ToolCallStep:
       error), already persisted as a ``tool`` message. The loop reads it to
       track the last successful result for salvage (RC2) and to record the
       call signature for dedup (RC4).
+    - ``stored`` — PRD 0009: on a SUCCESSFUL dispatch, the
+      :class:`StoredResult` written to the run's blackboard (ref + projection).
+      ``None`` on a validation error or a runtime tool error (only successes
+      are stored). The loop carries it so a terminal exit can build the
+      deliverable from the projection deterministically (P4).
     """
 
     validation_error: SubAgentToolDispatchResult | None = None
     dispatched: SubAgentToolDispatchResult | None = None
+    stored: StoredResult | None = None
 
 
 def _normalise_payload(raw: str) -> _NormalisedPayload:
@@ -740,6 +747,14 @@ class SubAgentRunner:
         last_tool_name: str | None = None
         last_tool_error: SubAgentToolDispatchResult | None = None
         stall_count = 0
+
+        # PRD 0009 — per-run blackboard. Each successful tool dispatch writes its
+        # full result here keyed by a short ref; the transcript carries only the
+        # projected compact digest (context saving), and a terminal exit builds
+        # the deliverable from the stored projection deterministically (P4) — so
+        # the Mail card no longer depends on the weak model emitting a perfect
+        # ``done`` (2026-05-30).
+        result_store = ToolResultStore()
 
         while True:
             # ---- Checkpoint 1: iteration boundary -----------------------
@@ -1158,7 +1173,7 @@ class SubAgentRunner:
                         ]
                     continue
 
-                step = await self._handle_tool_call(task_id, action)
+                step = await self._handle_tool_call(task_id, action, result_store)
                 validation_error = step.validation_error
                 if validation_error is not None:
                     # Issue 0062 — a pre-dispatch arg-validation / unknown-tool
@@ -1469,7 +1484,9 @@ class SubAgentRunner:
             )
         return None
 
-    async def _handle_tool_call(self, task_id: str, action: ToolCallAction) -> _ToolCallStep:
+    async def _handle_tool_call(
+        self, task_id: str, action: ToolCallAction, result_store: ToolResultStore
+    ) -> _ToolCallStep:
         """Execute a sub-agent-side tool call and persist its outcome.
 
         Returns a :class:`_ToolCallStep`: ``dispatched`` carries the
@@ -1538,9 +1555,31 @@ class SubAgentRunner:
             context=_RuntimeToolContext(task_id=task_id),
         )
 
+        # PRD 0009 — a SUCCESSFUL result is written to the per-run blackboard and
+        # the ``tool`` transcript message carries only its COMPACT projected
+        # digest + the ref, never the full blob. This is the context-saving lever
+        # (D2): a weak model no longer re-reads a 2 KB Gmail result every turn,
+        # and the body (0056) never enters the transcript. The full result lives
+        # in the store; the deliverable is rebuilt from it deterministically at a
+        # terminal exit (P4). An un-projected tool's digest IS its full result,
+        # so its transcript message is byte-identical to pre-0009. An ERROR is
+        # not stored (nothing to project) and keeps the structured error body so
+        # the model can read it and self-correct.
+        stored: StoredResult | None = None
         body: dict[str, Any]
         if result.ok:
-            body = {"status": "ok", "result": result.result}
+            definition = self._tool_registry.get(action.name)
+            stored = result_store.put(
+                tool_name=result.tool_name,
+                tool_version=result.tool_version,
+                result=result.result,
+                projector=definition.result_projector if definition else None,
+            )
+            body = {
+                "status": "ok",
+                "result_ref": stored.ref,
+                "result": stored.projection.digest,
+            }
         else:
             body = {
                 "status": "error",
@@ -1555,7 +1594,7 @@ class SubAgentRunner:
             )
         except TaskStoreError:
             _logger.exception("sub_agent_runner.persist_tool_result_failed", task_id=task_id)
-            return _ToolCallStep(dispatched=result)
+            return _ToolCallStep(dispatched=result, stored=stored)
 
         emit_debug(
             category="task",
@@ -1571,7 +1610,7 @@ class SubAgentRunner:
                 "kind": "tool_result",
             },
         )
-        return _ToolCallStep(dispatched=result)
+        return _ToolCallStep(dispatched=result, stored=stored)
 
     async def _handle_ask_user(self, task_id: str, question: str) -> None:
         """Legacy ``ask_user`` flow preserved until 0050 replaces it."""

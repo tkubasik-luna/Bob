@@ -62,6 +62,7 @@ from bob.sub_agent.tool_registry import (
     build_gmail_search_tool,
     build_web_fetch_tool,
     build_web_search_tool,
+    project_gmail_search,
 )
 from bob.task_store import TaskStore
 from bob.ui_registry import ComponentDescriptor
@@ -2390,3 +2391,124 @@ async def test_tool_error_then_successful_retry_resets_stall() -> None:
     assert task.result == "done cleanly"
     # The single error (stall 1, below the nudge threshold of 2) injected no nudge.
     assert not any(m["role"] == "system_validator" for c in client.calls for m in c["messages"])
+
+
+# ---------------------------------------------------------------------------
+# PRD 0009 P3 — tool result store + compact transcript digest
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_p3_tool_result_transcript_is_compact_digest_with_ref() -> None:
+    """PRD 0009 P3: a successful projected tool result enters the transcript as a
+    COMPACT digest + a ``result_ref`` — never the full blob. The Gmail body
+    (``bodyPreview``) must not reach the transcript (0056 + context saving)."""
+
+    store = _make_store()
+    task_id = _make_running_task(store)
+
+    mail = _valid_mail_props()  # carries bodyPreview
+
+    async def _handler(_ctx: Any, _args: Any) -> SubAgentToolHandlerOutcome:
+        return SubAgentToolHandlerOutcome(
+            status="ok",
+            result={"query": "label:INBOX", "count": 1, "messages": [mail]},
+        )
+
+    registry = SubAgentToolRegistry(
+        [
+            SubAgentToolDefinition(
+                name="gmail_search",
+                version="v1",
+                description="mail",
+                args_model=GmailSearchArgs,
+                handler=_handler,
+                result_projector=project_gmail_search,
+            )
+        ]
+    )
+
+    client = _ScriptedClient(
+        chat_values=[
+            _tool_call_payload("gmail_search", {"label": "INBOX", "max_results": 1}),
+            _done_v2_payload(result_summary="done"),
+        ]
+    )
+    runner = SubAgentRunner(
+        subagent_client=client,
+        task_store=store,
+        event_bus=EventBus(),
+        policy=SubAgentPolicy(),
+        tool_registry=registry,
+        clock=_ControllableClock(),
+    )
+
+    await runner.run(task_id)
+
+    tool_msgs = [m for m in store.get_task_messages(task_id) if m.role == "tool"]
+    assert len(tool_msgs) == 1
+    body = json.loads(tool_msgs[0].content)
+    assert body["tool"] == "gmail_search"
+    assert body["status"] == "ok"
+    assert body["result_ref"] == "gmail_search#1"
+    assert body["result"]["count"] == 1
+    # The body NEVER enters the transcript — the decisive 0056 + D2 assertion.
+    assert "bodyPreview" not in tool_msgs[0].content
+    assert "deck ready by Thursday" not in tool_msgs[0].content
+    assert body["result"]["messages"][0] == {
+        "subject": "Q3 forecast",
+        "receivedAt": "2026-05-28T14:22:00Z",
+        "from": "Marie Lefèvre",
+    }
+
+
+@pytest.mark.asyncio
+async def test_p3_unprojected_tool_keeps_full_result_in_transcript() -> None:
+    """PRD 0009 P3: a tool with no projector behaves as pre-0009 — its full
+    result is preserved in the transcript (digest == full result) — and gains a
+    ``result_ref`` handle. No regression for un-projected tools."""
+
+    store = _make_store()
+    task_id = _make_running_task(store)
+
+    async def _handler(_ctx: Any, _args: Any) -> SubAgentToolHandlerOutcome:
+        return SubAgentToolHandlerOutcome(
+            status="ok", result={"hits": ["a", "b"], "meta": {"k": "v"}}
+        )
+
+    registry = SubAgentToolRegistry(
+        [
+            SubAgentToolDefinition(
+                name="web_search",
+                version="v1",
+                description="search",
+                args_model=WebSearchArgs,
+                handler=_handler,  # no result_projector
+            )
+        ]
+    )
+
+    client = _ScriptedClient(
+        chat_values=[
+            _tool_call_payload("web_search", {"query": "x"}),
+            _done_v2_payload(result_summary="done"),
+        ]
+    )
+    runner = SubAgentRunner(
+        subagent_client=client,
+        task_store=store,
+        event_bus=EventBus(),
+        policy=SubAgentPolicy(),
+        tool_registry=registry,
+        clock=_ControllableClock(),
+    )
+
+    await runner.run(task_id)
+
+    tool_msgs = [m for m in store.get_task_messages(task_id) if m.role == "tool"]
+    assert len(tool_msgs) == 1
+    body = json.loads(tool_msgs[0].content)
+    # Full result preserved verbatim (digest == result for an un-projected tool).
+    assert body["result"] == {"hits": ["a", "b"], "meta": {"k": "v"}}
+    # But it still gets a ref handle on the blackboard.
+    assert body["result_ref"] == "web_search#1"
