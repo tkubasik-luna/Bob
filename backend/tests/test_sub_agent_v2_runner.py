@@ -27,12 +27,14 @@ from typing import Any
 import pytest
 
 from bob.db.migrations_runner import apply_migrations, default_migrations_dir
+from bob.debug_log import snapshot_for_task
 from bob.event_bus import EventBus
 from bob.llm.types import LLMResponse, ToolDefinition
 from bob.llm_client import LLMClient
 from bob.sub_agent import (
     REASON_HARD_KILLED,
     REASON_ITERATION_CAP,
+    REASON_STALLED,
     REASON_TOKEN_CAP,
     REASON_USER_CANCELLED,
     REASON_WALL_CLOCK_CAP,
@@ -1852,3 +1854,539 @@ async def test_guided_path_avoids_fenced_envelope_failure_mode() -> None:
     task = store.get_task(task_id)
     # Completed cleanly — NOT the ``failed`` / ``llm_failed`` the bug produced.
     assert task.state == "done"
+
+
+# ---------------------------------------------------------------------------
+# Loop-convergence guards (mail-tool-loop investigation, 2026-05-29)
+#
+# A successful tool result already in context must not be discarded by a loop
+# that never emits ``done``. These cover: dedup of identical tool calls (RC4),
+# the stall forcing function on progress-spam (RC1), salvage of the retrieved
+# data on a cap exit (RC2), and the control-char arg guard (RC5) — plus a
+# happy-path guard so the forcing function does not fire too eagerly.
+# ---------------------------------------------------------------------------
+
+
+def _tool_call_payload(name: str, args: dict[str, Any]) -> str:
+    return json.dumps({"action": "tool_call", "name": name, "args": args})
+
+
+def _make_echo_registry() -> tuple[SubAgentToolRegistry, list[Any]]:
+    """An ``echo`` tool returning its query as a successful result.
+
+    Returns the registry plus a list that records each handler invocation so a
+    test can assert how many times the tool actually ran — the dedup guard must
+    keep that at 1 even when the model re-requests the same call.
+    """
+
+    from pydantic import BaseModel
+
+    class _EchoArgs(BaseModel):
+        q: str
+
+    handler_calls: list[Any] = []
+
+    async def _handler(_ctx: Any, args: BaseModel) -> SubAgentToolHandlerOutcome:
+        handler_calls.append(args)
+        return SubAgentToolHandlerOutcome(
+            status="ok", result={"echo": getattr(args, "q", None), "found": True}
+        )
+
+    registry = SubAgentToolRegistry(
+        [
+            SubAgentToolDefinition(
+                name="echo",
+                version="v1",
+                description="echo back the query",
+                args_model=_EchoArgs,
+                handler=_handler,
+            )
+        ]
+    )
+    return registry, handler_calls
+
+
+@pytest.mark.asyncio
+async def test_duplicate_tool_call_not_redispatched_and_forces_salvaged_done() -> None:
+    """RC4 + RC1 + RC2: an identical ``(name, args)`` call is suppressed (not
+    re-dispatched); repeated dups drive the stall guard to a forced
+    ``done(degraded, stalled_no_progress)`` carrying the salvaged result."""
+
+    store = _make_store()
+    task_id = _make_running_task(store)
+    bus = EventBus()
+    state_changes = await _collect_state_changes(bus)
+    registry, handler_calls = _make_echo_registry()
+    # 5 identical calls: #1 dispatches, #2..#5 are dups → stall 1,2,3,4 → force.
+    client = _ScriptedClient(chat_values=[_tool_call_payload("echo", {"q": "x"}) for _ in range(5)])
+    runner = SubAgentRunner(
+        subagent_client=client,
+        task_store=store,
+        event_bus=bus,
+        policy=SubAgentPolicy(max_iterations=99, wall_clock_seconds=999.0, token_cap=10_000_000),
+        tool_registry=registry,
+        clock=_ControllableClock(),
+    )
+
+    await runner.run(task_id)
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    # Dispatched exactly once despite 5 identical requests.
+    assert len(handler_calls) == 1
+    # The suppressed dups never reached the transcript — only one tool message.
+    tool_msgs = [m for m in store.get_task_messages(task_id) if m.role == "tool"]
+    assert len(tool_msgs) == 1
+
+    task = store.get_task(task_id)
+    assert task.state == "done"
+    assert state_changes[-1]["status"] == "degraded"
+    assert state_changes[-1]["reason_code"] == REASON_STALLED
+    # RC2 — the salvaged result carries the retrieved data, not an empty string.
+    assert task.result is not None
+    assert "résultat partiel" in task.result
+    assert "x" in task.result
+
+
+@pytest.mark.asyncio
+async def test_progress_spam_after_tool_result_forces_salvaged_done() -> None:
+    """RC1: repeated ``progress`` after a successful tool result is the stall;
+    the runner force-terminates with a salvaged ``done`` + injects the nudge."""
+
+    store = _make_store()
+    task_id = _make_running_task(store)
+    bus = EventBus()
+    state_changes = await _collect_state_changes(bus)
+    registry, handler_calls = _make_echo_registry()
+    client = _ScriptedClient(
+        chat_values=[
+            _tool_call_payload("echo", {"q": "olivier"}),
+            _progress_payload("p1"),
+            _progress_payload("p2"),
+            _progress_payload("p3"),
+            _progress_payload("p4"),
+        ]
+    )
+    runner = SubAgentRunner(
+        subagent_client=client,
+        task_store=store,
+        event_bus=bus,
+        policy=SubAgentPolicy(max_iterations=99, wall_clock_seconds=999.0, token_cap=10_000_000),
+        tool_registry=registry,
+        clock=_ControllableClock(),
+    )
+
+    await runner.run(task_id)
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    assert len(handler_calls) == 1
+    task = store.get_task(task_id)
+    assert task.state == "done"
+    assert state_changes[-1]["reason_code"] == REASON_STALLED
+    assert task.result is not None
+    assert "olivier" in task.result
+    # The forcing nudge was injected once the stall hit the nudge threshold.
+    nudge_calls = [
+        c for c in client.calls if any(m["role"] == "system_validator" for m in c["messages"])
+    ]
+    assert nudge_calls
+
+
+@pytest.mark.asyncio
+async def test_iteration_cap_salvages_prior_tool_result() -> None:
+    """RC2: a cap firing after a successful tool call no longer discards the
+    retrieved data — the degraded ``done`` carries the salvaged result instead
+    of the empty string the bug produced ("aucun résultat")."""
+
+    store = _make_store()
+    task_id = _make_running_task(store)
+    bus = EventBus()
+    state_changes = await _collect_state_changes(bus)
+    registry, _handler_calls = _make_echo_registry()
+    # tool (iter1) + progress (iter2) + progress (iter3) → top of iter4 trips cap=3.
+    client = _ScriptedClient(
+        chat_values=[
+            _tool_call_payload("echo", {"q": "mail-data"}),
+            _progress_payload("p1"),
+            _progress_payload("p2"),
+        ]
+    )
+    runner = SubAgentRunner(
+        subagent_client=client,
+        task_store=store,
+        event_bus=bus,
+        policy=SubAgentPolicy(max_iterations=3, wall_clock_seconds=999.0, token_cap=10_000_000),
+        tool_registry=registry,
+        clock=_ControllableClock(),
+    )
+
+    await runner.run(task_id)
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    task = store.get_task(task_id)
+    assert task.state == "done"
+    assert state_changes[-1]["reason_code"] == REASON_ITERATION_CAP
+    # Old behaviour: result == "". Now the data survives.
+    assert task.result is not None
+    assert task.result != ""
+    assert "mail-data" in task.result
+
+
+@pytest.mark.asyncio
+async def test_control_char_in_tool_arg_routes_to_validator_not_dispatched() -> None:
+    """RC5: a control char in a string arg (guided-decode UTF-8 mangling, e.g.
+    ``é`` → U+0013) is rejected pre-dispatch and corrected under
+    ``system_validator`` — the tool never runs on the corrupted query."""
+
+    store = _make_store()
+    task_id = _make_running_task(store)
+    registry, handler_calls = _make_echo_registry()
+    client = _ScriptedClient(
+        chat_values=[
+            # "intéressement" with é mangled to U+0013 — exactly the log artefact.
+            _tool_call_payload("echo", {"q": "intressement"}),
+            _done_v2_payload(result_summary="recovered", status="complete", reason_code="ok"),
+        ]
+    )
+    runner = SubAgentRunner(
+        subagent_client=client,
+        task_store=store,
+        event_bus=EventBus(),
+        policy=SubAgentPolicy(),
+        tool_registry=registry,
+        clock=_ControllableClock(),
+    )
+
+    await runner.run(task_id)
+
+    # The corrupted query never dispatched.
+    assert handler_calls == []
+    # No ``tool`` message — the rejection rode ``system_validator``, not ``tool``.
+    assert [m for m in store.get_task_messages(task_id) if m.role == "tool"] == []
+    # Correction injected under system_validator on the retry call.
+    assert len(client.calls) == 2
+    validator_rows = [m for m in client.calls[1]["messages"] if m["role"] == "system_validator"]
+    assert len(validator_rows) == 1
+    assert "invalid_args" in validator_rows[0]["content"]
+    task = store.get_task(task_id)
+    assert task.state == "done"
+
+
+@pytest.mark.asyncio
+async def test_single_progress_after_tool_result_still_reaches_model_done() -> None:
+    """Guard against over-eager forcing: the Gmail recipe's legitimate single
+    'lecture du mail' ``progress`` between the tool result and ``done`` must NOT
+    trip the stall guard (nudge threshold is 2, so one is fine)."""
+
+    store = _make_store()
+    task_id = _make_running_task(store)
+    bus = EventBus()
+    state_changes = await _collect_state_changes(bus)
+    registry, handler_calls = _make_echo_registry()
+    client = _ScriptedClient(
+        chat_values=[
+            _progress_payload("recherche"),
+            _tool_call_payload("echo", {"q": "x"}),
+            _progress_payload("lecture du résultat"),
+            _done_v2_payload(result_summary="done cleanly", status="complete", reason_code="ok"),
+        ]
+    )
+    runner = SubAgentRunner(
+        subagent_client=client,
+        task_store=store,
+        event_bus=bus,
+        policy=SubAgentPolicy(),
+        tool_registry=registry,
+        clock=_ControllableClock(),
+    )
+
+    await runner.run(task_id)
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    assert len(handler_calls) == 1
+    task = store.get_task(task_id)
+    assert task.state == "done"
+    # Reached the model's own ``done`` (complete/ok), NOT a forced stall/cap.
+    assert state_changes[-1]["status"] == "complete"
+    assert state_changes[-1]["reason_code"] == "ok"
+    assert task.result == "done cleanly"
+
+
+@pytest.mark.asyncio
+async def test_salvaged_result_redacted_from_debug_sink_but_reaches_chat() -> None:
+    """RC2 privacy (issue 0056): a salvaged tool result reaches the chat client
+    via ``task.result`` but its raw body is scrubbed from the debug ring buffer /
+    ``/ws/debug`` feed / JSONL sink — the loop fix must not regress mail privacy
+    by dumping an email ``bodyPreview`` into the debug envelopes."""
+
+    from pydantic import BaseModel
+
+    secret = "TOPSECRET-BODY-XYZ"
+
+    class _MailishArgs(BaseModel):
+        q: str
+
+    async def _handler(_ctx: Any, _args: BaseModel) -> SubAgentToolHandlerOutcome:
+        return SubAgentToolHandlerOutcome(
+            status="ok", result={"bodyPreview": secret, "found": True}
+        )
+
+    registry = SubAgentToolRegistry(
+        [
+            SubAgentToolDefinition(
+                name="echo",
+                version="v1",
+                description="returns a sensitive body",
+                args_model=_MailishArgs,
+                handler=_handler,
+            )
+        ]
+    )
+    store = _make_store()
+    task_id = _make_running_task(store)
+    # 5 identical calls → dispatch once, then stall-force a salvaged done.
+    client = _ScriptedClient(chat_values=[_tool_call_payload("echo", {"q": "x"}) for _ in range(5)])
+    runner = SubAgentRunner(
+        subagent_client=client,
+        task_store=store,
+        event_bus=EventBus(),
+        policy=SubAgentPolicy(max_iterations=99, wall_clock_seconds=999.0, token_cap=10_000_000),
+        tool_registry=registry,
+        clock=_ControllableClock(),
+    )
+
+    await runner.run(task_id)
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    # Chat side: the salvaged result carries the data so Jarvis can still answer.
+    task = store.get_task(task_id)
+    assert task.result is not None
+    assert secret in task.result
+
+    # Debug side: NO captured debug event may echo the raw salvaged body.
+    captured = [event.to_dict() for event in snapshot_for_task(task_id)]
+    assert captured  # sanity — events were captured for the task
+    for ev in captured:
+        assert secret not in json.dumps(ev, ensure_ascii=False, default=str)
+
+
+# ---------------------------------------------------------------------------
+# Loop-convergence guards — Trou A/B (mail-tool-loop follow-up, 2026-05-29)
+#
+# The original RC1 guard only counted a stall AFTER a successful tool result
+# (``last_tool_result is not None``). Two gaps that the "Dernier mail du jour"
+# hang exposed (gmail_search ``after:"today"`` → invalid_query → 23 ``progress``
+# → external hard-kill with an empty "Raison brute"):
+#   * Trou A — consecutive ``progress`` with no usable result is unbounded;
+#   * Trou B — a tool that ERRORS leaves ``last_tool_result`` None, so the guard
+#     never armed even though the run was clearly looping.
+# These cover both: progress always counts; an errored dispatch counts; recovery
+# resets; and a failed(stalled) exit surfaces the tool error to the chat client.
+# ---------------------------------------------------------------------------
+
+
+def _make_erroring_registry(
+    *, error_message: str = "boom", error_code: str = "tool_boom"
+) -> SubAgentToolRegistry:
+    """A one-tool registry whose ``boomtool`` ALWAYS returns ``status=error`` —
+    the runtime tool-error shape (gmail_search invalid_query) that Trou B is about."""
+
+    from pydantic import BaseModel
+
+    class _Args(BaseModel):
+        q: str
+
+    async def _handler(_ctx: Any, _args: BaseModel) -> SubAgentToolHandlerOutcome:
+        return SubAgentToolHandlerOutcome(
+            status="error", error_code=error_code, error_message=error_message
+        )
+
+    return SubAgentToolRegistry(
+        [
+            SubAgentToolDefinition(
+                name="boomtool",
+                version="v1",
+                description="always errors",
+                args_model=_Args,
+                handler=_handler,
+            )
+        ]
+    )
+
+
+def _make_flaky_registry() -> tuple[SubAgentToolRegistry, list[Any]]:
+    """A ``flaky`` tool that ERRORS on ``q == "bad"`` and succeeds otherwise —
+    lets a test prove a corrected retry RESETS the stall streak (no over-fire)."""
+
+    from pydantic import BaseModel
+
+    class _Args(BaseModel):
+        q: str
+
+    handler_calls: list[Any] = []
+
+    async def _handler(_ctx: Any, args: BaseModel) -> SubAgentToolHandlerOutcome:
+        handler_calls.append(args)
+        if getattr(args, "q", None) == "bad":
+            return SubAgentToolHandlerOutcome(
+                status="error", error_code="tool_boom", error_message="bad query"
+            )
+        return SubAgentToolHandlerOutcome(
+            status="ok", result={"echo": getattr(args, "q", None), "found": True}
+        )
+
+    registry = SubAgentToolRegistry(
+        [
+            SubAgentToolDefinition(
+                name="flaky",
+                version="v1",
+                description="errors on q=='bad'",
+                args_model=_Args,
+                handler=_handler,
+            )
+        ]
+    )
+    return registry, handler_calls
+
+
+@pytest.mark.asyncio
+async def test_progress_spam_without_any_tool_forces_failed_stalled() -> None:
+    """Trou A: consecutive ``progress`` with NO tool call ever is now bounded.
+
+    The original RC1 guard only counted progress AFTER a successful tool result,
+    so a pure-progress spin (a weak model "thinking" forever) ran free until a
+    hard cap / external kill. Now EVERY progress counts: nudge at 2, force at 4 —
+    far below the (deliberately high) iteration cap, proving the stall guard, not
+    the cap, is what terminates it."""
+
+    store = _make_store()
+    task_id = _make_running_task(store)
+    bus = EventBus()
+    state_changes = await _collect_state_changes(bus)
+    # Many progress, no tool, no done. High caps so ONLY the stall guard can fire.
+    client = _ScriptedClient(chat_values=[_progress_payload(f"thinking {i}") for i in range(20)])
+    runner = SubAgentRunner(
+        subagent_client=client,
+        task_store=store,
+        event_bus=bus,
+        policy=SubAgentPolicy(max_iterations=99, wall_clock_seconds=999.0, token_cap=10_000_000),
+        clock=_ControllableClock(),
+    )
+
+    await runner.run(task_id)
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    # Forced at the 4th consecutive progress (stall 1,2,3,4) — not the 99 cap.
+    assert len(client.calls) == 4
+    task = store.get_task(task_id)
+    assert task.state == "failed"
+    assert state_changes[-1]["status"] == "failed"
+    assert state_changes[-1]["reason_code"] == REASON_STALLED
+    # The "no tool" nudge was injected once the stall hit the nudge threshold.
+    nudges = [
+        m["content"] for c in client.calls for m in c["messages"] if m["role"] == "system_validator"
+    ]
+    assert nudges
+    assert any("sans appeler d'outil" in n for n in nudges)
+
+
+@pytest.mark.asyncio
+async def test_tool_error_then_progress_spam_forces_failed_naming_the_error() -> None:
+    """Trou B: a tool that ERRORS leaves ``last_tool_result`` None — the original
+    RC1 guard never armed, so the model looped on ``progress`` until a hard-kill
+    (the "Dernier mail du jour" production hang). Now an errored dispatch counts
+    toward the stall guard; the run force-terminates ``failed(stalled)`` and the
+    reason — naming the tool error — reaches ``task.result`` so the orchestrator's
+    failed-synthesis can explain it instead of an empty "Raison brute"."""
+
+    store = _make_store()
+    task_id = _make_running_task(store)
+    bus = EventBus()
+    state_changes = await _collect_state_changes(bus)
+    registry = _make_erroring_registry(
+        error_message="after must be a YYYY-MM-DD string or datetime.date: got 'today'"
+    )
+    client = _ScriptedClient(
+        chat_values=[
+            _tool_call_payload("boomtool", {"q": "x"}),  # errors → stall 1
+            _progress_payload("j'ai appelé l'outil"),  # stall 2 → nudge
+            _progress_payload("je relance la recherche"),  # stall 3
+            _progress_payload("toujours en cours"),  # stall 4 → force
+        ]
+    )
+    runner = SubAgentRunner(
+        subagent_client=client,
+        task_store=store,
+        event_bus=bus,
+        policy=SubAgentPolicy(max_iterations=99, wall_clock_seconds=999.0, token_cap=10_000_000),
+        tool_registry=registry,
+        clock=_ControllableClock(),
+    )
+
+    await runner.run(task_id)
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    # Forced at stall 4 (1 error + 3 progress), not the 99-iteration cap.
+    assert len(client.calls) == 4
+    task = store.get_task(task_id)
+    assert task.state == "failed"
+    assert state_changes[-1]["status"] == "failed"
+    assert state_changes[-1]["reason_code"] == REASON_STALLED
+    # Trou B — the reason reaches task.result (was an empty "Raison brute" before).
+    assert task.result is not None
+    assert "after must be a YYYY-MM-DD" in task.result
+    assert "boomtool" in task.result
+    # The error-AWARE nudge (naming the failure) was injected, not the generic one.
+    nudges = [
+        m["content"] for c in client.calls for m in c["messages"] if m["role"] == "system_validator"
+    ]
+    assert any("a échoué" in n and "YYYY-MM-DD" in n for n in nudges)
+
+
+@pytest.mark.asyncio
+async def test_tool_error_then_successful_retry_resets_stall() -> None:
+    """Trou B must not over-fire: a tool error FOLLOWED by a corrected successful
+    call is genuine recovery. The fresh successful result resets the stall streak,
+    so the model reaches its OWN ``done`` (complete/ok) — never a forced stall."""
+
+    store = _make_store()
+    task_id = _make_running_task(store)
+    bus = EventBus()
+    state_changes = await _collect_state_changes(bus)
+    registry, handler_calls = _make_flaky_registry()
+    client = _ScriptedClient(
+        chat_values=[
+            _tool_call_payload("flaky", {"q": "bad"}),  # error → stall 1
+            _tool_call_payload("flaky", {"q": "good"}),  # ok → stall reset to 0
+            _done_v2_payload(result_summary="done cleanly", status="complete", reason_code="ok"),
+        ]
+    )
+    runner = SubAgentRunner(
+        subagent_client=client,
+        task_store=store,
+        event_bus=bus,
+        policy=SubAgentPolicy(),
+        tool_registry=registry,
+        clock=_ControllableClock(),
+    )
+
+    await runner.run(task_id)
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    # Both calls ran (the error, then the recovery); the run ended on the model's
+    # own done, not a forced stall.
+    assert len(handler_calls) == 2
+    task = store.get_task(task_id)
+    assert task.state == "done"
+    assert state_changes[-1]["status"] == "complete"
+    assert state_changes[-1]["reason_code"] == "ok"
+    assert task.result == "done cleanly"
+    # The single error (stall 1, below the nudge threshold of 2) injected no nudge.
+    assert not any(m["role"] == "system_validator" for c in client.calls for m in c["messages"])

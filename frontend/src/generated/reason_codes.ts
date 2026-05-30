@@ -68,6 +68,12 @@ export const REASON_CODES: readonly ReasonCode[] = [
     description: "L'appel d'outil a échoué côté sub-agent.",
   },
   {
+    code: "stalled_no_progress",
+    actor: "sub_agent",
+    severity: "warn",
+    description: "Le sub-agent a bouclé sans converger (réflexions / appels d'outil répétés alors qu'un résultat était déjà disponible) ; le runner a forcé une fin dégradée en récupérant le dernier résultat d'outil.",
+  },
+  {
     code: "validation_exhausted",
     actor: "jarvis",
     severity: "warn",

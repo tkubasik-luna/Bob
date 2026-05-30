@@ -64,6 +64,12 @@ REASON_HARD_KILLED = "hard_killed"
 REASON_INVALID_OUTPUT = "invalid_output"
 REASON_LLM_FAILED = "llm_failed"
 REASON_TOOL_FAILED = "tool_failed"
+#: The sub-agent looped without converging — it kept emitting ``progress`` /
+#: re-issuing the same ``tool_call`` after it already held a usable tool result
+#: instead of emitting ``done``. The runner force-terminates with a salvaged
+#: ``done(degraded, stalled_no_progress)`` (mail-tool-loop investigation,
+#: 2026-05-29). Distinct from ``iteration_cap`` so the symptom is greppable.
+REASON_STALLED = "stalled_no_progress"
 
 # --- Jarvis-side codes -------------------------------------------------------
 
@@ -125,6 +131,16 @@ _REGISTRY: tuple[ReasonCode, ...] = (
         actor="shared",
         severity="warn",
         description="L'appel d'outil a échoué côté sub-agent.",
+    ),
+    ReasonCode(
+        code=REASON_STALLED,
+        actor="sub_agent",
+        severity="warn",
+        description=(
+            "Le sub-agent a bouclé sans converger (réflexions / appels d'outil "
+            "répétés alors qu'un résultat était déjà disponible) ; le runner a "
+            "forcé une fin dégradée en récupérant le dernier résultat d'outil."
+        ),
     ),
     ReasonCode(
         code=REASON_VALIDATION_EXHAUSTED,
@@ -280,6 +296,7 @@ __all__ = [
     "REASON_ITERATION_CAP",
     "REASON_LLM_FAILED",
     "REASON_OK",
+    "REASON_STALLED",
     "REASON_TOKEN_CAP",
     "REASON_TOOL_FAILED",
     "REASON_UNKNOWN_TASK",

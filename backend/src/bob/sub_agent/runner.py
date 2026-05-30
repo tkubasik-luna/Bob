@@ -144,6 +144,7 @@ from bob.validation.reason_codes import (
     REASON_ITERATION_CAP,
     REASON_LLM_FAILED,
     REASON_OK,
+    REASON_STALLED,
     REASON_TOKEN_CAP,
     REASON_TOOL_FAILED,
     REASON_USER_CANCELLED,
@@ -167,6 +168,48 @@ _logger = structlog.get_logger(__name__)
 Clock = Callable[[], float]
 
 
+# --- Loop-convergence guards (mail-tool-loop investigation, 2026-05-29) -------
+#
+# A weak local model (qwen3.5-9b) does not reliably emit ``done``: it keeps
+# emitting filler ``progress`` and re-issuing tool calls until a hard cap fires.
+# Two distinct stall shapes are bounded here:
+#
+#   * (original RC1) the model holds a SUCCESSFUL tool result but narrates
+#     ``progress`` / re-issues the same ``tool_call`` instead of concluding;
+#   * (Trou A/B) the model loops on ``progress`` with NO usable result yet —
+#     typically after a tool ERROR, which leaves ``last_tool_result`` None so the
+#     original guard never armed. This is the "Dernier mail du jour" hang:
+#     ``gmail_search after:"today"`` → invalid_query → 23 ``progress`` lines →
+#     external hard-kill with an empty result.
+#
+# So a "stall" iteration is now ANY non-advancing step: a ``progress``, a
+# duplicate ``tool_call``, OR a ``tool_call`` whose dispatch ERRORED. Only a
+# fresh SUCCESSFUL tool result (or a ``done``) is forward progress and resets the
+# streak. Empirically (logs 2026-05-21..29) no task that ever reached a terminal
+# ``done`` emitted more than 3 consecutive ``progress`` — every run with ≥4 was a
+# loop — so the force threshold below never truncates a legitimate task.
+
+#: After this many consecutive stall iterations, re-inject a forcing nudge under
+#: the ``system_validator`` role. The message is context-aware (see
+#: :meth:`SubAgentRunner._stall_nudge_message`): "you already have a result →
+#: emit ``done``", "your tool call errored → fix the args or ``done(failed)``",
+#: or "stop looping on ``progress``". 2 leaves room for the recipe's single
+#: "lecture du mail" reflection between a tool result and the terminal ``done``.
+_STALL_NUDGE_THRESHOLD = 2
+
+#: Hard ceiling: after this many consecutive stall iterations the runner stops
+#: waiting on the model and force-terminates via
+#: :meth:`SubAgentRunner._force_stalled_done` — salvaging the last successful
+#: tool result (``done(degraded, stalled)``) or, failing that, naming the last
+#: tool error (``done(failed, stalled)``), so the exit is never an empty mystery.
+_STALL_FORCE_THRESHOLD = 4
+
+#: Max chars of a salvaged tool-result body folded into a degraded ``done``'s
+#: ``result_summary`` so Jarvis' done-synthesis still has the data to answer
+#: from without blowing up the synthesis prompt.
+_SALVAGE_MAX_CHARS = 2000
+
+
 def _estimate_tokens_text(text: str) -> int:
     """Rough heuristic — ~4 chars/token (matches ``bob.llm_client``)."""
 
@@ -180,6 +223,82 @@ def _estimate_messages_tokens(messages: list[dict[str, Any]]) -> int:
         if isinstance(content, str):
             total += _estimate_tokens_text(content)
     return total
+
+
+def _tool_call_key(name: str, args: dict[str, Any]) -> str:
+    """Canonical signature for a tool call so an identical repeat is detectable.
+
+    ``sort_keys`` makes the key order-insensitive; ``default=str`` keeps it
+    total over the permissive ``args`` bag (which may carry non-JSON-native
+    values from a tolerant parse). Used by the runner's dedup guard (RC4):
+    a second ``(name, args)`` already seen this run is not re-dispatched.
+    """
+
+    try:
+        canonical = json.dumps(args, sort_keys=True, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        canonical = repr(args)
+    return f"{name}\x00{canonical}"
+
+
+def _find_control_chars(value: Any) -> str | None:
+    """Return the first offending substring when ``value`` holds a control char.
+
+    PRD 0008 / mail-tool-loop (2026-05-29, RC5). Under LM Studio guided
+    (``response_format: json_schema``) decoding the model mangled a multibyte
+    UTF-8 char inside a string arg — ``"intéressement"`` became
+    ``"int\x13ressement"`` (``é`` → U+0013, a C0 control char). Such a query
+    matches nothing and the model loops. We scan string args (recursing into
+    nested dict/list) for C0/C1 control characters other than ``\t\n\r`` and
+    surface the offending value so the caller can route a ``system_validator``
+    correction (bounded retry) instead of dispatching a corrupted query.
+    Returns ``None`` when the value (and everything nested) is clean.
+    """
+
+    if isinstance(value, str):
+        for ch in value:
+            code = ord(ch)
+            if (code < 0x20 and ch not in "\t\n\r") or 0x7F <= code <= 0x9F:
+                return value
+        return None
+    if isinstance(value, dict):
+        for nested in value.values():
+            found = _find_control_chars(nested)
+            if found is not None:
+                return found
+        return None
+    if isinstance(value, list):
+        for nested in value:
+            found = _find_control_chars(nested)
+            if found is not None:
+                return found
+    return None
+
+
+def _salvage_tool_result_text(tool_name: str | None, result: dict[str, Any] | None) -> str:
+    """Build a degraded-``done`` ``result_summary`` from the last tool result.
+
+    mail-tool-loop (2026-05-29, RC2). When a cap or the stall guard force-
+    terminates a run, the data the sub-agent already retrieved (e.g. the very
+    email the user asked for) is sitting in the transcript. Rather than emit an
+    empty ``done`` — which made Jarvis announce "aucun résultat" despite a
+    successful ``gmail_search`` — we fold a compact form of the last successful
+    tool result into ``result_summary`` so Jarvis' done-synthesis can still
+    answer from it. Deliberately tool-agnostic (no Mail-overlay reconstruction
+    here — that lives in the skill pack): the runner stays generic and the data
+    survives. Returns ``""`` when there is nothing to salvage.
+    """
+
+    if not result:
+        return ""
+    try:
+        body = json.dumps(result, ensure_ascii=False, sort_keys=True)
+    except (TypeError, ValueError):
+        return ""
+    if len(body) > _SALVAGE_MAX_CHARS:
+        body = body[:_SALVAGE_MAX_CHARS] + "…"
+    label = f"outil {tool_name}" if tool_name else "outil"
+    return f"[résultat partiel — limite atteinte] dernier résultat de {label} : {body}"
 
 
 def _strip_code_fence(text: str) -> str:
@@ -361,6 +480,28 @@ class _NormalisedPayload:
 
     action: ProgressAction | ToolCallAction | DoneAction | None = None
     ask_user_question: str | None = None
+
+
+@dataclass(frozen=True)
+class _ToolCallStep:
+    """Outcome of :meth:`SubAgentRunner._handle_tool_call`.
+
+    Exactly one of the two fields is populated:
+
+    - ``validation_error`` — a PRE-dispatch model mistake (unknown tool /
+      schema-invalid args / control-char args). The call was NOT dispatched;
+      the caller routes a ``system_validator`` correction bounded by the
+      per-tool retry policy (issue 0062). Mirrors the legacy non-``None``
+      return that the loop already handled.
+    - ``dispatched`` — the tool actually ran; this carries its
+      :class:`SubAgentToolDispatchResult` (success OR a genuine runtime tool
+      error), already persisted as a ``tool`` message. The loop reads it to
+      track the last successful result for salvage (RC2) and to record the
+      call signature for dedup (RC4).
+    """
+
+    validation_error: SubAgentToolDispatchResult | None = None
+    dispatched: SubAgentToolDispatchResult | None = None
 
 
 def _normalise_payload(raw: str) -> _NormalisedPayload:
@@ -583,6 +724,23 @@ class SubAgentRunner:
         validator_feedback: list[dict[str, Any]] = []
         validator_envelope = CallEnvelope(tool_name=None, actor="sub_agent")
 
+        # --- Loop-convergence state (mail-tool-loop, 2026-05-29) -------------
+        # ``seen_tool_calls`` maps a canonical ``(name, args)`` signature to its
+        # repeat count so an identical call is rejected instead of re-dispatched
+        # (RC4). ``last_tool_result`` / ``last_tool_name`` hold the most recent
+        # SUCCESSFUL tool result so a cap / stall exit can salvage it into the
+        # terminal done instead of discarding it (RC2). ``last_tool_error`` holds
+        # the most recent FAILED dispatch (Trou B) so a stall exit can name the
+        # error instead of failing silently. ``stall_count`` is the run of
+        # non-advancing iterations — a ``progress``, a duplicate ``tool_call``, or
+        # an ERRORED ``tool_call`` (Trou A/B) — driving the forcing function
+        # (RC1); it resets to 0 ONLY on a new successful tool result.
+        seen_tool_calls: dict[str, int] = {}
+        last_tool_result: dict[str, Any] | None = None
+        last_tool_name: str | None = None
+        last_tool_error: SubAgentToolDispatchResult | None = None
+        stall_count = 0
+
         while True:
             # ---- Checkpoint 1: iteration boundary -----------------------
             if self._cancel_requested:
@@ -604,12 +762,15 @@ class SubAgentRunner:
                     task_id,
                     status="degraded",
                     reason_code=REASON_ITERATION_CAP,
-                    result_summary="",
+                    # RC2 — surface whatever the agent already retrieved rather
+                    # than an empty done (which read as "aucun résultat").
+                    result_summary=_salvage_tool_result_text(last_tool_name, last_tool_result),
                     cost=self._build_cost(
                         started_at=started_at,
                         iterations=iteration,
                         tokens_used=tokens_used,
                     ),
+                    redact_result_in_debug=True,
                 )
                 return
 
@@ -633,12 +794,14 @@ class SubAgentRunner:
                     task_id,
                     status="degraded",
                     reason_code=REASON_TOKEN_CAP,
-                    result_summary="",
+                    # RC2 — salvage the retrieved data instead of an empty done.
+                    result_summary=_salvage_tool_result_text(last_tool_name, last_tool_result),
                     cost=self._build_cost(
                         started_at=started_at,
                         iterations=iteration,
                         tokens_used=tokens_used,
                     ),
+                    redact_result_in_debug=True,
                 )
                 return
 
@@ -887,10 +1050,43 @@ class SubAgentRunner:
 
             if isinstance(action, ProgressAction):
                 iteration += 1
-                # Valid forward progress — clear any pending validator state.
+                # Valid-ish step — clear any pending validator state up front;
+                # the stall guard below may re-arm a nudge for the next call.
                 validator_feedback = []
                 validator_envelope = CallEnvelope(tool_name=None, actor="sub_agent")
                 await self._handle_progress(task_id, action.thought)
+                # RC1 + Trou A (mail-tool-loop) — consecutive ``progress`` is a
+                # stall whether or not a tool result exists yet. A weak model
+                # narrates "j'ai appelé X" without ever emitting ``done`` — and
+                # after a tool ERROR (``last_tool_result`` stays None) the original
+                # RC1 guard never armed, so the run spun 23 progress lines until an
+                # external hard-kill. Count EVERY progress; only a fresh successful
+                # tool result or a ``done`` resets the streak.
+                stall_count += 1
+                decision = self._stall_decision(stall_count)
+                if decision == "force":
+                    await self._force_stalled_done(
+                        task_id,
+                        last_tool_result=last_tool_result,
+                        last_tool_name=last_tool_name,
+                        last_tool_error=last_tool_error,
+                        started_at=started_at,
+                        iteration=iteration,
+                        tokens_used=tokens_used,
+                    )
+                    return
+                if decision == "nudge":
+                    validator_feedback = [
+                        build_validator_message(
+                            render_feedback(
+                                error_message=self._stall_nudge_message(
+                                    last_tool_result=last_tool_result,
+                                    last_tool_error=last_tool_error,
+                                ),
+                                offending_raw=None,
+                            )
+                        )
+                    ]
                 continue
 
             if isinstance(action, ToolCallAction):
@@ -909,7 +1105,61 @@ class SubAgentRunner:
                     )
                     return
                 iteration += 1
-                validation_error = await self._handle_tool_call(task_id, action)
+                # RC4 (mail-tool-loop) — an identical ``(name, args)`` call
+                # already issued this run is NOT re-dispatched: its result is
+                # already in the transcript. Suppress it (no dispatch, no
+                # transcript bloat), nudge the model to use the result or emit
+                # ``done``, and count the repeat toward the stall guard so a
+                # model that ignores the nudge still converges.
+                call_key = _tool_call_key(action.name, action.args)
+                if call_key in seen_tool_calls:
+                    seen_tool_calls[call_key] += 1
+                    stall_count += 1
+                    emit_debug(
+                        category="task",
+                        severity="debug",
+                        source="bob.sub_agent_runner._handle_tool_call",
+                        summary=f"Appel outil {action.name} ignoré (doublon)",
+                        payload={
+                            "task_id": task_id,
+                            "tool": action.name,
+                            "args": action.args,
+                            "kind": "tool_dedup",
+                            "repeat_count": seen_tool_calls[call_key],
+                        },
+                    )
+                    decision = self._stall_decision(stall_count)
+                    if decision == "force":
+                        await self._force_stalled_done(
+                            task_id,
+                            last_tool_result=last_tool_result,
+                            last_tool_name=last_tool_name,
+                            last_tool_error=last_tool_error,
+                            started_at=started_at,
+                            iteration=iteration,
+                            tokens_used=tokens_used,
+                        )
+                        return
+                    if decision == "nudge":
+                        validator_feedback = [
+                            build_validator_message(
+                                render_feedback(
+                                    error_message=(
+                                        f"Tu as déjà appelé ``{action.name}`` avec ces "
+                                        "mêmes arguments — le résultat est déjà dans le "
+                                        "contexte ci-dessus. N'appelle PAS le même outil à "
+                                        "nouveau : émets ``done`` avec le livrable construit "
+                                        "à partir de ce résultat, ou change d'arguments si "
+                                        "tu cherches vraiment autre chose."
+                                    ),
+                                    offending_raw=None,
+                                )
+                            )
+                        ]
+                    continue
+
+                step = await self._handle_tool_call(task_id, action)
+                validation_error = step.validation_error
                 if validation_error is not None:
                     # Issue 0062 — a pre-dispatch arg-validation / unknown-tool
                     # failure is the model's mistake, not a tool result. Route
@@ -951,8 +1201,62 @@ class SubAgentRunner:
                     validator_envelope.tool_name = action.name
                     validator_envelope.increment(error_code=validation_error.error_code)
                     continue
-                # Valid tool call dispatched — clear any pending validator
-                # state so it does not bleed into the next iteration's prompt.
+                # Valid tool call dispatched — record its signature for dedup
+                # (RC4). A SUCCESSFUL result is genuine forward progress: keep it
+                # for salvage (RC2), clear any stale error, reset the stall streak.
+                seen_tool_calls[call_key] = seen_tool_calls.get(call_key, 0) + 1
+                if step.dispatched is not None and step.dispatched.ok:
+                    last_tool_result = step.dispatched.result
+                    last_tool_name = step.dispatched.tool_name
+                    last_tool_error = None
+                    stall_count = 0
+                    validator_feedback = []
+                    validator_envelope = CallEnvelope(tool_name=None, actor="sub_agent")
+                    continue
+                if step.dispatched is not None and not step.dispatched.ok:
+                    # Trou B (mail-tool-loop) — the handler RAN and FAILED (e.g.
+                    # gmail_search ``after:"today"`` → invalid_query). The error is
+                    # already in the transcript as a ``tool`` message, so below the
+                    # nudge threshold we let the model read it and self-correct.
+                    # But a weak model loops narrating ``progress`` instead of
+                    # retrying — so an errored dispatch is NOT forward progress: it
+                    # counts toward the stall guard, nudges with the error detail
+                    # past the threshold, then force-terminates. Without this a tool
+                    # that only ever errors leaves ``last_tool_result`` None and the
+                    # loop is unbounded until a hard cap / external kill.
+                    last_tool_error = step.dispatched
+                    stall_count += 1
+                    decision = self._stall_decision(stall_count)
+                    if decision == "force":
+                        await self._force_stalled_done(
+                            task_id,
+                            last_tool_result=last_tool_result,
+                            last_tool_name=last_tool_name,
+                            last_tool_error=last_tool_error,
+                            started_at=started_at,
+                            iteration=iteration,
+                            tokens_used=tokens_used,
+                        )
+                        return
+                    if decision == "nudge":
+                        validator_feedback = [
+                            build_validator_message(
+                                render_feedback(
+                                    error_message=self._stall_nudge_message(
+                                        last_tool_result=last_tool_result,
+                                        last_tool_error=last_tool_error,
+                                    ),
+                                    offending_raw=None,
+                                )
+                            )
+                        ]
+                    else:
+                        validator_feedback = []
+                    validator_envelope = CallEnvelope(tool_name=None, actor="sub_agent")
+                    continue
+                # Defensive — dispatch produced no result object (the persist-
+                # failure path in ``_handle_tool_call`` returns ``_ToolCallStep()``
+                # with ``dispatched=None``). Clear validator state and loop.
                 validator_feedback = []
                 validator_envelope = CallEnvelope(tool_name=None, actor="sub_agent")
                 continue
@@ -1128,6 +1432,25 @@ class SubAgentRunner:
                 error_message=f"unknown sub-agent tool: {action.name}",
             )
 
+        # RC5 (mail-tool-loop) — reject control chars in string args BEFORE
+        # pydantic (which accepts them as valid ``str``). Guided decoding can
+        # mangle a multibyte UTF-8 char (``é`` → U+0013) into a query that
+        # matches nothing and feeds the loop; route a bounded ``system_validator``
+        # correction instead of dispatching the corrupted call.
+        offending = _find_control_chars(action.args)
+        if offending is not None:
+            return SubAgentToolDispatchResult(
+                outcome="error",
+                tool_name=definition.name,
+                tool_version=definition.version,
+                error_code="invalid_args",
+                error_message=(
+                    "argument string contains a control character (likely a "
+                    "mangled accented character from constrained decoding) — "
+                    "re-emit the value cleanly in UTF-8"
+                ),
+            )
+
         try:
             try:
                 definition.args_model.model_validate(action.args)
@@ -1146,23 +1469,23 @@ class SubAgentRunner:
             )
         return None
 
-    async def _handle_tool_call(
-        self, task_id: str, action: ToolCallAction
-    ) -> SubAgentToolDispatchResult | None:
+    async def _handle_tool_call(self, task_id: str, action: ToolCallAction) -> _ToolCallStep:
         """Execute a sub-agent-side tool call and persist its outcome.
 
-        Returns ``None`` once a *dispatched* call's result (success or a
-        genuine runtime tool error) has been persisted as a ``tool`` message,
-        round-tripping into the next iteration's prompt exactly as before.
+        Returns a :class:`_ToolCallStep`: ``dispatched`` carries the
+        :class:`SubAgentToolDispatchResult` of a call that actually ran (success
+        or a genuine runtime tool error, persisted as a ``tool`` message and
+        round-tripping into the next iteration's prompt); ``validation_error``
+        carries a PRE-dispatch model mistake instead.
 
         Issue 0059 validated ``action.args`` against the tool's ``args_model``
         BEFORE dispatch. Issue 0062 changes what happens on a validation
         failure: instead of round-tripping the structured error as a ``tool``
         message — feeding the model's own malformed output back under a role
         it is trained to trust (a prompt-injection hazard, PRD 0006) — we
-        RETURN the :class:`SubAgentToolDispatchResult` to :meth:`_run`, which
-        injects the correction under the ``system_validator`` role bounded by
-        the per-tool :class:`RetryPolicy`. A *runtime* tool error (the handler
+        RETURN it under ``_ToolCallStep.validation_error`` to :meth:`_run`,
+        which injects the correction under the ``system_validator`` role bounded
+        by the per-tool :class:`RetryPolicy`. A *runtime* tool error (the handler
         ran and failed) is a legitimate tool result and stays on ``tool``.
         """
 
@@ -1175,7 +1498,7 @@ class SubAgentRunner:
             )
         except TaskStoreError:
             _logger.exception("sub_agent_runner.persist_tool_call_failed", task_id=task_id)
-            return None
+            return _ToolCallStep()
 
         # Issue 0052: emit a ``tool_invoke`` reflection BEFORE the
         # dispatch so the overlay can show "calling X..." while the
@@ -1207,7 +1530,7 @@ class SubAgentRunner:
                 error_code=validation_error.error_code,
                 error_message=validation_error.error_message,
             )
-            return validation_error
+            return _ToolCallStep(validation_error=validation_error)
 
         result = await self._tool_dispatcher.dispatch(
             name=action.name,
@@ -1232,7 +1555,7 @@ class SubAgentRunner:
             )
         except TaskStoreError:
             _logger.exception("sub_agent_runner.persist_tool_result_failed", task_id=task_id)
-            return None
+            return _ToolCallStep(dispatched=result)
 
         emit_debug(
             category="task",
@@ -1248,7 +1571,7 @@ class SubAgentRunner:
                 "kind": "tool_result",
             },
         )
-        return None
+        return _ToolCallStep(dispatched=result)
 
     async def _handle_ask_user(self, task_id: str, question: str) -> None:
         """Legacy ``ask_user`` flow preserved until 0050 replaces it."""
@@ -1336,6 +1659,8 @@ class SubAgentRunner:
         result_summary: str,
         ui_payload: dict[str, Any] | str | None,
         cost: dict[str, Any],
+        redact_result_in_debug: bool = False,
+        persist_result_on_failure: bool = False,
     ) -> None:
         """Persist the terminal state + emit WS / bus events.
 
@@ -1345,6 +1670,27 @@ class SubAgentRunner:
         ``failed`` with the ``result_summary`` (or the reason code if
         empty) recorded as both a ``system`` message and ``task.result``
         so the existing ``task_result`` WS event still surfaces a string.
+
+        ``persist_result_on_failure`` (mail-tool-loop, 2026-05-29, Trou B):
+        a ``failed`` row normally leaves ``task.result`` ``None`` (legacy
+        ``_fail`` semantics). But the orchestrator's *failed*-synthesis reads
+        ONLY ``task.result`` (``orchestrator._do_generate_failed_synthesis``),
+        so a forced ``done(failed, stalled)`` whose ``result_summary`` names
+        the tool error would otherwise reach Jarvis as an empty "Raison brute".
+        With this flag set (the stalled-tool-error path only) the non-empty
+        ``result_summary`` is ALSO written to ``task.result`` via
+        :meth:`TaskStore.set_result`, so Jarvis can explain *why* it failed.
+        Every other failure path leaves the flag False and is byte-identical.
+
+        ``redact_result_in_debug`` (mail-tool-loop, 2026-05-29): when the
+        ``result_summary`` is a SALVAGED tool result (RC2) it may embed raw tool
+        output — e.g. a Gmail ``bodyPreview`` — which the issue 0056 privacy
+        posture forbids in the debug ring buffer / ``/ws/debug`` feed / JSONL
+        sink. With this flag the real text still flows to the chat client via
+        ``task.result`` + the ``task_result`` WS frame, but every DEBUG mirror
+        of it (the ``status_change`` envelope's ``result`` and the bus-captured
+        ``task_result`` copy) is elided. Defaults False so normal dones are
+        unchanged.
 
         Idempotent against races: if the row is already terminal we
         skip silently (the scheduler may have already finalised a
@@ -1404,6 +1750,12 @@ class SubAgentRunner:
                 )
                 self._task_store.update_state(task_id, "done")
             else:
+                # Trou B — opt-in: surface the reason via ``task.result`` so the
+                # failed-synthesis (which reads only that column) can explain the
+                # failure. Guarded on a non-empty ``result_summary`` so a bare
+                # reason-code failure keeps the legacy ``task.result is None``.
+                if persist_result_on_failure and result_summary:
+                    self._task_store.set_result(task_id, persisted_result)
                 message_id = self._task_store.append_message(
                     task_id,
                     role="system",
@@ -1437,7 +1789,9 @@ class SubAgentRunner:
         # overlay derive the summary from ``task.result`` itself.
         is_mail_payload = isinstance(ui_payload, dict) and ui_payload.get("component") == "Mail"
         debug_result_field: str | None = (
-            None if store_state != "done" or is_mail_payload else persisted_result
+            None
+            if store_state != "done" or is_mail_payload or redact_result_in_debug
+            else persisted_result
         )
         emit_debug(
             category="task",
@@ -1469,7 +1823,12 @@ class SubAgentRunner:
             },
         )
 
-        await _emit_task_message(self._task_store, task_id, message_id=message_id)
+        await _emit_task_message(
+            self._task_store,
+            task_id,
+            message_id=message_id,
+            redact_content_in_debug=redact_result_in_debug,
+        )
         await ws_events.emit(
             {
                 "type": "task_updated",
@@ -1509,8 +1868,19 @@ class SubAgentRunner:
             debug_task_result_event = {
                 "type": "task_result",
                 "task_id": task_id,
-                "result": None if is_mail_payload else persisted_result,
+                "result": (
+                    None if (is_mail_payload or redact_result_in_debug) else persisted_result
+                ),
                 "result_payload": _redact_ui_payload_for_debug(structured_payload),
+            }
+        elif redact_result_in_debug:
+            # RC2 salvage with no structured payload — keep the salvaged text
+            # (which may embed raw tool output / an email body) out of the debug
+            # sinks while the chat client still receives the full event.
+            debug_task_result_event = {
+                "type": "task_result",
+                "task_id": task_id,
+                "result": None,
             }
         await ws_events.emit(task_result_event, debug_event=debug_task_result_event)
         await self._bus.publish(
@@ -1525,6 +1895,130 @@ class SubAgentRunner:
             },
         )
 
+    @staticmethod
+    def _stall_decision(stall_count: int) -> str:
+        """Map a stall streak to ``"force"`` / ``"nudge"`` / ``"none"`` (RC1).
+
+        ``stall_count`` is the run of non-advancing iterations since the last
+        successful tool result — a ``progress``, a duplicate ``tool_call``, or a
+        ``tool_call`` whose dispatch ERRORED (Trou A/B). At
+        :data:`_STALL_FORCE_THRESHOLD` the runner force-terminates via
+        :meth:`_force_stalled_done`; at :data:`_STALL_NUDGE_THRESHOLD` it injects
+        a ``system_validator`` nudge (:meth:`_stall_nudge_message`). Checked
+        force-first so the higher threshold wins.
+        """
+
+        if stall_count >= _STALL_FORCE_THRESHOLD:
+            return "force"
+        if stall_count >= _STALL_NUDGE_THRESHOLD:
+            return "nudge"
+        return "none"
+
+    @staticmethod
+    def _stall_nudge_message(
+        *,
+        last_tool_result: dict[str, Any] | None,
+        last_tool_error: SubAgentToolDispatchResult | None,
+    ) -> str:
+        """Context-aware ``system_validator`` nudge for a stalling run (RC1 + Trou A/B).
+
+        Three shapes, in priority order:
+
+        - a SUCCESSFUL tool result is in hand → tell the model to stop emitting
+          ``progress`` and build the terminal ``done`` from it (original RC1);
+        - only a tool ERROR is in hand (Trou B) → name the error and tell the
+          model to fix the arguments and retry ONCE, or emit ``done(failed)``;
+        - nothing retrieved at all (Trou A — pure ``progress`` spin) → tell the
+          model to call a tool or conclude now.
+        """
+
+        if last_tool_result is not None:
+            return (
+                "Tu as déjà un résultat d'outil dans le contexte ci-dessus. "
+                "N'émets plus de ``progress`` : émets MAINTENANT une action "
+                "``done`` avec le livrable construit à partir de ce résultat. Si "
+                "le résultat est vide ou inutilisable, émets ``done`` avec le "
+                "statut adéquat."
+            )
+        if last_tool_error is not None:
+            detail = (last_tool_error.error_message or last_tool_error.error_code or "").strip()
+            return (
+                f"Ton dernier appel à l'outil ``{last_tool_error.tool_name or ''}`` "
+                f"a échoué : {detail}. N'émets plus de ``progress`` à vide. Corrige "
+                "les arguments et réessaie l'outil UNE seule fois, ou émets "
+                '``done`` avec ``status="failed"`` si tu ne peux pas aboutir.'
+            )
+        return (
+            "Tu émets des ``progress`` en boucle sans appeler d'outil ni conclure. "
+            "Appelle un outil pour avancer, ou émets MAINTENANT une action "
+            '``done`` (``status="failed"`` si la tâche est impossible).'
+        )
+
+    async def _force_stalled_done(
+        self,
+        task_id: str,
+        *,
+        last_tool_result: dict[str, Any] | None,
+        last_tool_name: str | None,
+        last_tool_error: SubAgentToolDispatchResult | None,
+        started_at: float,
+        iteration: int,
+        tokens_used: int,
+    ) -> None:
+        """Force-terminate a stalled run with the best content available (RC1 + Trou A/B).
+
+        Three content cases, in priority order:
+
+        - a SUCCESSFUL tool result in hand → ``done(degraded, stalled)`` salvaging
+          it (RC2), redacted in debug since it may embed raw tool output (privacy,
+          issue 0056);
+        - only a tool ERROR in hand (Trou B) → ``done(failed, stalled)`` whose
+          ``result_summary`` names the error, so Jarvis can explain the failure
+          instead of announcing "aucun résultat";
+        - nothing retrieved (Trou A — pure ``progress`` spin) → ``done(failed,
+          stalled)`` with an empty summary (the reason code carries the meaning).
+        """
+
+        cost = self._build_cost(
+            started_at=started_at,
+            iterations=iteration,
+            tokens_used=tokens_used,
+        )
+        if last_tool_result is not None:
+            await self._emit_terminal_done(
+                task_id,
+                status="degraded",
+                reason_code=REASON_STALLED,
+                result_summary=_salvage_tool_result_text(last_tool_name, last_tool_result),
+                cost=cost,
+                redact_result_in_debug=True,
+            )
+            return
+        if last_tool_error is not None:
+            detail = (last_tool_error.error_message or last_tool_error.error_code or "").strip()
+            tool_label = last_tool_error.tool_name or "outil"
+            await self._emit_terminal_done(
+                task_id,
+                status="failed",
+                reason_code=REASON_STALLED,
+                result_summary=(
+                    f"Échec après plusieurs tentatives — dernière erreur de "
+                    f"l'outil {tool_label} : {detail}"
+                ).strip(),
+                cost=cost,
+                # Trou B — let the failed-synthesis read the reason off
+                # ``task.result`` instead of an empty "Raison brute".
+                persist_result_on_failure=True,
+            )
+            return
+        await self._emit_terminal_done(
+            task_id,
+            status="failed",
+            reason_code=REASON_STALLED,
+            result_summary="",
+            cost=cost,
+        )
+
     async def _emit_terminal_done(
         self,
         task_id: str,
@@ -1533,6 +2027,8 @@ class SubAgentRunner:
         reason_code: str,
         result_summary: str,
         cost: dict[str, Any],
+        redact_result_in_debug: bool = False,
+        persist_result_on_failure: bool = False,
     ) -> None:
         """Convenience wrapper around :meth:`_finalize_done` for cap paths."""
 
@@ -1543,6 +2039,8 @@ class SubAgentRunner:
             result_summary=result_summary,
             ui_payload=None,
             cost=cost,
+            redact_result_in_debug=redact_result_in_debug,
+            persist_result_on_failure=persist_result_on_failure,
         )
 
     def _build_cost(
@@ -1585,24 +2083,36 @@ async def _emit_task_message(
     task_id: str,
     *,
     message_id: int,
+    redact_content_in_debug: bool = False,
 ) -> None:
-    """Push a ``task_message`` WS event for a freshly-appended task message."""
+    """Push a ``task_message`` WS event for a freshly-appended task message.
+
+    ``redact_content_in_debug`` (mail-tool-loop, 2026-05-29): when the message
+    body is a SALVAGED tool result (RC2) it may embed raw tool output (e.g. an
+    email ``bodyPreview``). The chat client still receives the full content, but
+    the debug ring buffer / ``/ws/debug`` feed / JSONL sink get a scrubbed copy
+    — mirroring the issue 0056 privacy posture applied to the other done events.
+    """
 
     try:
         for msg in store.get_task_messages(task_id):
             if msg.id != message_id:
                 continue
-            await ws_events.emit(
-                {
-                    "type": "task_message",
-                    "task_id": task_id,
-                    "message_id": msg.id,
-                    "role": msg.role,
-                    "content": msg.content,
-                    "action": msg.action,
-                    "created_at": msg.created_at,
-                }
+            event: dict[str, Any] = {
+                "type": "task_message",
+                "task_id": task_id,
+                "message_id": msg.id,
+                "role": msg.role,
+                "content": msg.content,
+                "action": msg.action,
+                "created_at": msg.created_at,
+            }
+            debug_event = (
+                {**event, "content": _MAIL_REDACTED_PLACEHOLDER}
+                if redact_content_in_debug
+                else None
             )
+            await ws_events.emit(event, debug_event=debug_event)
             return
     except TaskStoreError:
         _logger.exception("sub_agent_runner.emit_task_message_lookup_failed", task_id=task_id)
@@ -1614,6 +2124,7 @@ __all__ = [
     "REASON_ITERATION_CAP",
     "REASON_LLM_FAILED",
     "REASON_OK",
+    "REASON_STALLED",
     "REASON_TOKEN_CAP",
     "REASON_TOOL_FAILED",
     "REASON_USER_CANCELLED",

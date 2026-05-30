@@ -509,12 +509,17 @@ async def test_progress_sequence_then_done_persists_messages_and_emits_events() 
 
 @pytest.mark.asyncio
 async def test_progress_cap_exceeded_emits_done_degraded() -> None:
-    """11 consecutive progress emits trip the iteration cap.
+    """The iteration cap trips → forced ``done(degraded, iteration_cap)``.
 
     Issue 0045 (PRD 0006): the runner exits with a forced
     ``done(status=degraded, reason_code=iteration_cap)`` rather than
     the legacy ``failed`` state. The task row therefore lands in
     ``done``; the cap is recorded on the structured event payload.
+
+    Mail-tool-loop (Trou A, 2026-05-29): pure ``progress`` now ALSO trips the
+    stall guard (force at 4 consecutive). To exercise the ITERATION-CAP path
+    specifically, pin ``max_iterations`` below that threshold so the cap fires
+    first — the stall guard is covered separately in ``test_sub_agent_v2_runner``.
     """
 
     store = _make_store()
@@ -528,17 +533,16 @@ async def test_progress_cap_exceeded_emits_done_degraded() -> None:
     ws_events.set_emitter(_emitter)
     try:
         client = _ScriptedClient(
-            chat_values=[f'{{"action": "progress", "status": "step {i}"}}' for i in range(1, 12)]
+            chat_values=[f'{{"action": "progress", "status": "step {i}"}}' for i in range(1, 7)]
         )
-        # Pin the iteration cap to 10 so the test is independent of the global
-        # default (raised well above 10 for long autonomous tasks).
+        # Pin the iteration cap below the stall-force threshold (4) so the CAP is
+        # what fires on pure progress: at the top of the 4th loop the iteration
+        # counter has reached 3 and trips before a 4th LLM call.
         runner = SubAgentRunner(
             subagent_client=client,
             task_store=store,
             event_bus=EventBus(),
-            policy=SubAgentPolicy(
-                max_iterations=10, wall_clock_seconds=999.0, token_cap=999_999
-            ),
+            policy=SubAgentPolicy(max_iterations=3, wall_clock_seconds=999.0, token_cap=999_999),
         )
         await runner.run(task_id)
     finally:
@@ -550,11 +554,11 @@ async def test_progress_cap_exceeded_emits_done_degraded() -> None:
     assert task.state == "done"
     assert task.result == ""
 
-    # Exactly 10 progress messages persisted (the 11th tripped the cap
-    # at the iteration boundary *before* a new LLM call).
+    # Exactly 3 progress messages persisted (the cap tripped at the iteration
+    # boundary *before* a 4th LLM call).
     messages = store.get_task_messages(task_id)
     progress_msgs = [m for m in messages if m.action == "progress"]
-    assert len(progress_msgs) == 10
+    assert len(progress_msgs) == 3
 
     # The task_result event still surfaces (empty string for cap paths).
     results = [e for e in received_ws if e["type"] == "task_result"]
