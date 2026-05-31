@@ -6,13 +6,12 @@ import { useAudioLevel } from "../sphere/useAudioLevel";
 import { type SphereDerivedState, useSphereState } from "../sphere/useSphereState";
 import { useDevTweaksStore } from "../state/devTweaksStore";
 import { useChatStore } from "../store/chatStore";
-import type { ComponentDescriptor, Task } from "../types/ws";
+import type { ComponentDescriptor } from "../types/ws";
+import { AgentActivityPanel } from "./AgentActivityPanel";
 import { DevControls } from "./sphere/DevControls";
-import { HudTasks } from "./sphere/HudTasks";
 import { InputField } from "./sphere/InputField";
 import { MuteToggle } from "./sphere/MuteToggle";
 import { SectionsOverlay } from "./sphere/SectionsOverlay";
-import { TaskOverlay } from "./sphere/TaskOverlay";
 import { TranscriptLine } from "./sphere/TranscriptLine";
 import { sectionRegistry } from "./sphere/sectionRegistry";
 import { SphereWsContext } from "./sphere/sphereWsContext";
@@ -98,11 +97,6 @@ export function SphereUI() {
   // rendered through the unified registry. A text-only result is a list-of-one
   // Markdown section; a mail result is one Mail section per message.
   const [overlaySections, setOverlaySections] = useState<ComponentDescriptor[] | null>(null);
-  // Issue 0052 — per-task overlay state. Clicking a task in `HudTasks`
-  // sets this; the overlay subscribes to the task's live reflections
-  // (running) or renders its markdown / empty state (finished).
-  const [openTaskId, setOpenTaskId] = useState<string | null>(null);
-  const openTask: Task | null = openTaskId !== null ? (tasks[openTaskId] ?? null) : null;
   // PRD 0005 — Cmd+Shift+D toggles the dedicated debug window. The listener
   // attaches at mount and unattaches on unmount; the guard rejects key
   // events whose target is a text input so the user can still type `D`
@@ -132,16 +126,6 @@ export function SphereUI() {
   // streaming buffer lifecycle (the buffer is cleared when the
   // `assistant_msg` lands; we still need to remember we already acted).
   const evaluatedStreamUiRef = useRef<Set<string>>(new Set());
-  // Mirror `openTaskId` into a ref so the task-result auto-open effect can
-  // read the currently-open task without taking it as a dependency (which
-  // would re-run that effect on unrelated opens). When a task is already open
-  // in `TaskOverlay`, that overlay renders the result markdown itself on
-  // completion — auto-opening the standalone `MarkdownOverlay` too would stack
-  // two identical cards (the "two MD windows" bug).
-  const openTaskIdRef = useRef<string | null>(null);
-  useEffect(() => {
-    openTaskIdRef.current = openTaskId;
-  }, [openTaskId]);
   // PRD 0010 / issue 0066 — single dispatch point for a LIST of section
   // descriptors. The streaming `ui_payload` path and the final `assistant_msg.ui`
   // fallback both funnel a `ComponentDescriptor[]` through here.
@@ -260,9 +244,6 @@ export function SphereUI() {
     if (!latest) return;
     if (evaluatedTaskIdsRef.current.has(latest.id)) return;
     evaluatedTaskIdsRef.current.add(latest.id);
-    // Already showing this task in the per-task overlay? It renders the result
-    // itself on completion — don't also pop the standalone overlay.
-    if (openTaskIdRef.current === latest.id) return;
     // PRD 0010 / issue 0067 — when the sub-agent produced a STRUCTURED
     // deliverable, `resultPayload` carries the ordered list of section
     // descriptors. Open it through the single dispatcher so the SectionsOverlay
@@ -305,14 +286,12 @@ export function SphereUI() {
           mood={mood}
           audioLevelRef={audioLevelRef}
         />
-        <div className="hud-zone tr">
-          <HudTasks
-            onOpenResult={(content) =>
-              setOverlaySections([{ component: "Markdown", props: { content } }])
-            }
-            onOpenTask={(t) => setOpenTaskId(t.id)}
-          />
-        </div>
+        {/* PRD 0011 / issue 0076 — right-edge agent-activity panel replaces the
+         * top-right HudTasks zone. Collapsed = a narrow rail (active-agent
+         * badges + count); expanded = the full multi-agent lanes feed. The
+         * "résultat" button on a finished lane opens the SAME SectionsOverlay
+         * the streamed-ui / task-result paths use, via the shared dispatcher. */}
+        <AgentActivityPanel onOpenResult={(sections) => setOverlaySections(sections)} />
         <div className="hud-zone b">
           <TranscriptLine state={transcriptState} hidden={overlayOpen} />
           <InputField />
@@ -322,13 +301,6 @@ export function SphereUI() {
          * text-only result is a list-of-one Markdown section, a mail result is
          * a stack of Mail cards, all rendered through the section registry. */}
         <SectionsOverlay sections={overlaySections} onClose={() => setOverlaySections(null)} />
-        {/* Per-task overlay (issue 0052) — opens on row click in HudTasks.
-         * Kept mutually exclusive with the sections overlay above:
-         * the task-result auto-open effect skips a task that is already open
-         * here (`openTaskIdRef` guard), so a finishing task doesn't stack two
-         * identical result cards. Rendering both unconditionally keeps the
-         * Esc/backdrop dismiss paths independent. */}
-        <TaskOverlay task={openTask} onClose={() => setOpenTaskId(null)} />
         <MuteToggle />
         <DevControls />
       </div>

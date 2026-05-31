@@ -54,6 +54,7 @@ class MockSocket {
   }
 }
 
+import { useActivityFeedStore } from "../store/activityFeedStore";
 import { useChatStore } from "../store/chatStore";
 import type { ChatMessage, Task } from "../types/ws";
 import { SphereUI } from "./SphereUI";
@@ -153,6 +154,9 @@ describe("SphereUI — overlay auto-trigger integration", () => {
     // biome-ignore lint/suspicious/noExplicitAny: minimal WS stub for the test
     globalThis.WebSocket = MockSocket as any;
     useChatStore.setState(initialState, true);
+    // PRD 0011 / issue 0076 — the AgentActivityPanel reads the activity feed
+    // store; reset it so finished-agent lanes don't bleed across tests.
+    useActivityFeedStore.getState().reset();
     installGlStub();
   });
 
@@ -496,33 +500,53 @@ describe("SphereUI — overlay auto-trigger integration", () => {
     expect(container.querySelector(".overlay-card")).toBeNull();
   });
 
-  test("clicking a done task in the HUD re-opens its result in the overlay", () => {
-    // After auto-trigger + dismiss, the dedup ref blocks the auto path from
-    // re-opening the same task. The HUD row's onClick bypasses dedup so the
-    // user can re-visit any kept-in-FIFO task result.
-    const { container } = render(<SphereUI />);
+  test("a finished agent lane's 'résultat' button re-opens its result via SectionsOverlay (issue 0076)", () => {
+    // PRD 0011 / issue 0076 — HudTasks is gone; the AgentActivityPanel hosts the
+    // per-agent lanes. After the auto-open dedup blocks the auto path, the user
+    // re-visits a result through the finished lane's "résultat" button, which
+    // routes the task's `resultPayload` through the SAME SectionsOverlay
+    // dispatcher.
+    const sections = [{ component: "Markdown", props: { content: "# Kept\n\n- one\n- two" } }];
+    const { container, getByText, queryByText } = render(<SphereUI />);
 
+    // A done task carrying a structured payload → auto-opens the overlay once.
     act(() => {
       useChatStore.setState({
         tasks: {
-          t1: makeDoneTask("t1", "# Kept\n\n- one\n- two\n- three\n- four"),
+          // biome-ignore lint/suspicious/noExplicitAny: minimal Task shape for the test
+          t1: { ...makeDoneTask("t1", "# Kept"), resultPayload: sections } as any,
         },
       });
+      // The agent feed marks the lane finished so the panel renders a collapsed
+      // summary with a "résultat" button (the lane resolves its task by id).
+      const feed = useActivityFeedStore.getState();
+      feed.appendActivity({
+        type: "agent_activity",
+        agent_ref: "t1",
+        kind: "tool_call",
+        label: "recherche",
+        status: "ok",
+      });
+      feed.markAgentFinished("t1", "done");
     });
     expect(container.querySelector(".overlay-card")).not.toBeNull();
 
+    // Dismiss; the dedup ref now blocks the auto path from re-opening.
     act(() => {
       fireEvent.keyDown(window, { key: "Escape" });
     });
     expect(container.querySelector(".overlay-card")).toBeNull();
 
-    // Task still rendered in HUD (no fade-out) and clickable.
-    const row = container.querySelector('.hud-task[data-task-id="t1"]') as HTMLElement | null;
-    expect(row).not.toBeNull();
-    expect(row?.classList.contains("is-clickable")).toBe(true);
-
+    // Expand the panel (collapsed by default), then click the lane's result btn.
+    const railToggle = container.querySelector(".agent-rail-toggle") as HTMLElement | null;
+    if (railToggle) {
+      act(() => {
+        fireEvent.click(railToggle);
+      });
+    }
+    expect(queryByText("résultat")).not.toBeNull();
     act(() => {
-      fireEvent.click(row as HTMLElement);
+      fireEvent.click(getByText("résultat"));
     });
     expect(container.querySelector(".overlay-card")).not.toBeNull();
   });
