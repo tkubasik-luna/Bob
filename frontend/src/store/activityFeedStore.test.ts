@@ -2,9 +2,13 @@ import { beforeEach, describe, expect, it } from "vitest";
 import type { AgentActivityMsg, ReasoningDeltaMsg } from "../types/ws";
 import {
   type AgentTimelineItem,
+  type RehydratableTask,
   appendReasoningToTimeline,
+  rehydrateFinishedLanes,
   useActivityFeedStore,
 } from "./activityFeedStore";
+
+const task = (id: string, state: RehydratableTask["state"]): RehydratableTask => ({ id, state });
 
 const delta = (agent_ref: string, d: string): ReasoningDeltaMsg => ({
   type: "reasoning_delta",
@@ -213,5 +217,95 @@ describe("activityFeedStore — finish lifecycle (issue 0074)", () => {
     store.markAgentFinished("A", "done");
     store.reset();
     expect(useActivityFeedStore.getState().finishedByAgent).toEqual({});
+  });
+});
+
+describe("activityFeedStore — rehydrate from TaskStore snapshot (issue 0077)", () => {
+  describe("pure rehydrateFinishedLanes", () => {
+    it("reconstructs lanes + finished state for terminal tasks, in input order", () => {
+      const { agentOrder, finishedByAgent } = rehydrateFinishedLanes([], {}, [
+        task("t1", "done"),
+        task("t2", "failed"),
+      ]);
+      expect(agentOrder).toEqual(["t1", "t2"]);
+      expect(finishedByAgent).toEqual({ t1: "done", t2: "failed" });
+    });
+
+    it("does NOT mark an in-progress task finished and does not force its lane", () => {
+      const { agentOrder, finishedByAgent } = rehydrateFinishedLanes([], {}, [
+        task("t1", "done"),
+        task("t2", "running"),
+        task("t3", "pending"),
+        task("t4", "waiting_input"),
+      ]);
+      expect(agentOrder).toEqual(["t1"]);
+      expect(finishedByAgent).toEqual({ t1: "done" });
+      expect(finishedByAgent.t2).toBeUndefined();
+    });
+
+    it("retains prior agents already present (additive, never evicts)", () => {
+      const { agentOrder, finishedByAgent } = rehydrateFinishedLanes(["live"], { live: "done" }, [
+        task("t1", "failed"),
+      ]);
+      // The pre-existing live lane survives; the rehydrated one is appended.
+      expect(agentOrder).toEqual(["live", "t1"]);
+      expect(finishedByAgent).toEqual({ live: "done", t1: "failed" });
+    });
+
+    it("does not duplicate a lane already in agentOrder (idempotent re-replay)", () => {
+      const { agentOrder, finishedByAgent } = rehydrateFinishedLanes(["t1"], { t1: "done" }, [
+        task("t1", "done"),
+      ]);
+      expect(agentOrder).toEqual(["t1"]);
+      expect(finishedByAgent).toEqual({ t1: "done" });
+    });
+
+    it("does not mutate the input slices", () => {
+      const prevOrder: string[] = [];
+      const prevFinished: Record<string, RehydratableTask["state"]> = {};
+      rehydrateFinishedLanes(prevOrder, prevFinished, [task("t1", "done")]);
+      expect(prevOrder).toEqual([]);
+      expect(prevFinished).toEqual({});
+    });
+  });
+
+  describe("store action rehydrateFromTasks", () => {
+    it("registers finished lanes WITHOUT synthesising any reasoning timeline", () => {
+      const store = useActivityFeedStore.getState();
+      store.rehydrateFromTasks([task("t1", "done"), task("t2", "failed")]);
+
+      const { agentOrder, finishedByAgent, timelineByAgent } = useActivityFeedStore.getState();
+      expect(agentOrder).toEqual(["t1", "t2"]);
+      expect(finishedByAgent).toEqual({ t1: "done", t2: "failed" });
+      // No live reasoning is replayed — the rehydrated blocks have no timeline.
+      expect(timelineByAgent.t1).toBeUndefined();
+      expect(timelineByAgent.t2).toBeUndefined();
+    });
+
+    it("keeps a live streaming lane untouched while rehydrating finished ones", () => {
+      const store = useActivityFeedStore.getState();
+      // A lane is mid-stream (active) from live events.
+      store.appendReasoningDelta(delta("live", "thinking…"));
+      store.flushReasoning();
+
+      store.rehydrateFromTasks([task("done-1", "done"), task("live", "running")]);
+
+      const { agentOrder, finishedByAgent, timelineByAgent } = useActivityFeedStore.getState();
+      // The live lane is retained with its timeline; the finished one is added.
+      expect(agentOrder).toEqual(["live", "done-1"]);
+      expect(reasoningText(timelineByAgent.live)).toBe("thinking…");
+      // The still-running task is not marked finished.
+      expect(finishedByAgent).toEqual({ "done-1": "done" });
+    });
+
+    it("is a no-op (same state reference) when re-replaying already-rehydrated tasks", () => {
+      const store = useActivityFeedStore.getState();
+      store.rehydrateFromTasks([task("t1", "done")]);
+      const snapshot = useActivityFeedStore.getState();
+      store.rehydrateFromTasks([task("t1", "done")]);
+      const after = useActivityFeedStore.getState();
+      expect(after.agentOrder).toBe(snapshot.agentOrder);
+      expect(after.finishedByAgent).toBe(snapshot.finishedByAgent);
+    });
   });
 });

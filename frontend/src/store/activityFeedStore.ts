@@ -47,6 +47,28 @@ import type { AgentActivityMsg, ReasoningDeltaMsg, TaskState } from "../types/ws
  * NOT in this slice: the Jarvis block (0072), sliding window (0075) and the
  * side-panel rail (0076). The summary's title + result handle are NOT held here
  * (they live on the chatStore task); only the lifecycle bit + final state are.
+ *
+ * Issue 0077 — SESSION RETENTION + REHYDRATE. Two facets:
+ *   1. RETENTION is already a property of this store: nothing auto-evicts a
+ *      lane — `timelineByAgent` / `agentOrder` / `finishedByAgent` only shrink
+ *      on an explicit `clearAgent` (lane drop) or `reset` (new session). So the
+ *      whole session's blocks (active + finished) stay stacked; the panel just
+ *      scrolls. No code change needed here for retention beyond this note.
+ *   2. REHYDRATE-ON-RELOAD. The HUD has no persisted reasoning stream — live
+ *      `reasoning_delta` / `agent_activity` are in-memory only. But the backend
+ *      `TaskStore` persists tasks, and on (re)connect the chat WS REPLAYS the
+ *      `task_*` frames for every known task (the snapshot/bootstrap source —
+ *      there is no dedicated single-frame snapshot; the existing replayed
+ *      `task_created` → `task_updated` → `task_result` stream IS the snapshot).
+ *      Those frames land in `chatStore.tasks`. `rehydrateFromTasks` reconstructs
+ *      the FINISHED agent blocks from that set: for each task ALREADY in a
+ *      terminal state it registers the lane (`agentOrder`) and records the final
+ *      `TaskState` (`finishedByAgent`) — WITHOUT synthesising any reasoning
+ *      timeline. So a rehydrated block renders state + summary + a working
+ *      "résultat" button (the title / result come from the chatStore task the
+ *      lane resolves), but no replayed token-by-token reasoning — the intended
+ *      behaviour. In-progress tasks are NOT marked finished; they stay live and
+ *      will stream normally as their events arrive.
  */
 
 /** A contiguous run of reasoning text inside an agent's timeline. */
@@ -67,6 +89,55 @@ export type ChipItem = {
 
 /** One ordered entry in an agent's interleaved reasoning + chip timeline. */
 export type AgentTimelineItem = ReasoningItem | ChipItem;
+
+/** Issue 0077 — minimal task shape `rehydrateFromTasks` needs: the lane key
+ * (`id`, = the sub-task's `agent_ref`) and its current persisted `TaskState`.
+ * A structural subset of `Task` so callers can pass `chatStore.tasks` values
+ * directly. The title / result are NOT needed here — the lane resolves those
+ * from the chatStore task when it renders. */
+export type RehydratableTask = {
+  id: string;
+  state: TaskState;
+};
+
+/** The terminal states a persisted task can be rehydrated into. The backend
+ * collapses degraded / timeout / force-terminate onto `failed`, so only these
+ * two reach the wire as a finished block. */
+const TERMINAL_STATES: ReadonlySet<TaskState> = new Set<TaskState>(["done", "failed"]);
+
+/**
+ * Pure rehydrate reducer. Given the CURRENT store slices and the persisted
+ * tasks (e.g. `Object.values(chatStore.tasks)` after the connect-time replay),
+ * return the NEW `agentOrder` / `finishedByAgent` reconstructing the FINISHED
+ * agent blocks — without touching any timeline.
+ *
+ * Rules:
+ *   - A task in a terminal state (`done` / `failed`) registers its lane in
+ *     `agentOrder` (appended in input order if not already present) and records
+ *     its final state in `finishedByAgent`.
+ *   - A non-terminal task (`pending` / `running` / `waiting_input`) is IGNORED:
+ *     it is not marked finished, and we do NOT force a lane for it — a live
+ *     in-progress agent grows its lane from its own reasoning / activity events.
+ *   - Existing lanes / finished entries are PRESERVED (retention): rehydrate is
+ *     additive, never evicting prior agents already present in the store.
+ *   - Returns NEW objects; never mutates the inputs.
+ *
+ * Exported so the reconstruction is unit-testable without React / the WS.
+ */
+export function rehydrateFinishedLanes(
+  prevAgentOrder: string[],
+  prevFinishedByAgent: Record<string, TaskState>,
+  tasks: readonly RehydratableTask[],
+): { agentOrder: string[]; finishedByAgent: Record<string, TaskState> } {
+  const agentOrder = [...prevAgentOrder];
+  const finishedByAgent = { ...prevFinishedByAgent };
+  for (const task of tasks) {
+    if (!TERMINAL_STATES.has(task.state)) continue;
+    if (!agentOrder.includes(task.id)) agentOrder.push(task.id);
+    finishedByAgent[task.id] = task.state;
+  }
+  return { agentOrder, finishedByAgent };
+}
 
 type ActivityFeedState = {
   /** Ordered, interleaved timeline (reasoning segments + chips) per `agent_ref`.
@@ -91,6 +162,12 @@ type ActivityFeedState = {
    * this only records the lifecycle bit. Idempotent; a no-op if the state is
    * unchanged so a replayed terminal event doesn't churn the store. */
   markAgentFinished: (agentRef: string, finalState: TaskState) => void;
+  /** Issue 0077 — reconstruct the FINISHED agent blocks from the persisted
+   * tasks replayed on (re)connect. Registers a lane + final state for every
+   * task already in a terminal state; ignores in-progress tasks; preserves any
+   * lanes already present (retention). Does NOT synthesise reasoning — a
+   * rehydrated block shows state + summary + result only. Idempotent. */
+  rehydrateFromTasks: (tasks: readonly RehydratableTask[]) => void;
   /** Drop a single agent's timeline + lane (e.g. when its task terminates). */
   clearAgent: (agentRef: string) => void;
   /** Wipe all timelines / lanes / pending buffers. */
@@ -206,6 +283,21 @@ export const useActivityFeedStore = create<ActivityFeedState>((set) => ({
       return {
         finishedByAgent: { ...state.finishedByAgent, [agentRef]: finalState },
       };
+    }),
+  rehydrateFromTasks: (tasks) =>
+    set((state) => {
+      const next = rehydrateFinishedLanes(state.agentOrder, state.finishedByAgent, tasks);
+      // Avoid churn when nothing changed (e.g. a reconnect that re-replays the
+      // same already-rehydrated tasks): only emit new slices if they differ.
+      const orderUnchanged =
+        next.agentOrder.length === state.agentOrder.length &&
+        next.agentOrder.every((r, i) => r === state.agentOrder[i]);
+      const finishedKeys = Object.keys(next.finishedByAgent);
+      const finishedUnchanged =
+        finishedKeys.length === Object.keys(state.finishedByAgent).length &&
+        finishedKeys.every((k) => next.finishedByAgent[k] === state.finishedByAgent[k]);
+      if (orderUnchanged && finishedUnchanged) return state;
+      return { agentOrder: next.agentOrder, finishedByAgent: next.finishedByAgent };
     }),
   clearAgent: (agentRef) =>
     set((state) => {

@@ -50,6 +50,7 @@ export function useChatWsBridge(): UseChatWsBridgeResult {
   const appendReasoningDelta = useActivityFeedStore((s) => s.appendReasoningDelta);
   const appendActivity = useActivityFeedStore((s) => s.appendActivity);
   const markAgentFinished = useActivityFeedStore((s) => s.markAgentFinished);
+  const rehydrateFromTasks = useActivityFeedStore((s) => s.rehydrateFromTasks);
 
   // Bridge audioPlayer → store so `Bubble` can render the wave indicator
   // on the exact bubble currently being voiced. Cleared on natural end
@@ -153,6 +154,14 @@ export function useChatWsBridge(): UseChatWsBridgeResult {
           break;
         case "task_created":
           upsertTaskCreated(msg);
+          // PRD 0011 / issue 0077 — a task replayed already in a terminal state
+          // (the backend can replay `task_created` with the CURRENT state, not
+          // just `pending`) must rehydrate its finished lane too, in case the
+          // matching `task_updated` isn't separately replayed.
+          if (msg.replayed && (msg.state === "done" || msg.state === "failed")) {
+            markAgentFinished(msg.task_id, msg.state);
+            rehydrateFromTasks(Object.values(useChatStore.getState().tasks));
+          }
           break;
         case "task_updated":
           upsertTaskUpdated(msg);
@@ -163,10 +172,32 @@ export function useChatWsBridge(): UseChatWsBridgeResult {
           // can expand the collapsed block to re-read the reasoning.
           if (msg.state === "done" || msg.state === "failed") {
             markAgentFinished(msg.task_id, msg.state);
+            // PRD 0011 / issue 0077 — REHYDRATE on reload. On (re)connect the
+            // backend replays the `task_*` frames for every persisted task (the
+            // snapshot/bootstrap source). For a REPLAYED terminal task there is
+            // no live reasoning stream to register its lane, so the finished
+            // block would never appear (lanes render off `agentOrder`, which is
+            // grown by reasoning / activity events). Reconstruct the lanes from
+            // the now-updated chatStore task map: this registers the finished
+            // lane (+ final state) so the collapsed block shows up, with its
+            // result button resolving the replayed `result_payload`. No-op for
+            // the live path (the lane already exists) thanks to the store's
+            // change-detection. We guard on `replayed` to avoid touching lanes
+            // on every live terminal transition.
+            if (msg.replayed) {
+              rehydrateFromTasks(Object.values(useChatStore.getState().tasks));
+            }
           }
           break;
         case "task_result":
           setTaskResult(msg);
+          // PRD 0011 / issue 0077 — a replayed result implies a finished task.
+          // Rehydrate so the lane is present and its "résultat" button resolves
+          // the just-stored `result_payload`, even if the terminal `task_updated`
+          // ordering left the lane unregistered.
+          if (msg.replayed) {
+            rehydrateFromTasks(Object.values(useChatStore.getState().tasks));
+          }
           break;
         case "task_messages_snapshot":
           setTaskMessagesSnapshot(msg);
@@ -204,6 +235,7 @@ export function useChatWsBridge(): UseChatWsBridgeResult {
       appendReasoningDelta,
       appendActivity,
       markAgentFinished,
+      rehydrateFromTasks,
     ],
   );
 
