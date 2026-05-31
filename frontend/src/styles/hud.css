@@ -658,14 +658,11 @@ body {
   padding: 8px 10px;
 }
 
-/* Shift the sphere left so it stays visible when the panel takes the right
- * column. The canvas is inset:0; nudging its right inset re-centres the orb in
- * the remaining space. The rail (collapsed) is narrow enough to leave the
- * sphere centred, so we only shift while open. */
-.app:has(.agent-panel-open) .sphere-stage {
-  right: 320px;
-  transition: right 480ms ease, opacity 480ms ease;
-}
+/* PRD 0011 — the agent-activity panel floats as an OVERLAY above the HUD; it
+ * must NOT reshape the layout. Earlier this shrank `.sphere-stage` (right:320px)
+ * to re-centre the orb, but the WebGL canvas fills the stage 100%×100% and the
+ * renderer only re-sizes on `window.resize`, so the box change squished the
+ * canvas into an oval. No shift now — the sphere stays fixed and round. */
 
 @media (max-width: 768px) {
   .agent-panel {
