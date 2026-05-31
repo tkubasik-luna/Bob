@@ -25,9 +25,27 @@ from bob.llm_selection_store import (
     LLMSelectionStore,
     get_default_store,
 )
-from bob.lm_studio_manager import LMStudioManager, LMStudioUnavailableError
+from bob.llm_swap import LLMSwitcher
+from bob.lm_studio_manager import (
+    LMStudioLoadError,
+    LMStudioManager,
+    LMStudioModelNotFoundError,
+    LMStudioUnavailableError,
+)
 
 router = APIRouter(prefix="/api/llm", tags=["llm"])
+
+# DI seam for the live-swap coordinator. Primed by the app lifespan (it needs
+# the orchestrator + sub-agent holder). ``None`` until then; the PUT route
+# returns 503 if it is called before boot wiring (tests inject their own).
+_switcher: LLMSwitcher | None = None
+
+
+def set_switcher(switcher: LLMSwitcher | None) -> None:
+    """Install (or clear) the live-swap coordinator used by ``PUT /selection``."""
+
+    global _switcher
+    _switcher = switcher
 
 # DI seam so the route test can swap the store factory without booting the
 # whole app. Defaults to the process-wide singleton primed by the lifespan.
@@ -153,5 +171,100 @@ def get_llm_models() -> JSONResponse:
             )
             for m in models
         ]
+    )
+    return JSONResponse(status_code=status.HTTP_200_OK, content=payload.model_dump())
+
+
+class LLMSelectionUpdateRequest(BaseModel):
+    """Body for ``PUT /api/llm/selection`` — an ``lm_model`` change (issue 0080).
+
+    Only the model id is accepted in this slice: the provider switch is 0081
+    and the context-length override is 0082. ``lm_model`` is required and
+    non-empty (a clear/unpin is not a supported mutation here).
+    """
+
+    lm_model: str
+
+
+class LLMSelectionUpdateErrorResponse(BaseModel):
+    """Structured error body for a failed ``PUT /api/llm/selection``."""
+
+    error: str
+    detail: str
+
+
+@router.put(
+    "/selection",
+    response_model=LLMSelectionResponse,
+    responses={
+        status.HTTP_404_NOT_FOUND: {"model": LLMSelectionUpdateErrorResponse},
+        status.HTTP_409_CONFLICT: {"model": LLMSelectionUpdateErrorResponse},
+        status.HTTP_503_SERVICE_UNAVAILABLE: {"model": LLMSelectionUpdateErrorResponse},
+    },
+)
+async def put_llm_selection(body: LLMSelectionUpdateRequest) -> JSONResponse:
+    """Change the active LM Studio model — synchronous, blocking, validate-then-swap.
+
+    Delegates to the :class:`bob.llm_swap.LLMSwitcher`, which loads the target
+    (default ctx), unloads the previous model, rebuilds + swaps the LM client
+    for BOTH Jarvis and sub-agent roles, then persists the JSON. The whole
+    sequence is serialised by an ``asyncio.Lock`` so concurrent ``PUT``s never
+    interleave. On a load failure the previous selection is kept, nothing is
+    written, and a DISTINCT structured error maps to the right HTTP status:
+
+    - unknown model id → 404
+    - load failed (OOM) → 409
+    - LM Studio unreachable / swap not wired → 503
+
+    The generous load timeout lives in the SDK call; this route awaits it.
+    """
+
+    model_id = body.lm_model.strip()
+    if not model_id:
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content=LLMSelectionUpdateErrorResponse(
+                error="invalid_request", detail="lm_model must be a non-empty string"
+            ).model_dump(),
+        )
+
+    if _switcher is None:
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content=LLMSelectionUpdateErrorResponse(
+                error="swap_unavailable",
+                detail="LLM swap coordinator not initialised (app lifespan not running)",
+            ).model_dump(),
+        )
+
+    try:
+        result = await _switcher.swap_lm_model(model_id)
+    except LMStudioModelNotFoundError as exc:
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content=LLMSelectionUpdateErrorResponse(
+                error="model_not_found", detail=str(exc)
+            ).model_dump(),
+        )
+    except LMStudioLoadError as exc:
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content=LLMSelectionUpdateErrorResponse(
+                error="load_failed", detail=str(exc)
+            ).model_dump(),
+        )
+    except LMStudioUnavailableError as exc:
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content=LLMSelectionUpdateErrorResponse(
+                error="lm_studio_unavailable", detail=str(exc)
+            ).model_dump(),
+        )
+
+    selection = result.selection
+    payload = LLMSelectionResponse(
+        provider=selection.provider,
+        lm_model=selection.lm_model,
+        context_length=selection.context_length,
     )
     return JSONResponse(status_code=status.HTTP_200_OK, content=payload.model_dump())

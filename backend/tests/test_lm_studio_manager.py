@@ -9,11 +9,15 @@ that raises the SDK's ``LMStudioError``.
 
 from __future__ import annotations
 
+from typing import Any, cast
+
 import lmstudio
 from fastapi.testclient import TestClient
 
 from bob.lm_studio_manager import (
+    LMStudioLoadError,
     LMStudioManager,
+    LMStudioModelNotFoundError,
     LMStudioUnavailableError,
     _SDKClient,
     _SDKDownloadedModel,
@@ -56,6 +60,34 @@ class _FakeLoaded:
         self.identifier = identifier
 
 
+class _FakeLlmNamespace:
+    """Stand-in for the SDK ``client.llm`` session surface.
+
+    Records every ``load_new_instance`` / ``unload`` call so tests can assert
+    the validate-then-swap order. ``load_error`` (when set) is raised by
+    ``load_new_instance`` to model an OOM / not-found at the boundary.
+    """
+
+    def __init__(self, load_error: Exception | None = None) -> None:
+        self.load_error = load_error
+        self.loaded: list[tuple[str, object]] = []
+        self.unloaded: list[str] = []
+
+    def load_new_instance(
+        self,
+        model_key: str,
+        *,
+        config: object | None = None,
+    ) -> object:
+        if self.load_error is not None:
+            raise self.load_error
+        self.loaded.append((model_key, config))
+        return object()
+
+    def unload(self, model_identifier: str) -> None:
+        self.unloaded.append(model_identifier)
+
+
 class _FakeClient:
     """Replays a scripted catalogue; records that close() was called."""
 
@@ -63,10 +95,12 @@ class _FakeClient:
         self,
         downloaded: list[_SDKDownloadedModel],
         loaded: list[_SDKLoadedModel],
+        llm: _FakeLlmNamespace | None = None,
     ) -> None:
         self._downloaded = downloaded
         self._loaded = loaded
         self.closed = False
+        self.llm = llm or _FakeLlmNamespace()
 
     def list_downloaded_models(self) -> list[_SDKDownloadedModel]:
         return list(self._downloaded)
@@ -152,6 +186,82 @@ def test_list_models_unreachable_server_raises_distinct_error() -> None:
         raise AssertionError("expected LMStudioUnavailableError")
 
 
+def test_load_loads_target_and_unloads_previous() -> None:
+    llm = _FakeLlmNamespace()
+    client = _FakeClient(
+        _catalogue(),
+        loaded=[_FakeLoaded("old-model")],
+        llm=llm,
+    )
+
+    def factory(_host: str) -> _SDKClient:
+        return client
+
+    manager = LMStudioManager(host="localhost:1234", client_factory=factory)
+
+    manager.load("qwen2.5-7b-instruct", context_length=8192)
+
+    # Loaded the target with the default ctx folded into the SDK config.
+    assert llm.loaded == [("qwen2.5-7b-instruct", {"contextLength": 8192})]
+    # Previously-loaded model evicted AFTER the successful load.
+    assert llm.unloaded == ["old-model"]
+    assert client.closed is True
+
+
+def test_load_without_context_length_omits_config() -> None:
+    llm = _FakeLlmNamespace()
+    client = _FakeClient(_catalogue(), loaded=[], llm=llm)
+
+    manager = LMStudioManager(host="h", client_factory=lambda _h: client)
+    manager.load("qwen2.5-7b-instruct")
+
+    assert llm.loaded == [("qwen2.5-7b-instruct", None)]
+    assert llm.unloaded == []
+
+
+def test_load_unknown_model_raises_not_found_and_keeps_previous() -> None:
+    llm = _FakeLlmNamespace(load_error=lmstudio.LMStudioModelNotFoundError("no such model"))
+    client = _FakeClient(_catalogue(), loaded=[_FakeLoaded("old-model")], llm=llm)
+
+    manager = LMStudioManager(host="h", client_factory=lambda _h: client)
+
+    try:
+        manager.load("ghost-model")
+    except LMStudioModelNotFoundError:
+        pass
+    else:  # pragma: no cover
+        raise AssertionError("expected LMStudioModelNotFoundError")
+
+    # The previous model is NOT unloaded on a failed load (non-destructive).
+    assert llm.unloaded == []
+
+
+def test_load_failure_raises_load_error_and_keeps_previous() -> None:
+    llm = _FakeLlmNamespace(load_error=lmstudio.LMStudioServerError("out of memory"))
+    client = _FakeClient(_catalogue(), loaded=[_FakeLoaded("old-model")], llm=llm)
+
+    manager = LMStudioManager(host="h", client_factory=lambda _h: client)
+
+    try:
+        manager.load("qwen2.5-7b-instruct")
+    except LMStudioLoadError:
+        pass
+    else:  # pragma: no cover
+        raise AssertionError("expected LMStudioLoadError")
+
+    assert llm.unloaded == []
+
+
+def test_loaded_model_ids_returns_identifiers() -> None:
+    client = _FakeClient(
+        _catalogue(),
+        loaded=[_FakeLoaded("a"), _FakeLoaded("b")],
+    )
+
+    manager = LMStudioManager(host="h", client_factory=lambda _h: client)
+    assert manager.loaded_model_ids() == ["a", "b"]
+
+
 # --- GET /api/llm/models endpoint tests -------------------------------------
 
 
@@ -206,3 +316,107 @@ def test_get_models_endpoint_server_down_returns_503() -> None:
     body = response.json()
     assert body["error"] == "lm_studio_unavailable"
     assert "localhost:1234" in body["detail"]
+
+
+# --- PUT /api/llm/selection endpoint tests ----------------------------------
+#
+# The route delegates to a :class:`bob.llm_swap.LLMSwitcher`. We inject a fake
+# switcher through the router DI seam so the test exercises the route's HTTP
+# contract (status mapping, body shape) without the orchestrator / SDK. The
+# swap coordinator's own behaviour is covered in ``test_llm_swap.py``.
+
+
+class _FakeSwitcher:
+    """Stand-in for :class:`LLMSwitcher` — returns a result or raises."""
+
+    def __init__(self, *, result: object = None, error: Exception | None = None) -> None:
+        self._result = result
+        self._error = error
+        self.calls: list[str] = []
+
+    async def swap_lm_model(self, model_id: str) -> object:
+        self.calls.append(model_id)
+        if self._error is not None:
+            raise self._error
+        return self._result
+
+
+def test_put_selection_success_returns_new_selection() -> None:
+    from bob import llm_router
+    from bob.llm_selection_store import LLMSelection
+    from bob.llm_swap import SwapResult
+
+    selection = LLMSelection(
+        provider="lm_studio",
+        lm_model="target-model",
+        context_length={"target-model": 8192},
+    )
+    switcher = _FakeSwitcher(result=SwapResult(selection=selection))
+
+    llm_router.set_switcher(cast(Any, switcher))
+    try:
+        api = TestClient(app)
+        response = api.put("/api/llm/selection", json={"lm_model": "target-model"})
+    finally:
+        llm_router.set_switcher(None)
+
+    assert response.status_code == 200
+    assert switcher.calls == ["target-model"]
+    body = response.json()
+    assert body == {
+        "provider": "lm_studio",
+        "lm_model": "target-model",
+        "context_length": {"target-model": 8192},
+    }
+
+
+def test_put_selection_not_found_maps_to_404() -> None:
+    from bob import llm_router
+
+    switcher = _FakeSwitcher(error=LMStudioModelNotFoundError("ghost"))
+    llm_router.set_switcher(cast(Any, switcher))
+    try:
+        api = TestClient(app)
+        response = api.put("/api/llm/selection", json={"lm_model": "ghost"})
+    finally:
+        llm_router.set_switcher(None)
+
+    assert response.status_code == 404
+    assert response.json()["error"] == "model_not_found"
+
+
+def test_put_selection_load_failure_maps_to_409() -> None:
+    from bob import llm_router
+
+    switcher = _FakeSwitcher(error=LMStudioLoadError("out of memory"))
+    llm_router.set_switcher(cast(Any, switcher))
+    try:
+        api = TestClient(app)
+        response = api.put("/api/llm/selection", json={"lm_model": "big-model"})
+    finally:
+        llm_router.set_switcher(None)
+
+    assert response.status_code == 409
+    assert response.json()["error"] == "load_failed"
+
+
+def test_put_selection_unreachable_maps_to_503() -> None:
+    from bob import llm_router
+
+    switcher = _FakeSwitcher(error=LMStudioUnavailableError("server down"))
+    llm_router.set_switcher(cast(Any, switcher))
+    try:
+        api = TestClient(app)
+        response = api.put("/api/llm/selection", json={"lm_model": "m"})
+    finally:
+        llm_router.set_switcher(None)
+
+    assert response.status_code == 503
+    assert response.json()["error"] == "lm_studio_unavailable"
+
+
+def test_put_selection_no_switcher_returns_503() -> None:
+    api = TestClient(app)
+    response = api.put("/api/llm/selection", json={"lm_model": "m"})
+    assert response.status_code == 503
+    assert response.json()["error"] == "swap_unavailable"

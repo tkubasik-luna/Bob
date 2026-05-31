@@ -67,3 +67,48 @@ export async function fetchLlmSelection(signal?: AbortSignal): Promise<LlmSelect
   }
   return (await res.json()) as LlmSelection;
 }
+
+/** Raised by {@link putLlmModel} when the blocking model swap fails (the backend
+ * returns 404 / 409 / 503 with a structured `{error, detail}` body). The picker
+ * stays on the PREVIOUS model and surfaces `message` as the error detail. */
+export class LlmModelSwapError extends Error {
+  readonly code: string;
+  constructor(code: string, detail: string) {
+    super(detail);
+    this.name = "LlmModelSwapError";
+    this.code = code;
+  }
+}
+
+/** Change the active LM Studio model — synchronous + BLOCKING (PRD 0012 / 0080).
+ *
+ * The backend validate-then-swaps: it loads the target model (default ctx),
+ * unloads the previous one, swaps the LM client for both orchestrator roles,
+ * then persists the JSON. This can take a while (model load), so callers show a
+ * loading state while it is in flight. The generous timeout lives server-side.
+ *
+ * On failure the backend keeps the previous selection and returns a structured
+ * error body; we throw {@link LlmModelSwapError} so the caller stays on the
+ * previous model and shows the detail. On success the returned
+ * {@link LlmSelection} reflects the new pinned model. */
+export async function putLlmModel(lmModel: string, signal?: AbortSignal): Promise<LlmSelection> {
+  const res = await fetch(`${API_BASE_URL}/api/llm/selection`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ lm_model: lmModel }),
+    signal,
+  });
+  if (!res.ok) {
+    let code = "swap_failed";
+    let detail = `PUT /api/llm/selection failed: ${res.status}`;
+    try {
+      const body = (await res.json()) as { error?: string; detail?: string };
+      if (typeof body.error === "string" && body.error) code = body.error;
+      if (typeof body.detail === "string" && body.detail) detail = body.detail;
+    } catch {
+      // keep the defaults
+    }
+    throw new LlmModelSwapError(code, detail);
+  }
+  return (await res.json()) as LlmSelection;
+}

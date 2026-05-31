@@ -82,6 +82,26 @@ class LMStudioUnavailableError(RuntimeError):
     """
 
 
+class LMStudioModelNotFoundError(RuntimeError):
+    """The requested model id is not a downloaded LM Studio model.
+
+    Raised by :meth:`LMStudioManager.load` when the SDK reports the target
+    ``model_id`` is unknown (no such download). Distinct from a load failure so
+    the REST layer maps it to a 404-flavoured error and the swap path keeps the
+    previous selection.
+    """
+
+
+class LMStudioLoadError(RuntimeError):
+    """Loading the target model failed (e.g. out of memory).
+
+    Raised by :meth:`LMStudioManager.load` when the SDK accepts the model id
+    but the load itself fails — most commonly VRAM/RAM exhaustion (OOM). The
+    swap path catches this, keeps the previous selection and does NOT persist
+    the JSON.
+    """
+
+
 class _SDKModelInfo(Protocol):
     """Structural view of the SDK ``info`` object we read from.
 
@@ -109,8 +129,29 @@ class _SDKLoadedModel(Protocol):
     identifier: str
 
 
+class _SDKLlmNamespace(Protocol):
+    """The subset of the SDK ``client.llm`` session surface we depend on.
+
+    ``load_new_instance`` loads a downloaded model into memory; ``unload``
+    evicts a currently-loaded instance by its identifier. Both are management
+    calls — inference still runs through :mod:`bob.llm_client` on ``openai``.
+    """
+
+    def load_new_instance(
+        self,
+        model_key: str,
+        *,
+        config: dict[str, object] | None = ...,
+    ) -> object: ...
+
+    def unload(self, model_identifier: str) -> None: ...
+
+
 class _SDKClient(Protocol):
     """The subset of the ``lmstudio`` client surface we depend on."""
+
+    @property
+    def llm(self) -> _SDKLlmNamespace: ...
 
     def list_downloaded_models(self) -> Sequence[_SDKDownloadedModel]: ...
 
@@ -194,6 +235,86 @@ class LMStudioManager:
                 )
             )
         return models
+
+    def loaded_model_ids(self) -> list[str]:
+        """Return the ids of models currently loaded in LM Studio.
+
+        Used for cold-start resolution (issue 0080): when the selection pins no
+        model, the boot path prefers an already-loaded model over loading a new
+        one. Order follows the SDK's ``list_loaded_models`` order.
+
+        Raises :class:`LMStudioUnavailableError` when the server is unreachable.
+        """
+
+        client = self._open_client()
+        try:
+            loaded = client.list_loaded_models()
+        except lmstudio.LMStudioError as exc:
+            raise LMStudioUnavailableError(
+                f"LM Studio server unreachable at {self._host!r}: {exc}"
+            ) from exc
+        finally:
+            self._safe_close(client)
+
+        ids: list[str] = []
+        for handle in loaded:
+            identifier = getattr(handle, "identifier", None)
+            if isinstance(identifier, str) and identifier:
+                ids.append(identifier)
+        return ids
+
+    def load(self, model_id: str, context_length: int | None = None) -> None:
+        """Load ``model_id`` into LM Studio, unloading any previously-loaded models.
+
+        Validate-then-swap at the SDK boundary (issue 0080):
+
+        1. Snapshot the currently-loaded model identifiers.
+        2. ``load_new_instance(model_id, config={"contextLength": …})`` — load
+           the target with the default context length (omitted when ``None`` so
+           the SDK applies the model default).
+        3. On success, unload every *previously*-loaded model so memory does not
+           grow unbounded across swaps; the freshly-loaded target is kept.
+
+        Errors are surfaced as DISTINCT, catchable types so the swap coordinator
+        keeps the previous selection and the REST layer maps them cleanly:
+
+        - server unreachable → :class:`LMStudioUnavailableError`
+        - unknown model id → :class:`LMStudioModelNotFoundError`
+        - load failed (e.g. OOM) → :class:`LMStudioLoadError`
+
+        The unload of the previous models happens only AFTER a successful load,
+        so a failed load leaves the prior model resident (non-destructive).
+        """
+
+        client = self._open_client()
+        try:
+            previous = self._loaded_ids(client)
+            config: dict[str, object] | None = None
+            if context_length is not None:
+                config = {"contextLength": context_length}
+            try:
+                client.llm.load_new_instance(model_id, config=config)
+            except lmstudio.LMStudioModelNotFoundError as exc:
+                raise LMStudioModelNotFoundError(
+                    f"LM Studio model not found: {model_id!r}: {exc}"
+                ) from exc
+            except lmstudio.LMStudioError as exc:
+                # Server-side load failure — most commonly OOM. Distinct from the
+                # unreachable-server case (the connection itself succeeded).
+                raise LMStudioLoadError(
+                    f"LM Studio failed to load {model_id!r}: {exc}"
+                ) from exc
+
+            # Load succeeded — evict the models that were resident before so a
+            # long-running session does not accumulate loaded instances. The new
+            # target id is excluded even if it collides with a previous id.
+            for identifier in previous:
+                if identifier == model_id:
+                    continue
+                with contextlib.suppress(lmstudio.LMStudioError):
+                    client.llm.unload(identifier)
+        finally:
+            self._safe_close(client)
 
     # --- internals -----------------------------------------------------------
 

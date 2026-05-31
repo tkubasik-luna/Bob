@@ -40,15 +40,23 @@ from bob.debug_router import router as debug_router
 from bob.event_bus import EventBus, set_event_bus
 from bob.jarvis_prompt_loader import load_jarvis_prompt
 from bob.jarvis_store import JarvisStore
-from bob.llm.factory import build_subagent_client
+from bob.llm.factory import build_jarvis_client, build_subagent_client
 from bob.llm_router import router as llm_router
+from bob.llm_router import set_switcher as set_llm_switcher
 from bob.llm_selection_store import (
     LLM_SELECTION_FILENAME,
+    LLMSelection,
     LLMSelectionStore,
 )
 from bob.llm_selection_store import (
     set_default_store as set_default_llm_selection_store,
 )
+from bob.llm_swap import (
+    LLMSwitcher,
+    SubAgentClientHolder,
+    resolve_cold_start_model,
+)
+from bob.lm_studio_manager import LMStudioManager
 from bob.logging_setup import configure_logging
 from bob.orchestrator import get_default_orchestrator
 from bob.proactivity_handler import ProactivityHandler
@@ -117,6 +125,25 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     seeded_selection = llm_selection_store.seed_from_settings(settings)
     set_default_llm_selection_store(llm_selection_store)
 
+    # LM Studio management manager (PRD 0012 / issue 0079-0080). Single boundary
+    # onto the ``lmstudio`` SDK for cold-start resolution + the live model swap.
+    lm_studio_manager = LMStudioManager()
+
+    # Cold-start resolution (issue 0080): provider is LM Studio with no model
+    # pinned anywhere → adopt the model already loaded in LM Studio if any, else
+    # the first chat-capable downloaded model. Best-effort: an unreachable
+    # server leaves the selection unpinned (never crashes boot).
+    if not seeded_selection.lm_model:
+        resolved = resolve_cold_start_model(seeded_selection, lm_studio_manager)
+        if resolved:
+            seeded_selection = LLMSelection(
+                provider=seeded_selection.provider,
+                lm_model=resolved,
+                context_length=seeded_selection.context_length,
+            )
+            llm_selection_store.write(seeded_selection)
+            _logger.info("bob.llm.cold_start_resolved", lm_model=resolved)
+
     # Sub-agent runner factory used by the scheduler. We build the LLM client
     # once and reuse it across every runner invocation — the underlying
     # client is stateless and the orchestrator's previous wiring did the
@@ -126,14 +153,18 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     # scheduler. The boot path keeps a per-task index of live runners so the
     # cooperative-cancel hook resolves to :meth:`SubAgentRunner.request_cancel`
     # before the scheduler escalates to the hard-kill path.
-    subagent_client = build_subagent_client(settings)
+    # Issue 0080 — the sub-agent client lives behind a MUTABLE holder so the
+    # live model swap can replace it without rebuilding the scheduler. The
+    # runner factory reads ``holder.client`` PER TASK: a task spawned after a
+    # swap gets the new client; one already running keeps the one it captured.
+    subagent_holder = SubAgentClientHolder(build_subagent_client(settings, seeded_selection))
     subagent_policy = default_policy()
     subagent_registry = build_default_subagent_registry()
     live_runners: dict[str, SubAgentRunner] = {}
 
     def _runner_factory(task_id: str) -> Coroutine[Any, Any, None]:
         runner = SubAgentRunner(
-            subagent_client=subagent_client,
+            subagent_client=subagent_holder.client,
             task_store=task_store,
             policy=subagent_policy,
             tool_registry=subagent_registry,
@@ -198,9 +229,25 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     # PRD 0006 / issue 0050 — late-bind the addendum factory now that
     # the live runner pool exists.
     orchestrator.set_addendum_queue_factory(_addendum_queue_factory)
+    # Issue 0080 — the singleton builds its Jarvis client from frozen .env; align
+    # it with the (possibly cold-start-resolved) live selection so boot and a
+    # later swap agree on the active model.
+    orchestrator.set_jarvis_client(build_jarvis_client(settings, seeded_selection))
     orchestrator.start_proactive_loop()
     proactivity = ProactivityHandler(orchestrator_factory=get_default_orchestrator)
     bus.subscribe("task_state_changed", proactivity.on_task_state_changed)
+
+    # Issue 0080 — live model swap coordinator. Owns the asyncio.Lock and pushes
+    # rebuilt clients into the orchestrator + sub-agent holder. Primed into the
+    # router so ``PUT /api/llm/selection`` can delegate to it; cleared on teardown.
+    llm_switcher = LLMSwitcher(
+        settings=settings,
+        manager=lm_studio_manager,
+        selection_store=llm_selection_store,
+        orchestrator=orchestrator,
+        subagent_holder=subagent_holder,
+    )
+    set_llm_switcher(llm_switcher)
 
     load_jarvis_prompt(data_dir)
 
@@ -225,6 +272,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        set_llm_switcher(None)
         await orchestrator.stop_proactive_loop()
         # Issue 0045 — drain the scheduler's TaskGroup deterministically so
         # in-flight sub-agents don't leak past the lifespan teardown.

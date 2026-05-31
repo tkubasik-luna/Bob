@@ -1,22 +1,27 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   type LlmModel,
+  LlmModelSwapError,
   LlmModelsUnavailableError,
   type LlmSelection,
   fetchLlmModels,
   fetchLlmSelection,
+  putLlmModel,
 } from "../../lib/llmApi";
 
 // ProviderPicker — LLM engine picker mounted in the Sphere HUD top-left zone
-// (PRD 0012 / issue 0079). Ported from `Design Mockup/provider.jsx`.
+// (PRD 0012 / issues 0079-0080). Ported from `Design Mockup/provider.jsx`.
 //
-// SCOPE (this slice): READ-ONLY display + fetch-on-open.
+// SCOPE:
 //   - The segmented toggle renders (Claude CLI / LM Studio) but does NOT yet
 //     mutate the backend — the live provider switch is issue 0081.
 //   - Under LM Studio, opening the active-engine row fetches
-//     `GET /api/llm/models` and renders the LIVE list. Clicking a model does
-//     NOT select/load it yet (no PUT) — the list highlights only the CURRENT
+//     `GET /api/llm/models` and renders the LIVE list, highlighting the CURRENT
 //     selection from `GET /api/llm/selection`.
+//   - Issue 0080: clicking a model fires the BLOCKING `PUT /api/llm/selection`
+//     to load+swap it. While the swap runs the row shows a loading state; on
+//     failure the picker stays on the previous model and shows the error; on
+//     success the active-engine label (the HUD's engine/model footer) updates.
 // The hardcoded `LM_MODELS` catalogue from the mockup is replaced by the live
 // fetch; the `.pv-*` class structure and French labels are preserved.
 
@@ -37,6 +42,14 @@ type ListState =
   | { status: "ready"; models: LlmModel[] }
   | { status: "error"; detail: string };
 
+// Swap (PUT) lifecycle. `target` is the model id the user clicked so the row
+// can show its own spinner; `detail` carries the failure message. The picker
+// stays on the PREVIOUS selection while loading and on failure.
+type SwapState =
+  | { status: "idle" }
+  | { status: "loading"; target: string }
+  | { status: "error"; target: string; detail: string };
+
 export function ProviderPicker() {
   const [open, setOpen] = useState(false);
   // Provider toggle is local-only at this stage (no backend mutation). Seeded
@@ -44,6 +57,7 @@ export function ProviderPicker() {
   const [provider, setProvider] = useState<string>("lm_studio");
   const [selection, setSelection] = useState<LlmSelection | null>(null);
   const [list, setList] = useState<ListState>({ status: "idle" });
+  const [swap, setSwap] = useState<SwapState>({ status: "idle" });
   const fetchedRef = useRef(false);
 
   const isLM = provider === "lm_studio";
@@ -76,6 +90,30 @@ export function ProviderPicker() {
         setList({ status: "error", detail });
       });
   }, []);
+
+  // Fire the BLOCKING swap PUT for the clicked model (issue 0080). No-op when
+  // it is already the current selection or a swap is already in flight. On
+  // success we update the local selection so the active-engine label (the HUD
+  // engine/model footer) reflects the new model; on failure we stay put and
+  // surface the detail on the row.
+  const selectModel = useCallback(
+    (modelId: string) => {
+      if (swap.status === "loading") return;
+      if (modelId === (selection?.lm_model ?? null)) return;
+      setSwap({ status: "loading", target: modelId });
+      putLlmModel(modelId)
+        .then((next) => {
+          setSelection(next);
+          setSwap({ status: "idle" });
+        })
+        .catch((err: unknown) => {
+          const detail =
+            err instanceof LlmModelSwapError ? err.message : "Échec du changement de modèle";
+          setSwap({ status: "error", target: modelId, detail });
+        });
+    },
+    [swap.status, selection?.lm_model],
+  );
 
   const toggleOpen = () => {
     if (!isLM) return;
@@ -191,21 +229,34 @@ export function ProviderPicker() {
           {list.status === "ready" &&
             list.models.map((m) => {
               const on = m.id === currentModelId;
+              const isSwapping = swap.status === "loading" && swap.target === m.id;
+              const swapFailed = swap.status === "error" && swap.target === m.id;
+              const busy = swap.status === "loading";
+              const ramLabel = isSwapping
+                ? "chargement…"
+                : swapFailed
+                  ? "erreur"
+                  : m.loaded
+                    ? "chargé"
+                    : "";
               return (
-                <div
+                <button
                   key={m.id}
-                  // biome-ignore lint/a11y/useSemanticElements: ARIA option inside the listbox above; rows carry custom multi-field metadata chrome a native <option> can't render.
+                  type="button"
+                  // biome-ignore lint/a11y/useSemanticElements: ARIA option inside the listbox above; rows carry custom multi-field metadata chrome a native <option> can't render. <button> keeps it natively focusable + clickable.
                   role="option"
-                  tabIndex={-1}
                   aria-selected={on}
-                  className={`pv-row ${on ? "on" : ""}`}
+                  aria-busy={isSwapping}
+                  disabled={busy}
+                  className={`pv-row ${on ? "on" : ""} ${isSwapping ? "is-loading" : ""} ${swapFailed ? "is-error" : ""}`}
                   data-testid={`pv-row-${m.id}`}
+                  onClick={() => selectModel(m.id)}
                 >
                   <span className="pv-row-mark">{on ? "◆" : "◇"}</span>
                   <span className="pv-row-name">{m.id}</span>
-                  <span className="pv-row-spec">{modelSpec(m)}</span>
-                  <span className="pv-row-ram">{m.loaded ? "chargé" : ""}</span>
-                </div>
+                  <span className="pv-row-spec">{swapFailed ? swap.detail : modelSpec(m)}</span>
+                  <span className="pv-row-ram">{ramLabel}</span>
+                </button>
               );
             })}
         </div>

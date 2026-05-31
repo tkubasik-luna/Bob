@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 const apiMock = vi.hoisted(() => ({
   fetchLlmModels: vi.fn(),
   fetchLlmSelection: vi.fn(),
+  putLlmModel: vi.fn(),
 }));
 
 vi.mock("../../lib/llmApi", async () => {
@@ -17,9 +18,11 @@ vi.mock("../../lib/llmApi", async () => {
     ...actual,
     fetchLlmModels: apiMock.fetchLlmModels,
     fetchLlmSelection: apiMock.fetchLlmSelection,
+    putLlmModel: apiMock.putLlmModel,
   };
 });
 
+import { LlmModelSwapError } from "../../lib/llmApi";
 import { ProviderPicker } from "./ProviderPicker";
 
 const MODELS = [
@@ -43,6 +46,7 @@ describe("ProviderPicker", () => {
   beforeEach(() => {
     apiMock.fetchLlmModels.mockReset();
     apiMock.fetchLlmSelection.mockReset();
+    apiMock.putLlmModel.mockReset();
     apiMock.fetchLlmModels.mockResolvedValue(MODELS);
     apiMock.fetchLlmSelection.mockResolvedValue({
       provider: "lm_studio",
@@ -107,5 +111,65 @@ describe("ProviderPicker", () => {
     fireEvent.click(screen.getByRole("button", { expanded: true })); // close
     fireEvent.click(screen.getByRole("button", { expanded: false })); // reopen
     expect(apiMock.fetchLlmModels).toHaveBeenCalledTimes(1);
+  });
+
+  async function openAndGetRows() {
+    render(<ProviderPicker />);
+    await waitFor(() => expect(apiMock.fetchLlmSelection).toHaveBeenCalled());
+    fireEvent.click(screen.getByRole("button", { expanded: false }));
+    await waitFor(() => expect(screen.getAllByRole("option")).toHaveLength(2));
+  }
+
+  test("clicking a non-current model fires the blocking PUT with a loading state", async () => {
+    // Keep the PUT pending so we can observe the loading state.
+    let resolvePut: (sel: unknown) => void = () => {};
+    apiMock.putLlmModel.mockReturnValue(
+      new Promise((res) => {
+        resolvePut = res;
+      }),
+    );
+
+    await openAndGetRows();
+    const target = screen.getByTestId("pv-row-llama-3.3-70b");
+    fireEvent.click(target);
+
+    expect(apiMock.putLlmModel).toHaveBeenCalledWith("llama-3.3-70b");
+    // Loading state: row is busy + disabled while the swap runs.
+    await waitFor(() => expect(target).toHaveAttribute("aria-busy", "true"));
+    expect(target).toBeDisabled();
+    expect(target).toHaveTextContent(/chargement/i);
+
+    // Finish the swap → success updates the active-engine footer label.
+    resolvePut({
+      provider: "lm_studio",
+      lm_model: "llama-3.3-70b",
+      context_length: {},
+    });
+    await waitFor(() =>
+      expect(screen.getByRole("option", { selected: true })).toHaveTextContent("llama-3.3-70b"),
+    );
+    // Footer label (active-engine row) now shows the new model.
+    expect(screen.getByRole("button", { expanded: true })).toHaveTextContent("llama-3.3-70b");
+  });
+
+  test("a failed swap stays on the previous model and shows the error", async () => {
+    apiMock.putLlmModel.mockRejectedValue(new LlmModelSwapError("load_failed", "out of memory"));
+
+    await openAndGetRows();
+    fireEvent.click(screen.getByTestId("pv-row-llama-3.3-70b"));
+
+    // Error surfaced on the row; selection unchanged (still qwen).
+    await waitFor(() =>
+      expect(screen.getByTestId("pv-row-llama-3.3-70b")).toHaveTextContent(/out of memory/i),
+    );
+    expect(screen.getByRole("option", { selected: true })).toHaveTextContent("qwen2.5-7b-instruct");
+    // Footer label still shows the previous model.
+    expect(screen.getByRole("button", { expanded: true })).toHaveTextContent("qwen2.5-7b-instruct");
+  });
+
+  test("clicking the already-current model does not fire a PUT", async () => {
+    await openAndGetRows();
+    fireEvent.click(screen.getByTestId("pv-row-qwen2.5-7b-instruct"));
+    expect(apiMock.putLlmModel).not.toHaveBeenCalled();
   });
 });

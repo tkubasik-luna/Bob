@@ -1033,6 +1033,19 @@ class Orchestrator:
 
     # --- PRD 0006 / issue 0050 — completion batching + delivery -----------
 
+    def set_jarvis_client(self, client: LLMClient) -> None:
+        """Replace the Jarvis :class:`LLMClient` reference (live model swap, 0080).
+
+        Non-interruptive by construction: every request reads
+        ``self._jarvis_client`` at call time (lines ~740 / ~1347 / ~1630), so a
+        turn already in flight has bound the *previous* object and finishes on
+        it; the next request picks up the replacement. The swap coordinator
+        (:mod:`bob.llm_swap`) calls this under its ``asyncio.Lock`` after the
+        target model is loaded, so callers never observe a half-swapped state.
+        """
+
+        self._jarvis_client = client
+
     def set_addendum_queue_factory(
         self,
         factory: Callable[[str], AddendumQueue | None] | None,

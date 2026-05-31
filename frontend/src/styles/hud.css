@@ -3642,3 +3642,19 @@ body {
 .pv-row-error .pv-row-name {
   color: var(--accent);
 }
+/* Issue 0080 — clickable model rows (blocking swap PUT). */
+.pv-row:not(.on):not(:disabled):hover {
+  background: var(--hud-rule-dim);
+  cursor: pointer;
+}
+.pv-row:disabled {
+  cursor: progress;
+}
+.pv-row.is-loading .pv-row-ram {
+  color: var(--accent);
+}
+.pv-row.is-error .pv-row-spec,
+.pv-row.is-error .pv-row-ram {
+  color: var(--accent);
+  text-transform: none;
+}
