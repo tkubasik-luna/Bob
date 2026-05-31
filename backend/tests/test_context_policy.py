@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 from bob.context.policy import (
+    CONTEXT_LENGTH_RESERVE,
+    DEFAULT_TOKEN_BUDGET,
     LEGACY_FULL_HISTORY_POLICY_ID,
     legacy_full_history_policy,
     parse_policy_overrides,
+    token_budget_for_context_length,
 )
 
 
@@ -79,3 +82,37 @@ def test_parse_policy_overrides_normalises_provider_ids_to_tuple() -> None:
 
     policy = parse_policy_overrides(provider_ids=["x", "y"])
     assert isinstance(policy.provider_ids, tuple)
+
+
+# --- budget coupling (issue 0082) --------------------------------------------
+
+
+def test_reserve_constant_is_6000() -> None:
+    assert CONTEXT_LENGTH_RESERVE == 6000
+
+
+def test_budget_for_large_context_is_ctx_minus_reserve() -> None:
+    """A roomy window buys ctx minus RESERVE of prompt budget."""
+
+    assert token_budget_for_context_length(32768) == 32768 - 6000
+
+
+def test_budget_floored_at_default_for_small_context() -> None:
+    """A tiny window never starves the prompt below DEFAULT_TOKEN_BUDGET."""
+
+    # 4096 - 6000 < 0 → floored at the default.
+    assert token_budget_for_context_length(4096) == DEFAULT_TOKEN_BUDGET
+
+
+def test_budget_at_floor_boundary() -> None:
+    """At ctx == DEFAULT + RESERVE the formula exactly hits the floor."""
+
+    boundary = DEFAULT_TOKEN_BUDGET + CONTEXT_LENGTH_RESERVE
+    assert token_budget_for_context_length(boundary) == DEFAULT_TOKEN_BUDGET
+    assert token_budget_for_context_length(boundary + 1) == DEFAULT_TOKEN_BUDGET + 1
+
+
+def test_budget_none_context_keeps_default() -> None:
+    """None ctx (model default unknown / Claude CLI) keeps the conservative default."""
+
+    assert token_budget_for_context_length(None) == DEFAULT_TOKEN_BUDGET

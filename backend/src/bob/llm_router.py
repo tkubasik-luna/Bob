@@ -220,13 +220,18 @@ class LLMSelectionUpdateRequest(BaseModel):
     - ``provider`` — switch the active provider, Claude CLI ↔ LM Studio
       (issue 0081).
 
-    Exactly one must be present; the context-length override is issue 0082 and
-    out of scope here. Both fields default to ``None`` so a body carrying just
-    one validates; the route rejects a body with zero or both.
+    Exactly one of ``lm_model`` / ``provider`` must be present; the route
+    rejects a body with zero or both.
+
+    ``context_length`` (issue 0082) is an OPTIONAL companion to ``lm_model``: it
+    is the explicit ctx-slider Apply value, so the target model is loaded at that
+    window and the budget couples to it. It is meaningless alongside
+    ``provider`` (the route rejects that combination).
     """
 
     lm_model: str | None = None
     provider: str | None = None
+    context_length: int | None = None
 
 
 class LLMSelectionUpdateErrorResponse(BaseModel):
@@ -301,6 +306,20 @@ async def put_llm_selection(body: LLMSelectionUpdateRequest) -> JSONResponse:
             status.HTTP_422_UNPROCESSABLE_ENTITY,
         )
 
+    if has_provider and body.context_length is not None:
+        return _error_response(
+            "invalid_request",
+            "'context_length' is only valid alongside 'lm_model'",
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+        )
+
+    if body.context_length is not None and body.context_length <= 0:
+        return _error_response(
+            "invalid_request",
+            "'context_length' must be a positive integer",
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+        )
+
     if _switcher is None:
         return _error_response(
             "swap_unavailable",
@@ -310,11 +329,15 @@ async def put_llm_selection(body: LLMSelectionUpdateRequest) -> JSONResponse:
 
     if has_provider:
         return await _handle_provider_swap(body.provider or "")
-    return await _handle_model_swap(body.lm_model or "")
+    return await _handle_model_swap(body.lm_model or "", body.context_length)
 
 
-async def _handle_model_swap(lm_model: str) -> JSONResponse:
-    """Run the LM Studio model swap (issue 0080) and map outcomes to HTTP."""
+async def _handle_model_swap(lm_model: str, context_length: int | None) -> JSONResponse:
+    """Run the LM Studio model swap (issue 0080/0082) and map outcomes to HTTP.
+
+    ``context_length`` (issue 0082) is the optional ctx-slider Apply value
+    threaded into the load + per-model persistence + budget coupling.
+    """
 
     assert _switcher is not None  # guarded by the caller
     model_id = lm_model.strip()
@@ -326,7 +349,7 @@ async def _handle_model_swap(lm_model: str) -> JSONResponse:
         )
 
     try:
-        result = await _switcher.swap_lm_model(model_id)
+        result = await _switcher.swap_lm_model(model_id, context_length)
     except LMStudioModelNotFoundError as exc:
         return _error_response("model_not_found", str(exc), status.HTTP_404_NOT_FOUND)
     except LMStudioLoadError as exc:

@@ -65,6 +65,30 @@ type ProviderSwapState =
   | { status: "loading"; target: string }
   | { status: "error"; target: string; detail: string };
 
+// Ctx-length Apply (PUT { lm_model, context_length }) lifecycle (issue 0082).
+// Distinct from the model SWAP state so an Apply (reload-with-ctx of the SAME
+// model) shows its own loading/error without colliding with a model switch.
+type CtxApplyState =
+  | { status: "idle" }
+  | { status: "loading" }
+  | { status: "error"; detail: string };
+
+// Lower bound for the ctx slider — a sane floor so the thumb never lands on a
+// degenerate window. The upper bound is the selected model's max_context_length.
+const CTX_SLIDER_MIN = 1024;
+// Step the slider in 1k-token increments — smooth enough to feel continuous,
+// coarse enough that the persisted/applied value is a round number.
+const CTX_SLIDER_STEP = 1024;
+
+// The ctx value to seed the slider for `model`: the persisted per-model value
+// from the selection JSON if present, else the model's max (its default window).
+function defaultCtxFor(model: LlmModel | null, selection: LlmSelection | null): number | null {
+  if (model === null) return null;
+  const persisted = selection?.context_length?.[model.id];
+  if (typeof persisted === "number" && persisted > 0) return persisted;
+  return model.max_context_length;
+}
+
 export function ProviderPicker() {
   const [open, setOpen] = useState(false);
   // Provider toggle is local-only at this stage (no backend mutation). Seeded
@@ -74,6 +98,11 @@ export function ProviderPicker() {
   const [list, setList] = useState<ListState>({ status: "idle" });
   const [swap, setSwap] = useState<SwapState>({ status: "idle" });
   const [providerSwap, setProviderSwap] = useState<ProviderSwapState>({ status: "idle" });
+  // Ctx slider is LOCAL state (issue 0082): dragging mutates only this; the
+  // explicit Apply button fires the blocking reload-with-ctx PUT. `null` until
+  // a model + its bound are known.
+  const [ctxValue, setCtxValue] = useState<number | null>(null);
+  const [ctxApply, setCtxApply] = useState<CtxApplyState>({ status: "idle" });
   const fetchedRef = useRef(false);
 
   const isLM = provider === "lm_studio";
@@ -177,6 +206,43 @@ export function ProviderPicker() {
   const activeModel = models.find((m) => m.id === currentModelId) ?? null;
   const claudeModel = selection?.claude_model ?? CLAUDE_MODEL_FALLBACK;
   const providerSwapping = providerSwap.status === "loading";
+
+  // Seed / reseed the ctx slider whenever the active model (or its persisted
+  // ctx) changes: the persisted per-model value if present, else the model
+  // default (its max). This is the "reapplied when returning to that model"
+  // behaviour — switching back to a model restores its remembered ctx.
+  const ctxMax = activeModel?.max_context_length ?? null;
+  const seededCtx = defaultCtxFor(activeModel, selection);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: reseed only when the model id / its persisted ctx / its max changes — not on every local drag.
+  useEffect(() => {
+    setCtxValue(seededCtx);
+    setCtxApply({ status: "idle" });
+  }, [currentModelId, ctxMax, selection?.context_length?.[currentModelId ?? ""]]);
+
+  // Fire the BLOCKING ctx Apply (issue 0082): reload the CURRENT model at the
+  // slider's ctx via the same validate-then-swap path. Dragging the slider does
+  // NOT call this — only the explicit Apply button does. No-op without a model /
+  // a value, or while another mutation is in flight. The applied value is == the
+  // persisted one → backend reloads anyway (idempotent re-apply is allowed).
+  const applyCtx = useCallback(() => {
+    if (currentModelId === null || ctxValue === null) return;
+    if (ctxApply.status === "loading" || swap.status === "loading") return;
+    setCtxApply({ status: "loading" });
+    putLlmModel(currentModelId, ctxValue)
+      .then((next) => {
+        setSelection(next);
+        setCtxApply({ status: "idle" });
+      })
+      .catch((err: unknown) => {
+        const detail =
+          err instanceof LlmModelSwapError ? err.message : "Échec de l'application du contexte";
+        setCtxApply({ status: "error", detail });
+      });
+  }, [currentModelId, ctxValue, ctxApply.status, swap.status]);
+
+  // Whether the Apply button is meaningfully actionable: a model + value exist
+  // and nothing is mid-flight. (We still allow re-applying the persisted value.)
+  const ctxApplying = ctxApply.status === "loading";
 
   return (
     <div className={`pv ${isLM ? "is-lm" : "is-claude"}`} data-testid="provider-picker">
@@ -311,6 +377,50 @@ export function ProviderPicker() {
                 </button>
               );
             })}
+
+          {/* ctx-length slider + Apply (issue 0082) — only with a known max for
+            the active model. Dragging mutates LOCAL state only; Apply fires the
+            blocking reload-with-ctx. Clamped to [MIN, max_context_length]. */}
+          {activeModel !== null && ctxMax !== null && ctxValue !== null && (
+            <div className="pv-ctx" data-testid="pv-ctx">
+              <div className="pv-ctx-head">
+                <span>CONTEXTE</span>
+                <span className="pv-ctx-val" data-testid="pv-ctx-value">
+                  {ctxValue.toLocaleString()} tok
+                </span>
+              </div>
+              <input
+                type="range"
+                className="pv-ctx-slider"
+                data-testid="pv-ctx-slider"
+                aria-label="Longueur de contexte"
+                min={Math.min(CTX_SLIDER_MIN, ctxMax)}
+                max={ctxMax}
+                step={CTX_SLIDER_STEP}
+                value={Math.min(ctxValue, ctxMax)}
+                disabled={ctxApplying}
+                onChange={(e) => setCtxValue(Number(e.target.value))}
+              />
+              <div className="pv-ctx-actions">
+                <span className="pv-ctx-max">max {ctxMax.toLocaleString()}</span>
+                <button
+                  type="button"
+                  className="pv-ctx-apply"
+                  data-testid="pv-ctx-apply"
+                  disabled={ctxApplying}
+                  aria-busy={ctxApplying}
+                  onClick={applyCtx}
+                >
+                  {ctxApplying ? "application…" : "Appliquer"}
+                </button>
+              </div>
+              {ctxApply.status === "error" && (
+                <div className="pv-ctx-error" role="alert">
+                  {ctxApply.detail}
+                </div>
+              )}
+            </div>
+          )}
         </div>
       )}
     </div>

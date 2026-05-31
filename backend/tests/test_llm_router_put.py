@@ -47,7 +47,7 @@ class _FakeSwitcher:
         self.provider_result = provider_result
         self.provider_error = provider_error
         self.provider_calls: list[str] = []
-        self.model_calls: list[str] = []
+        self.model_calls: list[tuple[str, int | None]] = []
 
     async def swap_provider(self, provider: str) -> SwapResult:
         self.provider_calls.append(provider)
@@ -56,8 +56,10 @@ class _FakeSwitcher:
         assert self.provider_result is not None
         return self.provider_result
 
-    async def swap_lm_model(self, model_id: str) -> SwapResult:
-        self.model_calls.append(model_id)
+    async def swap_lm_model(
+        self, model_id: str, context_length: int | None = None
+    ) -> SwapResult:
+        self.model_calls.append((model_id, context_length))
         assert self.provider_result is not None
         return self.provider_result
 
@@ -162,6 +164,82 @@ def test_put_rejects_empty_body() -> None:
 
     assert response.status_code == 422
     assert response.json()["error"] == "invalid_request"
+
+
+def test_put_model_with_context_length_threads_ctx_to_switcher() -> None:
+    switcher = _FakeSwitcher(
+        provider_result=SwapResult(
+            selection=LLMSelection(
+                provider="lm_studio", lm_model="m", context_length={"m": 32768}
+            )
+        )
+    )
+    client = _client(switcher)
+    try:
+        response = client.put(
+            "/api/llm/selection", json={"lm_model": "m", "context_length": 32768}
+        )
+    finally:
+        _reset()
+
+    assert response.status_code == 200
+    assert switcher.model_calls == [("m", 32768)]
+    assert switcher.provider_calls == []
+
+
+def test_put_model_without_context_length_passes_none() -> None:
+    switcher = _FakeSwitcher(
+        provider_result=SwapResult(
+            selection=LLMSelection(provider="lm_studio", lm_model="m", context_length={})
+        )
+    )
+    client = _client(switcher)
+    try:
+        response = client.put("/api/llm/selection", json={"lm_model": "m"})
+    finally:
+        _reset()
+
+    assert response.status_code == 200
+    assert switcher.model_calls == [("m", None)]
+
+
+def test_put_provider_with_context_length_rejected_422() -> None:
+    switcher = _FakeSwitcher(
+        provider_result=SwapResult(
+            selection=LLMSelection(provider="lm_studio", lm_model=None, context_length={})
+        )
+    )
+    client = _client(switcher)
+    try:
+        response = client.put(
+            "/api/llm/selection", json={"provider": "lm_studio", "context_length": 8192}
+        )
+    finally:
+        _reset()
+
+    assert response.status_code == 422
+    assert response.json()["error"] == "invalid_request"
+    assert switcher.provider_calls == []
+    assert switcher.model_calls == []
+
+
+def test_put_non_positive_context_length_rejected_422() -> None:
+    switcher = _FakeSwitcher(
+        provider_result=SwapResult(
+            selection=LLMSelection(provider="lm_studio", lm_model="m", context_length={})
+        )
+    )
+    client = _client(switcher)
+    try:
+        response = client.put(
+            "/api/llm/selection", json={"lm_model": "m", "context_length": 0}
+        )
+    finally:
+        _reset()
+
+    assert response.status_code == 422
+    assert response.json()["error"] == "invalid_request"
+    assert switcher.model_calls == []
 
 
 def test_put_provider_503_when_switcher_not_wired() -> None:

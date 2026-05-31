@@ -225,4 +225,71 @@ describe("ProviderPicker", () => {
     fireEvent.click(screen.getByRole("radio", { name: /lm studio/i }));
     expect(apiMock.putLlmProvider).not.toHaveBeenCalled();
   });
+
+  // --- ctx-length slider + Apply (issue 0082) --------------------------------
+
+  test("ctx slider is clamped to the active model's max_context_length", async () => {
+    await openAndGetRows();
+
+    const slider = (await screen.findByTestId("pv-ctx-slider")) as HTMLInputElement;
+    // Active model is qwen with max 32768; the slider's max mirrors it.
+    expect(slider.max).toBe("32768");
+    expect(Number(slider.min)).toBeLessThanOrEqual(Number(slider.value));
+    // Seeded from the persisted per-model ctx (32768 in the seeded selection).
+    expect(slider.value).toBe("32768");
+  });
+
+  test("dragging the slider updates local state only — no PUT", async () => {
+    await openAndGetRows();
+
+    const slider = await screen.findByTestId("pv-ctx-slider");
+    fireEvent.change(slider, { target: { value: "16384" } });
+
+    // The displayed value reflects the drag…
+    expect(screen.getByTestId("pv-ctx-value")).toHaveTextContent(/16,?384/);
+    // …but NO reload was triggered by the drag alone.
+    expect(apiMock.putLlmModel).not.toHaveBeenCalled();
+  });
+
+  test("Apply fires the blocking reload-with-ctx PUT carrying the slider value", async () => {
+    let resolvePut: (sel: unknown) => void = () => {};
+    apiMock.putLlmModel.mockReturnValue(
+      new Promise((res) => {
+        resolvePut = res;
+      }),
+    );
+
+    await openAndGetRows();
+    const slider = await screen.findByTestId("pv-ctx-slider");
+    fireEvent.change(slider, { target: { value: "8192" } });
+
+    const apply = screen.getByTestId("pv-ctx-apply");
+    fireEvent.click(apply);
+
+    // The Apply (not the drag) fires the PUT with the model id + slider ctx.
+    expect(apiMock.putLlmModel).toHaveBeenCalledWith("qwen2.5-7b-instruct", 8192);
+    // Loading state while in flight.
+    await waitFor(() => expect(apply).toHaveAttribute("aria-busy", "true"));
+    expect(apply).toBeDisabled();
+
+    resolvePut({
+      provider: "lm_studio",
+      lm_model: "qwen2.5-7b-instruct",
+      context_length: { "qwen2.5-7b-instruct": 8192 },
+      claude_model: "claude-opus-4",
+    });
+    await waitFor(() => expect(apply).not.toBeDisabled());
+  });
+
+  test("a failed ctx Apply surfaces the error and keeps the slider usable", async () => {
+    apiMock.putLlmModel.mockRejectedValue(new LlmModelSwapError("load_failed", "out of memory"));
+
+    await openAndGetRows();
+    fireEvent.change(await screen.findByTestId("pv-ctx-slider"), { target: { value: "8192" } });
+    fireEvent.click(screen.getByTestId("pv-ctx-apply"));
+
+    await waitFor(() => expect(screen.getByTestId("pv-ctx")).toHaveTextContent(/out of memory/i));
+    // Slider re-enabled after the failure so the user can retry.
+    expect(screen.getByTestId("pv-ctx-apply")).not.toBeDisabled();
+  });
 });

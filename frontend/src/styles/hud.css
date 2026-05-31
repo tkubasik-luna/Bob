@@ -3658,3 +3658,70 @@ body {
   color: var(--accent);
   text-transform: none;
 }
+
+/* ctx-length slider + Apply (issue 0082) — sits under the model list inside
+   the open LM Studio dropdown. Local drag, explicit Apply triggers reload. */
+.pv-ctx {
+  padding: 9px 10px;
+  border-top: 1px solid var(--hud-rule-dim);
+  font-family: var(--font-mono);
+}
+.pv-ctx-head {
+  display: flex;
+  justify-content: space-between;
+  font-size: 8.5px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+.pv-ctx-val {
+  color: var(--ink);
+  text-transform: none;
+  letter-spacing: 0.04em;
+}
+.pv-ctx-slider {
+  width: 100%;
+  margin: 7px 0 5px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+.pv-ctx-slider:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+.pv-ctx-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.pv-ctx-max {
+  font-size: 8.5px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+.pv-ctx-apply {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  padding: 4px 12px;
+  background: transparent;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  cursor: pointer;
+}
+.pv-ctx-apply:hover:not(:disabled) {
+  background: var(--accent);
+  color: var(--hud-bg, #000);
+}
+.pv-ctx-apply:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+.pv-ctx-error {
+  margin-top: 6px;
+  font-size: 8.5px;
+  letter-spacing: 0.04em;
+  color: var(--accent);
+}

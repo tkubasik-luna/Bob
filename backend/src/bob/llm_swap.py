@@ -36,6 +36,10 @@ import shutil
 from dataclasses import dataclass
 
 from bob.config import Settings
+from bob.context.policy import (
+    DEFAULT_TOKEN_BUDGET,
+    token_budget_for_context_length,
+)
 from bob.llm.factory import build_jarvis_client, build_subagent_client
 from bob.llm_client import LLMClient
 from bob.llm_selection_store import LLMSelection, LLMSelectionStore
@@ -124,13 +128,24 @@ class LLMSwitcher:
         self._subagent_holder = subagent_holder
         self._lock = asyncio.Lock()
 
-    async def swap_lm_model(self, model_id: str) -> SwapResult:
+    async def swap_lm_model(
+        self, model_id: str, context_length: int | None = None
+    ) -> SwapResult:
         """Validate-then-swap to ``model_id`` (LM Studio provider).
 
-        Blocking + serialised. On success: the target is loaded (default ctx),
-        the previous model unloaded, both role clients rebuilt + swapped, and
-        the new selection persisted. The returned :class:`SwapResult` carries
-        the persisted selection.
+        Blocking + serialised. On success: the target is loaded, the previous
+        model unloaded, both role clients rebuilt + swapped, the bounded-context
+        token budget recomputed from the loaded ctx, and the new selection
+        persisted. The returned :class:`SwapResult` carries the persisted
+        selection.
+
+        ``context_length`` (issue 0082) is the explicit ctx-slider Apply value:
+
+        - when given, the target is loaded AT that window, the value is stored
+          in the per-model ctx map, and the budget is coupled to it;
+        - when ``None``, the persisted per-model ctx (if any) is reused, else the
+          SDK applies the model's own default and the budget keeps
+          :data:`~bob.context.policy.DEFAULT_TOKEN_BUDGET`.
 
         On failure the SDK error propagates unchanged
         (:class:`~bob.lm_studio_manager.LMStudioModelNotFoundError` /
@@ -142,14 +157,19 @@ class LLMSwitcher:
 
         async with self._lock:
             current = self._selection_store.read()
-            context_length = self._resolve_context_length(current, model_id)
+            effective_ctx = (
+                context_length
+                if context_length is not None
+                else self._resolve_context_length(current, model_id)
+            )
 
             # 1. Load the target (+ unload previous). Blocking SDK call → thread.
             #    A raised error exits the lock with NO state mutation.
-            await asyncio.to_thread(self._manager.load, model_id, context_length)
+            await asyncio.to_thread(self._manager.load, model_id, effective_ctx)
 
-            # 2. Build the next selection (preserve provider + the ctx map).
-            new_selection = self._next_selection(current, model_id)
+            # 2. Build the next selection (preserve provider + the ctx map, and
+            #    pin an explicit ctx override for this model when supplied).
+            new_selection = self._next_selection(current, model_id, context_length)
 
             # 3. Rebuild + swap both role clients from the NEW selection.
             self._orchestrator.set_jarvis_client(
@@ -157,7 +177,12 @@ class LLMSwitcher:
             )
             self._subagent_holder.set(build_subagent_client(self._settings, new_selection))
 
-            # 4. Persist only after a fully successful swap.
+            # 4. Couple the bounded-context budget to the loaded ctx window.
+            self._orchestrator.set_token_budget(
+                token_budget_for_context_length(effective_ctx)
+            )
+
+            # 5. Persist only after a fully successful swap.
             self._selection_store.write(new_selection)
             return SwapResult(selection=new_selection)
 
@@ -216,7 +241,22 @@ class LLMSwitcher:
             )
             self._subagent_holder.set(build_subagent_client(self._settings, new_selection))
 
-            # 4. Persist only after a fully successful swap.
+            # 4. Recouple the bounded-context budget. Claude CLI has no ctx
+            #    control → reset to the conservative default; LM Studio couples
+            #    to the pinned model's persisted ctx (None → default too).
+            if provider == "lm_studio":
+                pinned_ctx = (
+                    new_selection.context_length.get(new_selection.lm_model)
+                    if new_selection.lm_model is not None
+                    else None
+                )
+                self._orchestrator.set_token_budget(
+                    token_budget_for_context_length(pinned_ctx)
+                )
+            else:
+                self._orchestrator.set_token_budget(DEFAULT_TOKEN_BUDGET)
+
+            # 5. Persist only after a fully successful swap.
             self._selection_store.write(new_selection)
             return SwapResult(selection=new_selection)
 
@@ -252,19 +292,28 @@ class LLMSwitcher:
         return current.context_length.get(model_id)
 
     @staticmethod
-    def _next_selection(current: LLMSelection | None, model_id: str) -> LLMSelection:
+    def _next_selection(
+        current: LLMSelection | None,
+        model_id: str,
+        context_length: int | None = None,
+    ) -> LLMSelection:
         """Build the selection to persist after a successful load.
 
         Keeps the active provider (``lm_studio`` here) and the existing
-        per-model context-length map; only ``lm_model`` changes.
+        per-model context-length map; only ``lm_model`` changes. When an
+        explicit ``context_length`` is supplied (issue 0082 ctx-slider Apply) it
+        is pinned for this model in the map so returning to the model reapplies
+        it; ``None`` leaves any prior per-model value untouched.
         """
 
         provider = current.provider if current is not None else "lm_studio"
-        context_length = dict(current.context_length) if current is not None else {}
+        ctx_map = dict(current.context_length) if current is not None else {}
+        if context_length is not None:
+            ctx_map[model_id] = context_length
         return LLMSelection(
             provider=provider,
             lm_model=model_id,
-            context_length=context_length,
+            context_length=ctx_map,
         )
 
 

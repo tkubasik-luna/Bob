@@ -47,6 +47,32 @@ DEFAULT_RECENT_TURNS_WINDOW = 3
 #: the long-session smoke test plateaus around turn 30 with K=3.
 DEFAULT_TOKEN_BUDGET = 2048
 
+#: Tokens reserved out of the model's context window for everything the
+#: bounded prompt budget does NOT account for (issue 0082): ≈4096 for the
+#: generation, plus ≈2k for tools / system framing / safety headroom. The
+#: coupled budget (:func:`token_budget_for_context_length`) is the context
+#: window minus this reserve, floored at :data:`DEFAULT_TOKEN_BUDGET`.
+CONTEXT_LENGTH_RESERVE = 6000
+
+
+def token_budget_for_context_length(context_length: int | None) -> int:
+    """Couple the bounded-context token budget to the loaded context window.
+
+    Issue 0082: on LM Studio the chosen context length DRIVES the budget so a
+    big window actually buys more visible history. The formula is::
+
+        token_budget = max(DEFAULT_TOKEN_BUDGET, context_length - RESERVE)
+
+    where ``RESERVE`` is :data:`CONTEXT_LENGTH_RESERVE`. A ``None`` context
+    length (model default unknown, or Claude CLI which has no ctx control)
+    keeps the conservative :data:`DEFAULT_TOKEN_BUDGET`. The floor guarantees
+    a tiny window never starves the prompt below the legacy default.
+    """
+
+    if context_length is None:
+        return DEFAULT_TOKEN_BUDGET
+    return max(DEFAULT_TOKEN_BUDGET, context_length - CONTEXT_LENGTH_RESERVE)
+
 
 @dataclass(frozen=True)
 class ContextPolicy:

@@ -87,20 +87,31 @@ export class LlmModelSwapError extends Error {
 
 /** Change the active LM Studio model — synchronous + BLOCKING (PRD 0012 / 0080).
  *
- * The backend validate-then-swaps: it loads the target model (default ctx),
- * unloads the previous one, swaps the LM client for both orchestrator roles,
- * then persists the JSON. This can take a while (model load), so callers show a
- * loading state while it is in flight. The generous timeout lives server-side.
+ * The backend validate-then-swaps: it loads the target model, unloads the
+ * previous one, swaps the LM client for both orchestrator roles, then persists
+ * the JSON. This can take a while (model load), so callers show a loading state
+ * while it is in flight. The generous timeout lives server-side.
+ *
+ * `contextLength` (issue 0082) is the optional ctx-slider Apply value: when
+ * given the model is loaded AT that window, the value is pinned per-model in the
+ * selection JSON, and the bounded-context token budget couples to it. Omitting
+ * it reuses any persisted per-model ctx, else the model default.
  *
  * On failure the backend keeps the previous selection and returns a structured
  * error body; we throw {@link LlmModelSwapError} so the caller stays on the
  * previous model and shows the detail. On success the returned
  * {@link LlmSelection} reflects the new pinned model. */
-export async function putLlmModel(lmModel: string, signal?: AbortSignal): Promise<LlmSelection> {
+export async function putLlmModel(
+  lmModel: string,
+  contextLength?: number,
+  signal?: AbortSignal,
+): Promise<LlmSelection> {
+  const body: { lm_model: string; context_length?: number } = { lm_model: lmModel };
+  if (contextLength !== undefined) body.context_length = contextLength;
   const res = await fetch(`${API_BASE_URL}/api/llm/selection`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ lm_model: lmModel }),
+    body: JSON.stringify(body),
     signal,
   });
   if (!res.ok) {

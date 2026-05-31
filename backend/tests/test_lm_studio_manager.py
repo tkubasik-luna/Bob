@@ -345,10 +345,12 @@ class _FakeSwitcher:
     def __init__(self, *, result: object = None, error: Exception | None = None) -> None:
         self._result = result
         self._error = error
-        self.calls: list[str] = []
+        self.calls: list[tuple[str, int | None]] = []
 
-    async def swap_lm_model(self, model_id: str) -> object:
-        self.calls.append(model_id)
+    async def swap_lm_model(
+        self, model_id: str, context_length: int | None = None
+    ) -> object:
+        self.calls.append((model_id, context_length))
         if self._error is not None:
             raise self._error
         return self._result
@@ -376,7 +378,7 @@ def test_put_selection_success_returns_new_selection() -> None:
         llm_router.reset_settings_provider()
 
     assert response.status_code == 200
-    assert switcher.calls == ["target-model"]
+    assert switcher.calls == [("target-model", None)]
     body = response.json()
     # ``claude_model`` (issue 0081) is now part of the response shape; the
     # model-swap fields are unchanged.

@@ -88,6 +88,7 @@ from bob.context.policy import (
     LEGACY_FULL_HISTORY_POLICY_ID,
     ContextPolicy,
     bounded_v2_policy,
+    parse_policy_overrides,
 )
 from bob.context.prompt_fragments import (
     ASK_USER_PARAPHRASE_TEMPLATE,
@@ -1045,6 +1046,27 @@ class Orchestrator:
         """
 
         self._jarvis_client = client
+
+    def set_token_budget(self, token_budget: int) -> None:
+        """Rebuild the active context policy with a new prompt ``token_budget``.
+
+        Issue 0082: the bounded-context budget is coupled to the loaded LM
+        Studio context window (see
+        :func:`bob.context.policy.token_budget_for_context_length`). The swap
+        coordinator (:mod:`bob.llm_swap`) calls this under its ``asyncio.Lock``
+        on a model load / ctx-Apply (LM Studio) and on a provider swap (reset to
+        :data:`~bob.context.policy.DEFAULT_TOKEN_BUDGET` for Claude CLI).
+
+        Non-interruptive like :meth:`set_jarvis_client`: the assembler reads
+        ``self._context_policy`` per turn, so an in-flight turn finishes on the
+        previous policy and the next picks up the rebuilt one. Only the
+        ``token_budget`` field changes; provider order / window / ids are kept.
+        """
+
+        self._context_policy = parse_policy_overrides(
+            token_budget=token_budget,
+            base=self._context_policy,
+        )
 
     def set_addendum_queue_factory(
         self,

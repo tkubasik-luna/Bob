@@ -72,13 +72,17 @@ class _FakeManager:
 
 
 class _OrchestratorSpy:
-    """Captures the Jarvis client the switcher pushes."""
+    """Captures the Jarvis client + token budget the switcher pushes."""
 
     def __init__(self, client: LLMClient) -> None:
         self.jarvis_client = client
+        self.token_budget: int | None = None
 
     def set_jarvis_client(self, client: LLMClient) -> None:
         self.jarvis_client = client
+
+    def set_token_budget(self, token_budget: int) -> None:
+        self.token_budget = token_budget
 
 
 def _switcher(
@@ -229,6 +233,102 @@ async def test_lock_serialises_concurrent_swaps(tmp_path: Path) -> None:
     final = store.read()
     assert final is not None
     assert final.lm_model in {"model-a", "model-b"}
+
+
+# --- context-length override + budget coupling (issue 0082) ------------------
+
+
+@pytest.mark.asyncio
+async def test_swap_with_explicit_ctx_loads_at_ctx_persists_and_couples_budget(
+    tmp_path: Path,
+) -> None:
+    """An explicit ctx Apply loads at that window, pins it per-model, couples budget."""
+
+    manager = _FakeManager()
+    initial = LLMSelection(provider="lm_studio", lm_model="boot-model", context_length={})
+    switcher, orch, _holder, store = _switcher(tmp_path, manager=manager, initial=initial)
+
+    await switcher.swap_lm_model("target-model", 32768)
+
+    # Loaded AT the explicit ctx (not the model default).
+    assert manager.loads == [("target-model", 32768)]
+    # Pinned per-model in the JSON for reapply on return.
+    persisted = store.read()
+    assert persisted is not None
+    assert persisted.context_length == {"target-model": 32768}
+    # Budget coupled: max(2048, 32768 - 6000) = 26768.
+    assert orch.token_budget == 26768
+
+
+@pytest.mark.asyncio
+async def test_swap_without_ctx_reuses_persisted_per_model_ctx(tmp_path: Path) -> None:
+    """No explicit ctx → the persisted per-model value drives load + budget."""
+
+    manager = _FakeManager()
+    initial = LLMSelection(
+        provider="lm_studio",
+        lm_model="boot-model",
+        context_length={"target-model": 16384},
+    )
+    switcher, orch, _holder, _store = _switcher(tmp_path, manager=manager, initial=initial)
+
+    await switcher.swap_lm_model("target-model")
+
+    assert manager.loads == [("target-model", 16384)]
+    # max(2048, 16384 - 6000) = 10384.
+    assert orch.token_budget == 10384
+
+
+@pytest.mark.asyncio
+async def test_swap_without_any_ctx_keeps_default_budget(tmp_path: Path) -> None:
+    """No explicit ctx and no persisted ctx → model default load, default budget."""
+
+    manager = _FakeManager()
+    initial = LLMSelection(provider="lm_studio", lm_model="boot-model", context_length={})
+    switcher, orch, _holder, _store = _switcher(tmp_path, manager=manager, initial=initial)
+
+    await switcher.swap_lm_model("target-model")
+
+    assert manager.loads == [("target-model", None)]
+    assert orch.token_budget == 2048  # DEFAULT_TOKEN_BUDGET
+
+
+@pytest.mark.asyncio
+async def test_swap_to_claude_resets_budget_to_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Switching to Claude CLI (no ctx control) resets the budget to the default."""
+
+    monkeypatch.setattr("bob.llm_swap.shutil.which", lambda _bin: "/usr/local/bin/claude")
+    manager = _FakeManager()
+    initial = LLMSelection(
+        provider="lm_studio",
+        lm_model="boot-model",
+        context_length={"boot-model": 32768},
+    )
+    switcher, orch, _holder, _store = _switcher(tmp_path, manager=manager, initial=initial)
+
+    await switcher.swap_provider("claude_cli")
+
+    assert orch.token_budget == 2048  # DEFAULT_TOKEN_BUDGET
+
+
+@pytest.mark.asyncio
+async def test_swap_to_lm_studio_couples_budget_to_pinned_ctx(tmp_path: Path) -> None:
+    """Switching to LM Studio couples the budget to the pinned model's ctx."""
+
+    manager = _FakeManager()
+    initial = LLMSelection(
+        provider="claude_cli",
+        lm_model="boot-model",
+        context_length={"boot-model": 16384},
+    )
+    switcher, orch, _holder, _store = _switcher(tmp_path, manager=manager, initial=initial)
+
+    await switcher.swap_provider("lm_studio")
+
+    # max(2048, 16384 - 6000) = 10384.
+    assert orch.token_budget == 10384
 
 
 # --- provider swap (issue 0081) ----------------------------------------------
