@@ -1,5 +1,6 @@
 import { type MouseEvent, useState } from "react";
 import type { Task, TaskState } from "../types/ws";
+import { AgentBlock } from "./AgentBlock";
 
 type Props = {
   task: Task;
@@ -80,58 +81,63 @@ export function TaskCard({ task, onOpen, onDismiss, onCancel }: Props) {
       : undefined;
 
   return (
-    <button
-      type="button"
-      onClick={() => onOpen?.(task)}
-      disabled={optimisticCancel}
-      title={failureTooltip}
-      className={`group flex w-full items-center gap-3 rounded-md border border-neutral-800 bg-neutral-900 px-3 py-2 text-left transition-colors hover:border-neutral-700 hover:bg-neutral-800 ${
-        optimisticCancel ? "cursor-wait opacity-60" : ""
-      }`}
-    >
-      <span
-        aria-label={STATE_LABEL[task.state]}
-        title={STATE_LABEL[task.state]}
-        className={`block h-2.5 w-2.5 flex-none rounded-full ${STATE_DOT_CLASSES[task.state]}`}
-      />
-      <span className="flex min-w-0 flex-1 flex-col">
-        <span className="truncate text-sm text-neutral-100">{task.title}</span>
-        {task.state === "pending" && (
-          <span className="truncate text-xs text-neutral-500">En attente</span>
-        )}
-        {/* Slice #0022 — live progress status from the sub-agent. Only
+    <div className="flex w-full flex-col">
+      <button
+        type="button"
+        onClick={() => onOpen?.(task)}
+        disabled={optimisticCancel}
+        title={failureTooltip}
+        className={`group flex w-full items-center gap-3 rounded-md border border-neutral-800 bg-neutral-900 px-3 py-2 text-left transition-colors hover:border-neutral-700 hover:bg-neutral-800 ${
+          optimisticCancel ? "cursor-wait opacity-60" : ""
+        }`}
+      >
+        <span
+          aria-label={STATE_LABEL[task.state]}
+          title={STATE_LABEL[task.state]}
+          className={`block h-2.5 w-2.5 flex-none rounded-full ${STATE_DOT_CLASSES[task.state]}`}
+        />
+        <span className="flex min-w-0 flex-1 flex-col">
+          <span className="truncate text-sm text-neutral-100">{task.title}</span>
+          {task.state === "pending" && (
+            <span className="truncate text-xs text-neutral-500">En attente</span>
+          )}
+          {/* Slice #0022 — live progress status from the sub-agent. Only
             rendered while the task is actually running; the store clears
             the field on any other transition so we never show a stale
             line under a `done` / `failed` card. */}
-        {task.state === "running" && task.progressStatus && (
-          <span className="truncate text-xs text-zinc-500 italic">{task.progressStatus}</span>
+          {task.state === "running" && task.progressStatus && (
+            <span className="truncate text-xs text-zinc-500 italic">{task.progressStatus}</span>
+          )}
+        </span>
+        <span className="flex-none text-xs text-neutral-500 tabular-nums">{time}</span>
+        {!isTerminal && onCancel && (
+          <button
+            type="button"
+            onClick={handleCancel}
+            disabled={optimisticCancel}
+            aria-label={`Annuler la tâche ${task.title}`}
+            title="Annuler la tâche"
+            className="flex h-6 w-6 flex-none items-center justify-center rounded text-neutral-500 opacity-0 transition-opacity hover:bg-red-700/40 hover:text-red-200 group-hover:opacity-100 focus:opacity-100 disabled:cursor-wait disabled:opacity-50"
+          >
+            <CancelIcon />
+          </button>
         )}
-      </span>
-      <span className="flex-none text-xs text-neutral-500 tabular-nums">{time}</span>
-      {!isTerminal && onCancel && (
-        <button
-          type="button"
-          onClick={handleCancel}
-          disabled={optimisticCancel}
-          aria-label={`Annuler la tâche ${task.title}`}
-          title="Annuler la tâche"
-          className="flex h-6 w-6 flex-none items-center justify-center rounded text-neutral-500 opacity-0 transition-opacity hover:bg-red-700/40 hover:text-red-200 group-hover:opacity-100 focus:opacity-100 disabled:cursor-wait disabled:opacity-50"
-        >
-          <CancelIcon />
-        </button>
-      )}
-      {isTerminal && onDismiss && (
-        <button
-          type="button"
-          onClick={handleDismiss}
-          aria-label={`Masquer la tâche ${task.title}`}
-          title="Masquer (sans supprimer l'historique)"
-          className="flex h-6 w-6 flex-none items-center justify-center rounded text-neutral-500 opacity-0 transition-opacity hover:bg-neutral-700 hover:text-neutral-200 group-hover:opacity-100 focus:opacity-100"
-        >
-          <EyeOffIcon />
-        </button>
-      )}
-    </button>
+        {isTerminal && onDismiss && (
+          <button
+            type="button"
+            onClick={handleDismiss}
+            aria-label={`Masquer la tâche ${task.title}`}
+            title="Masquer (sans supprimer l'historique)"
+            className="flex h-6 w-6 flex-none items-center justify-center rounded text-neutral-500 opacity-0 transition-opacity hover:bg-neutral-700 hover:text-neutral-200 group-hover:opacity-100 focus:opacity-100"
+          >
+            <EyeOffIcon />
+          </button>
+        )}
+      </button>
+      {/* PRD 0011 / issue 0069 — live streaming reasoning for a running
+          sub-task. Renders nothing until the first `reasoning_delta` lands. */}
+      {task.state === "running" && <AgentBlock agentRef={task.id} />}
+    </div>
   );
 }
 

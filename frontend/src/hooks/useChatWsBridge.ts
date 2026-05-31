@@ -5,6 +5,7 @@ import {
   subscribeSpeaking,
 } from "../audio/audioPlayer";
 import { WS_URL } from "../config";
+import { useActivityFeedStore } from "../store/activityFeedStore";
 import { useChatStore } from "../store/chatStore";
 import type { ClientMessage, ConnectionStatus, ServerMessage } from "../types/ws";
 import { useVoiceMode } from "./useVoiceMode";
@@ -46,6 +47,7 @@ export function useChatWsBridge(): UseChatWsBridgeResult {
   const appendSpeechDelta = useChatStore((s) => s.appendSpeechDelta);
   const setStreamingUi = useChatStore((s) => s.setStreamingUi);
   const clearStreamingAssistant = useChatStore((s) => s.clearStreamingAssistant);
+  const appendReasoningDelta = useActivityFeedStore((s) => s.appendReasoningDelta);
 
   // Bridge audioPlayer → store so `Bubble` can render the wave indicator
   // on the exact bubble currently being voiced. Cleared on natural end
@@ -162,6 +164,11 @@ export function useChatWsBridge(): UseChatWsBridgeResult {
         case "task_message":
           appendTaskMessage(msg);
           break;
+        case "reasoning_delta":
+          // PRD 0011 / issue 0069 — live reasoning of a running sub-task.
+          // Accumulated per `agent_ref` so `AgentBlock` renders it streaming.
+          appendReasoningDelta(msg);
+          break;
       }
     },
     [
@@ -179,6 +186,7 @@ export function useChatWsBridge(): UseChatWsBridgeResult {
       appendSpeechDelta,
       setStreamingUi,
       clearStreamingAssistant,
+      appendReasoningDelta,
     ],
   );
 

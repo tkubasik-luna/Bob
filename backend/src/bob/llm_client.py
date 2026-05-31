@@ -260,6 +260,42 @@ class LLMClient(ABC):
         response = await self.complete(messages, tools=tools, session_id=session_id)
         return self._fallback_stream(response)
 
+    async def stream_chat(
+        self,
+        messages: list[dict[str, Any]],
+        schema: dict[str, Any] | None = None,
+        session_id: str | None = None,
+    ) -> AsyncIterator[StreamChunk]:
+        """Streaming counterpart to :meth:`chat` (PRD 0011 / issue 0069).
+
+        Streams a guided-JSON (``schema``) or plain chat completion and yields
+        :class:`StreamChunk`s. The aggregated ``text`` chunks reconstruct the
+        SAME string :meth:`chat` would have returned (the sub-agent then parses
+        its action from that aggregate — guided-JSON intact). ``reasoning``
+        chunks carry the model's chain-of-thought for the cosmetic live feed and
+        never participate in action parsing.
+
+        Default implementation runs the non-streaming :meth:`chat` and replays
+        the whole response as a single ``text`` chunk, so providers without
+        native streaming (Claude CLI) satisfy the contract with no reasoning
+        chunks (degraded mode). :class:`LMStudioClient` overrides it to drive a
+        real ``stream=True`` request and surface ``delta.reasoning_content``.
+        """
+
+        raw = await self.chat(messages, schema=schema, session_id=session_id)
+        return self._fallback_chat_stream(raw)
+
+    @staticmethod
+    async def _fallback_chat_stream(raw: str) -> AsyncIterator[StreamChunk]:
+        """Replay a non-streamed ``chat`` reply as one ``text`` chunk.
+
+        No ``reasoning`` chunk is emitted — the absence is exactly the
+        degraded-mode signal :class:`ReasoningStreamReader` exposes (issue 0069).
+        """
+
+        if raw:
+            yield StreamChunk(kind="text", text_delta=raw)
+
     @staticmethod
     async def _fallback_stream(response: LLMResponse) -> AsyncIterator[StreamChunk]:
         """Synthesise a chunk sequence for providers without native streaming.
@@ -492,6 +528,166 @@ class LMStudioClient(LLMClient):
         )
 
         return raw
+
+    async def stream_chat(
+        self,
+        messages: list[dict[str, Any]],
+        schema: dict[str, Any] | None = None,
+        session_id: str | None = None,
+    ) -> AsyncIterator[StreamChunk]:
+        """Streaming guided-JSON ``chat`` (PRD 0011 / issue 0069).
+
+        Drives a ``stream=True`` request mirroring :meth:`chat` (same
+        ``response_format`` when ``schema`` is set, same validator-role fold)
+        and yields ``text`` + ``reasoning`` :class:`StreamChunk`s tick by tick.
+        Concatenating the ``text`` deltas reconstructs exactly what :meth:`chat`
+        would have returned, so the sub-agent's guided-JSON action parse is
+        byte-for-byte unchanged. ``reasoning`` chunks (from
+        ``delta.reasoning_content``) are cosmetic — fed to the activity feed,
+        never to parsing.
+        """
+
+        messages = _normalise_validator_role(messages, allow_arbitrary_roles=False)
+        _assert_standard_roles(messages)
+        kwargs: dict[str, Any] = {
+            "model": self._settings.LLM_MODEL,
+            "messages": messages,
+            "timeout": self._settings.LLM_TIMEOUT_SECONDS,
+            "max_tokens": 4096,
+            "stream": True,
+        }
+        if schema is not None:
+            kwargs["response_format"] = {
+                "type": "json_schema",
+                "json_schema": schema,
+            }
+
+        correlation_id = uuid4().hex
+        token_estimate = _estimate_tokens(messages)
+        emit_debug(
+            category="llm",
+            severity="info",
+            source="bob.llm_client.stream_chat",
+            summary=(
+                f"LLM chat stream démarré ({token_estimate} tokens prompt, "
+                f"model={self._settings.LLM_MODEL})"
+            ),
+            payload={
+                "messages": messages,
+                "model": self._settings.LLM_MODEL,
+                "tokens_prompt_estimate": token_estimate,
+                "has_schema": schema is not None,
+                "session_id": session_id,
+                "streaming": True,
+            },
+            correlation_id=correlation_id,
+        )
+
+        started = time.perf_counter()
+        try:
+            stream = await self._client.chat.completions.create(**kwargs)
+        except Exception as exc:
+            latency_ms = (time.perf_counter() - started) * 1000.0
+            emit_debug(
+                category="llm",
+                severity="error",
+                source="bob.llm_client.stream_chat",
+                summary=f"LLM chat stream échoué en {latency_ms:.0f}ms: {exc}",
+                payload={
+                    "model": self._settings.LLM_MODEL,
+                    "latency_ms": latency_ms,
+                    "exception": str(exc),
+                    "exception_type": exc.__class__.__name__,
+                    "traceback": traceback.format_exc(),
+                    "session_id": session_id,
+                },
+                correlation_id=correlation_id,
+            )
+            raise
+
+        return self._consume_chat_stream(
+            stream,
+            session_id=session_id,
+            correlation_id=correlation_id,
+            messages=messages,
+            started=started,
+        )
+
+    async def _consume_chat_stream(
+        self,
+        stream: Any,
+        *,
+        session_id: str | None,
+        correlation_id: str,
+        messages: list[dict[str, Any]],
+        started: float,
+    ) -> AsyncIterator[StreamChunk]:
+        """Walk the OpenAI ``AsyncStream`` for a guided-JSON ``chat`` call.
+
+        Yields ``text`` deltas (``delta.content``) and ``reasoning`` deltas
+        (``delta.reasoning_content``) as they arrive, accumulating the text for
+        the post-stream log. Reasoning content is NOT folded into the logged
+        response — it is cosmetic (issue 0069).
+        """
+
+        text_buffer = ""
+        tokens_in: int | None = None
+        tokens_out: int | None = None
+        try:
+            async for raw_chunk in stream:
+                choices = getattr(raw_chunk, "choices", None) or []
+                if not choices:
+                    usage = getattr(raw_chunk, "usage", None)
+                    if usage is not None:
+                        tokens_in = getattr(usage, "prompt_tokens", None) or tokens_in
+                        tokens_out = getattr(usage, "completion_tokens", None) or tokens_out
+                    continue
+                delta = getattr(choices[0], "delta", None)
+                if delta is None:
+                    continue
+
+                reasoning_content = getattr(delta, "reasoning_content", None) or ""
+                if isinstance(reasoning_content, str) and reasoning_content:
+                    yield StreamChunk(kind="reasoning", reasoning_delta=reasoning_content)
+
+                content = getattr(delta, "content", None) or ""
+                if isinstance(content, str) and content:
+                    text_buffer += content
+                    yield StreamChunk(kind="text", text_delta=content)
+
+                usage = getattr(raw_chunk, "usage", None)
+                if usage is not None:
+                    tokens_in = getattr(usage, "prompt_tokens", None) or tokens_in
+                    tokens_out = getattr(usage, "completion_tokens", None) or tokens_out
+        finally:
+            latency_ms = (time.perf_counter() - started) * 1000.0
+            log_llm_call(
+                session_id=session_id,
+                messages=messages,
+                raw_response=text_buffer,
+                latency_ms=latency_ms,
+                tokens_in=tokens_in,
+                tokens_out=tokens_out,
+            )
+            emit_debug(
+                category="llm",
+                severity="info",
+                source="bob.llm_client.stream_chat",
+                summary=(
+                    f"LLM chat stream terminé en {latency_ms:.0f}ms "
+                    f"({tokens_out if tokens_out is not None else '?'} tokens response)"
+                ),
+                payload={
+                    "response": text_buffer,
+                    "latency_ms": latency_ms,
+                    "tokens_in": tokens_in,
+                    "tokens_out": tokens_out,
+                    "model": self._settings.LLM_MODEL,
+                    "session_id": session_id,
+                    "streaming": True,
+                },
+                correlation_id=correlation_id,
+            )
 
     async def complete(
         self,
@@ -836,6 +1032,17 @@ class LMStudioClient(LLMClient):
                 delta = getattr(choice, "delta", None)
                 if delta is None:
                     continue
+
+                # Reasoning-mode delta (PRD 0011 / issue 0069) — a
+                # reasoning-capable model surfaces its chain-of-thought under
+                # ``delta.reasoning_content`` on OpenAI-compatible endpoints.
+                # This is COSMETIC: it feeds the live agent-activity feed and
+                # is deliberately NOT folded into ``text_buffer`` / the action
+                # parse. Endpoints without a reasoning channel simply never set
+                # the field, so this is a no-op there (degraded mode).
+                reasoning_content = getattr(delta, "reasoning_content", None) or ""
+                if isinstance(reasoning_content, str) and reasoning_content:
+                    yield StreamChunk(kind="reasoning", reasoning_delta=reasoning_content)
 
                 # Text-mode delta — uncommon under the unified ``say``
                 # tool, supported for robustness.

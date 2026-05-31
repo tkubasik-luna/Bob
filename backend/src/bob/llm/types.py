@@ -63,8 +63,10 @@ class LLMResponse:
 
 
 #: Kind discriminator for :class:`StreamChunk`. See the class docstring
-#: for the four supported phases.
-StreamChunkKind = Literal["tool_call_start", "tool_call_args_delta", "tool_call_end", "text"]
+#: for the supported phases.
+StreamChunkKind = Literal[
+    "tool_call_start", "tool_call_args_delta", "tool_call_end", "text", "reasoning"
+]
 
 
 @dataclass(frozen=True)
@@ -91,8 +93,17 @@ class StreamChunk:
       is rare under the unified ``say`` tool but supported for
       robustness (the orchestrator's retry path treats it as a
       contract violation and re-prompts).
+    - ``reasoning`` — emitted when the provider surfaces the model's
+      chain-of-thought as ``delta.reasoning_content`` (reasoning-capable
+      models on OpenAI-compatible endpoints, e.g. LM Studio).
+      ``reasoning_delta`` carries the latest reasoning suffix. This is a
+      purely COSMETIC channel (PRD 0011 / issue 0069): it feeds the live
+      agent-activity feed and never participates in tool-call / text
+      action parsing — the action is always parsed from the aggregated
+      ``content`` (the ``text`` / ``tool_call_*`` chunks), never from the
+      reasoning stream.
 
-    The discriminator design avoids a six-field union with mostly-None
+    The discriminator design avoids a seven-field union with mostly-None
     members. Call sites pattern-match on ``kind`` and read only the
     fields meaningful for that kind.
     """
@@ -112,3 +123,7 @@ class StreamChunk:
     #: Set on ``text``. The latest text suffix, not the accumulated
     #: buffer.
     text_delta: str = ""
+    #: Set on ``reasoning``. The latest reasoning-content suffix
+    #: (``delta.reasoning_content``), not the accumulated buffer. Cosmetic
+    #: — never feeds action parsing (PRD 0011 / issue 0069).
+    reasoning_delta: str = ""

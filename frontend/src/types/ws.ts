@@ -332,8 +332,27 @@ export type TaskMessageMsg = {
   created_at: string;
 };
 
+/** PRD 0011 / issue 0069 — a live chunk of a running sub-agent's reasoning
+ * (chain-of-thought). Emitted on the chat WS per reasoning delta during a
+ * sub-task run, tagged by `agent_ref` (the sub-task's `task_id`). The frontend
+ * `activityFeedStore` accumulates `delta` into a per-agent reasoning buffer so
+ * the `AgentBlock` can render the streaming reasoning text token-by-token.
+ *
+ * Purely COSMETIC: the sub-agent's action is always parsed server-side from the
+ * aggregated content, never from this stream. A model / endpoint without a
+ * reasoning channel simply never emits this event (degraded mode). */
+export type ReasoningDeltaMsg = {
+  type: "reasoning_delta";
+  /** The running sub-task's `task_id`. */
+  agent_ref: string;
+  /** Newly-visible suffix of the reasoning stream, NOT the accumulated
+   * buffer. The consumer concatenates. */
+  delta: string;
+};
+
 export type ServerMessage =
   | SessionMsg
+  | ReasoningDeltaMsg
   | AssistantMsg
   | SpeechDeltaMsg
   | UiPayloadMsg

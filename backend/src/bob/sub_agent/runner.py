@@ -103,6 +103,7 @@ from bob.context.prompt_fragments import (
     SUB_AGENT_V2_ADDENDUM_TEMPLATE,
     SUB_AGENT_V2_SYSTEM_PROMPT,
     select_skill_packs,
+    temporal_context_fragment,
 )
 from bob.debug_log import current_task_id, emit_debug, start_task
 from bob.event_bus import EventBus, get_event_bus
@@ -119,6 +120,7 @@ from bob.sub_agent.actions import (
 )
 from bob.sub_agent.addendum_queue import AddendumEntry, AddendumQueue
 from bob.sub_agent.policy import SubAgentPolicy, default_policy
+from bob.sub_agent.reasoning_stream import ReasoningStreamReader
 from bob.sub_agent.result_store import StoredResult, ToolResultStore
 from bob.sub_agent.tool_registry import (
     SubAgentToolArgsValidationError,
@@ -1020,18 +1022,20 @@ class SubAgentRunner:
                 messages = [*messages, *validator_feedback]
 
             try:
-                # Issue 0060 — pass the derived envelope schema ONLY on a
-                # guided backend (``self._envelope_schema`` is ``None``
-                # otherwise). On LM Studio this becomes a ``response_format``
-                # json_schema so the reply is clean ``{"action": …}`` JSON and
-                # the ``_normalise_payload`` fence/prose tolerance below is
-                # never the failure mode; on Claude CLI ``schema`` stays unset
-                # and the path is byte-for-byte unchanged.
-                raw = await self._client.chat(
-                    messages,
-                    schema=self._envelope_schema,
-                    session_id=task_id,
-                )
+                # PRD 0011 / issue 0069 — stream the per-iteration call so the
+                # model's reasoning surfaces live in the agent-activity feed
+                # while the call runs. CRITICAL INVARIANT: the action is STILL
+                # parsed from the final aggregated content below (guided-JSON
+                # intact) — reasoning is cosmetic, zero correctness impact. The
+                # envelope schema is still passed ONLY on a guided backend
+                # (``self._envelope_schema`` is ``None`` otherwise), as a
+                # ``response_format`` json_schema, exactly as the non-streaming
+                # ``chat`` path did (issue 0060). On a backend whose
+                # ``stream_chat`` has no native streaming (Claude CLI) the
+                # base-class fallback replays ``chat`` as one text chunk — the
+                # path stays byte-for-byte equivalent and degraded mode (no
+                # reasoning channel) is reachable.
+                raw = await self._stream_iteration(task_id, messages)
             except asyncio.CancelledError:
                 # Hard-kill from the scheduler. Mark the path so the
                 # terminal ``done`` records ``hard_killed``. Then convert
@@ -1500,6 +1504,10 @@ class SubAgentRunner:
 
         tool_catalogue = _render_tool_catalogue(self._tool_registry)
         system_prompt = SUB_AGENT_V2_SYSTEM_PROMPT.render(goal=task.goal)
+        # Inject the current date so date-typed tool args (e.g. gmail_search
+        # ``after`` / ``before``) get the right year — local models otherwise
+        # hallucinate a stale one and the query builder rejects it.
+        system_prompt += "\n\n" + temporal_context_fragment()
         # Issue 0063: append any goal-matching skill packs (the Gmail recipe
         # today) so the base contract stays tool-agnostic and a non-matching
         # goal never pays for an irrelevant recipe's tokens.
@@ -1529,6 +1537,41 @@ class SubAgentRunner:
             )
 
         return messages
+
+    async def _stream_iteration(
+        self, task_id: str, messages: list[dict[str, Any]]
+    ) -> str:
+        """Stream one per-iteration LLM call, surfacing reasoning live.
+
+        PRD 0011 / issue 0069. Drives :meth:`bob.llm_client.LLMClient.stream_chat`
+        through a :class:`ReasoningStreamReader` so reasoning deltas are emitted
+        on the chat WS as ``reasoning_delta`` events (tagged by ``agent_ref`` =
+        ``task_id``) as they arrive, while the action-bearing content is
+        aggregated and returned for the SAME guided-JSON parse the non-streaming
+        ``chat`` path used. Reasoning is cosmetic: it never touches the returned
+        string, so action parsing / validation / retry behaviour is unchanged.
+
+        ``asyncio.CancelledError`` (the scheduler's hard-kill) propagates out so
+        the caller's existing handler records ``hard_killed`` — mirroring the
+        old ``chat`` await.
+        """
+
+        reader = ReasoningStreamReader(
+            await self._client.stream_chat(
+                messages,
+                schema=self._envelope_schema,
+                session_id=task_id,
+            )
+        )
+        async for delta in reader.reasoning_deltas():
+            await ws_events.emit(
+                {
+                    "type": "reasoning_delta",
+                    "agent_ref": task_id,
+                    "delta": delta,
+                }
+            )
+        return reader.content
 
     # --- Action handlers -----------------------------------------------------
 

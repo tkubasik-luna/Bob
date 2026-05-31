@@ -868,8 +868,8 @@ async def test_prompt_injects_tool_arg_schema() -> None:
     # Every real gmail_search field name is now visible to the model.
     for field_name in GmailSearchArgs.model_fields:
         assert field_name in system_prompt
-    # Constraints survive too (max_results is clamped 1..5).
-    assert '"maximum": 5' in system_prompt
+    # Constraints survive too (max_results has a floor of 1, no upper cap).
+    assert '"minimum": 1' in system_prompt
 
 
 @pytest.mark.asyncio
@@ -2982,7 +2982,7 @@ def test_p6_base_prompt_teaches_result_ref_without_naming_a_tool() -> None:
 
     rendered = SUB_AGENT_V2_SYSTEM_PROMPT.render(goal="dummy")
     assert "result_ref" in rendered
-    assert "outil#1" in rendered  # generic example
+    assert "tool#1" in rendered  # generic example
     # Stays tool-agnostic — no specific tool leaks into the base contract.
     assert "gmail_search" not in rendered
 
