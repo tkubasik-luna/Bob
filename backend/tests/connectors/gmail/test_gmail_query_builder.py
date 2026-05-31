@@ -42,6 +42,15 @@ def test_before_accepts_date_object() -> None:
     assert build_query(before=date(2025, 6, 1)) == "before:2025/06/01"
 
 
+def test_after_tolerates_iso_datetime_with_zulu() -> None:
+    # Local models routinely append a time + Z; Gmail's after: is date-only.
+    assert build_query(after="2026-05-30T00:00:00Z") == "after:2026/05/30"
+
+
+def test_after_tolerates_space_separated_time() -> None:
+    assert build_query(after="2026-05-30 09:30") == "after:2026/05/30"
+
+
 def test_after_rejects_garbage_string() -> None:
     with pytest.raises(QueryBuilderError, match="after"):
         build_query(after="not-a-date")

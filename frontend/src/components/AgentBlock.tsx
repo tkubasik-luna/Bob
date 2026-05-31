@@ -1,227 +1,304 @@
 import { useCallback, useLayoutEffect, useRef, useState } from "react";
+import { type AgentPhase, PHASE_META, deriveAgentPhase } from "../lib/agentPhase";
 import { isAtBottom, shouldAutoScroll } from "../lib/autoScroll";
-import { type AgentTimelineItem, useActivityFeedStore } from "../store/activityFeedStore";
+import {
+  type AgentPerf,
+  type AgentTimelineItem,
+  useActivityFeedStore,
+} from "../store/activityFeedStore";
+import { useChatStore } from "../store/chatStore";
 import type { AgentActivityStatus } from "../types/ws";
+import { MarkdownView } from "./MarkdownView";
 
 type Props = {
-  /** The running sub-task's id — matches the `agent_ref` on `reasoning_delta`
-   * and `agent_activity` events. */
+  /** The running sub-task's id — matches the `agent_ref` on `reasoning_delta`,
+   * `agent_activity` and `agent_perf` events. `"jarvis"` for the orchestrator. */
   agentRef: string;
-  /** Issue 0074 — collapsed-summary affordances. The mount context (TaskCard)
-   * owns the task, so the summary's TITLE and the RESULT open path are passed
-   * in rather than duplicated in the store. */
+  /** Issue 0074 — collapsed-summary title (the sub-task's title; Jarvis has none). */
   title?: string;
-  /** Issue 0074 — true when the task has a result the "résultat" button can
-   * surface. When false the button is hidden (e.g. a bare failure). */
+  /** Issue 0074 — true when the task has a result the "résultat" button surfaces. */
   hasResult?: boolean;
-  /** Issue 0074 — open the EXISTING result view for this agent's task. Wired by
-   * TaskCard to the very same `onOpen(task)` → `openTask(id)` path the card body
-   * click uses, which opens the TaskDrawer (Objectif / Résultat / Historique).
-   * Reuses the existing open path — does NOT reimplement any overlay. */
+  /** Issue 0074 — open the EXISTING result view (TaskDrawer / SectionsOverlay). */
   onOpenResult?: () => void;
 };
 
-/** Minimal status → glyph + colour mapping for a chip. Kept tiny and
- * dependency-free (no icon library) — the chip is observability, not chrome. */
-const STATUS_STYLE: Record<AgentActivityStatus, { glyph: string; className: string }> = {
-  running: { glyph: "◌", className: "border-blue-700/50 bg-blue-900/30 text-blue-200/90" },
-  ok: { glyph: "✓", className: "border-emerald-700/50 bg-emerald-900/30 text-emerald-200/90" },
-  error: { glyph: "✕", className: "border-rose-700/50 bg-rose-900/30 text-rose-200/90" },
-  warn: { glyph: "▲", className: "border-amber-700/50 bg-amber-900/30 text-amber-200/90" },
-  info: { glyph: "•", className: "border-slate-600/50 bg-slate-800/40 text-slate-300/90" },
-};
+const JARVIS_REF = "jarvis";
 
-/** Issue 0074 — terminal-state badge for the collapsed summary. Only the two
- * terminal `TaskState`s reach here (the bridge marks finished on done / failed,
- * collapsing degraded / timeout / force-terminate onto `failed`). */
-const FINAL_BADGE: Record<"done" | "failed", { label: string; className: string }> = {
-  done: {
-    label: "Terminée",
-    className: "border-emerald-700/50 bg-emerald-900/30 text-emerald-200",
-  },
-  failed: { label: "Échec", className: "border-rose-700/50 bg-rose-900/30 text-rose-200" },
+/** A stable lane tint for a sub-agent, derived from its id so the same agent
+ * keeps its colour across renders. Jarvis uses the secondary accent. */
+const SUB_TINTS = ["#82a4ae", "#8fa585", "#c2a06a", "#a88ba2", "#8294b0"];
+function laneTint(agentRef: string): string {
+  if (agentRef === JARVIS_REF) return "var(--accent-2)";
+  let h = 0;
+  for (let i = 0; i < agentRef.length; i++) h = (h * 31 + agentRef.charCodeAt(i)) >>> 0;
+  return SUB_TINTS[h % SUB_TINTS.length];
+}
+
+/** Chip status → glyph. The mockup's diamond mark is coloured by CSS class. */
+const CHIP_GLYPH: Record<AgentActivityStatus, string> = {
+  running: "",
+  ok: "✓",
+  error: "✗",
+  warn: "▲",
+  info: "•",
 };
 
 /**
- * PRD 0011 — agent-activity block.
+ * Reasoning-streaming PRD — per-agent lane, ported from the Design-Mockup
+ * `AgentLane`. Renders the HONEST signal set Bob has on `/v1` (see
+ * `lib/agentPhase`): a derived PHASE row (indeterminate spinner, never a % bar —
+ * the load/prompt-progress bars are native-only and not available), a
+ * collapsible THINKING monologue (the `reasoning_delta` stream — degraded agents
+ * fall back to their narrated `progress` thought on the same channel), TOOL
+ * CHIPS (the `agent_activity` timeline — label + status; args/result are a later
+ * backend slice), a PERF footer (`agent_perf`) and an inline ERROR.
  *
- * Issue 0069 rendered only the live streaming reasoning. Issue 0071 renders the
- * full per-agent timeline: reasoning text segments and discrete activity chips
- * INTERLEAVED in the exact chronological order they arrived (the store keeps an
- * ordered `AgentTimelineItem[]`). Chips are inline in the same flow as the
- * reasoning — NOT a separate zone (PRD 0011 decision) — shown as a small
- * icon + label coloured by status.
+ * Lifecycle (issue 0074): while running it streams; on a terminal state it
+ * collapses to a one-line summary + a "résultat" button (opens the existing
+ * result view) + an expand affordance that re-shows the full body. The timeline
+ * + perf are RETAINED across the terminal transition so expand can re-read them.
  *
- * Issue 0075 — SLIDING WINDOW for the ACTIVE block. A long reasoning must not
- * take over the screen, so this block is bounded-height with a scroll window
- * that AUTO-SCROLLS to the latest tokens as deltas arrive. If the user scrolls
- * up to read back, auto-scroll PAUSES until they return to the bottom (standard
- * chat-log behaviour). A "voir tout" toggle expands the block to its full
- * height; toggling back restores the bounded window. The auto-scroll decision
- * is the pure helper in `lib/autoScroll` (unit-tested there).
- *
- * Issue 0074 — COLLAPSE LIFECYCLE. When the agent's task terminates the block
- * stops being the live ACTIVE timeline and becomes a COLLAPSED summary: title +
- * final-state badge + a "résultat" button (opens the EXISTING result view via
- * `onOpenResult`) + an "expand / relire la réflexion" affordance that re-shows
- * the FULL reasoning + chips timeline (the same full-timeline rendering 0075's
- * "voir tout" expands to). The finished bit comes from the store's
- * `finishedByAgent` map; the timeline arrays are retained across the terminal
- * transition so expand can re-read them. A failure (failed / cap / stall
- * force-terminate) collapses with the `Échec` badge.
- *
- * The Jarvis block (0072) and the side-panel rail (0076) are later issues.
- * Renders nothing until the first item arrives (a model with no reasoning
- * channel still surfaces its chips here once it acts) AND it isn't finished —
- * a finished agent with no timeline still shows its collapsed summary.
+ * Renders nothing for a never-started, never-finished agent.
  */
 export function AgentBlock({ agentRef, title, hasResult, onOpenResult }: Props) {
   const timeline = useActivityFeedStore((s) => s.timelineByAgent[agentRef]);
   const finalState = useActivityFeedStore((s) => s.finishedByAgent[agentRef]);
+  const perf = useActivityFeedStore((s) => s.perfByAgent[agentRef]);
+  const answer = useActivityFeedStore((s) => s.answerByAgent[agentRef]);
+  // Jarvis has no `task`/terminal state — its turn is bracketed by the
+  // `thinking` WS event (chat store `isWaitingResponse`). Used to settle the
+  // persistent lane to `done` between turns instead of hanging on "Réflexion".
+  const isWaiting = useChatStore((s) => s.isWaitingResponse);
 
   const [expanded, setExpanded] = useState(false);
-  /** True when the windowed (non-expanded) content actually overflows the
-   * bounded height. The "voir tout" toggle is pointless on a short reasoning /
-   * a one-line answer, so it only shows when there's genuinely more to reveal. */
-  const [overflowing, setOverflowing] = useState(false);
+  const [thinkOpen, setThinkOpen] = useState<boolean | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
-  /** Latched intent: true while the user is pinned to the bottom (auto-scroll
-   * follows new tokens), false once they scroll up to read back. Flips back to
-   * true when they scroll down to the bottom again. Held in a ref so a scroll
-   * event doesn't force a re-render — only the layout effect reads it. */
   const stuckToBottomRef = useRef(true);
 
   const onScroll = useCallback(() => {
     const el = scrollRef.current;
-    if (!el) return;
-    stuckToBottomRef.current = isAtBottom(el);
+    if (el) stuckToBottomRef.current = isAtBottom(el);
   }, []);
 
-  // After each render that added content, pin to the bottom IFF the user is
-  // still stuck there and we're not expanded (don't fight a manual scroll).
   const itemCount = timeline?.length ?? 0;
   const lastText = timeline && itemCount > 0 ? JSON.stringify(timeline[itemCount - 1]) : "";
-  // biome-ignore lint/correctness/useExhaustiveDependencies: re-pin whenever the trailing item grows (lastText) or the count changes — those are the content signals; refs are intentionally not deps.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: re-pin when the trailing item grows (lastText) or count changes; refs are intentionally not deps.
   useLayoutEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
     if (shouldAutoScroll({ stuckToBottom: stuckToBottomRef.current, expanded })) {
       el.scrollTop = el.scrollHeight;
     }
-    // Overflow is only measurable while windowed (expanded drops the max-h, so
-    // scrollHeight == clientHeight). Keep the last windowed verdict otherwise so
-    // the "réduire" toggle stays available after expanding.
-    if (!expanded) {
-      setOverflowing(el.scrollHeight > el.clientHeight + 1);
-    }
   }, [itemCount, lastText, expanded]);
 
   const finished = finalState === "done" || finalState === "failed";
   const hasTimeline = !!timeline && timeline.length > 0;
-
-  // ACTIVE block with nothing to show yet, and not finished → render nothing.
   if (!finished && !hasTimeline) return null;
 
+  const isJarvis = agentRef === JARVIS_REF;
+  const phase = deriveAgentPhase(
+    timeline,
+    finalState,
+    isJarvis ? { turnActive: isWaiting } : undefined,
+  );
+  const tint = laneTint(agentRef);
+  const name = isJarvis ? "JARVIS" : (title ?? agentRef);
+  const role = isJarvis ? "orchestrator" : "sub-agent";
+
+  // Split the interleaved timeline into the mockup's zones: a thinking monologue
+  // (reasoning runs concatenated) and the tool chips.
+  const thinkingText = (timeline ?? [])
+    .filter(
+      (it): it is Extract<AgentTimelineItem, { kind: "reasoning" }> => it.kind === "reasoning",
+    )
+    .map((it) => it.text)
+    .join("");
+  const chips = (timeline ?? []).filter(
+    (it): it is Extract<AgentTimelineItem, { kind: "chip" }> => it.kind === "chip",
+  );
+  const streaming =
+    phase.status === "running" &&
+    !!timeline &&
+    timeline.length > 0 &&
+    timeline[timeline.length - 1].kind === "reasoning";
+
   // ── COLLAPSED summary (issue 0074) ───────────────────────────────────────
-  // Once finished, the block is a compact summary by default; the timeline is
-  // only re-shown when the user expands it ("relire la réflexion").
-  if (finished) {
-    const badge = FINAL_BADGE[finalState as "done" | "failed"];
+  if (finished && !expanded) {
+    const summary =
+      finalState === "failed"
+        ? thinkingText.split("\n").pop() || "Échec"
+        : thinkingText.split("\n").find((l) => l.trim()) || title || "Terminé";
     return (
-      <div className="mt-1 rounded border border-blue-900/40 bg-blue-950/20 text-[11px]">
-        <div className="flex items-center gap-2 px-2 py-1">
-          <span
-            className={`inline-flex flex-none items-center rounded border px-1.5 py-0.5 text-[10px] ${badge.className}`}
-          >
-            {badge.label}
-          </span>
-          {title && <span className="min-w-0 flex-1 truncate text-blue-300/80">{title}</span>}
-          {hasResult && onOpenResult && (
-            <button
-              type="button"
-              onClick={onOpenResult}
-              className="flex-none rounded border border-blue-800/50 px-1.5 py-0.5 text-[10px] text-blue-300/90 transition-colors hover:bg-blue-900/30 hover:text-blue-200"
-            >
-              résultat
-            </button>
-          )}
-        </div>
-        {/* Expand affordance — re-shows the FULL reasoning + chips timeline
-            (same full rendering as 0075's "voir tout"). Hidden when the agent
-            never streamed a timeline (nothing to re-read). */}
-        {hasTimeline && (
-          <>
-            {expanded && (
-              <div
-                ref={scrollRef}
-                onScroll={onScroll}
-                className="overflow-y-auto border-blue-900/40 border-t px-2 py-1 leading-snug text-blue-300/80"
-              >
-                {timeline.map(renderTimelineItem)}
-              </div>
-            )}
-            <button
-              type="button"
-              onClick={() => setExpanded((v) => !v)}
-              className="w-full border-blue-900/40 border-t px-2 py-0.5 text-left text-[10px] text-blue-400/70 transition-colors hover:text-blue-300"
-            >
-              {expanded ? "réduire" : "relire la réflexion"}
-            </button>
-          </>
+      <div
+        className={`agent-lane is-${isJarvis ? "jarvis" : "sub"} status-${phase.status} is-folded`}
+        style={{ ["--lane-tint" as string]: tint }}
+      >
+        <button type="button" className="al-head" onClick={() => setExpanded(true)}>
+          <span className="al-glyph">{isJarvis ? "⌬" : "◇"}</span>
+          <span className="al-name">{name}</span>
+          <span className="al-role">{role}</span>
+          <span className="al-chev">▸</span>
+        </button>
+        <PhaseRow phase={phase} />
+        <div className={`al-fold ${finalState === "failed" ? "is-err" : ""}`}>{summary}</div>
+        {hasResult && onOpenResult && (
+          <button type="button" className="al-result" onClick={onOpenResult}>
+            résultat
+          </button>
         )}
       </div>
     );
   }
 
-  // ── ACTIVE block (issues 0069 / 0071 / 0075) ─────────────────────────────
+  // ── ACTIVE / expanded lane ───────────────────────────────────────────────
+  const thinkExpanded = thinkOpen === null ? !finished : thinkOpen;
   return (
-    <div className="mt-1 rounded border border-blue-900/40 bg-blue-950/20">
-      <div
-        ref={scrollRef}
-        onScroll={onScroll}
-        className={`overflow-y-auto px-2 py-1 text-[11px] leading-snug text-blue-300/80 ${
-          expanded ? "" : "max-h-32"
-        }`}
+    <div
+      className={`agent-lane is-${isJarvis ? "jarvis" : "sub"} status-${phase.status}`}
+      style={{ ["--lane-tint" as string]: tint }}
+    >
+      <button
+        type="button"
+        className="al-head"
+        onClick={() => (finished ? setExpanded(false) : undefined)}
       >
-        {timeline.map(renderTimelineItem)}
+        <span className="al-glyph">{isJarvis ? "⌬" : "◇"}</span>
+        <span className="al-name">{name}</span>
+        <span className="al-role">{role}</span>
+        {finished && <span className="al-chev">▾</span>}
+      </button>
+
+      <PhaseRow phase={phase} />
+
+      <div className="al-body">
+        {/* No reasoning channel (guided-JSON sub-agent — schema suppresses it)
+            and nothing narrated yet: keep the lane alive with a status line so
+            it never looks dead during the slow generation gap. */}
+        {!thinkingText && phase.status === "running" && (
+          <div className="al-status">
+            <span className="al-status-dot" />
+            <span>{PHASE_META[phase.key].label}</span>
+          </div>
+        )}
+        {thinkingText && (
+          <div className="al-think">
+            <button
+              type="button"
+              className="al-think-head"
+              onClick={() => setThinkOpen(!thinkExpanded)}
+            >
+              <span className="al-think-label">Réflexion</span>
+              <span className="al-think-count">
+                {streaming ? "streaming…" : `${countWords(thinkingText)} mots`}
+              </span>
+              <span className="al-think-toggle">{thinkExpanded ? "masquer" : "voir"}</span>
+            </button>
+            {thinkExpanded && (
+              <div ref={scrollRef} onScroll={onScroll} className="al-think-body">
+                {thinkingText}
+                {streaming && <span className="al-caret" />}
+              </div>
+            )}
+          </div>
+        )}
+
+        {chips.length > 0 && (
+          <div className="al-tools">
+            {chips.map((c, i) => (
+              <div
+                key={`${c.label}-${i}`}
+                className={`al-chip ${
+                  c.status === "running" ? "is-run" : c.status === "error" ? "is-fail" : "is-ok"
+                }`}
+                title={c.activityKind}
+              >
+                <div className="al-chip-head">
+                  <span className="al-chip-mark" />
+                  <span className="al-chip-name">{c.label}</span>
+                  {c.status === "running" && <span className="al-chip-run">running</span>}
+                </div>
+                {c.args && <div className="al-chip-args">{c.args}</div>}
+                {(c.result || (c.status !== "running" && CHIP_GLYPH[c.status])) && (
+                  <div className="al-chip-result">
+                    {c.status !== "running" && CHIP_GLYPH[c.status] && (
+                      <span className="al-chip-glyph">{CHIP_GLYPH[c.status]}</span>
+                    )}
+                    {c.result && <span>{c.result}</span>}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+
+        {finalState === "failed" && (
+          <div className="al-error">
+            <span className="al-error-glyph">✗</span>
+            <span>{thinkingText.split("\n").pop() || "Le sous-agent a échoué."}</span>
+          </div>
+        )}
+
+        {answer && (
+          <div className="al-answer">
+            <div className="al-answer-cap">Réponse</div>
+            <MarkdownView props={{ content: answer }} />
+          </div>
+        )}
+
+        <PerfFooter perf={perf} />
+
+        {finished && hasResult && onOpenResult && (
+          <button type="button" className="al-result" onClick={onOpenResult}>
+            résultat
+          </button>
+        )}
       </div>
-      {/* Only offer the toggle when the windowed content overflows (or is
-          already expanded). A short answer that fits needs no "voir tout". */}
-      {(overflowing || expanded) && (
-        <button
-          type="button"
-          onClick={() => setExpanded((v) => !v)}
-          className="w-full border-blue-900/40 border-t px-2 py-0.5 text-left text-[10px] text-blue-400/70 transition-colors hover:text-blue-300"
-        >
-          {expanded ? "réduire" : "voir tout"}
-        </button>
+    </div>
+  );
+}
+
+/** Phase row: animated pip + label + right marker + indeterminate spinner
+ * (running) or a settled bar (done/error). No % bar — that signal is native-only. */
+function PhaseRow({ phase }: { phase: AgentPhase }) {
+  const meta = PHASE_META[phase.key];
+  const right = phase.status === "done" ? "complete" : phase.status === "error" ? "fault" : "";
+  return (
+    <div className="al-phase" style={{ ["--phase-tint" as string]: meta.tint }}>
+      <span className={`al-pip is-${phase.key}`} />
+      <span className="al-phase-label">{meta.label}</span>
+      <span className="al-phase-right">{right}</span>
+      {phase.status === "running" ? (
+        <span className="al-prog al-prog-indef">
+          <span className="al-prog-sweep" />
+        </span>
+      ) : (
+        <span className="al-prog al-prog-done" />
       )}
     </div>
   );
 }
 
-/** Render one interleaved timeline item — a reasoning text run or an activity
- * chip. Shared by the ACTIVE window and the COLLAPSED expand view so both show
- * the identical chronological flow. The index is a stable identity here: the
- * timeline is strictly append-only — a reasoning segment's text only grows in
- * place, and chips are never removed or reordered. */
-function renderTimelineItem(item: AgentTimelineItem, i: number) {
-  if (item.kind === "reasoning") {
-    return (
-      <span key={`r-${i}`} className="whitespace-pre-wrap">
-        {item.text}
-      </span>
-    );
-  }
-  const style = STATUS_STYLE[item.status];
+/** Perf footer — token usage + timing, rendered only for the fields present. */
+function PerfFooter({ perf }: { perf: AgentPerf | undefined }) {
+  if (!perf) return null;
+  const items: Array<[string, string]> = [];
+  if (perf.tokS != null) items.push([`${perf.tokS}`, "tok/s"]);
+  if (perf.ttftS != null) items.push([`${perf.ttftS}s`, "ttft"]);
+  if (perf.reasoningTokens) items.push([`${perf.reasoningTokens}`, "think"]);
+  if (perf.tokensIn != null) items.push([`${perf.tokensIn}`, "ctx"]);
+  if (items.length === 0) return null;
   return (
-    <span
-      key={`c-${i}`}
-      className={`mx-0.5 my-px inline-flex items-center gap-1 rounded border px-1.5 py-0.5 align-middle text-[10px] ${style.className}`}
-      title={item.activityKind}
-    >
-      <span aria-hidden>{style.glyph}</span>
-      <span>{item.label}</span>
-    </span>
+    <div className="al-perf">
+      {items.map(([v, label]) => (
+        <span key={label}>
+          <b>{v}</b> {label}
+        </span>
+      ))}
+    </div>
   );
+}
+
+function countWords(s: string): number {
+  const t = s.trim();
+  return t ? t.split(/\s+/).length : 0;
 }

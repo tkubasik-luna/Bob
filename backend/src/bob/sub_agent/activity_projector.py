@@ -52,7 +52,10 @@ renders in: ``running`` (in-flight), ``ok`` (succeeded), ``error`` (failed),
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
+
+if TYPE_CHECKING:
+    from bob.llm.types import StreamChunk
 
 #: User-facing chip kinds. Curated (PRD 0011): discrete agent ACTIONS +
 #: salient incidents, never per-step OK noise.
@@ -88,17 +91,54 @@ class AgentActivity:
     kind: AgentActivityKind
     label: str
     status: AgentActivityStatus
+    #: Reasoning-streaming PRD (B2) — optional tool-call detail for the chip:
+    #: a compact, REDACTED arg summary and a content-free result summary. Only
+    #: set on ``tool_call`` chips; ``None`` elsewhere. Both pass the Mail-field
+    #: scrub before reaching here (see :func:`_summarise_args` / `_summarise_result`)
+    #: because every emit — even ``debug_event=None`` — mirrors into the debug
+    #: ring buffer.
+    args: str | None = None
+    result: str | None = None
 
     def to_wire(self) -> dict[str, Any]:
         """The ``agent_activity`` WS frame (matches ``AgentActivityMsg`` on the FE)."""
 
-        return {
+        frame: dict[str, Any] = {
             "type": "agent_activity",
             "agent_ref": self.agent_ref,
             "kind": self.kind,
             "label": self.label,
             "status": self.status,
         }
+        if self.args is not None:
+            frame["args"] = self.args
+        if self.result is not None:
+            frame["result"] = self.result
+        return frame
+
+
+def agent_perf_frame(agent_ref: str, perf: StreamChunk | None) -> dict[str, Any] | None:
+    """Build the ``agent_perf`` WS frame from a terminal ``perf`` :class:`StreamChunk`.
+
+    Returns ``None`` when there is nothing worth showing (no chunk, or every
+    field empty), so a degraded backend never emits an empty footer. Matches
+    ``AgentPerfMsg`` on the frontend. Like ``agent_activity`` it is a cosmetic,
+    first-class user-facing event tagged by ``agent_ref`` so the store routes it
+    to the right lane.
+    """
+
+    if perf is None:
+        return None
+    fields = {
+        "tokens_in": perf.tokens_in,
+        "tokens_out": perf.tokens_out,
+        "reasoning_tokens": perf.reasoning_tokens,
+        "ttft_s": perf.ttft_s,
+        "tok_s": perf.tok_s,
+    }
+    if all(v is None for v in fields.values()):
+        return None
+    return {"type": "agent_perf", "agent_ref": agent_ref, **fields}
 
 
 # --- Internal events ---------------------------------------------------------
@@ -132,20 +172,34 @@ class TaskFinished:
 
 @dataclass(frozen=True)
 class ToolCallStarted:
-    """A sub-agent tool dispatch is about to run (``status=running`` chip)."""
+    """A sub-agent tool dispatch is about to run (``status=running`` chip).
+
+    ``args`` is the RAW tool-argument dict; the projector redacts + compacts it
+    into the chip's ``args`` summary (never echoed verbatim).
+    """
 
     agent_ref: str
     tool_name: str
+    args: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
 class ToolCallFinished:
-    """A sub-agent tool dispatch settled (``status=ok`` / ``error`` chip)."""
+    """A sub-agent tool dispatch settled (``status=ok`` / ``error`` chip).
+
+    ``args`` is the raw arg dict (same as the start event so the settled chip is
+    self-contained). ``result`` is the RAW structured tool result on success
+    (the projector redacts it and derives a content-free summary like
+    ``"12 éléments"``); it is ``None`` on failure, where ``error_code`` already
+    frames the outcome.
+    """
 
     agent_ref: str
     tool_name: str
     ok: bool
     error_code: str | None = None
+    args: dict[str, Any] | None = None
+    result: Any = None
 
 
 @dataclass(frozen=True)
@@ -256,6 +310,50 @@ def _redact_free_text(text: str) -> str:
     return collapsed
 
 
+def _summarise_args(args: dict[str, Any] | None) -> str | None:
+    """Compact, Mail-REDACTED one-line summary of a tool's args for a chip.
+
+    Runs the args through the shared Mail-field scrub (so a Mail descriptor in
+    the args can't leak), renders the scrubbed key/values as ``k: v`` pairs and
+    truncates. Returns ``None`` for empty args (no detail row).
+    """
+
+    if not args:
+        return None
+    scrubbed = redact_payload(args)
+    if not isinstance(scrubbed, dict):
+        return _redact_free_text(str(scrubbed))
+    parts = [f"{k}: {v}" for k, v in scrubbed.items()]
+    return _redact_free_text(" · ".join(parts))
+
+
+def _summarise_result(result: Any) -> str | None:
+    """Content-FREE, Mail-REDACTED summary of a tool result for a chip.
+
+    Deliberately avoids echoing the result body: a list becomes ``"N éléments"``,
+    a dict its scrubbed key set, anything else a hard-truncated scalar. Combined
+    with the Mail scrub this can never carry an email subject/snippet/body onto
+    the chip (which also lands in the debug ring buffer).
+    """
+
+    if result is None:
+        return None
+    scrubbed = redact_payload(result) if isinstance(result, dict | str) else result
+    if isinstance(scrubbed, list):
+        n = len(scrubbed)
+        return f"{n} élément{'s' if n != 1 else ''}"
+    if isinstance(scrubbed, dict):
+        keys = list(scrubbed.keys())
+        # A common shape: {"items"/"messages"/"results": [...]} — count it.
+        for key in ("items", "messages", "results", "events", "files"):
+            seq = scrubbed.get(key)
+            if isinstance(seq, list):
+                n = len(seq)
+                return f"{n} {key}"
+        return _redact_free_text(", ".join(keys))
+    return _redact_free_text(str(scrubbed))
+
+
 def redact_payload(payload: dict[str, Any] | str | None) -> dict[str, Any] | str | None:
     """Reapply the debug Mail-field redaction on a user-facing payload.
 
@@ -319,15 +417,19 @@ def project(event: InternalEvent) -> AgentActivity | None:
             kind="tool_call",
             label=f"Outil {event.tool_name}",
             status="running",
+            args=_summarise_args(event.args),
         )
 
     if isinstance(event, ToolCallFinished):
+        args = _summarise_args(event.args)
         if event.ok:
             return AgentActivity(
                 agent_ref=event.agent_ref,
                 kind="tool_call",
                 label=f"Outil {event.tool_name}",
                 status="ok",
+                args=args,
+                result=_summarise_result(event.result),
             )
         detail = f" ({event.error_code})" if event.error_code else ""
         return AgentActivity(
@@ -335,6 +437,7 @@ def project(event: InternalEvent) -> AgentActivity | None:
             kind="tool_call",
             label=f"Outil {event.tool_name}{detail}",
             status="error",
+            args=args,
         )
 
     if isinstance(event, AskUser):

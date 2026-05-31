@@ -1,5 +1,11 @@
 import { create } from "zustand";
-import type { AgentActivityMsg, ReasoningDeltaMsg, TaskState } from "../types/ws";
+import type {
+  AgentActivityMsg,
+  AgentAnswerMsg,
+  AgentPerfMsg,
+  ReasoningDeltaMsg,
+  TaskState,
+} from "../types/ws";
 
 /**
  * PRD 0011 — agent-activity feed store.
@@ -85,10 +91,24 @@ export type ChipItem = {
   activityKind: AgentActivityMsg["kind"];
   label: string;
   status: AgentActivityMsg["status"];
+  /** B2 — compact redacted arg summary (tool-call chips). */
+  args?: string;
+  /** B2 — content-free redacted result summary (settled ok tool-call chips). */
+  result?: string;
 };
 
 /** One ordered entry in an agent's interleaved reasoning + chip timeline. */
 export type AgentTimelineItem = ReasoningItem | ChipItem;
+
+/** Reasoning-streaming PRD — per-agent terminal perf footer. Mirrors the wire
+ * `agent_perf` event minus routing. Every field optional (degraded backend). */
+export type AgentPerf = {
+  tokensIn: number | null;
+  tokensOut: number | null;
+  reasoningTokens: number | null;
+  ttftS: number | null;
+  tokS: number | null;
+};
 
 /** Issue 0077 — minimal task shape `rehydrateFromTasks` needs: the lane key
  * (`id`, = the sub-task's `agent_ref`) and its current persisted `TaskState`.
@@ -151,9 +171,21 @@ type ActivityFeedState = {
    * `AgentBlock` reads this to switch from the live ACTIVE timeline to the
    * COLLAPSED summary while keeping the timeline content for expand. */
   finishedByAgent: Record<string, TaskState>;
+  /** Reasoning-streaming PRD — per-agent terminal perf footer (tok/s, ttft,
+   * tokens). Set once when the `agent_perf` event lands; absent until then. */
+  perfByAgent: Record<string, AgentPerf>;
+  /** Reasoning-streaming PRD — per-agent SETTLED reply, distinct from the
+   * chain-of-thought timeline. Jarvis sets it via `agent_answer`; sub-agents via
+   * the `task_result` deliverable. Rendered as a dedicated answer block. */
+  answerByAgent: Record<string, string>;
   /** Append a `reasoning_delta` suffix. COALESCED: the delta is buffered and
    * applied on the next animation-frame flush, not synchronously per token. */
   appendReasoningDelta: (msg: ReasoningDeltaMsg) => void;
+  /** Record an agent's terminal perf footer from an `agent_perf` event. */
+  setPerf: (msg: AgentPerfMsg) => void;
+  /** Record an agent's settled reply (from `agent_answer` or a sub-task's
+   * `task_result`). A blank/whitespace text is ignored (no empty block). */
+  setAnswer: (agentRef: string, text: string) => void;
   /** Append an activity chip as its own ordered timeline item. Applies
    * immediately (after draining any pending reasoning to preserve order). */
   appendActivity: (msg: AgentActivityMsg) => void;
@@ -219,6 +251,26 @@ export const useActivityFeedStore = create<ActivityFeedState>((set) => ({
   timelineByAgent: {},
   agentOrder: [],
   finishedByAgent: {},
+  perfByAgent: {},
+  answerByAgent: {},
+  setAnswer: (agentRef, text) =>
+    set((state) => {
+      if (!text.trim() || state.answerByAgent[agentRef] === text) return state;
+      return { answerByAgent: { ...state.answerByAgent, [agentRef]: text } };
+    }),
+  setPerf: (msg) =>
+    set((state) => ({
+      perfByAgent: {
+        ...state.perfByAgent,
+        [msg.agent_ref]: {
+          tokensIn: msg.tokens_in,
+          tokensOut: msg.tokens_out,
+          reasoningTokens: msg.reasoning_tokens,
+          ttftS: msg.ttft_s,
+          tokS: msg.tok_s,
+        },
+      },
+    })),
   appendReasoningDelta: (msg) => {
     // Buffer the suffix; do NOT touch the store yet. Multiple tokens arriving
     // within one frame collapse into a single concatenated suffix here.
@@ -262,6 +314,8 @@ export const useActivityFeedStore = create<ActivityFeedState>((set) => ({
         activityKind: msg.kind,
         label: msg.label,
         status: msg.status,
+        args: msg.args,
+        result: msg.result,
       };
       const agentOrder = state.agentOrder.includes(msg.agent_ref)
         ? state.agentOrder
@@ -302,8 +356,10 @@ export const useActivityFeedStore = create<ActivityFeedState>((set) => ({
   clearAgent: (agentRef) =>
     set((state) => {
       pendingReasoning.delete(agentRef);
-      // A dropped lane has no finished state to remember.
+      // A dropped lane has no finished state / perf footer to remember.
       const { [agentRef]: _finished, ...restFinished } = state.finishedByAgent;
+      const { [agentRef]: _perf, ...restPerf } = state.perfByAgent;
+      const { [agentRef]: _answer, ...restAnswer } = state.answerByAgent;
       if (!(agentRef in state.timelineByAgent)) {
         if (!state.agentOrder.includes(agentRef) && !(agentRef in state.finishedByAgent)) {
           return state;
@@ -311,6 +367,8 @@ export const useActivityFeedStore = create<ActivityFeedState>((set) => ({
         return {
           agentOrder: state.agentOrder.filter((r) => r !== agentRef),
           finishedByAgent: restFinished,
+          perfByAgent: restPerf,
+          answerByAgent: restAnswer,
         };
       }
       const { [agentRef]: _removed, ...rest } = state.timelineByAgent;
@@ -318,6 +376,8 @@ export const useActivityFeedStore = create<ActivityFeedState>((set) => ({
         timelineByAgent: rest,
         agentOrder: state.agentOrder.filter((r) => r !== agentRef),
         finishedByAgent: restFinished,
+        perfByAgent: restPerf,
+        answerByAgent: restAnswer,
       };
     }),
   reset: () => {
@@ -326,6 +386,12 @@ export const useActivityFeedStore = create<ActivityFeedState>((set) => ({
       cancelFlush(flushHandle);
       flushHandle = null;
     }
-    set({ timelineByAgent: {}, agentOrder: [], finishedByAgent: {} });
+    set({
+      timelineByAgent: {},
+      agentOrder: [],
+      finishedByAgent: {},
+      perfByAgent: {},
+      answerByAgent: {},
+    });
   },
 }));

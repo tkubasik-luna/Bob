@@ -153,9 +153,40 @@ async def test_show_task_result_recalls_structured_mail_descriptor() -> None:
 
     assert result.outcome == "ok"
     # Re-emitted with the ORIGINAL Mail component + full props — NOT a Markdown
-    # wrap of the spoken result text.
-    assert result.ui == mail_descriptor
-    assert result.ui is not mail_descriptor  # defensive copy, not the stored ref
+    # wrap of the spoken result text. The recall surface returns the full
+    # section LIST (a single card is a list-of-one).
+    assert result.ui == [mail_descriptor]
+    assert result.ui[0] is not mail_descriptor  # defensive copy, not the stored ref
+
+
+@pytest.mark.asyncio
+async def test_show_task_result_reemits_all_mail_cards() -> None:
+    """Regression — a multi-card deliverable (e.g. "20 derniers mails") must
+    recall EVERY card, not collapse to the first. Before the fix the recall
+    path returned only the first renderable section."""
+
+    dispatcher, task_store, _jarvis_store, _emitted = _make_dispatcher()
+    task_id = task_store.create_task(title="20 derniers mails reçus", goal="…")
+    task_store.update_state(task_id, "running")
+    task_store.update_state(task_id, "done")
+    cards: list[dict[str, object]] = [
+        {"component": "Mail", "props": {"messageId": f"msg-{i}", "subject": f"Sujet {i}"}}
+        for i in range(20)
+    ]
+    task_store.set_result(task_id, "20 email(s) trouvé(s).", result_payload=cards)
+
+    result = await dispatcher.dispatch(
+        ToolCall(
+            id="call_multi_mail",
+            name="show_task_result",
+            arguments={"speech": "Voilà tes 20 derniers mails :", "query": "20 derniers mails"},
+        )
+    )
+
+    assert result.outcome == "ok"
+    assert isinstance(result.ui, list)
+    assert len(result.ui) == 20
+    assert result.ui == cards
 
 
 @pytest.mark.asyncio

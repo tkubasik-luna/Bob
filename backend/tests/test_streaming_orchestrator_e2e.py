@@ -350,18 +350,23 @@ async def test_e2e_jarvis_lane_reasoning_chip_and_final_answer(
     speech_deltas = [e for e in recorder if e["type"] == "speech_delta"]
     assert "".join(d["delta"] for d in speech_deltas) == "Salut Tom"
 
-    # Jarvis-lane reasoning + final answer ride ``reasoning_delta`` with the
-    # fixed ``agent_ref="jarvis"`` (distinct from any sub-task lane).
+    # Jarvis-lane reasoning rides ``reasoning_delta`` (chain-of-thought ONLY —
+    # the settled answer is now a distinct channel, not folded in here).
     jarvis_reasoning = [
         e
         for e in recorder
         if e["type"] == "reasoning_delta" and e.get("agent_ref") == "jarvis"
     ]
     joined = "".join(d["delta"] for d in jarvis_reasoning)
-    # Live chain-of-thought present...
     assert "L'utilisateur dit bonjour." in joined
-    # ...and the final answer duplicated into the lane, AFTER the reasoning.
-    assert joined.endswith("Salut Tom")
+    # The reasoning channel does NOT carry the answer any more.
+    assert "Salut Tom" not in joined
+    # The settled answer rides a dedicated ``agent_answer`` event for the lane's
+    # distinct "Réponse" block.
+    jarvis_answers = [
+        e for e in recorder if e["type"] == "agent_answer" and e.get("agent_ref") == "jarvis"
+    ]
+    assert [a["text"] for a in jarvis_answers] == ["Salut Tom"]
 
 
 @pytest.mark.asyncio
@@ -372,7 +377,7 @@ async def test_e2e_jarvis_lane_degraded_no_reasoning_still_has_answer(
 
     Mirrors the sub-agent degraded fallback (issue 0070): no ``reasoning``
     chunk means no live chain-of-thought, but the lane is never empty — the
-    settled answer is still duplicated in as ``reasoning_delta`` text, and the
+    settled answer arrives on the dedicated ``agent_answer`` event, and the
     ``speech_delta`` → TTS path is unaffected.
     """
 
@@ -380,12 +385,18 @@ async def test_e2e_jarvis_lane_degraded_no_reasoning_still_has_answer(
     orchestrator, _js = _build_orchestrator(client)
     await orchestrator.process_user_message("s1", "hi")
 
+    # No reasoning channel → no Jarvis reasoning frames at all.
     jarvis_reasoning = [
         e
         for e in recorder
         if e["type"] == "reasoning_delta" and e.get("agent_ref") == "jarvis"
     ]
-    assert "".join(d["delta"] for d in jarvis_reasoning) == "Coucou"
+    assert jarvis_reasoning == []
+    # The answer still reaches the lane via ``agent_answer``.
+    jarvis_answers = [
+        e for e in recorder if e["type"] == "agent_answer" and e.get("agent_ref") == "jarvis"
+    ]
+    assert [a["text"] for a in jarvis_answers] == ["Coucou"]
     speech_deltas = [e for e in recorder if e["type"] == "speech_delta"]
     assert "".join(d["delta"] for d in speech_deltas) == "Coucou"
 

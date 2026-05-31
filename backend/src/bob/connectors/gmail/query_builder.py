@@ -59,8 +59,12 @@ def _coerce_date(value: date | str, *, arg_name: str) -> str:
     if isinstance(value, str):
         # Tolerate both "2025-05-28" and "2025/05/28" — the operator works
         # with either, but we standardise to slashes for grep-ability of
-        # the produced query string.
-        normalised = value.strip().replace("-", "/")
+        # the produced query string. Also tolerate a trailing ISO time/zone
+        # component ("2025-05-28T00:00:00Z", "2025-05-28 09:30") — local
+        # models routinely append one; Gmail's ``after:`` is date-only so we
+        # drop everything past the date.
+        date_part = value.strip().split("T", 1)[0].split(" ", 1)[0]
+        normalised = date_part.replace("-", "/")
         try:
             parts = normalised.split("/")
             if len(parts) != 3:

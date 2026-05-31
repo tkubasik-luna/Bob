@@ -383,12 +383,53 @@ export type AgentActivityMsg = {
   /** Short, user-facing, redacted label for the chip. */
   label: string;
   status: AgentActivityStatus;
+  /** B2 — compact, Mail-redacted tool-arg summary (only on `tool_call` chips). */
+  args?: string;
+  /** B2 — content-free, Mail-redacted result summary (only on a settled `ok`
+   * `tool_call`; e.g. "12 messages"). */
+  result?: string;
+};
+
+/** Reasoning-streaming PRD — terminal per-agent perf footer. Emitted once at
+ * the end of a streamed LLM call (sub-agent or Jarvis, tagged by `agent_ref`),
+ * carrying token usage + timing for the activity-feed perf footer. Mirrors
+ * `bob.sub_agent.activity_projector.agent_perf_frame`. Every field is optional —
+ * a degraded backend (no usage/timing) never emits this event at all, and any
+ * single field may be absent. Purely cosmetic. */
+export type AgentPerfMsg = {
+  type: "agent_perf";
+  /** The producing agent's id (`task_id`, or `"jarvis"`). */
+  agent_ref: string;
+  /** Prompt-side token count. */
+  tokens_in: number | null;
+  /** Generated token count. */
+  tokens_out: number | null;
+  /** Tokens spent on the reasoning channel (0/absent under guided-JSON). */
+  reasoning_tokens: number | null;
+  /** Time-to-first-token, seconds. */
+  ttft_s: number | null;
+  /** Generation throughput, tokens/sec. */
+  tok_s: number | null;
+};
+
+/** Reasoning-streaming PRD — an agent's SETTLED reply, distinct from its
+ * chain-of-thought (`reasoning_delta`). Emitted once at the end of a successful
+ * turn (Jarvis) so the lane can render a dedicated "Réponse" block below the
+ * reasoning. Sub-agent answers reach the same store slice via `task_result`. */
+export type AgentAnswerMsg = {
+  type: "agent_answer";
+  /** The producing agent's id (`"jarvis"`, or a sub-task `task_id`). */
+  agent_ref: string;
+  /** The full settled reply (markdown). */
+  text: string;
 };
 
 export type ServerMessage =
   | SessionMsg
   | ReasoningDeltaMsg
   | AgentActivityMsg
+  | AgentPerfMsg
+  | AgentAnswerMsg
   | AssistantMsg
   | SpeechDeltaMsg
   | UiPayloadMsg

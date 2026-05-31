@@ -658,6 +658,452 @@ body {
   padding: 8px 10px;
 }
 
+/* ════════════════════════════════════════════════════════════════════
+   AGENT LANE — ported from Design-Mockup `agents.jsx` / `AgentLane`.
+   One lane per agent (Jarvis + each sub-agent). Streams through a derived
+   phase (lib/agentPhase) with a thinking monologue, tool chips, perf footer
+   and inline error. No % progress bars (native-only signal — see handoff);
+   wait phases use an indeterminate sweep.
+   ════════════════════════════════════════════════════════════════════ */
+.agent-lane {
+  position: relative;
+  border-left: 2px solid var(--lane-tint);
+  padding: 9px 2px 11px 13px;
+  border-radius: 0 8px 8px 0;
+  background: color-mix(in oklab, var(--lane-tint) 4%, transparent);
+}
+.agent-lane.is-jarvis {
+  background: color-mix(in oklab, var(--lane-tint) 7%, transparent);
+  border-left-width: 3px;
+}
+.agent-lane.status-error {
+  background: color-mix(in oklab, var(--err) 7%, transparent);
+}
+
+.al-head {
+  appearance: none;
+  background: transparent;
+  border: 0;
+  width: 100%;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  cursor: pointer;
+  padding: 0 0 7px;
+  text-align: left;
+}
+.al-glyph {
+  color: var(--lane-tint);
+  font-size: 13px;
+  line-height: 1;
+  flex: none;
+}
+.is-jarvis .al-glyph {
+  font-size: 15px;
+}
+.al-name {
+  font-family: var(--font-sans);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 200px;
+}
+.is-jarvis .al-name {
+  letter-spacing: 0.14em;
+}
+.al-role {
+  font-size: 8.5px;
+  letter-spacing: 0.18em;
+  color: var(--ink-faint);
+  text-transform: uppercase;
+  flex: none;
+}
+.al-chev {
+  margin-left: auto;
+  font-size: 10px;
+  opacity: 0.7;
+  color: var(--ink-dim);
+}
+
+/* phase row */
+.al-phase {
+  display: grid;
+  grid-template-columns: 12px 1fr auto;
+  grid-template-rows: auto 3px;
+  align-items: center;
+  column-gap: 8px;
+  row-gap: 6px;
+}
+.al-pip {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--phase-tint, var(--accent));
+  box-shadow: 0 0 0 3px color-mix(in oklab, var(--phase-tint, var(--accent)) 18%, transparent);
+}
+.al-pip.is-thinking,
+.al-pip.is-tool,
+.al-pip.is-waiting {
+  animation: pip-breathe 1.6s ease-in-out infinite;
+}
+@keyframes pip-breathe {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+.al-pip.is-error {
+  background: var(--err);
+}
+.al-phase-label {
+  font-size: 10.5px;
+  letter-spacing: 0.06em;
+  color: var(--ink);
+  font-family: var(--font-sans);
+}
+.status-error .al-phase-label {
+  color: var(--err);
+}
+.al-phase-right {
+  font-size: 9.5px;
+  color: var(--ink-dim);
+  letter-spacing: 0.1em;
+  font-variant-numeric: tabular-nums;
+}
+.al-prog {
+  grid-column: 1 / -1;
+  position: relative;
+  height: 3px;
+  background: var(--hud-rule-dim);
+  border-radius: 2px;
+  overflow: hidden;
+}
+.al-prog-done {
+  background: color-mix(in oklab, var(--phase-tint, var(--accent)) 50%, transparent);
+}
+.al-prog-indef {
+  background: var(--hud-rule-dim);
+}
+.al-prog-sweep {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 38%;
+  background: linear-gradient(90deg, transparent, var(--phase-tint, var(--accent)), transparent);
+  animation: al-sweep 1.25s ease-in-out infinite;
+}
+@keyframes al-sweep {
+  0% {
+    left: -40%;
+  }
+  100% {
+    left: 100%;
+  }
+}
+
+.al-body {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  margin-top: 10px;
+}
+
+/* folded sub-agent one-line summary */
+.al-fold {
+  margin-top: 7px;
+  padding-left: 1px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--ink-dim);
+  letter-spacing: 0.01em;
+  line-height: 1.4;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.al-fold.is-err {
+  color: var(--err);
+}
+
+/* live status line — shown when a running lane has no reasoning text yet
+   (guided-JSON sub-agent), so it never looks dead during generation */
+.al-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--ink-dim);
+  letter-spacing: 0.04em;
+}
+.al-status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--lane-tint);
+  animation: pip-breathe 1.2s ease-in-out infinite;
+}
+
+/* thinking monologue */
+.al-think {
+  border: 1px solid var(--hud-rule-dim);
+  border-radius: 8px;
+  overflow: hidden;
+  background: color-mix(in oklab, var(--ink) 3%, transparent);
+}
+.al-think-head {
+  appearance: none;
+  width: 100%;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 7px 10px;
+  text-align: left;
+}
+.al-think-label {
+  font-size: 9px;
+  letter-spacing: 0.22em;
+  color: var(--ink-dim);
+  text-transform: uppercase;
+}
+.al-think-count {
+  font-size: 9px;
+  color: var(--ink-faint);
+  letter-spacing: 0.06em;
+}
+.al-think-toggle {
+  margin-left: auto;
+  font-size: 9px;
+  color: #a89bc0;
+  letter-spacing: 0.12em;
+}
+.al-think-body {
+  padding: 0 10px 10px;
+  margin-top: -1px;
+  max-height: 180px;
+  overflow-y: auto;
+  font-family: var(--font-sans);
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--ink-dim);
+  font-style: italic;
+  white-space: pre-wrap;
+  text-wrap: pretty;
+}
+.al-caret {
+  display: inline-block;
+  width: 6px;
+  height: 13px;
+  vertical-align: text-bottom;
+  margin-left: 2px;
+  background: #a89bc0;
+  animation: al-caret-blink 0.9s steps(2) infinite;
+}
+@keyframes al-caret-blink {
+  0%,
+  49% {
+    opacity: 1;
+  }
+  50%,
+  100% {
+    opacity: 0;
+  }
+}
+
+/* tool chips */
+.al-tools {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.al-chip {
+  border: 1px solid var(--hud-rule-dim);
+  border-radius: 8px;
+  padding: 7px 10px;
+  background: color-mix(in oklab, var(--ink) 3%, transparent);
+  animation: al-step-in 300ms ease;
+}
+@keyframes al-step-in {
+  from {
+    opacity: 0;
+    transform: translateX(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+.al-chip-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.al-chip-mark {
+  width: 6px;
+  height: 6px;
+  border-radius: 1px;
+  transform: rotate(45deg);
+  background: var(--lane-tint);
+}
+.al-chip.is-run .al-chip-mark {
+  animation: pip-breathe 1s ease-in-out infinite;
+}
+.al-chip.is-ok .al-chip-mark {
+  background: #8fba9f;
+}
+.al-chip.is-fail .al-chip-mark {
+  background: var(--err);
+}
+.al-chip-name {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink);
+  letter-spacing: 0.02em;
+}
+.al-chip-run {
+  margin-left: auto;
+  font-size: 8.5px;
+  letter-spacing: 0.18em;
+  color: var(--ink-faint);
+  text-transform: uppercase;
+}
+.al-chip-args {
+  margin-top: 5px;
+  padding: 4px 8px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--ink-dim);
+  background: color-mix(in oklab, var(--ink) 5%, transparent);
+  border-radius: 5px;
+  letter-spacing: 0.01em;
+  word-break: break-word;
+  animation: al-step-in 240ms ease;
+}
+.al-chip-result {
+  margin-top: 6px;
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--ink-dim);
+  animation: al-step-in 240ms ease;
+}
+.al-chip-glyph {
+  font-size: 11px;
+}
+.al-chip.is-ok .al-chip-glyph {
+  color: #8fba9f;
+}
+.al-chip.is-fail .al-chip-glyph {
+  color: var(--err);
+}
+
+/* inline error */
+.al-error {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  border: 1px solid color-mix(in oklab, var(--err) 40%, transparent);
+  background: color-mix(in oklab, var(--err) 10%, transparent);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--err);
+  line-height: 1.5;
+}
+.al-error-glyph {
+  font-size: 12px;
+}
+
+/* settled answer block — the real reply, distinct from the reasoning */
+.al-answer {
+  border-top: 1px solid var(--hud-rule-dim);
+  padding-top: 9px;
+}
+.al-answer-cap {
+  font-size: 9px;
+  letter-spacing: 0.24em;
+  color: #8fba9f;
+  text-transform: uppercase;
+  margin-bottom: 6px;
+}
+.al-answer {
+  font-family: var(--font-sans);
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--ink);
+}
+.al-answer p {
+  margin: 0 0 0.55em;
+}
+.al-answer p:last-child {
+  margin-bottom: 0;
+}
+.al-answer ul,
+.al-answer ol {
+  margin: 0 0 0.55em;
+  padding-left: 16px;
+}
+.al-answer code {
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: color-mix(in oklab, var(--accent) 14%, transparent);
+}
+
+/* perf footer */
+.al-perf {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  margin-top: 4px;
+  padding-top: 8px;
+  border-top: 1px solid var(--hud-rule-dim);
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  color: var(--ink-faint);
+  letter-spacing: 0.04em;
+}
+.al-perf b {
+  color: var(--ink-dim);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+
+/* résultat button (collapsed summary + expanded terminal) */
+.al-result {
+  appearance: none;
+  align-self: flex-start;
+  margin-top: 6px;
+  background: transparent;
+  border: 1px solid color-mix(in oklab, var(--lane-tint) 50%, transparent);
+  color: var(--ink-dim);
+  border-radius: 6px;
+  padding: 3px 9px;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+  transition: all 160ms ease;
+}
+.al-result:hover {
+  color: var(--ink);
+  border-color: var(--lane-tint);
+}
+
 /* PRD 0011 — the agent-activity panel floats as an OVERLAY above the HUD; it
  * must NOT reshape the layout. Earlier this shrank `.sphere-stage` (right:320px)
  * to re-centre the orb, but the WebGL canvas fills the stage 100%×100% and the

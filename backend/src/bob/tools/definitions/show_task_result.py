@@ -65,28 +65,31 @@ class ShowTaskResultArgs(BaseModel):
     )
 
 
-def _first_renderable_descriptor(
+def _renderable_descriptors(
     payload: list[dict[str, object]] | None,
-) -> dict[str, object] | None:
-    """Return the first structured ``{component, props}`` section, else ``None``.
+) -> list[dict[str, object]]:
+    """Return every structured ``{component, props}`` section, in order.
 
     PRD 0008 / issue 0064 (recall path); PRD 0010 / issue 0066 made the stored
-    deliverable a LIST of section descriptors. The recall surface (the Jarvis
-    ``say.ui`` slot) still re-emits a single descriptor, so we take the first
-    renderable section here. An empty list / no structured section falls through
-    to the legacy Markdown wrap of ``task.result``.
+    deliverable a LIST of section descriptors. The recall surface re-emits the
+    WHOLE list so a multi-card deliverable (e.g. every mail of a "20 derniers
+    mails" task) is surfaced in full — previously only the first section was
+    re-emitted, collapsing a 20-mail result to a single card. An empty list /
+    no structured section returns ``[]`` and the caller falls through to the
+    legacy Markdown wrap of ``task.result``.
     """
 
     if not payload:
-        return None
-    for section in payload:
+        return []
+    return [
+        section
+        for section in payload
         if (
             isinstance(section, dict)
             and isinstance(section.get("component"), str)
             and bool(section.get("component"))
-        ):
-            return section
-    return None
+        )
+    ]
 
 
 _DESCRIPTION = (
@@ -189,10 +192,12 @@ async def _show_task_result_handler(ctx: ToolHandlerContext, args: BaseModel) ->
     # completion did (Mail → MailOverlay) instead of forcing a Markdown wrap.
     # Tasks with no structured deliverable (plain documents / summaries) keep
     # the Markdown wrap of the stored ``task.result`` text — unchanged.
-    ui: dict[str, Any]
-    first_section = _first_renderable_descriptor(task.result_payload)
-    if first_section is not None:
-        ui = dict(first_section)
+    ui: Any
+    sections = _renderable_descriptors(task.result_payload)
+    if sections:
+        # Re-emit every structured section so a multi-card deliverable surfaces
+        # in full (a single section still rebuilds the same single-card overlay).
+        ui = [dict(section) for section in sections]
     else:
         ui = {
             "component": "Markdown",

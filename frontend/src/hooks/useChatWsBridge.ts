@@ -49,6 +49,8 @@ export function useChatWsBridge(): UseChatWsBridgeResult {
   const clearStreamingAssistant = useChatStore((s) => s.clearStreamingAssistant);
   const appendReasoningDelta = useActivityFeedStore((s) => s.appendReasoningDelta);
   const appendActivity = useActivityFeedStore((s) => s.appendActivity);
+  const setPerf = useActivityFeedStore((s) => s.setPerf);
+  const setAnswer = useActivityFeedStore((s) => s.setAnswer);
   const markAgentFinished = useActivityFeedStore((s) => s.markAgentFinished);
   const rehydrateFromTasks = useActivityFeedStore((s) => s.rehydrateFromTasks);
 
@@ -191,6 +193,10 @@ export function useChatWsBridge(): UseChatWsBridgeResult {
           break;
         case "task_result":
           setTaskResult(msg);
+          // Reasoning-streaming PRD — the deliverable IS the sub-agent's settled
+          // answer; route it into the lane's answer block (same slice Jarvis uses
+          // via `agent_answer`).
+          setAnswer(msg.task_id, msg.result);
           // PRD 0011 / issue 0077 — a replayed result implies a finished task.
           // Rehydrate so the lane is present and its "résultat" button resolves
           // the just-stored `result_payload`, even if the terminal `task_updated`
@@ -215,6 +221,16 @@ export function useChatWsBridge(): UseChatWsBridgeResult {
           // agent's timeline INTERLEAVED chronologically with the reasoning.
           appendActivity(msg);
           break;
+        case "agent_perf":
+          // Reasoning-streaming PRD — terminal per-agent perf footer (tok/s,
+          // ttft, tokens). One per streamed call; routed to the agent's lane.
+          setPerf(msg);
+          break;
+        case "agent_answer":
+          // Reasoning-streaming PRD — Jarvis's settled reply, distinct from its
+          // chain-of-thought; rendered as the lane's answer block.
+          setAnswer(msg.agent_ref, msg.text);
+          break;
       }
     },
     [
@@ -234,6 +250,8 @@ export function useChatWsBridge(): UseChatWsBridgeResult {
       clearStreamingAssistant,
       appendReasoningDelta,
       appendActivity,
+      setPerf,
+      setAnswer,
       markAgentFinished,
       rehydrateFromTasks,
     ],

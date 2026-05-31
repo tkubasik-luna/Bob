@@ -3,7 +3,7 @@
 Two layers are exercised:
 
 - :class:`GmailSearchArgs` Pydantic validation — at-least-one-filter rule,
-  ``max_results`` cap, all-None rejection.
+  ``max_results`` floor (>= 1, no upper cap), all-None rejection.
 - :func:`_gmail_search_handler` end-to-end — happy path returns
   ``to_mail_props``-shaped dicts whose first entry validates against the
   ``Mail`` JSON schema, error path folds a :class:`GmailClient` exception
@@ -101,11 +101,14 @@ def test_args_all_blank_strings_rejected() -> None:
         GmailSearchArgs(from_name="  ", subject_contains="")
 
 
-def test_args_max_results_capped_at_five() -> None:
-    """``max_results`` rejects values above the hard cap of 5."""
+def test_args_max_results_has_no_upper_cap() -> None:
+    """``max_results`` accepts arbitrarily large values — the 5-cap is gone.
 
-    with pytest.raises(ValidationError):
-        GmailSearchArgs(from_name="Holyana", max_results=10)
+    One Mail card is rendered per returned message, so there is no reason to
+    reject a large request server-side."""
+
+    args = GmailSearchArgs(from_name="Holyana", max_results=50)
+    assert args.max_results == 50
 
 
 def test_args_max_results_zero_rejected() -> None:

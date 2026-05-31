@@ -65,7 +65,7 @@ class LLMResponse:
 #: Kind discriminator for :class:`StreamChunk`. See the class docstring
 #: for the supported phases.
 StreamChunkKind = Literal[
-    "tool_call_start", "tool_call_args_delta", "tool_call_end", "text", "reasoning"
+    "tool_call_start", "tool_call_args_delta", "tool_call_end", "text", "reasoning", "perf"
 ]
 
 
@@ -127,3 +127,13 @@ class StreamChunk:
     #: (``delta.reasoning_content``), not the accumulated buffer. Cosmetic
     #: — never feeds action parsing (PRD 0011 / issue 0069).
     reasoning_delta: str = ""
+    #: Set on ``perf`` (emitted once at stream end). Token usage + timing for
+    #: the activity-feed perf footer. All optional — a provider that omits
+    #: ``usage`` (or a stream that closed early) leaves them ``None``. Purely
+    #: COSMETIC, like ``reasoning``: never feeds action parsing.
+    tokens_in: int | None = None
+    tokens_out: int | None = None
+    reasoning_tokens: int | None = None
+    #: Time to first token (seconds) and generation throughput (tokens/sec).
+    ttft_s: float | None = None
+    tok_s: float | None = None

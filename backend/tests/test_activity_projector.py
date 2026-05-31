@@ -231,3 +231,83 @@ def test_redact_payload_passes_non_mail_through() -> None:
     assert redact_payload(md) == md
     assert redact_payload("plain string") == "plain string"
     assert redact_payload(None) is None
+
+
+# ---------------------------------------------------------------------------
+# 4. B2 — tool-call chips carry redacted args + content-free result summaries
+# ---------------------------------------------------------------------------
+
+
+def test_tool_call_started_carries_arg_summary() -> None:
+    chip = project(
+        ToolCallStarted(
+            agent_ref=AGENT, tool_name="gmail_search", args={"query": "from:daniela", "limit": 10}
+        )
+    )
+    assert chip is not None
+    assert chip.args is not None
+    assert "from:daniela" in chip.args
+    assert "limit: 10" in chip.args
+    assert chip.result is None
+
+
+def test_tool_call_finished_ok_summarises_result_count_not_content() -> None:
+    chip = project(
+        ToolCallFinished(
+            agent_ref=AGENT,
+            tool_name="gmail_search",
+            ok=True,
+            args={"query": "from:daniela"},
+            result={"messages": [{"subject": "Salaire secret"}, {"subject": "Autre"}]},
+        )
+    )
+    assert chip is not None
+    assert chip.status == "ok"
+    assert chip.result == "2 messages"
+    # Content-free: no subject text leaks into the summary.
+    assert "Salaire" not in (chip.result or "")
+
+
+def test_tool_call_finished_error_has_no_result() -> None:
+    chip = project(
+        ToolCallFinished(
+            agent_ref=AGENT, tool_name="gmail_search", ok=False, error_code="bad", args={"q": "x"}
+        )
+    )
+    assert chip is not None and chip.status == "error"
+    assert chip.result is None
+    assert chip.args == "q: x"
+
+
+def test_tool_call_args_are_mail_redacted() -> None:
+    """A Mail descriptor smuggled into the args is scrubbed before the chip."""
+
+    chip = project(
+        ToolCallStarted(
+            agent_ref=AGENT,
+            tool_name="draft",
+            args={"component": "Mail", "props": {"subject": "Top secret", "messageId": "m1"}},
+        )
+    )
+    assert chip is not None and chip.args is not None
+    assert "Top secret" not in chip.args
+
+
+def test_tool_call_result_list_is_counted() -> None:
+    chip = project(
+        ToolCallFinished(
+            agent_ref=AGENT, tool_name="calendar", ok=True, result=[{"x": 1}, {"x": 2}, {"x": 3}]
+        )
+    )
+    assert chip is not None and chip.result == "3 éléments"
+
+
+def test_to_wire_includes_args_and_result_only_when_present() -> None:
+    bare = AgentActivity(agent_ref=AGENT, kind="stall", label="x", status="warn").to_wire()
+    assert "args" not in bare and "result" not in bare
+
+    full = AgentActivity(
+        agent_ref=AGENT, kind="tool_call", label="x", status="ok", args="q: 1", result="2 messages"
+    ).to_wire()
+    assert full["args"] == "q: 1"
+    assert full["result"] == "2 messages"

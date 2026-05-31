@@ -25,6 +25,60 @@ Future locales will sit alongside (``personality_v1_fr``,
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
+
+#: French weekday names indexed by ``datetime.weekday()`` (Monday == 0).
+_FR_WEEKDAYS = (
+    "lundi",
+    "mardi",
+    "mercredi",
+    "jeudi",
+    "vendredi",
+    "samedi",
+    "dimanche",
+)
+#: French month names indexed by ``month - 1``.
+_FR_MONTHS = (
+    "janvier",
+    "février",
+    "mars",
+    "avril",
+    "mai",
+    "juin",
+    "juillet",
+    "août",
+    "septembre",
+    "octobre",
+    "novembre",
+    "décembre",
+)
+
+
+def temporal_context_fragment(now: datetime | None = None) -> str:
+    """Render a one-line French statement of the current date.
+
+    Injected verbatim into the Jarvis and sub-agent system prompts so the
+    LLM always knows "today" without guessing (the local models otherwise
+    hallucinate a stale year — see the ``gmail_search`` ``after:"2024-…"``
+    stall). Both the human-readable form and the ISO date are surfaced: the
+    former answers "quel jour on est ?", the latter is the exact token the
+    model should pass to date-typed tool arguments.
+
+    ``now`` is injectable for deterministic tests; production passes ``None``
+    so the fragment is re-evaluated on every call (a session may span days).
+    """
+
+    moment = now or datetime.now()
+    weekday = _FR_WEEKDAYS[moment.weekday()]
+    month = _FR_MONTHS[moment.month - 1]
+    iso = moment.strftime("%Y-%m-%d")
+    return (
+        f"Contexte temporel : nous sommes le {weekday} {moment.day} {month} "
+        f"{moment.year} (date du jour au format ISO : {iso}). Utilise cette "
+        "date pour tout raisonnement relatif (« aujourd'hui », « hier », "
+        "« ce mois-ci ») et comme valeur des arguments d'outils attendant "
+        "une date."
+    )
 
 
 @dataclass(frozen=True)
@@ -295,39 +349,41 @@ SYSTEM_BLOCK_PERSONALITY_REMINDER = PromptFragment(
 
 SUB_AGENT_V2_SYSTEM_PROMPT = PromptFragment(
     id="sub_agent_v2_system",
-    version=6,
+    version=7,
     template=(
-        "Tu es un sub-agent autonome. Ton but : {goal}.\n"
-        "À chaque tour tu émets UNE seule action JSON parmi :\n"
-        '  - {{"action": "progress", "thought": "<réflexion>"}} pour '
-        "exposer une réflexion intermédiaire (la boucle continue).\n"
-        '  - {{"action": "tool_call", "name": "<nom>", "args": {{...}}}} '
-        "pour invoquer un outil disponible ci-dessous (la boucle continue "
-        "après l'exécution).\n"
-        '  - {{"action": "done", "result_summary": "<résumé 1-2 phrases>", '
-        '"ui_payload": "<livrable Markdown complet, ou null>", '
-        '"result_ref": "<réf. d\'un résultat d\'outil, ou null>", '
-        '"status": "complete", "reason_code": "ok", "cost": {{}}}} pour '
-        "terminer.\n"
-        "Quand la tâche produit un livrable que TU rédiges (exposé, rapport, "
-        "chronologie, document…), mets le contenu Markdown COMPLET dans "
-        "``ui_payload`` (une chaîne Markdown, pas un objet) et un résumé court "
-        "(1-2 phrases) dans ``result_summary``. Si la tâche n'a pas de livrable "
-        "à afficher, ``ui_payload`` vaut null.\n"
-        "Quand un outil a renvoyé un résultat, son message ``tool`` contient un "
-        "identifiant court ``result_ref`` (ex. ``outil#1``). Pour conclure À "
-        "PARTIR de ce résultat, mets ce ``result_ref`` dans ``done`` : le "
-        "livrable affichable (carte, aperçu…) est reconstruit AUTOMATIQUEMENT "
-        "côté serveur — tu n'as PAS besoin de recopier les données du résultat "
-        "dans ``ui_payload``.\n"
-        "Statuts ``done`` : ``complete`` (but atteint), ``degraded`` "
-        "(résultat partiel sous contrainte), ``failed`` (erreur non "
-        "récupérable). ``cancelled`` et ``timeout`` sont émis par le "
-        "runner lui-même, ne les renvoie pas.\n"
+        "You are an autonomous sub-agent. Your goal: {goal}.\n"
+        "Reason internally in English. ALL user-facing text you write — "
+        "``result_summary`` and the Markdown inside ``ui_payload`` — MUST be "
+        "in French (the user, Tom, reads French).\n"
+        "At each turn you emit EXACTLY ONE JSON action among:\n"
+        '  - {{"action": "progress", "thought": "<reasoning>"}} to expose '
+        "intermediate reasoning (the loop continues).\n"
+        '  - {{"action": "tool_call", "name": "<name>", "args": {{...}}}} '
+        "to invoke an available tool listed below (the loop continues after "
+        "execution).\n"
+        '  - {{"action": "done", "result_summary": "<1-2 sentence summary, '
+        'in French>", "ui_payload": "<full Markdown deliverable in French, or '
+        'null>", "result_ref": "<ref to a tool result, or null>", '
+        '"status": "complete", "reason_code": "ok", "cost": {{}}}} to '
+        "finish.\n"
+        "When the task produces a deliverable that YOU author (briefing, "
+        "report, timeline, document…), put the COMPLETE Markdown content (in "
+        "French) in ``ui_payload`` (a Markdown string, not an object) and a "
+        "short summary (1-2 sentences, in French) in ``result_summary``. If "
+        "the task has no deliverable to display, ``ui_payload`` is null.\n"
+        "When a tool has returned a result, its ``tool`` message contains a "
+        "short identifier ``result_ref`` (e.g. ``tool#1``). To conclude FROM "
+        "that result, put this ``result_ref`` in ``done``: the displayable "
+        "deliverable (card, preview…) is rebuilt AUTOMATICALLY server-side — "
+        "you do NOT need to copy the result data into ``ui_payload``.\n"
+        "``done`` statuses: ``complete`` (goal reached), ``degraded`` "
+        "(partial result under constraint), ``failed`` (non-recoverable "
+        "error). ``cancelled`` and ``timeout`` are emitted by the runner "
+        "itself — do not return them.\n"
         "\n"
-        "Réponds avec l'objet JSON UNIQUEMENT, sans texte autour. Le "
-        "Markdown du livrable vit À L'INTÉRIEUR de la chaîne ``ui_payload`` "
-        "— l'enveloppe reste du JSON pur."
+        "Reply with the JSON object ONLY, no surrounding text. The "
+        "deliverable Markdown lives INSIDE the ``ui_payload`` string — the "
+        "envelope stays pure JSON."
     ),
     description=(
         "Base system prompt for sub-agents under the v2 contract (PRD 0006 / "
@@ -339,7 +395,10 @@ SUB_AGENT_V2_SYSTEM_PROMPT = PromptFragment(
         "``done`` may reference it instead of copying the data into "
         "``ui_payload`` (the server rebuilds the deliverable from the stored "
         "result deterministically). The example ref is deliberately generic "
-        "(``outil#1``) so the base contract names no specific tool."
+        "(``tool#1``) so the base contract names no specific tool. v7 switches "
+        "the contract + internal reasoning to English (better CoT / tool-call "
+        "accuracy on small local models) while pinning all user-facing output "
+        "(``result_summary``, ``ui_payload``) to French."
     ),
 )
 
@@ -390,59 +449,57 @@ class SkillPack:
 
 GMAIL_SEARCH_SKILL_PACK = SkillPack(
     id="gmail_search_recipe",
-    version=2,
+    version=3,
     fragment=PromptFragment(
         id="gmail_search_recipe",
-        version=2,
+        version=3,
         template=(
-            "Cas spécial — recherche d'un mail. Quand le but consiste à "
-            "retrouver un email dans la boîte Gmail de l'utilisateur :\n"
-            '  1. (optionnel) ``progress(thought="recherche Gmail")`` pour '
-            "signaler que tu commences.\n"
-            "  2. Appelle ``gmail_search`` avec les filtres les plus "
-            "spécifiques que tu peux inférer du but (``from_name``, "
-            "``from_email``, ``subject_contains``, ``after``, ``before``, "
-            "``has_attachment``, ``label``). ``max_results`` reste à 1 sauf "
-            "si le but mentionne explicitement plusieurs mails. N'appelle "
-            "JAMAIS ``gmail_search`` sans au moins un filtre — un appel sans "
-            "argument est rejeté. **Fallback obligatoire pour un but "
-            "générique** (« dernier mail », « dernier mail reçu », « ma "
-            "boîte », « inbox », sans expéditeur ni sujet ni date) : "
-            '``label="INBOX"``. Pour « dernier mail envoyé » sans cible : '
-            '``label="SENT"``. Ne retente JAMAIS le même appel sans filtre — '
-            "choisis le fallback ``label`` dès le premier essai si rien "
-            "d'autre n'est inférable.\n"
-            "  3. C'est tout pour le cas nominal : dès que ``gmail_search`` "
-            "renvoie un résultat (vide ou non), la carte Mail et le résumé "
-            "parlé sont construits AUTOMATIQUEMENT et la tâche se termine. Tu "
-            "n'as ni à rédiger le ``done`` ni à recopier les ``props`` du "
-            "mail. (Si jamais tu reprends la main après le résultat, termine "
-            "par ``done`` en mettant le ``result_ref`` du résultat — pas "
-            "besoin de ``ui_payload``.)\n"
+            "Special case — mail lookup. When the goal is to find an email in "
+            "the user's Gmail inbox:\n"
+            '  1. (optional) ``progress(thought="searching Gmail")`` to signal '
+            "you are starting.\n"
+            "  2. Call ``gmail_search`` with the most specific filters you can "
+            "infer from the goal (``from_name``, ``from_email``, "
+            "``subject_contains``, ``after``, ``before``, ``has_attachment``, "
+            "``label``). ``max_results`` stays at 1 unless the goal explicitly "
+            "mentions several mails. NEVER call ``gmail_search`` without at "
+            "least one filter — an argument-less call is rejected. **Mandatory "
+            "fallback for a generic goal** (« dernier mail », « dernier mail "
+            "reçu », « ma boîte », « inbox », with no sender, subject or "
+            'date): ``label="INBOX"``. For « dernier mail envoyé » with no '
+            'target: ``label="SENT"``. NEVER retry the same filter-less call '
+            "— pick the ``label`` fallback on the first attempt if nothing "
+            "else is inferable.\n"
+            "  3. That is all for the nominal case: as soon as ``gmail_search`` "
+            "returns a result (empty or not), the Mail card and the spoken "
+            "summary are built AUTOMATICALLY and the task ends. You neither "
+            "write the ``done`` nor copy the mail ``props``. (If you ever "
+            "regain control after the result, finish with ``done`` carrying "
+            "the result's ``result_ref`` — no ``ui_payload`` needed.)\n"
             "\n"
-            "Si ``gmail_search`` renvoie une ERREUR (et non un résultat), "
-            'c\'est à TOI de conclure : émets ``done(status="failed", '
-            "ui_payload=null)`` dont le ``result_summary`` sera lu à voix "
-            "haute, mot pour mot :\n"
+            "If ``gmail_search`` returns an ERROR (not a result), it is up to "
+            'YOU to conclude: emit ``done(status="failed", ui_payload=null)`` '
+            "whose ``result_summary`` will be read aloud, verbatim. The spoken "
+            "summary MUST be in French, using these exact sentences:\n"
             "  - ``gmail_search_bootstrap_required`` / "
             "``gmail_search_refresh_failed`` / ``gmail_search_auth_failed`` "
-            "(accès OAuth expiré/révoqué) : « Mon accès à Gmail a expiré — "
+            "(OAuth access expired/revoked): « Mon accès à Gmail a expiré — "
             "relance le script de connexion (python -m "
-            "bob.connectors.gmail.auth). » — le chemin ``python -m "
-            "bob.connectors.gmail.auth`` DOIT figurer littéralement.\n"
-            "  - ``gmail_search_api_unreachable`` (Gmail 5xx / quota / "
-            "timeout réseau) : « Je n'ai pas pu joindre Gmail à l'instant — "
-            "réessaie dans un moment. »\n"
-            "  - ``gmail_search_invalid_query`` / ``gmail_search_failed`` : "
+            "bob.connectors.gmail.auth). » — the path ``python -m "
+            "bob.connectors.gmail.auth`` MUST appear literally.\n"
+            "  - ``gmail_search_api_unreachable`` (Gmail 5xx / quota / network "
+            "timeout): « Je n'ai pas pu joindre Gmail à l'instant — réessaie "
+            "dans un moment. »\n"
+            "  - ``gmail_search_invalid_query`` / ``gmail_search_failed``: "
             "« Je n'ai pas pu effectuer la recherche Gmail — vérifie ta "
             "demande. »\n"
-            "  - ``invalid_args`` (validation du tool) : réessaie "
-            "``gmail_search`` AVEC un filtre cette fois ; si l'erreur "
-            'persiste, ``done(status="failed", ui_payload=null, '
+            "  - ``invalid_args`` (tool validation): retry ``gmail_search`` "
+            "WITH a filter this time; if the error persists, "
+            '``done(status="failed", ui_payload=null, '
             "result_summary=\"Je n'ai pas su construire la recherche "
             'Gmail.")``.\n'
-            "Tiens-toi à ces phrases mot pour mot (substitue le nom/email "
-            "cherché si pertinent)."
+            "Stick to these French sentences word for word (substitute the "
+            "searched name/email if relevant)."
         ),
         description=(
             "Gmail email-lookup recipe — slimmed in PRD 0009 (v2). The happy "
@@ -454,7 +511,10 @@ GMAIL_SEARCH_SKILL_PACK = SkillPack(
             "only (a) building a good search (filters + INBOX/SENT fallback "
             "for generic goals) and (b) the tool-ERROR branches, which do not "
             "converge and still need a model-authored ``done(failed)`` with a "
-            "pinned French speech."
+            "pinned French speech. v3 (matching base prompt v7) switches the "
+            "recipe instructions to English for small-model reliability while "
+            "keeping the verbatim spoken error sentences in French (they are "
+            "read aloud to the user via TTS)."
         ),
     ),
     triggers=("mail", "gmail", "courriel", "messagerie", "boîte", "inbox"),

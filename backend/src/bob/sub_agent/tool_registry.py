@@ -37,6 +37,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta
 from typing import Any, Literal, Protocol
 
 import structlog
@@ -332,7 +333,35 @@ def build_web_fetch_tool() -> SubAgentToolDefinition:
 # ---------------------------------------------------------------------------
 
 
-_GMAIL_SEARCH_MAX_RESULTS_CAP = 5
+#: Relative-date tokens the LLM may pass for ``after`` / ``before`` instead of
+#: an absolute date. Resolved server-side against "now" so the value never
+#: depends on the model knowing today's date (see issue: the model passed a
+#: stale ``after:"2024-…"`` and stalled). Keys are matched case-insensitively.
+_RELATIVE_DATE_TOKENS = {
+    "today": 0,
+    "aujourd'hui": 0,
+    "aujourdhui": 0,
+    "yesterday": -1,
+    "hier": -1,
+}
+
+
+def _resolve_relative_date(value: str | None, *, today: date | None = None) -> str | None:
+    """Resolve a relative-date token to a ``YYYY-MM-DD`` string.
+
+    Returns the input unchanged when it is not a recognised token (absolute
+    dates fall straight through to the query builder). ``today`` is injectable
+    for deterministic tests; production passes ``None`` → ``datetime.now()``.
+    """
+
+    if value is None:
+        return None
+    token = value.strip().lower()
+    delta = _RELATIVE_DATE_TOKENS.get(token)
+    if delta is None:
+        return value
+    base = today or datetime.now().date()
+    return (base + timedelta(days=delta)).strftime("%Y-%m-%d")
 
 
 class GmailSearchArgs(BaseModel):
@@ -341,17 +370,16 @@ class GmailSearchArgs(BaseModel):
     Mirrors the keyword surface of
     :func:`bob.connectors.gmail.query_builder.build_query` so the sub-agent
     LLM can express a precise lookup without ever touching Gmail's raw
-    operator syntax. ``max_results`` is hard-capped at 5 server-side: the
-    Mail overlay shows one card at a time, asking the LLM to triage more
-    than a handful is wasted tokens.
+    operator syntax. ``max_results`` has no upper cap — the Mail overlay
+    renders one card per returned message, so any number the LLM asks for
+    surfaces in full.
 
     Validation rules:
 
     - At least one of the seven filter fields must be set — an all-None
       payload would otherwise emit an empty query and Gmail returns the
       whole inbox, which is never the caller's intent.
-    - ``max_results`` is clamped into ``[1, 5]`` so out-of-range values
-      gracefully degrade instead of raising.
+    - ``max_results`` must be ``>= 1``; there is no upper bound.
     """
 
     from_name: str | None = Field(
@@ -368,11 +396,19 @@ class GmailSearchArgs(BaseModel):
     )
     after: str | None = Field(
         default=None,
-        description="ISO 8601 date — only mails received strictly after.",
+        description=(
+            "Date — only mails received strictly after. Accepts an ISO date "
+            "('2026-05-30') or a relative token ('today'/'aujourd'hui', "
+            "'yesterday'/'hier')."
+        ),
     )
     before: str | None = Field(
         default=None,
-        description="ISO 8601 date — only mails received strictly before.",
+        description=(
+            "Date — only mails received strictly before. Accepts an ISO date "
+            "('2026-05-30') or a relative token ('today'/'aujourd'hui', "
+            "'yesterday'/'hier')."
+        ),
     )
     has_attachment: bool | None = Field(
         default=None,
@@ -385,8 +421,7 @@ class GmailSearchArgs(BaseModel):
     max_results: int = Field(
         default=1,
         ge=1,
-        le=_GMAIL_SEARCH_MAX_RESULTS_CAP,
-        description=("Maximum number of messages to return (1-5; cap enforced server-side)."),
+        description=("Maximum number of messages to return (>= 1; no upper cap)."),
     )
 
     @model_validator(mode="after")
@@ -462,8 +497,8 @@ async def _gmail_search_handler(
             from_name=args.from_name,
             from_email=args.from_email,
             subject_contains=args.subject_contains,
-            after=args.after,
-            before=args.before,
+            after=_resolve_relative_date(args.after),
+            before=_resolve_relative_date(args.before),
             has_attachment=args.has_attachment,
             label=args.label,
         )
@@ -639,9 +674,7 @@ def project_gmail_search(result: dict[str, Any]) -> ProjectedResult:
     # Non-dict entries are skipped — a malformed item must never crash the
     # projection nor poison the section list.
     usable: list[dict[str, Any]] = [msg for msg in messages if isinstance(msg, dict)]
-    sections: list[dict[str, Any]] = [
-        {"component": "Mail", "props": msg} for msg in usable
-    ]
+    sections: list[dict[str, Any]] = [{"component": "Mail", "props": msg} for msg in usable]
 
     if count > 0 and usable:
         first = usable[0]
@@ -687,7 +720,8 @@ def build_gmail_search_tool() -> SubAgentToolDefinition:
             "filtres structurés (expéditeur, sujet, dates, etc.) et renvoie "
             "la liste des messages correspondants prête à être affichée par "
             "le composant ``Mail``. Utilise dès que la demande concerne un "
-            "mail précis. ``max_results`` est limité à 5."
+            "mail précis. ``max_results`` n'a pas de limite haute (1 par "
+            "défaut) ; chaque message renvoyé donne une carte ``Mail``."
         ),
         args_model=GmailSearchArgs,
         handler=_gmail_search_handler,

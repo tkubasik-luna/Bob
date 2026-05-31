@@ -129,6 +129,7 @@ from bob.sub_agent.activity_projector import (
     ToolCallFinished,
     ToolCallStarted,
     Validation,
+    agent_perf_frame,
     project,
 )
 from bob.sub_agent.addendum_queue import AddendumEntry, AddendumQueue
@@ -234,6 +235,19 @@ def _estimate_tokens_text(text: str) -> int:
     """Rough heuristic — ~4 chars/token (matches ``bob.llm_client``)."""
 
     return len(text) // 4
+
+
+async def _emit_perf(agent_ref: str, perf: Any) -> None:
+    """Ship the terminal ``agent_perf`` frame for a streamed call, if non-empty.
+
+    ``perf`` is the reader's terminal ``StreamChunk`` (or ``None``). A degraded
+    backend (no usage/timing) yields no frame — same rides-the-WS-shim path as
+    ``reasoning_delta`` / ``agent_activity``.
+    """
+
+    frame = agent_perf_frame(agent_ref, perf)
+    if frame is not None:
+        await ws_events.emit(frame, debug_event=None)
 
 
 def _estimate_messages_tokens(messages: list[dict[str, Any]]) -> int:
@@ -1667,6 +1681,7 @@ class SubAgentRunner:
                     "delta": delta,
                 }
             )
+        await _emit_perf(task_id, reader.perf)
         return reader.content, reader.degraded
 
     async def _emit_activity(self, event: InternalEvent) -> None:
@@ -1998,7 +2013,9 @@ class SubAgentRunner:
         # it settles. A pre-dispatch validation failure (next block) does NOT
         # reach the settle chip — the ``validation_failed`` chip in ``_run``
         # covers that mistake instead.
-        await self._emit_activity(ToolCallStarted(agent_ref=task_id, tool_name=action.name))
+        await self._emit_activity(
+            ToolCallStarted(agent_ref=task_id, tool_name=action.name, args=action.args)
+        )
 
         # Issue 0059 — pre-dispatch schema validation. Issue 0062 — a failure
         # here is the model's mistake, not a tool result: return it so the
@@ -2087,6 +2104,11 @@ class SubAgentRunner:
                 tool_name=action.name,
                 ok=result.ok,
                 error_code=None if result.ok else result.error_code,
+                args=action.args,
+                # B2 — RAW structured result on success; the projector redacts +
+                # derives a content-free summary. Never the digest string (which
+                # could carry a Mail subject) and never set on failure.
+                result=result.result if result.ok else None,
             )
         )
         return _ToolCallStep(dispatched=result, stored=stored)

@@ -54,6 +54,7 @@ class ReasoningStreamReader:
         self._content_parts: list[str] = []
         self._saw_reasoning = False
         self._done = False
+        self._perf: StreamChunk | None = None
 
     async def reasoning_deltas(self) -> AsyncIterator[str]:
         """Yield reasoning deltas in order while draining the underlying stream.
@@ -73,6 +74,10 @@ class ReasoningStreamReader:
             elif chunk.kind == "text":
                 if chunk.text_delta:
                     self._content_parts.append(chunk.text_delta)
+            elif chunk.kind == "perf":
+                # Terminal cosmetic chunk — token usage + timing for the feed's
+                # perf footer. Stashed, exposed via :attr:`perf` once drained.
+                self._perf = chunk
             # tool_call_* chunks are not part of the sub-agent envelope path —
             # ignored deliberately (the action is guided-JSON text content).
         self._done = True
@@ -110,6 +115,22 @@ class ReasoningStreamReader:
                 "reasoning_deltas() first"
             )
         return not self._saw_reasoning
+
+    @property
+    def perf(self) -> StreamChunk | None:
+        """The terminal ``perf`` chunk (token usage + timing), or ``None``.
+
+        ``None`` when the provider emitted no usage / timing (e.g. a stream that
+        closed early, or a backend without ``stream_options`` support). Same
+        post-drain guard as :attr:`content`.
+        """
+
+        if not self._done:
+            raise ReasoningStreamReaderError(
+                "perf read before the reasoning stream was drained — exhaust "
+                "reasoning_deltas() first"
+            )
+        return self._perf
 
 
 __all__ = ["ReasoningStreamReader", "ReasoningStreamReaderError"]

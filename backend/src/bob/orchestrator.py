@@ -116,11 +116,11 @@ from bob.epoch import (
     RetrievalAPI,
 )
 from bob.jarvis_store import JarvisStore
-from bob.llm.types import LLMResponse, ToolCall
+from bob.llm.types import LLMResponse, StreamChunk, ToolCall
 from bob.llm_client import LLMClient
 from bob.rolling_summary_store import RollingSummaryStore
 from bob.streaming import StreamEmitter
-from bob.sub_agent.activity_projector import AgentActivity
+from bob.sub_agent.activity_projector import AgentActivity, agent_perf_frame
 from bob.task_completion_debouncer import (
     DEFAULT_DEBOUNCE_SECONDS,
     TaskCompletionDebouncer,
@@ -805,6 +805,10 @@ class Orchestrator:
                     await emitter.finalize(chunk.final_arguments)
             elif chunk.kind == "text":
                 text_buffer += chunk.text_delta
+            elif chunk.kind == "perf":
+                # PRD reasoning-streaming — terminal token-usage + timing for the
+                # Jarvis lane's perf footer. Cosmetic, same WS shim as reasoning.
+                await self._emit_jarvis_perf(chunk)
             elif chunk.kind == "reasoning":
                 # PRD 0011 / issue 0072 — Jarvis's native ``reasoning_content``
                 # channel surfaces live in its lane as ``reasoning_delta`` events
@@ -894,6 +898,17 @@ class Orchestrator:
             }
         )
 
+    async def _emit_jarvis_perf(self, perf: StreamChunk) -> None:
+        """Push Jarvis's terminal ``agent_perf`` frame on the chat WS (cosmetic).
+
+        Same builder + WS shim the sub-agent runner uses; ``None`` (degraded
+        backend, no usage) emits nothing.
+        """
+
+        frame = agent_perf_frame(JARVIS_AGENT_REF, perf)
+        if frame is not None:
+            await ws_events.emit(frame, debug_event=None)
+
     async def _emit_jarvis_activity(self, chip: AgentActivity) -> None:
         """Project + push a Jarvis orchestration chip on the chat WS (issue 0072).
 
@@ -907,26 +922,24 @@ class Orchestrator:
         await ws_events.emit(chip.to_wire(), debug_event=None)
 
     async def _emit_jarvis_final_answer(self, speech: str) -> None:
-        """Duplicate Jarvis's final spoken answer as TEXT into its lane (issue 0072).
+        """Emit Jarvis's settled reply as a DISTINCT answer into its lane.
 
-        The answer rides the SAME ``reasoning_delta`` channel the lane already
-        renders (no new frontend component), but it is DISTINCT from the
-        chain-of-thought: reasoning streams live DURING generation, the answer is
-        emitted ONCE here at the end of a successful turn. Ordering therefore
-        reads sensibly in the block (thoughts first, answer last) and the two are
-        never double-counted — the reasoning stream carries chain-of-thought, this
-        carries the settled reply. This is purely additive to the existing
-        ``speech_delta`` → sphere/TTS path, which still fires unchanged inside the
-        :class:`StreamEmitter` during the stream.
+        The chain-of-thought streams live on ``reasoning_delta`` DURING
+        generation; the settled reply is a separate thing the user asked to see
+        on its own. So it rides a dedicated ``agent_answer`` event (the lane
+        renders it as a distinct "Réponse" block, below the reasoning) — NOT the
+        reasoning channel, so the two never mix or double-count. Emitted ONCE at
+        the end of a successful turn. Purely additive to the ``speech_delta`` →
+        sphere/TTS path, which still fires unchanged during the stream.
         """
 
         if not speech.strip():
             return
         await ws_events.emit(
             {
-                "type": "reasoning_delta",
+                "type": "agent_answer",
                 "agent_ref": JARVIS_AGENT_REF,
-                "delta": speech,
+                "text": speech,
             }
         )
 

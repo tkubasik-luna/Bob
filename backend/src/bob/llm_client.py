@@ -144,6 +144,64 @@ def _estimate_tokens(messages: list[dict[str, Any]]) -> int:
     return total_chars // 4
 
 
+def _read_usage(
+    raw_chunk: Any,
+    tokens_in: int | None,
+    tokens_out: int | None,
+    reasoning_tokens: int | None,
+) -> tuple[int | None, int | None, int | None]:
+    """Fold a streamed chunk's ``usage`` block into running token counters.
+
+    LM Studio emits a final usage-only chunk when ``stream_options.include_usage``
+    is set: ``prompt_tokens`` / ``completion_tokens`` and a nested
+    ``completion_tokens_details.reasoning_tokens``. Each is kept iff present so a
+    later empty chunk never clobbers a real count.
+    """
+
+    usage = getattr(raw_chunk, "usage", None)
+    if usage is None:
+        return tokens_in, tokens_out, reasoning_tokens
+    tokens_in = getattr(usage, "prompt_tokens", None) or tokens_in
+    tokens_out = getattr(usage, "completion_tokens", None) or tokens_out
+    details = getattr(usage, "completion_tokens_details", None)
+    if details is not None:
+        reasoning_tokens = getattr(details, "reasoning_tokens", None) or reasoning_tokens
+    return tokens_in, tokens_out, reasoning_tokens
+
+
+def _build_perf_chunk(
+    *,
+    started: float,
+    first_token_at: float | None,
+    tokens_in: int | None,
+    tokens_out: int | None,
+    reasoning_tokens: int | None,
+) -> StreamChunk:
+    """Build the terminal ``perf`` :class:`StreamChunk` for the activity-feed footer.
+
+    ``ttft_s`` = time from request to the first streamed token. ``tok_s`` =
+    generation throughput over the post-first-token window (so prompt-processing
+    latency doesn't drag the number down). Both ``None`` when the inputs are
+    unknown (no usage, or an empty stream).
+    """
+
+    now = time.perf_counter()
+    ttft_s = (first_token_at - started) if first_token_at is not None else None
+    tok_s: float | None = None
+    if tokens_out and first_token_at is not None:
+        gen_window = now - first_token_at
+        if gen_window > 0:
+            tok_s = round(tokens_out / gen_window, 1)
+    return StreamChunk(
+        kind="perf",
+        tokens_in=tokens_in,
+        tokens_out=tokens_out,
+        reasoning_tokens=reasoning_tokens,
+        ttft_s=round(ttft_s, 3) if ttft_s is not None else None,
+        tok_s=tok_s,
+    )
+
+
 class LLMClientError(RuntimeError):
     """Raised when an LLM backend fails irrecoverably (non-zero exit, timeout)."""
 
@@ -555,6 +613,10 @@ class LMStudioClient(LLMClient):
             "timeout": self._settings.LLM_TIMEOUT_SECONDS,
             "max_tokens": 4096,
             "stream": True,
+            # PRD reasoning-streaming — request a final usage-only chunk so the
+            # activity feed can show perf stats (tok/s, tokens). LM Studio omits
+            # ``usage`` on streamed responses unless this is set.
+            "stream_options": {"include_usage": True},
         }
         if schema is not None:
             kwargs["response_format"] = {
@@ -633,14 +695,15 @@ class LMStudioClient(LLMClient):
         text_buffer = ""
         tokens_in: int | None = None
         tokens_out: int | None = None
+        reasoning_tokens: int | None = None
+        first_token_at: float | None = None
         try:
             async for raw_chunk in stream:
                 choices = getattr(raw_chunk, "choices", None) or []
                 if not choices:
-                    usage = getattr(raw_chunk, "usage", None)
-                    if usage is not None:
-                        tokens_in = getattr(usage, "prompt_tokens", None) or tokens_in
-                        tokens_out = getattr(usage, "completion_tokens", None) or tokens_out
+                    tokens_in, tokens_out, reasoning_tokens = _read_usage(
+                        raw_chunk, tokens_in, tokens_out, reasoning_tokens
+                    )
                     continue
                 delta = getattr(choices[0], "delta", None)
                 if delta is None:
@@ -648,17 +711,27 @@ class LMStudioClient(LLMClient):
 
                 reasoning_content = getattr(delta, "reasoning_content", None) or ""
                 if isinstance(reasoning_content, str) and reasoning_content:
+                    if first_token_at is None:
+                        first_token_at = time.perf_counter()
                     yield StreamChunk(kind="reasoning", reasoning_delta=reasoning_content)
 
                 content = getattr(delta, "content", None) or ""
                 if isinstance(content, str) and content:
+                    if first_token_at is None:
+                        first_token_at = time.perf_counter()
                     text_buffer += content
                     yield StreamChunk(kind="text", text_delta=content)
 
-                usage = getattr(raw_chunk, "usage", None)
-                if usage is not None:
-                    tokens_in = getattr(usage, "prompt_tokens", None) or tokens_in
-                    tokens_out = getattr(usage, "completion_tokens", None) or tokens_out
+                tokens_in, tokens_out, reasoning_tokens = _read_usage(
+                    raw_chunk, tokens_in, tokens_out, reasoning_tokens
+                )
+            yield _build_perf_chunk(
+                started=started,
+                first_token_at=first_token_at,
+                tokens_in=tokens_in,
+                tokens_out=tokens_out,
+                reasoning_tokens=reasoning_tokens,
+            )
         finally:
             latency_ms = (time.perf_counter() - started) * 1000.0
             log_llm_call(
@@ -927,6 +1000,9 @@ class LMStudioClient(LLMClient):
             "timeout": self._settings.LLM_TIMEOUT_SECONDS,
             "max_tokens": 4096,
             "stream": True,
+            # PRD reasoning-streaming — see ``stream_chat``. Final usage-only
+            # chunk feeds the activity feed's perf stats.
+            "stream_options": {"include_usage": True},
         }
         # Issue 0058 — same codec injection as ``complete``.
         if tools:
@@ -1016,17 +1092,18 @@ class LMStudioClient(LLMClient):
         text_buffer = ""
         tokens_in: int | None = None
         tokens_out: int | None = None
+        reasoning_tokens: int | None = None
+        first_token_at: float | None = None
 
         try:
             async for raw_chunk in stream:
                 choices = getattr(raw_chunk, "choices", None) or []
                 if not choices:
-                    # OpenAI emits a closing ``usage`` chunk on some
-                    # providers with no ``choices`` payload.
-                    usage = getattr(raw_chunk, "usage", None)
-                    if usage is not None:
-                        tokens_in = getattr(usage, "prompt_tokens", None)
-                        tokens_out = getattr(usage, "completion_tokens", None)
+                    # OpenAI / LM Studio emit a closing ``usage`` chunk (with
+                    # ``stream_options.include_usage``) with no ``choices``.
+                    tokens_in, tokens_out, reasoning_tokens = _read_usage(
+                        raw_chunk, tokens_in, tokens_out, reasoning_tokens
+                    )
                     continue
                 choice = choices[0]
                 delta = getattr(choice, "delta", None)
@@ -1042,24 +1119,29 @@ class LMStudioClient(LLMClient):
                 # the field, so this is a no-op there (degraded mode).
                 reasoning_content = getattr(delta, "reasoning_content", None) or ""
                 if isinstance(reasoning_content, str) and reasoning_content:
+                    if first_token_at is None:
+                        first_token_at = time.perf_counter()
                     yield StreamChunk(kind="reasoning", reasoning_delta=reasoning_content)
 
                 # Text-mode delta — uncommon under the unified ``say``
                 # tool, supported for robustness.
                 content = getattr(delta, "content", None) or ""
                 if isinstance(content, str) and content:
+                    if first_token_at is None:
+                        first_token_at = time.perf_counter()
                     text_buffer += content
                     yield StreamChunk(kind="text", text_delta=content)
 
                 # Tool-call deltas — delegated to the codec's stream parser.
                 for chunk in parser.feed(delta):
+                    if first_token_at is None:
+                        first_token_at = time.perf_counter()
                     yield chunk
 
                 # Final usage chunk on some providers.
-                usage = getattr(raw_chunk, "usage", None)
-                if usage is not None:
-                    tokens_in = getattr(usage, "prompt_tokens", None) or tokens_in
-                    tokens_out = getattr(usage, "completion_tokens", None) or tokens_out
+                tokens_in, tokens_out, reasoning_tokens = _read_usage(
+                    raw_chunk, tokens_in, tokens_out, reasoning_tokens
+                )
 
             # Stream exhausted — flush ``tool_call_end`` chunks. A malformed
             # final-args raise is translated back into the legacy
@@ -1085,6 +1167,14 @@ class LMStudioClient(LLMClient):
                         correlation_id=correlation_id,
                     )
                 raise LLMClientError(exc.message) from exc
+
+            yield _build_perf_chunk(
+                started=started,
+                first_token_at=first_token_at,
+                tokens_in=tokens_in,
+                tokens_out=tokens_out,
+                reasoning_tokens=reasoning_tokens,
+            )
         finally:
             latency_ms = (time.perf_counter() - started) * 1000.0
             # Reconstruct a raw-for-log shape mirroring :meth:`complete`.
