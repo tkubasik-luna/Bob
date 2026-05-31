@@ -1,12 +1,24 @@
 import { useCallback, useLayoutEffect, useRef, useState } from "react";
 import { isAtBottom, shouldAutoScroll } from "../lib/autoScroll";
-import { useActivityFeedStore } from "../store/activityFeedStore";
+import { type AgentTimelineItem, useActivityFeedStore } from "../store/activityFeedStore";
 import type { AgentActivityStatus } from "../types/ws";
 
 type Props = {
   /** The running sub-task's id — matches the `agent_ref` on `reasoning_delta`
    * and `agent_activity` events. */
   agentRef: string;
+  /** Issue 0074 — collapsed-summary affordances. The mount context (TaskCard)
+   * owns the task, so the summary's TITLE and the RESULT open path are passed
+   * in rather than duplicated in the store. */
+  title?: string;
+  /** Issue 0074 — true when the task has a result the "résultat" button can
+   * surface. When false the button is hidden (e.g. a bare failure). */
+  hasResult?: boolean;
+  /** Issue 0074 — open the EXISTING result view for this agent's task. Wired by
+   * TaskCard to the very same `onOpen(task)` → `openTask(id)` path the card body
+   * click uses, which opens the TaskDrawer (Objectif / Résultat / Historique).
+   * Reuses the existing open path — does NOT reimplement any overlay. */
+  onOpenResult?: () => void;
 };
 
 /** Minimal status → glyph + colour mapping for a chip. Kept tiny and
@@ -17,6 +29,17 @@ const STATUS_STYLE: Record<AgentActivityStatus, { glyph: string; className: stri
   error: { glyph: "✕", className: "border-rose-700/50 bg-rose-900/30 text-rose-200/90" },
   warn: { glyph: "▲", className: "border-amber-700/50 bg-amber-900/30 text-amber-200/90" },
   info: { glyph: "•", className: "border-slate-600/50 bg-slate-800/40 text-slate-300/90" },
+};
+
+/** Issue 0074 — terminal-state badge for the collapsed summary. Only the two
+ * terminal `TaskState`s reach here (the bridge marks finished on done / failed,
+ * collapsing degraded / timeout / force-terminate onto `failed`). */
+const FINAL_BADGE: Record<"done" | "failed", { label: string; className: string }> = {
+  done: {
+    label: "Terminée",
+    className: "border-emerald-700/50 bg-emerald-900/30 text-emerald-200",
+  },
+  failed: { label: "Échec", className: "border-rose-700/50 bg-rose-900/30 text-rose-200" },
 };
 
 /**
@@ -37,14 +60,24 @@ const STATUS_STYLE: Record<AgentActivityStatus, { glyph: string; className: stri
  * height; toggling back restores the bounded window. The auto-scroll decision
  * is the pure helper in `lib/autoScroll` (unit-tested there).
  *
- * Deliberately minimal and unobtrusive. The collapsed/finished summary
- * lifecycle (0074), the Jarvis block (0072) and the side-panel rail (0076) are
- * later issues — this block is always the ACTIVE one in its mount context.
+ * Issue 0074 — COLLAPSE LIFECYCLE. When the agent's task terminates the block
+ * stops being the live ACTIVE timeline and becomes a COLLAPSED summary: title +
+ * final-state badge + a "résultat" button (opens the EXISTING result view via
+ * `onOpenResult`) + an "expand / relire la réflexion" affordance that re-shows
+ * the FULL reasoning + chips timeline (the same full-timeline rendering 0075's
+ * "voir tout" expands to). The finished bit comes from the store's
+ * `finishedByAgent` map; the timeline arrays are retained across the terminal
+ * transition so expand can re-read them. A failure (failed / cap / stall
+ * force-terminate) collapses with the `Échec` badge.
+ *
+ * The Jarvis block (0072) and the side-panel rail (0076) are later issues.
  * Renders nothing until the first item arrives (a model with no reasoning
- * channel still surfaces its chips here once it acts).
+ * channel still surfaces its chips here once it acts) AND it isn't finished —
+ * a finished agent with no timeline still shows its collapsed summary.
  */
-export function AgentBlock({ agentRef }: Props) {
+export function AgentBlock({ agentRef, title, hasResult, onOpenResult }: Props) {
   const timeline = useActivityFeedStore((s) => s.timelineByAgent[agentRef]);
+  const finalState = useActivityFeedStore((s) => s.finishedByAgent[agentRef]);
 
   const [expanded, setExpanded] = useState(false);
   const scrollRef = useRef<HTMLDivElement | null>(null);
@@ -73,8 +106,64 @@ export function AgentBlock({ agentRef }: Props) {
     }
   }, [itemCount, lastText, expanded]);
 
-  if (!timeline || timeline.length === 0) return null;
+  const finished = finalState === "done" || finalState === "failed";
+  const hasTimeline = !!timeline && timeline.length > 0;
 
+  // ACTIVE block with nothing to show yet, and not finished → render nothing.
+  if (!finished && !hasTimeline) return null;
+
+  // ── COLLAPSED summary (issue 0074) ───────────────────────────────────────
+  // Once finished, the block is a compact summary by default; the timeline is
+  // only re-shown when the user expands it ("relire la réflexion").
+  if (finished) {
+    const badge = FINAL_BADGE[finalState as "done" | "failed"];
+    return (
+      <div className="mt-1 rounded border border-blue-900/40 bg-blue-950/20 text-[11px]">
+        <div className="flex items-center gap-2 px-2 py-1">
+          <span
+            className={`inline-flex flex-none items-center rounded border px-1.5 py-0.5 text-[10px] ${badge.className}`}
+          >
+            {badge.label}
+          </span>
+          {title && <span className="min-w-0 flex-1 truncate text-blue-300/80">{title}</span>}
+          {hasResult && onOpenResult && (
+            <button
+              type="button"
+              onClick={onOpenResult}
+              className="flex-none rounded border border-blue-800/50 px-1.5 py-0.5 text-[10px] text-blue-300/90 transition-colors hover:bg-blue-900/30 hover:text-blue-200"
+            >
+              résultat
+            </button>
+          )}
+        </div>
+        {/* Expand affordance — re-shows the FULL reasoning + chips timeline
+            (same full rendering as 0075's "voir tout"). Hidden when the agent
+            never streamed a timeline (nothing to re-read). */}
+        {hasTimeline && (
+          <>
+            {expanded && (
+              <div
+                ref={scrollRef}
+                onScroll={onScroll}
+                className="overflow-y-auto border-blue-900/40 border-t px-2 py-1 leading-snug text-blue-300/80"
+              >
+                {timeline.map(renderTimelineItem)}
+              </div>
+            )}
+            <button
+              type="button"
+              onClick={() => setExpanded((v) => !v)}
+              className="w-full border-blue-900/40 border-t px-2 py-0.5 text-left text-[10px] text-blue-400/70 transition-colors hover:text-blue-300"
+            >
+              {expanded ? "réduire" : "relire la réflexion"}
+            </button>
+          </>
+        )}
+      </div>
+    );
+  }
+
+  // ── ACTIVE block (issues 0069 / 0071 / 0075) ─────────────────────────────
   return (
     <div className="mt-1 rounded border border-blue-900/40 bg-blue-950/20">
       <div
@@ -84,28 +173,7 @@ export function AgentBlock({ agentRef }: Props) {
           expanded ? "" : "max-h-32"
         }`}
       >
-        {timeline.map((item, i) => {
-          if (item.kind === "reasoning") {
-            return (
-              // biome-ignore lint/suspicious/noArrayIndexKey: the timeline is strictly append-only — a reasoning segment's index is fixed once a chip is appended after it (its text only grows in place), and chips are never removed or reordered, so the index is a stable identity.
-              <span key={`r-${i}`} className="whitespace-pre-wrap">
-                {item.text}
-              </span>
-            );
-          }
-          const style = STATUS_STYLE[item.status];
-          return (
-            <span
-              // biome-ignore lint/suspicious/noArrayIndexKey: append-only timeline (see reasoning branch) — the chip's index is its stable identity.
-              key={`c-${i}`}
-              className={`mx-0.5 my-px inline-flex items-center gap-1 rounded border px-1.5 py-0.5 align-middle text-[10px] ${style.className}`}
-              title={item.activityKind}
-            >
-              <span aria-hidden>{style.glyph}</span>
-              <span>{item.label}</span>
-            </span>
-          );
-        })}
+        {timeline.map(renderTimelineItem)}
       </div>
       <button
         type="button"
@@ -115,5 +183,31 @@ export function AgentBlock({ agentRef }: Props) {
         {expanded ? "réduire" : "voir tout"}
       </button>
     </div>
+  );
+}
+
+/** Render one interleaved timeline item — a reasoning text run or an activity
+ * chip. Shared by the ACTIVE window and the COLLAPSED expand view so both show
+ * the identical chronological flow. The index is a stable identity here: the
+ * timeline is strictly append-only — a reasoning segment's text only grows in
+ * place, and chips are never removed or reordered. */
+function renderTimelineItem(item: AgentTimelineItem, i: number) {
+  if (item.kind === "reasoning") {
+    return (
+      <span key={`r-${i}`} className="whitespace-pre-wrap">
+        {item.text}
+      </span>
+    );
+  }
+  const style = STATUS_STYLE[item.status];
+  return (
+    <span
+      key={`c-${i}`}
+      className={`mx-0.5 my-px inline-flex items-center gap-1 rounded border px-1.5 py-0.5 align-middle text-[10px] ${style.className}`}
+      title={item.activityKind}
+    >
+      <span aria-hidden>{style.glyph}</span>
+      <span>{item.label}</span>
+    </span>
   );
 }

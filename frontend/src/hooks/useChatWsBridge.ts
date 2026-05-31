@@ -49,6 +49,7 @@ export function useChatWsBridge(): UseChatWsBridgeResult {
   const clearStreamingAssistant = useChatStore((s) => s.clearStreamingAssistant);
   const appendReasoningDelta = useActivityFeedStore((s) => s.appendReasoningDelta);
   const appendActivity = useActivityFeedStore((s) => s.appendActivity);
+  const markAgentFinished = useActivityFeedStore((s) => s.markAgentFinished);
 
   // Bridge audioPlayer → store so `Bubble` can render the wave indicator
   // on the exact bubble currently being voiced. Cleared on natural end
@@ -155,6 +156,14 @@ export function useChatWsBridge(): UseChatWsBridgeResult {
           break;
         case "task_updated":
           upsertTaskUpdated(msg);
+          // PRD 0011 / issue 0074 — a terminal transition (done / failed; the
+          // backend collapses degraded / timeout / force-terminate onto
+          // `failed`) flips the agent's block from the live ACTIVE timeline to
+          // the COLLAPSED summary. The timeline arrays are RETAINED so the user
+          // can expand the collapsed block to re-read the reasoning.
+          if (msg.state === "done" || msg.state === "failed") {
+            markAgentFinished(msg.task_id, msg.state);
+          }
           break;
         case "task_result":
           setTaskResult(msg);
@@ -194,6 +203,7 @@ export function useChatWsBridge(): UseChatWsBridgeResult {
       clearStreamingAssistant,
       appendReasoningDelta,
       appendActivity,
+      markAgentFinished,
     ],
   );
 

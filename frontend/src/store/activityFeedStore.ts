@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import type { AgentActivityMsg, ReasoningDeltaMsg } from "../types/ws";
+import type { AgentActivityMsg, ReasoningDeltaMsg, TaskState } from "../types/ws";
 
 /**
  * PRD 0011 — agent-activity feed store.
@@ -33,8 +33,20 @@ import type { AgentActivityMsg, ReasoningDeltaMsg } from "../types/ws";
  * item. Order is preserved, so a later issue can window/collapse the timelines
  * without re-deriving order.
  *
- * NOT in this slice: the Jarvis block (0072), collapse lifecycle (0074),
- * sliding window (0075) and the side-panel rail (0076).
+ * Issue 0074 — COLLAPSE LIFECYCLE. When a task terminates the block must stop
+ * being the live ACTIVE view and become a COLLAPSED summary, while keeping the
+ * timeline content so the user can expand it again to re-read the reasoning.
+ * The timeline arrays already persist (nothing clears them on terminal state —
+ * `clearAgent` is only for an explicit lane drop), so all this slice adds is a
+ * tiny per-agent FINISHED map: `finishedByAgent[agentRef]` records the terminal
+ * `TaskState` once a task ends. The block reads it to flip ACTIVE → COLLAPSED.
+ * The map is purely additive — `agentOrder` / `timelineByAgent` and every 0073/
+ * 0075 behaviour are untouched. `reset` clears it; `clearAgent` drops the one
+ * entry (a dropped lane has no finished state to remember).
+ *
+ * NOT in this slice: the Jarvis block (0072), sliding window (0075) and the
+ * side-panel rail (0076). The summary's title + result handle are NOT held here
+ * (they live on the chatStore task); only the lifecycle bit + final state are.
  */
 
 /** A contiguous run of reasoning text inside an agent's timeline. */
@@ -63,12 +75,22 @@ type ActivityFeedState = {
   /** First-seen-ordered list of `agent_ref`s with a lane. A lanes container
    * maps over this to render one `AgentBlock` per agent in a stable order. */
   agentOrder: string[];
+  /** Issue 0074 — per-agent terminal state. Absent while the agent is live;
+   * set to the final `TaskState` (`done` / `failed`) once its task ends. The
+   * `AgentBlock` reads this to switch from the live ACTIVE timeline to the
+   * COLLAPSED summary while keeping the timeline content for expand. */
+  finishedByAgent: Record<string, TaskState>;
   /** Append a `reasoning_delta` suffix. COALESCED: the delta is buffered and
    * applied on the next animation-frame flush, not synchronously per token. */
   appendReasoningDelta: (msg: ReasoningDeltaMsg) => void;
   /** Append an activity chip as its own ordered timeline item. Applies
    * immediately (after draining any pending reasoning to preserve order). */
   appendActivity: (msg: AgentActivityMsg) => void;
+  /** Issue 0074 — mark an agent finished with its terminal `TaskState`. The
+   * timeline is RETAINED (so the collapsed block can expand to re-read it);
+   * this only records the lifecycle bit. Idempotent; a no-op if the state is
+   * unchanged so a replayed terminal event doesn't churn the store. */
+  markAgentFinished: (agentRef: string, finalState: TaskState) => void;
   /** Drop a single agent's timeline + lane (e.g. when its task terminates). */
   clearAgent: (agentRef: string) => void;
   /** Wipe all timelines / lanes / pending buffers. */
@@ -119,6 +141,7 @@ const cancelFlush =
 export const useActivityFeedStore = create<ActivityFeedState>((set) => ({
   timelineByAgent: {},
   agentOrder: [],
+  finishedByAgent: {},
   appendReasoningDelta: (msg) => {
     // Buffer the suffix; do NOT touch the store yet. Multiple tokens arriving
     // within one frame collapse into a single concatenated suffix here.
@@ -175,17 +198,34 @@ export const useActivityFeedStore = create<ActivityFeedState>((set) => ({
       };
     });
   },
+  markAgentFinished: (agentRef, finalState) =>
+    set((state) => {
+      // Idempotent: a replayed / duplicate terminal event with the same state
+      // is a no-op so we don't churn the store (and trigger re-renders).
+      if (state.finishedByAgent[agentRef] === finalState) return state;
+      return {
+        finishedByAgent: { ...state.finishedByAgent, [agentRef]: finalState },
+      };
+    }),
   clearAgent: (agentRef) =>
     set((state) => {
       pendingReasoning.delete(agentRef);
+      // A dropped lane has no finished state to remember.
+      const { [agentRef]: _finished, ...restFinished } = state.finishedByAgent;
       if (!(agentRef in state.timelineByAgent)) {
-        if (!state.agentOrder.includes(agentRef)) return state;
-        return { agentOrder: state.agentOrder.filter((r) => r !== agentRef) };
+        if (!state.agentOrder.includes(agentRef) && !(agentRef in state.finishedByAgent)) {
+          return state;
+        }
+        return {
+          agentOrder: state.agentOrder.filter((r) => r !== agentRef),
+          finishedByAgent: restFinished,
+        };
       }
       const { [agentRef]: _removed, ...rest } = state.timelineByAgent;
       return {
         timelineByAgent: rest,
         agentOrder: state.agentOrder.filter((r) => r !== agentRef),
+        finishedByAgent: restFinished,
       };
     }),
   reset: () => {
@@ -194,6 +234,6 @@ export const useActivityFeedStore = create<ActivityFeedState>((set) => ({
       cancelFlush(flushHandle);
       flushHandle = null;
     }
-    set({ timelineByAgent: {}, agentOrder: [] });
+    set({ timelineByAgent: {}, agentOrder: [], finishedByAgent: {} });
   },
 }));

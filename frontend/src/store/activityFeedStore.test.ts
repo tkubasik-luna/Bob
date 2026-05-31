@@ -144,3 +144,74 @@ describe("activityFeedStore — lane lifecycle", () => {
     expect(agentOrder).toEqual(["B"]);
   });
 });
+
+describe("activityFeedStore — finish lifecycle (issue 0074)", () => {
+  it("marking an agent finished RETAINS its timeline and exposes the final state", () => {
+    const store = useActivityFeedStore.getState();
+    store.appendReasoningDelta(delta("A", "thinking…"));
+    store.appendActivity(activity("A", "gmail.search"));
+    store.flushReasoning();
+
+    store.markAgentFinished("A", "done");
+
+    const { timelineByAgent, finishedByAgent, agentOrder } = useActivityFeedStore.getState();
+    // Timeline content is kept so the collapsed block can expand to re-read it.
+    expect(reasoningText(timelineByAgent.A)).toBe("thinking…");
+    expect(timelineByAgent.A).toHaveLength(2);
+    // The lane remains enumerable; only the lifecycle bit is added.
+    expect(agentOrder).toEqual(["A"]);
+    expect(finishedByAgent.A).toBe("done");
+  });
+
+  it("records a failure state for a force-terminated / failed agent", () => {
+    const store = useActivityFeedStore.getState();
+    store.appendReasoningDelta(delta("A", "stalled"));
+    store.flushReasoning();
+    store.markAgentFinished("A", "failed");
+
+    expect(useActivityFeedStore.getState().finishedByAgent.A).toBe("failed");
+    // Timeline (incl. the incident reasoning) survives so it's still visible.
+    expect(reasoningText(useActivityFeedStore.getState().timelineByAgent.A)).toBe("stalled");
+  });
+
+  it("an unfinished agent stays active (no entry in finishedByAgent)", () => {
+    const store = useActivityFeedStore.getState();
+    store.appendReasoningDelta(delta("A", "a"));
+    store.appendReasoningDelta(delta("B", "b"));
+    store.flushReasoning();
+    store.markAgentFinished("A", "done");
+
+    const { finishedByAgent } = useActivityFeedStore.getState();
+    expect(finishedByAgent.A).toBe("done");
+    // B never terminated → still active.
+    expect(finishedByAgent.B).toBeUndefined();
+  });
+
+  it("markAgentFinished is idempotent for the same state (no churn)", () => {
+    const store = useActivityFeedStore.getState();
+    store.markAgentFinished("A", "done");
+    const first = useActivityFeedStore.getState().finishedByAgent;
+    store.markAgentFinished("A", "done");
+    // Same reference: no state object was produced for a redundant terminal event.
+    expect(useActivityFeedStore.getState().finishedByAgent).toBe(first);
+  });
+
+  it("clearAgent drops the finished entry alongside the lane", () => {
+    const store = useActivityFeedStore.getState();
+    store.appendReasoningDelta(delta("A", "a"));
+    store.flushReasoning();
+    store.markAgentFinished("A", "done");
+    store.clearAgent("A");
+
+    const { timelineByAgent, finishedByAgent } = useActivityFeedStore.getState();
+    expect(timelineByAgent.A).toBeUndefined();
+    expect(finishedByAgent.A).toBeUndefined();
+  });
+
+  it("reset clears the finished map", () => {
+    const store = useActivityFeedStore.getState();
+    store.markAgentFinished("A", "done");
+    store.reset();
+    expect(useActivityFeedStore.getState().finishedByAgent).toEqual({});
+  });
+});

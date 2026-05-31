@@ -134,9 +134,26 @@ export function TaskCard({ task, onOpen, onDismiss, onCancel }: Props) {
           </button>
         )}
       </button>
-      {/* PRD 0011 / issue 0069 — live streaming reasoning for a running
-          sub-task. Renders nothing until the first `reasoning_delta` lands. */}
-      {task.state === "running" && <AgentBlock agentRef={task.id} />}
+      {/* PRD 0011 — the agent-activity block. While the task is RUNNING it is
+          the live streaming reasoning (0069/0071/0075, renders nothing until
+          the first `reasoning_delta` lands). On a TERMINAL state (0074) it
+          collapses to a summary — title + state badge + a "résultat" button
+          that reuses the exact `onOpen(task)` → `openTask(id)` drawer path the
+          card body click uses, plus an expand affordance to re-read the
+          reasoning. Mounted for running AND terminal tasks so the collapsed
+          block survives the transition; the block itself decides ACTIVE vs
+          COLLAPSED from the store's `finishedByAgent` lifecycle bit. */}
+      {(task.state === "running" || isTerminal) && (
+        <AgentBlock
+          agentRef={task.id}
+          title={task.title}
+          hasResult={
+            (typeof task.result === "string" && task.result.length > 0) ||
+            (Array.isArray(task.resultPayload) && task.resultPayload.length > 0)
+          }
+          onOpenResult={onOpen ? () => onOpen(task) : undefined}
+        />
+      )}
     </div>
   );
 }
