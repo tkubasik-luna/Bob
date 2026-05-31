@@ -41,6 +41,14 @@ from bob.event_bus import EventBus, set_event_bus
 from bob.jarvis_prompt_loader import load_jarvis_prompt
 from bob.jarvis_store import JarvisStore
 from bob.llm.factory import build_subagent_client
+from bob.llm_router import router as llm_router
+from bob.llm_selection_store import (
+    LLM_SELECTION_FILENAME,
+    LLMSelectionStore,
+)
+from bob.llm_selection_store import (
+    set_default_store as set_default_llm_selection_store,
+)
 from bob.logging_setup import configure_logging
 from bob.orchestrator import get_default_orchestrator
 from bob.proactivity_handler import ProactivityHandler
@@ -102,6 +110,12 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     jarvis_store_module.set_default_store(store)
     task_store = TaskStore(conn)
     task_store_module.set_default_store(task_store)
+
+    # LLM selection store (PRD 0012 / issue 0078). JSON file under BOB_DATA_DIR
+    # owns the runtime selection: seed from .env on first boot, JSON wins after.
+    llm_selection_store = LLMSelectionStore(data_dir / LLM_SELECTION_FILENAME)
+    seeded_selection = llm_selection_store.seed_from_settings(settings)
+    set_default_llm_selection_store(llm_selection_store)
 
     # Sub-agent runner factory used by the scheduler. We build the LLM client
     # once and reuse it across every runner invocation — the underlying
@@ -195,6 +209,8 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         data_dir=str(data_dir),
         db_path=str(db_path),
         history_len=len(store.history()),
+        llm_provider=seeded_selection.provider,
+        llm_model=seeded_selection.lm_model,
     )
 
     tts = get_default_tts_service()
@@ -218,6 +234,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         task_scheduler_module.set_default_scheduler(None)
         task_store_module.set_default_store(None)
         jarvis_store_module.set_default_store(None)
+        set_default_llm_selection_store(None)
         conn.close()
         uninstall_file_sink()
 
@@ -226,6 +243,7 @@ app = FastAPI(title="Bob backend", lifespan=lifespan)
 app.include_router(ws_router)
 app.include_router(ws_debug_router)
 app.include_router(debug_router)
+app.include_router(llm_router)
 
 
 @app.get("/health")
