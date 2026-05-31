@@ -97,6 +97,7 @@ from bob.context.prompt_fragments import (
     FORWARD_CONFIRMATION,
     SPAWN_CONFIRMATION,
     TOOLS_SYSTEM_ADDENDUM,
+    temporal_context_fragment,
 )
 from bob.context.providers.cross_epoch_digest import CrossEpochDigestProvider
 from bob.context.providers.legacy_full_history import LegacyFullHistoryProvider
@@ -119,6 +120,7 @@ from bob.llm.types import LLMResponse, ToolCall
 from bob.llm_client import LLMClient
 from bob.rolling_summary_store import RollingSummaryStore
 from bob.streaming import StreamEmitter
+from bob.sub_agent.activity_projector import AgentActivity
 from bob.task_completion_debouncer import (
     DEFAULT_DEBOUNCE_SECONDS,
     TaskCompletionDebouncer,
@@ -203,6 +205,13 @@ ProactiveEventKind = Literal["ask_user", "done", "failed"]
 
 
 JarvisState = Literal["idle", "thinking"]
+
+
+# PRD 0011 / issue 0072 — Jarvis gets its OWN lane in the agent-activity feed,
+# alongside the sub-tasks. Its lane key is this fixed ``agent_ref`` (sub-tasks
+# use their ``task_id``). The generic per-agent lane renderer (issue 0073)
+# renders ANY ``agent_ref`` including this one, so no frontend change is needed.
+JARVIS_AGENT_REF = "jarvis"
 
 
 class OrchestratorContractError(RuntimeError):
@@ -796,6 +805,20 @@ class Orchestrator:
                     await emitter.finalize(chunk.final_arguments)
             elif chunk.kind == "text":
                 text_buffer += chunk.text_delta
+            elif chunk.kind == "reasoning":
+                # PRD 0011 / issue 0072 — Jarvis's native ``reasoning_content``
+                # channel surfaces live in its lane as ``reasoning_delta`` events
+                # (``agent_ref="jarvis"``), mirroring the sub-agent runner's
+                # :meth:`SubAgentRunner._stream_iteration`. COSMETIC ONLY: the
+                # reasoning bytes never touch ``text_buffer`` / the argument
+                # accumulators, so tool-call parsing + ``speech_delta`` +
+                # ``ui_payload`` are byte-for-byte unchanged. A non-reasoning
+                # backend (Claude CLI fallback, local model without
+                # ``reasoning_content``) simply never emits a ``reasoning``
+                # chunk — the lane shows chips + final answer text instead,
+                # exactly like a degraded sub-agent.
+                if chunk.reasoning_delta:
+                    await self._emit_jarvis_reasoning(chunk.reasoning_delta)
 
         # Defensive: a stream that ends WITHOUT an explicit
         # ``tool_call_end`` for the active say leaves the emitter
@@ -844,6 +867,68 @@ class Orchestrator:
         if tool_calls:
             return LLMResponse(text=None, tool_calls=tool_calls)
         return LLMResponse(text=text_buffer or None, tool_calls=[])
+
+    # --- PRD 0011 / issue 0072 — Jarvis lane emission helpers ----------------
+    #
+    # Jarvis publishes on the SAME user-facing channels the sub-agent runner
+    # uses (``reasoning_delta`` + ``agent_activity``), tagged with the fixed
+    # ``agent_ref="jarvis"`` so the generic per-agent lane renderer (issue 0073)
+    # gives Jarvis its own block. All three helpers are COSMETIC / observability
+    # only — none of them feed back into the tool-call control loop.
+
+    async def _emit_jarvis_reasoning(self, delta: str) -> None:
+        """Push one Jarvis reasoning suffix on the chat WS (``agent_ref="jarvis"``).
+
+        Reuses the EXACT wire shape the sub-agent runner emits
+        (``{type, agent_ref, delta}``) so the frontend store interleaves it in
+        the Jarvis lane with no new contract. Cosmetic: never read back.
+        """
+
+        if not delta:
+            return
+        await ws_events.emit(
+            {
+                "type": "reasoning_delta",
+                "agent_ref": JARVIS_AGENT_REF,
+                "delta": delta,
+            }
+        )
+
+    async def _emit_jarvis_activity(self, chip: AgentActivity) -> None:
+        """Project + push a Jarvis orchestration chip on the chat WS (issue 0072).
+
+        Takes an already-built :class:`AgentActivity` (so the orchestration
+        labels — "délègue: …", "synthèse" — can be curated here) and ships its
+        wire frame through the same :func:`ws_events.emit` shim the sub-agent
+        chips use. ``debug_event=None`` mirrors the runner so the ring-buffer
+        mirror is the chip itself, not a second reflection record.
+        """
+
+        await ws_events.emit(chip.to_wire(), debug_event=None)
+
+    async def _emit_jarvis_final_answer(self, speech: str) -> None:
+        """Duplicate Jarvis's final spoken answer as TEXT into its lane (issue 0072).
+
+        The answer rides the SAME ``reasoning_delta`` channel the lane already
+        renders (no new frontend component), but it is DISTINCT from the
+        chain-of-thought: reasoning streams live DURING generation, the answer is
+        emitted ONCE here at the end of a successful turn. Ordering therefore
+        reads sensibly in the block (thoughts first, answer last) and the two are
+        never double-counted — the reasoning stream carries chain-of-thought, this
+        carries the settled reply. This is purely additive to the existing
+        ``speech_delta`` → sphere/TTS path, which still fires unchanged inside the
+        :class:`StreamEmitter` during the stream.
+        """
+
+        if not speech.strip():
+            return
+        await ws_events.emit(
+            {
+                "type": "reasoning_delta",
+                "agent_ref": JARVIS_AGENT_REF,
+                "delta": speech,
+            }
+        )
 
     async def _degrade_validation_exhausted(
         self,
@@ -1190,6 +1275,21 @@ class Orchestrator:
         text = await self._render_proactive_text(task_id, prompt)
         if text is None:
             return
+        # PRD 0011 / issue 0072 — a proactive done-synthesis is a Jarvis
+        # orchestration act: surface a "synthèse" chip in the Jarvis lane, then
+        # duplicate the synthesised answer text into the lane (same channels +
+        # ``agent_ref="jarvis"`` as a user-turn answer) so the proactive reply is
+        # observable in the feed, not just spoken. The ``assistant_msg`` push
+        # below is the unchanged sphere/TTS path.
+        await self._emit_jarvis_activity(
+            AgentActivity(
+                agent_ref=JARVIS_AGENT_REF,
+                kind="tool_call",
+                label="synthèse",
+                status="ok",
+            )
+        )
+        await self._emit_jarvis_final_answer(text)
         await self._push_proactive_assistant_msg(text)
 
     async def _do_generate_failed_synthesis(self, task_id: str) -> None:
@@ -1224,7 +1324,10 @@ class Orchestrator:
         """Run a single-turn chat() and return the trimmed text (or None)."""
 
         messages: list[dict[str, Any]] = [
-            {"role": "system", "content": self._jarvis_prompt},
+            {
+                "role": "system",
+                "content": f"{self._jarvis_prompt}\n\n{temporal_context_fragment()}",
+            },
             {"role": "user", "content": prompt},
         ]
         try:
@@ -1278,7 +1381,7 @@ class Orchestrator:
             "system_chat",
             components_description=self._ui_registry.get_components_description_for_prompt(),
         )
-        return f"{self._jarvis_prompt}\n\n{ui_addendum}"
+        return f"{self._jarvis_prompt}\n\n{temporal_context_fragment()}\n\n{ui_addendum}"
 
     def _build_waiting_input_addendum(self) -> str:
         """Render a system-prompt suffix listing tasks waiting for the user.
@@ -1593,6 +1696,14 @@ class Orchestrator:
                 speech = _FORWARD_CONFIRMATION
             else:
                 speech = _SPAWN_CONFIRMATION
+            # PRD 0011 / issue 0072 — orchestration chip in the Jarvis lane: a
+            # delegation (spawn/replan), a forward, or a cancel is a salient
+            # Jarvis ACTION worth a chip, mirroring a sub-agent's ``tool_call``
+            # chip. We curate a clear French label per kind. ``ok`` status: the
+            # task surface dispatched successfully.
+            await self._emit_jarvis_delegate_chips(
+                spawned=spawned, forwarded=forwarded, cancelled=cancelled
+            )
             self._jarvis_store.append("assistant", speech)
             return (
                 OrchestratorResponse(
@@ -1640,6 +1751,11 @@ class Orchestrator:
                 ),
                 None,
             )
+        # PRD 0011 / issue 0072 — duplicate Jarvis's final spoken answer as TEXT
+        # into its lane. The live ``speech_delta`` → sphere/TTS path already
+        # fired during the stream (unchanged); this is the settled answer landing
+        # once in the block, distinct from the chain-of-thought reasoning stream.
+        await self._emit_jarvis_final_answer(say_speech)
         return (
             OrchestratorResponse(
                 speech=say_speech,
@@ -1650,6 +1766,54 @@ class Orchestrator:
                 msg_id=msg_id,
             ),
             None,
+        )
+
+    async def _emit_jarvis_delegate_chips(
+        self,
+        *,
+        spawned: list[str],
+        forwarded: list[str],
+        cancelled: list[str],
+    ) -> None:
+        """Emit one Jarvis orchestration chip per delegate / forward / cancel (issue 0072).
+
+        Each chip rides the curated agent-activity taxonomy (``kind="tool_call"``,
+        ``status="ok"``) with a clear French label naming the orchestration act
+        and, when resolvable, the delegated task's title. The title is pulled
+        from the task store and redacted through the projector's free-text
+        scrubber so a Mail-derived title can never leak email content onto this
+        channel. A missing / unreadable task degrades to the bare label.
+        """
+
+        for task_id in spawned:
+            await self._emit_jarvis_activity(
+                self._jarvis_orchestration_chip("délègue", task_id)
+            )
+        for task_id in forwarded:
+            await self._emit_jarvis_activity(
+                self._jarvis_orchestration_chip("transmet", task_id)
+            )
+        for task_id in cancelled:
+            await self._emit_jarvis_activity(
+                self._jarvis_orchestration_chip("annule", task_id)
+            )
+
+    def _jarvis_orchestration_chip(self, verb: str, task_id: str) -> AgentActivity:
+        """Build a curated ``tool_call`` chip for one orchestration act (issue 0072)."""
+
+        from bob.sub_agent.activity_projector import _redact_free_text
+
+        title: str | None = None
+        try:
+            title = self._task_store.get_task(task_id).title
+        except TaskStoreError:
+            title = None
+        label = f"{verb} : {_redact_free_text(title)}" if title else verb
+        return AgentActivity(
+            agent_ref=JARVIS_AGENT_REF,
+            kind="tool_call",
+            label=label,
+            status="ok",
         )
 
     def _collect_dispatch_result(
@@ -1699,12 +1863,24 @@ def _coerce_say_ui(ui: Any) -> list[ComponentDescriptor]:
     * ``None`` → empty list (the common case).
     * A dict carrying a string ``component`` → single
       :class:`ComponentDescriptor`, top-level props folded into ``props``.
+    * A list of such dicts → one descriptor per renderable section, in order
+      (the ``show_task_result`` recall path surfaces a multi-card deliverable
+      — e.g. every mail of a "20 derniers mails" task — not just the first).
     * Any other shape → empty list + a warning log so misuse is loud
       without breaking the live turn.
     """
 
     if ui is None:
         return []
+    if isinstance(ui, list):
+        descriptors: list[ComponentDescriptor] = []
+        for section in ui:
+            descriptor = coerce_component_descriptor(section)
+            if descriptor is None:
+                _logger.warning("orchestrator.say_ui_unexpected_shape", ui=section)
+                continue
+            descriptors.append(descriptor)
+        return descriptors
     descriptor = coerce_component_descriptor(ui)
     if descriptor is None:
         _logger.warning("orchestrator.say_ui_unexpected_shape", ui=ui)

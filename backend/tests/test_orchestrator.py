@@ -465,7 +465,7 @@ async def test_spawn_emits_task_created_via_orchestrator() -> None:
     finally:
         ws_events.set_emitter(None)
 
-    task_events = [e for e in received if e["task_id"] == task_id]
+    task_events = [e for e in received if e.get("task_id") == task_id]
     assert len(task_events) == 1
     created = task_events[0]
     assert created["type"] == "task_created"
@@ -713,9 +713,12 @@ async def test_do_generate_done_synthesis_emits_assistant_msg_with_flag() -> Non
     finally:
         ws_events.set_emitter(None)
 
-    assert len(received) == 1
-    event = received[0]
-    assert event["type"] == "assistant_msg"
+    # PRD 0011 / issue 0072 — the done-synthesis now also emits a Jarvis-lane
+    # "synthèse" chip + the answer text into the lane (``agent_ref="jarvis"``);
+    # the ``assistant_msg`` (sphere/TTS) frame is unchanged. Filter to it.
+    assistant_msgs = [e for e in received if e["type"] == "assistant_msg"]
+    assert len(assistant_msgs) == 1
+    event = assistant_msgs[0]
     assert event["proactive"] is True
     assert event["speech"] == "La recherche est finie. En résumé : 3 papiers pertinents."
     assert event["ui"] == []
@@ -781,8 +784,9 @@ async def test_do_generate_done_synthesis_handles_empty_result() -> None:
     finally:
         ws_events.set_emitter(None)
 
-    assert len(received) == 1
-    assert received[0]["speech"] == "C'est terminé."
+    assistant_msgs = [e for e in received if e["type"] == "assistant_msg"]
+    assert len(assistant_msgs) == 1
+    assert assistant_msgs[0]["speech"] == "C'est terminé."
 
 
 # ---------------------------------------------------------------------------
@@ -853,12 +857,17 @@ async def test_proactive_loop_buffers_while_thinking_then_flushes_when_idle() ->
             await asyncio.sleep(0.15)
             assert received == []
 
-            # Flip to idle → the flusher unblocks and emits.
+            # Flip to idle → the flusher unblocks and emits. Filter to the
+            # ``assistant_msg`` (sphere/TTS) frame: issue 0072 also lands a
+            # Jarvis-lane "synthèse" chip + answer-text frame on the bus.
             orchestrator._jarvis_state = "idle"
-            flushed = await _wait_until(lambda: len(received) == 1)
+            flushed = await _wait_until(
+                lambda: any(e["type"] == "assistant_msg" for e in received)
+            )
             assert flushed
-            assert received[0]["proactive"] is True
-            assert received[0]["speech"] == "Synthèse OK."
+            answer = next(e for e in received if e["type"] == "assistant_msg")
+            assert answer["proactive"] is True
+            assert answer["speech"] == "Synthèse OK."
         finally:
             await orchestrator.stop_proactive_loop()
     finally:
@@ -889,11 +898,15 @@ async def test_proactive_loop_respects_user_typing_then_flushes_on_reset() -> No
             await asyncio.sleep(0.15)
             assert received == []
 
-            # Stop typing → flush within a couple of poll cycles.
+            # Stop typing → flush within a couple of poll cycles. Filter to the
+            # ``assistant_msg`` frame (issue 0072 also emits Jarvis-lane frames).
             orchestrator.set_user_typing(False)
-            flushed = await _wait_until(lambda: len(received) == 1)
+            flushed = await _wait_until(
+                lambda: any(e["type"] == "assistant_msg" for e in received)
+            )
             assert flushed
-            assert received[0]["speech"] == "Synthèse OK."
+            answer = next(e for e in received if e["type"] == "assistant_msg")
+            assert answer["speech"] == "Synthèse OK."
         finally:
             await orchestrator.stop_proactive_loop()
     finally:
@@ -925,10 +938,16 @@ async def test_proactive_loop_flushes_fifo_when_idle() -> None:
             await asyncio.sleep(0.1)
             assert received == []
 
+            # Filter to ``assistant_msg`` frames — issue 0072 interleaves a
+            # Jarvis-lane chip + answer-text frame per synthesis on the bus.
             orchestrator._jarvis_state = "idle"
-            flushed = await _wait_until(lambda: len(received) == 2, timeout=2.0)
+            flushed = await _wait_until(
+                lambda: len([e for e in received if e["type"] == "assistant_msg"]) == 2,
+                timeout=2.0,
+            )
             assert flushed
-            assert [e["speech"] for e in received] == ["First done.", "Second done."]
+            answers = [e["speech"] for e in received if e["type"] == "assistant_msg"]
+            assert answers == ["First done.", "Second done."]
         finally:
             await orchestrator.stop_proactive_loop()
     finally:

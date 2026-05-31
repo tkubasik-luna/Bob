@@ -308,6 +308,125 @@ async def test_e2e_streaming_msg_id_consistent_with_assistant_msg(
 
 
 @pytest.mark.asyncio
+async def test_e2e_jarvis_lane_reasoning_chip_and_final_answer(
+    recorder: list[dict[str, Any]],
+) -> None:
+    """PRD 0011 / issue 0072 — Jarvis gets its own feed lane (``agent_ref="jarvis"``).
+
+    A streamed Jarvis ``say`` turn that ALSO carries native ``reasoning_content``
+    chunks must surface, on the SAME user-facing channels the sub-agents use:
+
+    1. ``reasoning_delta`` frames tagged ``agent_ref="jarvis"`` (the live
+       chain-of-thought), AND
+    2. the final spoken answer duplicated as TEXT into the lane (also a
+       ``reasoning_delta`` with ``agent_ref="jarvis"``, emitted once at the end),
+
+    WITHOUT breaking the existing ``speech_delta`` → sphere/TTS path.
+    """
+
+    call_id = "call_say"
+    chunks: list[StreamChunk] = [
+        StreamChunk(kind="tool_call_start", tool_call_id=call_id, name="say"),
+        # Native reasoning interleaved with the argument stream (cosmetic).
+        StreamChunk(kind="reasoning", reasoning_delta="L'utilisateur "),
+        StreamChunk(kind="reasoning", reasoning_delta="dit bonjour."),
+        StreamChunk(kind="tool_call_args_delta", tool_call_id=call_id, args_delta='{"speech":"'),
+        StreamChunk(kind="tool_call_args_delta", tool_call_id=call_id, args_delta="Salut "),
+        StreamChunk(kind="tool_call_args_delta", tool_call_id=call_id, args_delta="Tom"),
+        StreamChunk(kind="tool_call_args_delta", tool_call_id=call_id, args_delta='"}'),
+        StreamChunk(
+            kind="tool_call_end",
+            tool_call_id=call_id,
+            final_arguments={"speech": "Salut Tom"},
+        ),
+    ]
+    client = FakeLLMClient(stream_responses=[chunks])
+    orchestrator, _js = _build_orchestrator(client)
+    response = await orchestrator.process_user_message("s1", "bonjour")
+
+    assert response.speech == "Salut Tom"
+
+    # Speech still streams to the sphere/TTS path, unchanged.
+    speech_deltas = [e for e in recorder if e["type"] == "speech_delta"]
+    assert "".join(d["delta"] for d in speech_deltas) == "Salut Tom"
+
+    # Jarvis-lane reasoning + final answer ride ``reasoning_delta`` with the
+    # fixed ``agent_ref="jarvis"`` (distinct from any sub-task lane).
+    jarvis_reasoning = [
+        e
+        for e in recorder
+        if e["type"] == "reasoning_delta" and e.get("agent_ref") == "jarvis"
+    ]
+    joined = "".join(d["delta"] for d in jarvis_reasoning)
+    # Live chain-of-thought present...
+    assert "L'utilisateur dit bonjour." in joined
+    # ...and the final answer duplicated into the lane, AFTER the reasoning.
+    assert joined.endswith("Salut Tom")
+
+
+@pytest.mark.asyncio
+async def test_e2e_jarvis_lane_degraded_no_reasoning_still_has_answer(
+    recorder: list[dict[str, Any]],
+) -> None:
+    """A non-reasoning Jarvis stream still lands the final answer in the lane.
+
+    Mirrors the sub-agent degraded fallback (issue 0070): no ``reasoning``
+    chunk means no live chain-of-thought, but the lane is never empty — the
+    settled answer is still duplicated in as ``reasoning_delta`` text, and the
+    ``speech_delta`` → TTS path is unaffected.
+    """
+
+    client = FakeLLMClient(stream_responses=[_scripted_say_stream(speech_chunks=["Coucou"])])
+    orchestrator, _js = _build_orchestrator(client)
+    await orchestrator.process_user_message("s1", "hi")
+
+    jarvis_reasoning = [
+        e
+        for e in recorder
+        if e["type"] == "reasoning_delta" and e.get("agent_ref") == "jarvis"
+    ]
+    assert "".join(d["delta"] for d in jarvis_reasoning) == "Coucou"
+    speech_deltas = [e for e in recorder if e["type"] == "speech_delta"]
+    assert "".join(d["delta"] for d in speech_deltas) == "Coucou"
+
+
+@pytest.mark.asyncio
+async def test_e2e_jarvis_lane_delegate_emits_orchestration_chip(
+    recorder: list[dict[str, Any]],
+) -> None:
+    """A ``spawn_task`` turn surfaces a Jarvis orchestration chip in the lane.
+
+    PRD 0011 / issue 0072 — when Jarvis delegates, an ``agent_activity`` chip
+    (``agent_ref="jarvis"``, ``kind="tool_call"``) naming the delegated task
+    appears in the Jarvis lane.
+    """
+
+    spawn_call = ToolCall(
+        id="call_spawn",
+        name="spawn_task",
+        arguments={"title": "Exposé", "goal": "Rédige un long exposé"},
+    )
+    client = FakeLLMClient(
+        complete_responses=[LLMResponse(text=None, tool_calls=[spawn_call])]
+    )
+    orchestrator, _js = _build_orchestrator(client)
+    response = await orchestrator.process_user_message("s1", "fais un exposé")
+    assert len(response.spawned_task_ids) == 1
+
+    jarvis_chips = [
+        e
+        for e in recorder
+        if e["type"] == "agent_activity" and e.get("agent_ref") == "jarvis"
+    ]
+    assert len(jarvis_chips) == 1
+    chip = jarvis_chips[0]
+    assert chip["kind"] == "tool_call"
+    assert chip["status"] == "ok"
+    assert chip["label"].startswith("délègue")
+    assert "Exposé" in chip["label"]
+
+
+@pytest.mark.asyncio
 async def test_e2e_streaming_falls_back_to_complete_when_stream_unscripted(
     recorder: list[dict[str, Any]],
 ) -> None:
