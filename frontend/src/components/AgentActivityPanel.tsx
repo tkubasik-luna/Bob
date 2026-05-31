@@ -15,10 +15,6 @@ type Props = {
    * reimplements an overlay. The lanes resolve each task's `result_payload` and
    * pass it through here. */
   onOpenResult: (sections: ComponentDescriptor[]) => void;
-  /** PRD 0011 — report the panel's visual footprint so `SphereUI` can shift the
-   * sphere + input zone left when the panel is open (rather than letting the
-   * absolutely-positioned panel overlap the input). */
-  onStateChange?: (state: "none" | "rail" | "open") => void;
 };
 
 /**
@@ -43,7 +39,7 @@ type Props = {
  * The panel renders nothing when there's no agent activity at all, so an idle
  * HUD stays clean (sphere centred, no rail).
  */
-export function AgentActivityPanel({ onOpenResult, onStateChange }: Props) {
+export function AgentActivityPanel({ onOpenResult }: Props) {
   const agentOrder = useActivityFeedStore((s) => s.agentOrder);
   const finishedByAgent = useActivityFeedStore((s) => s.finishedByAgent);
   const timelineByAgent = useActivityFeedStore((s) => s.timelineByAgent);
@@ -75,11 +71,6 @@ export function AgentActivityPanel({ onOpenResult, onStateChange }: Props) {
       seenSignalRef.current = activitySignal;
     }
   }, [activitySignal, activeCount]);
-
-  const visualState = agentOrder.length === 0 ? "none" : expanded ? "open" : "rail";
-  useEffect(() => {
-    onStateChange?.(visualState);
-  }, [visualState, onStateChange]);
 
   const handleCollapse = () => {
     // Latch: suppress auto-expand until the NEXT new activity edge.
