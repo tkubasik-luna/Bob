@@ -24,6 +24,7 @@ from typing import Any
 
 import structlog
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from bob import jarvis_store as jarvis_store_module
 from bob import orchestrator as orchestrator_module
@@ -288,6 +289,23 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(title="Bob backend", lifespan=lifespan)
+
+# PRD 0012 — the Sphere HUD webview calls the REST API (`/api/llm/*`) cross-origin
+# (Vite dev server on :1420, and the Tauri webview origin in the packaged app), so
+# the browser preflights mutating requests with OPTIONS. Without CORS the preflight
+# 405s and the picker never reaches PUT. WS is exempt (no preflight). Allow the known
+# local dev / Tauri origins only — this is a localhost-only desktop backend.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://127.0.0.1:1420",
+        "http://localhost:1420",
+        "tauri://localhost",
+        "http://tauri.localhost",
+    ],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 app.include_router(ws_router)
 app.include_router(ws_debug_router)
 app.include_router(debug_router)
