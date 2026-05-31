@@ -75,15 +75,18 @@ body {
   position: absolute;
   inset: 0;
   z-index: 1;
-  transition: right 420ms cubic-bezier(0.16, 1, 0.3, 1);
+  transition: transform 420ms cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 /* PRD 0011 / issue 0076 — when the agent-activity panel is OPEN it occupies a
- * fixed right column (320px + 16px gutter + 16px margin). Reserve that space so
- * the sphere and the bottom input zone shift left instead of being overlapped
- * by the absolutely-positioned panel. The collapsed rail is thin → ignored. */
+ * fixed right column (320px + 16px gutter + 16px margin = 352px). Shift the
+ * sphere + input zone LEFT to clear it. The stage must move via `transform`,
+ * NOT by shrinking its box (`right`): the WebGL canvas fills the stage at
+ * 100%×100%, so resizing the box ovalises the sphere. translateX keeps the
+ * canvas square and just recentres it in the visible left area (half the
+ * reserved column). The collapsed rail is thin → ignored. */
 .app[data-agent-panel="open"] .sphere-stage {
-  right: 352px;
+  transform: translateX(-176px);
 }
 .app[data-agent-panel="open"] .hud-zone.b {
   left: calc((100% - 352px) / 2);
