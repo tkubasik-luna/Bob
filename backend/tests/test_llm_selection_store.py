@@ -116,6 +116,7 @@ def test_get_endpoint_returns_current_selection(tmp_path: Path) -> None:
     )
 
     llm_router.set_store_provider(lambda: store)
+    llm_router.set_settings_provider(lambda: _settings(CLAUDE_CLI_MODEL="claude-opus-4"))
     try:
         # TestClient without the ``with`` block does not run the lifespan, so
         # the DI-seam store above is what the route reads.
@@ -123,10 +124,36 @@ def test_get_endpoint_returns_current_selection(tmp_path: Path) -> None:
         response = client.get("/api/llm/selection")
     finally:
         llm_router.reset_store_provider()
+        llm_router.reset_settings_provider()
 
     assert response.status_code == 200
+    # ``claude_model`` (issue 0081) is the read-only Claude label the picker
+    # shows on the Claude side — surfaced from ``CLAUDE_CLI_MODEL``.
     assert response.json() == {
         "provider": "lm_studio",
         "lm_model": "endpoint-model",
         "context_length": {"endpoint-model": 16384},
+        "claude_model": "claude-opus-4",
     }
+
+
+def test_get_endpoint_claude_model_falls_back_to_default(tmp_path: Path) -> None:
+    """With ``CLAUDE_CLI_MODEL`` unset, the picker still gets a non-empty label."""
+
+    from bob import llm_router
+
+    path = tmp_path / LLM_SELECTION_FILENAME
+    store = LLMSelectionStore(path)
+    store.write(LLMSelection(provider="lm_studio", lm_model="m", context_length={}))
+
+    llm_router.set_store_provider(lambda: store)
+    llm_router.set_settings_provider(lambda: _settings(CLAUDE_CLI_MODEL=None))
+    try:
+        client = TestClient(app)
+        response = client.get("/api/llm/selection")
+    finally:
+        llm_router.reset_store_provider()
+        llm_router.reset_settings_provider()
+
+    assert response.status_code == 200
+    assert response.json()["claude_model"] == llm_router.DEFAULT_CLAUDE_MODEL_LABEL

@@ -10,6 +10,7 @@ const apiMock = vi.hoisted(() => ({
   fetchLlmModels: vi.fn(),
   fetchLlmSelection: vi.fn(),
   putLlmModel: vi.fn(),
+  putLlmProvider: vi.fn(),
 }));
 
 vi.mock("../../lib/llmApi", async () => {
@@ -19,6 +20,7 @@ vi.mock("../../lib/llmApi", async () => {
     fetchLlmModels: apiMock.fetchLlmModels,
     fetchLlmSelection: apiMock.fetchLlmSelection,
     putLlmModel: apiMock.putLlmModel,
+    putLlmProvider: apiMock.putLlmProvider,
   };
 });
 
@@ -47,11 +49,13 @@ describe("ProviderPicker", () => {
     apiMock.fetchLlmModels.mockReset();
     apiMock.fetchLlmSelection.mockReset();
     apiMock.putLlmModel.mockReset();
+    apiMock.putLlmProvider.mockReset();
     apiMock.fetchLlmModels.mockResolvedValue(MODELS);
     apiMock.fetchLlmSelection.mockResolvedValue({
       provider: "lm_studio",
       lm_model: "qwen2.5-7b-instruct",
       context_length: { "qwen2.5-7b-instruct": 32768 },
+      claude_model: "claude-opus-4",
     });
   });
 
@@ -171,5 +175,54 @@ describe("ProviderPicker", () => {
     await openAndGetRows();
     fireEvent.click(screen.getByTestId("pv-row-qwen2.5-7b-instruct"));
     expect(apiMock.putLlmModel).not.toHaveBeenCalled();
+  });
+
+  // --- provider switch (issue 0081) ------------------------------------------
+
+  test("toggling to Claude CLI fires the provider PUT and shows the read-only label", async () => {
+    apiMock.putLlmProvider.mockResolvedValue({
+      provider: "claude_cli",
+      lm_model: "qwen2.5-7b-instruct",
+      context_length: {},
+      claude_model: "claude-opus-4",
+    });
+
+    render(<ProviderPicker />);
+    await waitFor(() => expect(apiMock.fetchLlmSelection).toHaveBeenCalled());
+
+    fireEvent.click(screen.getByRole("radio", { name: /claude cli/i }));
+    expect(apiMock.putLlmProvider).toHaveBeenCalledWith("claude_cli");
+
+    // The Claude side shows the read-only model label from the backend
+    // (`claude_model`), with NO model dropdown and NO listbox.
+    await waitFor(() => expect(screen.getByRole("radio", { name: /claude cli/i })).toBeChecked());
+    expect(screen.getByText("claude-opus-4")).toBeInTheDocument();
+    expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
+    // The active-engine row is disabled on the Claude side (no model picker).
+    const activeRow = screen.getByRole("button", { name: /CLI bridge/i });
+    expect(activeRow).toBeDisabled();
+  });
+
+  test("a failed provider switch reverts the toggle and surfaces the error", async () => {
+    apiMock.putLlmProvider.mockRejectedValue(
+      new LlmModelSwapError("claude_cli_unavailable", "claude binary not found"),
+    );
+
+    render(<ProviderPicker />);
+    await waitFor(() => expect(apiMock.fetchLlmSelection).toHaveBeenCalled());
+
+    fireEvent.click(screen.getByRole("radio", { name: /claude cli/i }));
+
+    // Reverted to LM Studio (the backend kept the previous provider) + error shown.
+    await waitFor(() => expect(screen.getByRole("radio", { name: /lm studio/i })).toBeChecked());
+    expect(screen.getByRole("alert")).toHaveTextContent(/claude binary not found/i);
+  });
+
+  test("toggling to the already-active provider does not fire a PUT", async () => {
+    render(<ProviderPicker />);
+    await waitFor(() => expect(apiMock.fetchLlmSelection).toHaveBeenCalled());
+    // Already on LM Studio (seeded selection).
+    fireEvent.click(screen.getByRole("radio", { name: /lm studio/i }));
+    expect(apiMock.putLlmProvider).not.toHaveBeenCalled();
   });
 });

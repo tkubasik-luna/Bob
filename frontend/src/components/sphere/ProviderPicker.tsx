@@ -7,14 +7,17 @@ import {
   fetchLlmModels,
   fetchLlmSelection,
   putLlmModel,
+  putLlmProvider,
 } from "../../lib/llmApi";
 
 // ProviderPicker — LLM engine picker mounted in the Sphere HUD top-left zone
 // (PRD 0012 / issues 0079-0080). Ported from `Design Mockup/provider.jsx`.
 //
 // SCOPE:
-//   - The segmented toggle renders (Claude CLI / LM Studio) but does NOT yet
-//     mutate the backend — the live provider switch is issue 0081.
+//   - Issue 0081: the segmented toggle fires the BLOCKING `PUT /api/llm/selection`
+//     with `{ provider }` to switch Claude CLI ↔ LM Studio. The backend
+//     validates the target first (LM Studio reachable / `claude` on PATH); on
+//     failure the picker reverts to the previous provider and shows the error.
 //   - Under LM Studio, opening the active-engine row fetches
 //     `GET /api/llm/models` and renders the LIVE list, highlighting the CURRENT
 //     selection from `GET /api/llm/selection`.
@@ -22,10 +25,14 @@ import {
 //     to load+swap it. While the swap runs the row shows a loading state; on
 //     failure the picker stays on the previous model and shows the error; on
 //     success the active-engine label (the HUD's engine/model footer) updates.
+//   - The Claude side shows a READ-ONLY model label (`selection.claude_model`,
+//     from `CLAUDE_CLI_MODEL` server-side) — no dropdown, no ctx control.
 // The hardcoded `LM_MODELS` catalogue from the mockup is replaced by the live
 // fetch; the `.pv-*` class structure and French labels are preserved.
 
-const CLAUDE_MODEL = "claude-sonnet-4.5";
+// Fallback Claude label shown before the selection loads (the backend's
+// `claude_model` field is authoritative once `GET /selection` resolves).
+const CLAUDE_MODEL_FALLBACK = "claude-sonnet-4.5";
 
 /** Compact "params · quant" spec line. `params` is derived from the model id
  * is not exposed by the live API at this stage, so we show architecture · quant
@@ -50,6 +57,14 @@ type SwapState =
   | { status: "loading"; target: string }
   | { status: "error"; target: string; detail: string };
 
+// Provider-switch (PUT { provider }) lifecycle (issue 0081). `target` is the
+// provider the user toggled to so the failing chip can be attributed; on
+// failure the toggle reverts to the previous provider and shows `detail`.
+type ProviderSwapState =
+  | { status: "idle" }
+  | { status: "loading"; target: string }
+  | { status: "error"; target: string; detail: string };
+
 export function ProviderPicker() {
   const [open, setOpen] = useState(false);
   // Provider toggle is local-only at this stage (no backend mutation). Seeded
@@ -58,6 +73,7 @@ export function ProviderPicker() {
   const [selection, setSelection] = useState<LlmSelection | null>(null);
   const [list, setList] = useState<ListState>({ status: "idle" });
   const [swap, setSwap] = useState<SwapState>({ status: "idle" });
+  const [providerSwap, setProviderSwap] = useState<ProviderSwapState>({ status: "idle" });
   const fetchedRef = useRef(false);
 
   const isLM = provider === "lm_studio";
@@ -127,15 +143,40 @@ export function ProviderPicker() {
     });
   };
 
-  const switchProvider = (p: string) => {
-    if (p === provider) return;
-    setProvider(p);
-    if (p !== "lm_studio") setOpen(false);
-  };
+  // Fire the BLOCKING provider-switch PUT (issue 0081). Optimistically flips
+  // the local toggle so the UI responds immediately, then reverts to the
+  // previous provider on failure. No-op when it is already the active provider
+  // or a switch is already in flight. On success the local selection is updated
+  // so the active-engine label tracks the new provider.
+  const switchProvider = useCallback(
+    (p: string) => {
+      if (p === provider) return;
+      if (providerSwap.status === "loading") return;
+      const previous = provider;
+      setProvider(p);
+      if (p !== "lm_studio") setOpen(false);
+      setProviderSwap({ status: "loading", target: p });
+      putLlmProvider(p)
+        .then((next) => {
+          setSelection(next);
+          setProvider(next.provider);
+          setProviderSwap({ status: "idle" });
+        })
+        .catch((err: unknown) => {
+          const detail =
+            err instanceof LlmModelSwapError ? err.message : "Échec du changement de moteur";
+          setProvider(previous); // revert — the backend kept the previous provider
+          setProviderSwap({ status: "error", target: p, detail });
+        });
+    },
+    [provider, providerSwap.status],
+  );
 
   const currentModelId = selection?.lm_model ?? null;
   const models = list.status === "ready" ? list.models : [];
   const activeModel = models.find((m) => m.id === currentModelId) ?? null;
+  const claudeModel = selection?.claude_model ?? CLAUDE_MODEL_FALLBACK;
+  const providerSwapping = providerSwap.status === "loading";
 
   return (
     <div className={`pv ${isLM ? "is-lm" : "is-claude"}`} data-testid="provider-picker">
@@ -153,6 +194,7 @@ export function ProviderPicker() {
           // biome-ignore lint/a11y/useSemanticElements: ARIA radiogroup of buttons per the mockup — <button> is the correct focusable element; the role only adds radio semantics.
           role="radio"
           aria-checked={!isLM}
+          disabled={providerSwapping}
           className={`pv-seg-btn ${!isLM ? "on" : ""}`}
           onClick={() => switchProvider("claude_cli")}
         >
@@ -164,6 +206,7 @@ export function ProviderPicker() {
           // biome-ignore lint/a11y/useSemanticElements: ARIA radiogroup of buttons per the mockup — <button> is the correct focusable element; the role only adds radio semantics.
           role="radio"
           aria-checked={isLM}
+          disabled={providerSwapping}
           className={`pv-seg-btn ${isLM ? "on" : ""}`}
           onClick={() => switchProvider("lm_studio")}
         >
@@ -191,7 +234,8 @@ export function ProviderPicker() {
             </>
           ) : (
             <>
-              <span className="pv-active-name">{CLAUDE_MODEL}</span>
+              {/* Claude side: READ-ONLY model label — no dropdown, no ctx. */}
+              <span className="pv-active-name">{claudeModel}</span>
               <span className="pv-active-spec">CLI bridge</span>
             </>
           )}
@@ -199,6 +243,14 @@ export function ProviderPicker() {
         <span className="pv-active-state">{isLM ? "chargé" : "connecté"}</span>
         {isLM && <span className="pv-chev">{open ? "▴" : "▾"}</span>}
       </button>
+
+      {/* Provider-switch error (issue 0081) — the toggle reverted to the
+        previous provider; surface why so the user can retry / start LM Studio. */}
+      {providerSwap.status === "error" && (
+        <div className="pv-provider-error" role="alert">
+          {providerSwap.detail}
+        </div>
+      )}
 
       {/* live model list — only under LM Studio, only when open. Read-only this
         slice: the options DISPLAY the live list + highlight the current

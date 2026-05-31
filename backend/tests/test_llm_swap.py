@@ -24,14 +24,17 @@ from bob.config import Settings
 from bob.llm_client import LLMClient
 from bob.llm_selection_store import LLMSelection, LLMSelectionStore
 from bob.llm_swap import (
+    ClaudeCliUnavailableError,
     LLMSwitcher,
     SubAgentClientHolder,
+    UnknownProviderError,
     resolve_cold_start_model,
 )
 from bob.lm_studio_manager import (
     LMStudioLoadError,
     LMStudioModel,
     LMStudioModelNotFoundError,
+    LMStudioUnavailableError,
 )
 from bob.orchestrator import Orchestrator
 
@@ -226,6 +229,132 @@ async def test_lock_serialises_concurrent_swaps(tmp_path: Path) -> None:
     final = store.read()
     assert final is not None
     assert final.lm_model in {"model-a", "model-b"}
+
+
+# --- provider swap (issue 0081) ----------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_swap_provider_to_claude_when_binary_present(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Claude CLI target with the binary on PATH → both clients rebuilt + JSON written."""
+
+    monkeypatch.setattr("bob.llm_swap.shutil.which", lambda _bin: "/usr/local/bin/claude")
+    manager = _FakeManager()
+    initial = LLMSelection(
+        provider="lm_studio",
+        lm_model="boot-model",
+        context_length={"boot-model": 8192},
+    )
+    switcher, orch, holder, store = _switcher(tmp_path, manager=manager, initial=initial)
+
+    old_jarvis = orch.jarvis_client
+    old_subagent = holder.client
+
+    result = await switcher.swap_provider("claude_cli")
+
+    # No LM Studio load happens on a Claude-target switch (validation is which()).
+    assert manager.loads == []
+    # Both role clients were rebuilt (new objects) and swapped.
+    assert orch.jarvis_client is not old_jarvis
+    assert holder.client is not old_subagent
+    # Persisted: provider flipped, pinned model + ctx map preserved.
+    assert result.selection.provider == "claude_cli"
+    persisted = store.read()
+    assert persisted is not None
+    assert persisted.provider == "claude_cli"
+    assert persisted.lm_model == "boot-model"
+    assert persisted.context_length == {"boot-model": 8192}
+
+
+@pytest.mark.asyncio
+async def test_swap_provider_to_claude_missing_binary_keeps_previous(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Claude CLI target with NO binary on PATH → error, previous provider kept, no write."""
+
+    monkeypatch.setattr("bob.llm_swap.shutil.which", lambda _bin: None)
+    manager = _FakeManager()
+    initial = LLMSelection(provider="lm_studio", lm_model="boot-model", context_length={})
+    switcher, orch, holder, store = _switcher(tmp_path, manager=manager, initial=initial)
+
+    old_jarvis = orch.jarvis_client
+    old_subagent = holder.client
+
+    with pytest.raises(ClaudeCliUnavailableError):
+        await switcher.swap_provider("claude_cli")
+
+    # Nothing mutated — previous clients + persisted provider retained.
+    assert orch.jarvis_client is old_jarvis
+    assert holder.client is old_subagent
+    persisted = store.read()
+    assert persisted is not None
+    assert persisted.provider == "lm_studio"
+
+
+@pytest.mark.asyncio
+async def test_swap_provider_to_lm_studio_when_reachable(tmp_path: Path) -> None:
+    """LM Studio target with a reachable server → both clients rebuilt + JSON written."""
+
+    manager = _FakeManager()  # list_models() returns [] → reachable
+    initial = LLMSelection(provider="claude_cli", lm_model="boot-model", context_length={})
+    switcher, orch, holder, store = _switcher(tmp_path, manager=manager, initial=initial)
+
+    old_jarvis = orch.jarvis_client
+    old_subagent = holder.client
+
+    result = await switcher.swap_provider("lm_studio")
+
+    assert orch.jarvis_client is not old_jarvis
+    assert holder.client is not old_subagent
+    assert result.selection.provider == "lm_studio"
+    persisted = store.read()
+    assert persisted is not None
+    assert persisted.provider == "lm_studio"
+
+
+@pytest.mark.asyncio
+async def test_swap_provider_to_lm_studio_unreachable_keeps_previous(tmp_path: Path) -> None:
+    """LM Studio target with an unreachable server → error, previous provider kept, no write."""
+
+    class _UnreachableManager(_FakeManager):
+        def list_models(self) -> list[LMStudioModel]:
+            raise LMStudioUnavailableError("server down")
+
+    manager = _UnreachableManager()
+    initial = LLMSelection(provider="claude_cli", lm_model=None, context_length={})
+    switcher, orch, holder, store = _switcher(tmp_path, manager=manager, initial=initial)
+
+    old_jarvis = orch.jarvis_client
+    old_subagent = holder.client
+
+    with pytest.raises(LMStudioUnavailableError):
+        await switcher.swap_provider("lm_studio")
+
+    assert orch.jarvis_client is old_jarvis
+    assert holder.client is old_subagent
+    persisted = store.read()
+    assert persisted is not None
+    assert persisted.provider == "claude_cli"
+
+
+@pytest.mark.asyncio
+async def test_swap_provider_unknown_value_rejected_before_any_probe(tmp_path: Path) -> None:
+    """An unknown provider id raises before any probe / rebuild / write."""
+
+    manager = _FakeManager()
+    initial = LLMSelection(provider="lm_studio", lm_model="boot-model", context_length={})
+    switcher, orch, _holder, store = _switcher(tmp_path, manager=manager, initial=initial)
+
+    old_jarvis = orch.jarvis_client
+
+    with pytest.raises(UnknownProviderError):
+        await switcher.swap_provider("gpt5")
+
+    assert manager.loads == []
+    assert orch.jarvis_client is old_jarvis
+    assert store.read().provider == "lm_studio"  # type: ignore[union-attr]
 
 
 # --- cold-start resolution ---------------------------------------------------

@@ -32,6 +32,7 @@ load timeout.
 from __future__ import annotations
 
 import asyncio
+import shutil
 from dataclasses import dataclass
 
 from bob.config import Settings
@@ -40,6 +41,29 @@ from bob.llm_client import LLMClient
 from bob.llm_selection_store import LLMSelection, LLMSelectionStore
 from bob.lm_studio_manager import LMStudioManager
 from bob.orchestrator import Orchestrator
+
+#: Providers the live switch (issue 0081) accepts. The selection model uses the
+#: same two values; anything else is rejected before any probe runs.
+_VALID_PROVIDERS = frozenset({"lm_studio", "claude_cli"})
+
+
+class ClaudeCliUnavailableError(RuntimeError):
+    """The ``claude`` CLI binary could not be found on ``PATH``.
+
+    Raised by :meth:`LLMSwitcher.swap_provider` when validating a switch to the
+    Claude CLI provider and ``shutil.which(settings.CLAUDE_CLI_BIN)`` returns
+    ``None``. Distinct + catchable so the REST layer maps it to a clear HTTP
+    error and the swap path keeps the previous provider (nothing written).
+    """
+
+
+class UnknownProviderError(ValueError):
+    """The requested provider id is not one the live switch supports.
+
+    Raised by :meth:`LLMSwitcher.swap_provider` for any value outside
+    ``{"lm_studio", "claude_cli"}`` — a client bug or hand-crafted request. The
+    route maps it to a 422-flavoured error; no probe, no swap, no write.
+    """
 
 
 class SubAgentClientHolder:
@@ -136,6 +160,82 @@ class LLMSwitcher:
             # 4. Persist only after a fully successful swap.
             self._selection_store.write(new_selection)
             return SwapResult(selection=new_selection)
+
+    async def swap_provider(self, provider: str) -> SwapResult:
+        """Validate-then-swap the active provider (Claude CLI ↔ LM Studio).
+
+        Mirrors :meth:`swap_lm_model`: lock-guarded, non-interruptive (both
+        consumers read their client reference per request / per task), and
+        validate-the-TARGET-before-mutating-anything:
+
+        - ``lm_studio`` target → probe the LM Studio server is reachable
+          (:meth:`LMStudioManager.list_models`, a no-load management call). An
+          unreachable server raises :class:`~bob.lm_studio_manager.LMStudioUnavailableError`.
+        - ``claude_cli`` target → verify the ``claude`` binary is on ``PATH``
+          via ``shutil.which(settings.CLAUDE_CLI_BIN)``; absence raises
+          :class:`ClaudeCliUnavailableError`.
+
+        On validation success: build the next selection (provider changed, the
+        per-model ctx map kept), rebuild BOTH role clients from it via the
+        factory (which dispatches the backend off the new provider), swap the
+        orchestrator + sub-agent holder references, then persist the JSON.
+
+        On validation failure NOTHING is mutated — previous provider kept, no
+        rebuild, no write — and the error propagates for the route to map. A
+        no-op (provider already active) is still validated then rewritten so the
+        contract ("the returned selection is the active one") holds uniformly.
+        """
+
+        if provider not in _VALID_PROVIDERS:
+            raise UnknownProviderError(f"Unknown LLM provider: {provider!r}")
+
+        async with self._lock:
+            current = self._selection_store.read()
+
+            # 1. Validate the TARGET before touching any state. A raised error
+            #    exits the lock with no rebuild and no write.
+            if provider == "lm_studio":
+                # Reachability probe — a management list call (no model load).
+                # Blocking SDK call → worker thread so the loop is not parked.
+                await asyncio.to_thread(self._manager.list_models)
+            else:  # claude_cli
+                if shutil.which(self._settings.CLAUDE_CLI_BIN) is None:
+                    raise ClaudeCliUnavailableError(
+                        f"Claude CLI binary not found on PATH: "
+                        f"{self._settings.CLAUDE_CLI_BIN!r}"
+                    )
+
+            # 2. Build the next selection (provider changed, ctx map + pinned
+            #    LM model preserved so a later switch back is cheap).
+            new_selection = self._next_provider_selection(current, provider)
+
+            # 3. Rebuild + swap both role clients from the NEW selection. The
+            #    factory dispatches the backend off ``new_selection.provider``.
+            self._orchestrator.set_jarvis_client(
+                build_jarvis_client(self._settings, new_selection)
+            )
+            self._subagent_holder.set(build_subagent_client(self._settings, new_selection))
+
+            # 4. Persist only after a fully successful swap.
+            self._selection_store.write(new_selection)
+            return SwapResult(selection=new_selection)
+
+    @staticmethod
+    def _next_provider_selection(current: LLMSelection | None, provider: str) -> LLMSelection:
+        """Build the selection to persist after a successful provider switch.
+
+        Only ``provider`` changes; the pinned ``lm_model`` and the per-model
+        context-length map round-trip unchanged so switching back to LM Studio
+        restores the prior model without a re-pick.
+        """
+
+        lm_model = current.lm_model if current is not None else None
+        context_length = dict(current.context_length) if current is not None else {}
+        return LLMSelection(
+            provider=provider,
+            lm_model=lm_model,
+            context_length=context_length,
+        )
 
     @staticmethod
     def _resolve_context_length(current: LLMSelection | None, model_id: str) -> int | None:

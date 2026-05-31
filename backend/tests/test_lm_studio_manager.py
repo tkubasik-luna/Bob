@@ -14,6 +14,7 @@ from typing import Any, cast
 import lmstudio
 from fastapi.testclient import TestClient
 
+from bob.config import Settings
 from bob.lm_studio_manager import (
     LMStudioLoadError,
     LMStudioManager,
@@ -25,6 +26,18 @@ from bob.lm_studio_manager import (
     _SDKModelInfo,
 )
 from bob.main import app
+
+
+def _settings(**overrides: object) -> Settings:
+    base: dict[str, object] = {
+        "LLM_PROVIDER": "lm_studio",
+        "LLM_BASE_URL": "http://localhost:1234/v1",
+        "LLM_MODEL": "qwen2.5-7b-instruct",
+        "LLM_API_KEY": "lm-studio",
+    }
+    base.update(overrides)
+    return Settings(**base)  # type: ignore[arg-type]
+
 
 # --- SDK fakes ---------------------------------------------------------------
 
@@ -354,19 +367,24 @@ def test_put_selection_success_returns_new_selection() -> None:
     switcher = _FakeSwitcher(result=SwapResult(selection=selection))
 
     llm_router.set_switcher(cast(Any, switcher))
+    llm_router.set_settings_provider(lambda: _settings(CLAUDE_CLI_MODEL="claude-opus-4"))
     try:
         api = TestClient(app)
         response = api.put("/api/llm/selection", json={"lm_model": "target-model"})
     finally:
         llm_router.set_switcher(None)
+        llm_router.reset_settings_provider()
 
     assert response.status_code == 200
     assert switcher.calls == ["target-model"]
     body = response.json()
+    # ``claude_model`` (issue 0081) is now part of the response shape; the
+    # model-swap fields are unchanged.
     assert body == {
         "provider": "lm_studio",
         "lm_model": "target-model",
         "context_length": {"target-model": 8192},
+        "claude_model": "claude-opus-4",
     }
 
 

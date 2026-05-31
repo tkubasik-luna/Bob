@@ -18,11 +18,16 @@ export type LlmModel = {
   loaded: boolean;
 };
 
-/** Current selection — mirror of the backend `LLMSelectionResponse`. */
+/** Current selection — mirror of the backend `LLMSelectionResponse`.
+ *
+ * `claude_model` (issue 0081) is the READ-ONLY model label shown on the Claude
+ * CLI side of the picker (from `CLAUDE_CLI_MODEL`, or a server default). There
+ * is no Claude model dropdown — it is informational only. */
 export type LlmSelection = {
   provider: string;
   lm_model: string | null;
   context_length: Record<string, number>;
+  claude_model: string;
 };
 
 /** Raised by {@link fetchLlmModels} when LM Studio is unreachable (the backend
@@ -96,6 +101,40 @@ export async function putLlmModel(lmModel: string, signal?: AbortSignal): Promis
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ lm_model: lmModel }),
+    signal,
+  });
+  if (!res.ok) {
+    let code = "swap_failed";
+    let detail = `PUT /api/llm/selection failed: ${res.status}`;
+    try {
+      const body = (await res.json()) as { error?: string; detail?: string };
+      if (typeof body.error === "string" && body.error) code = body.error;
+      if (typeof body.detail === "string" && body.detail) detail = body.detail;
+    } catch {
+      // keep the defaults
+    }
+    throw new LlmModelSwapError(code, detail);
+  }
+  return (await res.json()) as LlmSelection;
+}
+
+/** Switch the active provider — Claude CLI ↔ LM Studio (PRD 0012 / issue 0081).
+ *
+ * Synchronous + BLOCKING, mirroring {@link putLlmModel}: the backend validates
+ * the target first (LM Studio reachable / `claude` binary on PATH), then
+ * rebuilds + swaps the client for both orchestrator roles and persists the
+ * JSON. On a validation failure the backend keeps the PREVIOUS provider and
+ * returns a structured `{error, detail}` body; we throw {@link LlmModelSwapError}
+ * so the caller can revert the toggle and surface the detail. On success the
+ * returned {@link LlmSelection} reflects the new active provider. */
+export async function putLlmProvider(
+  provider: string,
+  signal?: AbortSignal,
+): Promise<LlmSelection> {
+  const res = await fetch(`${API_BASE_URL}/api/llm/selection`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ provider }),
     signal,
   });
   if (!res.ok) {

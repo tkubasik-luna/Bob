@@ -21,11 +21,16 @@ from fastapi import APIRouter, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from bob.config import Settings, get_settings
 from bob.llm_selection_store import (
     LLMSelectionStore,
     get_default_store,
 )
-from bob.llm_swap import LLMSwitcher
+from bob.llm_swap import (
+    ClaudeCliUnavailableError,
+    LLMSwitcher,
+    UnknownProviderError,
+)
 from bob.lm_studio_manager import (
     LMStudioLoadError,
     LMStudioManager,
@@ -54,6 +59,24 @@ _store_provider: Callable[[], LLMSelectionStore] = get_default_store
 # DI seam for the LM Studio management client. Defaults to a fresh manager
 # pointing at the local server; tests inject one wired to a fake SDK client.
 _manager_provider: Callable[[], LMStudioManager] = LMStudioManager
+
+# DI seam for settings. The Claude model label (``GET /selection``) is read
+# from ``CLAUDE_CLI_MODEL``; tests override this without booting the app.
+_settings_provider: Callable[[], Settings] = get_settings
+
+
+def set_settings_provider(provider: Callable[[], Settings]) -> None:
+    """Override the settings factory used to surface the Claude model label."""
+
+    global _settings_provider
+    _settings_provider = provider
+
+
+def reset_settings_provider() -> None:
+    """Restore the default settings factory."""
+
+    global _settings_provider
+    _settings_provider = get_settings
 
 
 def set_store_provider(provider: Callable[[], LLMSelectionStore]) -> None:
@@ -84,12 +107,23 @@ def reset_manager_provider() -> None:
     _manager_provider = LMStudioManager
 
 
+#: Fallback Claude model label when ``CLAUDE_CLI_MODEL`` is unset, so the
+#: picker's Claude side always has a non-empty read-only label to render.
+DEFAULT_CLAUDE_MODEL_LABEL = "claude-sonnet-4.5"
+
+
 class LLMSelectionResponse(BaseModel):
-    """Body for ``GET /api/llm/selection``."""
+    """Body for ``GET /api/llm/selection``.
+
+    ``claude_model`` (issue 0081) is the read-only model label the picker shows
+    on the Claude CLI side — the configured ``CLAUDE_CLI_MODEL`` or a default.
+    It is informational only: there is no Claude model dropdown.
+    """
 
     provider: str
     lm_model: str | None
     context_length: dict[str, int]
+    claude_model: str
 
 
 @router.get("/selection", response_model=LLMSelectionResponse)
@@ -107,10 +141,12 @@ def get_llm_selection() -> LLMSelectionResponse:
     provider = selection.provider if selection is not None else "lm_studio"
     lm_model = selection.lm_model if selection is not None else None
     context_length = selection.context_length if selection is not None else {}
+    claude_model = _settings_provider().CLAUDE_CLI_MODEL or DEFAULT_CLAUDE_MODEL_LABEL
     return LLMSelectionResponse(
         provider=provider,
         lm_model=lm_model,
         context_length=context_length,
+        claude_model=claude_model,
     )
 
 
@@ -176,14 +212,21 @@ def get_llm_models() -> JSONResponse:
 
 
 class LLMSelectionUpdateRequest(BaseModel):
-    """Body for ``PUT /api/llm/selection`` — an ``lm_model`` change (issue 0080).
+    """Body for ``PUT /api/llm/selection``.
 
-    Only the model id is accepted in this slice: the provider switch is 0081
-    and the context-length override is 0082. ``lm_model`` is required and
-    non-empty (a clear/unpin is not a supported mutation here).
+    Two mutually-exclusive mutations are accepted:
+
+    - ``lm_model`` — change the active LM Studio model (issue 0080).
+    - ``provider`` — switch the active provider, Claude CLI ↔ LM Studio
+      (issue 0081).
+
+    Exactly one must be present; the context-length override is issue 0082 and
+    out of scope here. Both fields default to ``None`` so a body carrying just
+    one validates; the route rejects a body with zero or both.
     """
 
-    lm_model: str
+    lm_model: str | None = None
+    provider: str | None = None
 
 
 class LLMSelectionUpdateErrorResponse(BaseModel):
@@ -193,78 +236,130 @@ class LLMSelectionUpdateErrorResponse(BaseModel):
     detail: str
 
 
+def _error_response(code: str, detail: str, http_status: int) -> JSONResponse:
+    """Build a structured ``{error, detail}`` body at ``http_status``."""
+
+    return JSONResponse(
+        status_code=http_status,
+        content=LLMSelectionUpdateErrorResponse(error=code, detail=detail).model_dump(),
+    )
+
+
+def _selection_payload(selection: object) -> JSONResponse:
+    """Build the 200 body for a successful swap, including the Claude label."""
+
+    # ``selection`` is an ``LLMSelection``; typed loosely to keep the import
+    # surface here unchanged (the value object lives in the swap result).
+    claude_model = _settings_provider().CLAUDE_CLI_MODEL or DEFAULT_CLAUDE_MODEL_LABEL
+    payload = LLMSelectionResponse(
+        provider=selection.provider,  # type: ignore[attr-defined]
+        lm_model=selection.lm_model,  # type: ignore[attr-defined]
+        context_length=selection.context_length,  # type: ignore[attr-defined]
+        claude_model=claude_model,
+    )
+    return JSONResponse(status_code=status.HTTP_200_OK, content=payload.model_dump())
+
+
 @router.put(
     "/selection",
     response_model=LLMSelectionResponse,
     responses={
         status.HTTP_404_NOT_FOUND: {"model": LLMSelectionUpdateErrorResponse},
         status.HTTP_409_CONFLICT: {"model": LLMSelectionUpdateErrorResponse},
+        status.HTTP_422_UNPROCESSABLE_ENTITY: {"model": LLMSelectionUpdateErrorResponse},
         status.HTTP_503_SERVICE_UNAVAILABLE: {"model": LLMSelectionUpdateErrorResponse},
     },
 )
 async def put_llm_selection(body: LLMSelectionUpdateRequest) -> JSONResponse:
-    """Change the active LM Studio model — synchronous, blocking, validate-then-swap.
+    """Mutate the active LLM selection — synchronous, blocking, validate-then-swap.
 
-    Delegates to the :class:`bob.llm_swap.LLMSwitcher`, which loads the target
-    (default ctx), unloads the previous model, rebuilds + swaps the LM client
-    for BOTH Jarvis and sub-agent roles, then persists the JSON. The whole
-    sequence is serialised by an ``asyncio.Lock`` so concurrent ``PUT``s never
-    interleave. On a load failure the previous selection is kept, nothing is
-    written, and a DISTINCT structured error maps to the right HTTP status:
+    Dispatches on the body to exactly one mutation, each delegating to the
+    :class:`bob.llm_swap.LLMSwitcher` (lock-serialised, validate-the-target-
+    before-mutating, rebuild + swap BOTH role clients, then persist the JSON):
+
+    - ``provider`` set (issue 0081) → switch Claude CLI ↔ LM Studio. Validates
+      the target first (LM Studio reachable / ``claude`` on ``PATH``); on
+      failure the previous provider is kept and nothing is written.
+    - ``lm_model`` set (issue 0080) → change the active LM Studio model.
+
+    Exactly one field must be present (zero or both → 422). Error → HTTP:
 
     - unknown model id → 404
     - load failed (OOM) → 409
-    - LM Studio unreachable / swap not wired → 503
+    - unknown provider / invalid request → 422
+    - LM Studio unreachable / ``claude`` missing / swap not wired → 503
 
     The generous load timeout lives in the SDK call; this route awaits it.
     """
 
-    model_id = body.lm_model.strip()
-    if not model_id:
-        return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            content=LLMSelectionUpdateErrorResponse(
-                error="invalid_request", detail="lm_model must be a non-empty string"
-            ).model_dump(),
+    has_model = body.lm_model is not None
+    has_provider = body.provider is not None
+    if has_model == has_provider:
+        return _error_response(
+            "invalid_request",
+            "Exactly one of 'lm_model' or 'provider' must be provided",
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
         )
 
     if _switcher is None:
-        return JSONResponse(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            content=LLMSelectionUpdateErrorResponse(
-                error="swap_unavailable",
-                detail="LLM swap coordinator not initialised (app lifespan not running)",
-            ).model_dump(),
+        return _error_response(
+            "swap_unavailable",
+            "LLM swap coordinator not initialised (app lifespan not running)",
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+
+    if has_provider:
+        return await _handle_provider_swap(body.provider or "")
+    return await _handle_model_swap(body.lm_model or "")
+
+
+async def _handle_model_swap(lm_model: str) -> JSONResponse:
+    """Run the LM Studio model swap (issue 0080) and map outcomes to HTTP."""
+
+    assert _switcher is not None  # guarded by the caller
+    model_id = lm_model.strip()
+    if not model_id:
+        return _error_response(
+            "invalid_request",
+            "lm_model must be a non-empty string",
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
         )
 
     try:
         result = await _switcher.swap_lm_model(model_id)
     except LMStudioModelNotFoundError as exc:
-        return JSONResponse(
-            status_code=status.HTTP_404_NOT_FOUND,
-            content=LLMSelectionUpdateErrorResponse(
-                error="model_not_found", detail=str(exc)
-            ).model_dump(),
-        )
+        return _error_response("model_not_found", str(exc), status.HTTP_404_NOT_FOUND)
     except LMStudioLoadError as exc:
-        return JSONResponse(
-            status_code=status.HTTP_409_CONFLICT,
-            content=LLMSelectionUpdateErrorResponse(
-                error="load_failed", detail=str(exc)
-            ).model_dump(),
+        return _error_response("load_failed", str(exc), status.HTTP_409_CONFLICT)
+    except LMStudioUnavailableError as exc:
+        return _error_response(
+            "lm_studio_unavailable", str(exc), status.HTTP_503_SERVICE_UNAVAILABLE
+        )
+    return _selection_payload(result.selection)
+
+
+async def _handle_provider_swap(provider: str) -> JSONResponse:
+    """Run the provider switch (issue 0081) and map outcomes to HTTP.
+
+    The target is validated before any swap: LM Studio reachable for the
+    ``lm_studio`` target, ``claude`` on ``PATH`` for ``claude_cli``. A
+    validation failure keeps the previous provider and writes nothing.
+    """
+
+    assert _switcher is not None  # guarded by the caller
+    provider_id = provider.strip()
+    try:
+        result = await _switcher.swap_provider(provider_id)
+    except UnknownProviderError as exc:
+        return _error_response(
+            "unknown_provider", str(exc), status.HTTP_422_UNPROCESSABLE_ENTITY
+        )
+    except ClaudeCliUnavailableError as exc:
+        return _error_response(
+            "claude_cli_unavailable", str(exc), status.HTTP_503_SERVICE_UNAVAILABLE
         )
     except LMStudioUnavailableError as exc:
-        return JSONResponse(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            content=LLMSelectionUpdateErrorResponse(
-                error="lm_studio_unavailable", detail=str(exc)
-            ).model_dump(),
+        return _error_response(
+            "lm_studio_unavailable", str(exc), status.HTTP_503_SERVICE_UNAVAILABLE
         )
-
-    selection = result.selection
-    payload = LLMSelectionResponse(
-        provider=selection.provider,
-        lm_model=selection.lm_model,
-        context_length=selection.context_length,
-    )
-    return JSONResponse(status_code=status.HTTP_200_OK, content=payload.model_dump())
+    return _selection_payload(result.selection)
