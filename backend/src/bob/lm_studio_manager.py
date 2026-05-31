@@ -28,6 +28,7 @@ import contextlib
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Protocol
+from urllib.parse import urlsplit
 
 import lmstudio
 
@@ -35,6 +36,23 @@ import lmstudio
 #: ``None`` is passed; we keep an explicit default so a misconfigured host is
 #: visible at the call site.
 DEFAULT_LM_STUDIO_HOST = "localhost:1234"
+
+
+def host_from_base_url(base_url: str | None) -> str:
+    """Derive the ``lmstudio`` SDK ``host:port`` from the inference ``LLM_BASE_URL``.
+
+    Inference runs on the ``openai`` client against an OpenAI-compatible URL like
+    ``http://192.168.86.21:1234/v1``; the management SDK wants the bare
+    ``host:port`` (no scheme, no ``/v1`` path). Both must point at the same server,
+    so the manager host is derived from the same setting rather than configured
+    twice. Falls back to :data:`DEFAULT_LM_STUDIO_HOST` when the URL is absent or
+    has no network location.
+    """
+
+    if not base_url:
+        return DEFAULT_LM_STUDIO_HOST
+    parsed = urlsplit(base_url if "//" in base_url else f"//{base_url}")
+    return parsed.netloc or DEFAULT_LM_STUDIO_HOST
 
 #: ``LlmInfo.type`` values we treat as chat-capable. ``vlm`` (vision LLM) is a
 #: chat model with image input; ``embedding`` models are excluded.

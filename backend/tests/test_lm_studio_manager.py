@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 
 from bob.config import Settings
 from bob.lm_studio_manager import (
+    DEFAULT_LM_STUDIO_HOST,
     LMStudioLoadError,
     LMStudioManager,
     LMStudioModelNotFoundError,
@@ -24,6 +25,7 @@ from bob.lm_studio_manager import (
     _SDKDownloadedModel,
     _SDKLoadedModel,
     _SDKModelInfo,
+    host_from_base_url,
 )
 from bob.main import app
 
@@ -153,6 +155,18 @@ def _catalogue() -> list[_SDKDownloadedModel]:
 
 
 # --- LMStudioManager unit tests ---------------------------------------------
+
+
+def test_host_from_base_url_strips_scheme_and_path() -> None:
+    # Inference URL (openai client) → bare host:port for the management SDK.
+    assert host_from_base_url("http://192.168.86.21:1234/v1") == "192.168.86.21:1234"
+    assert host_from_base_url("http://localhost:1234/v1/") == "localhost:1234"
+    assert host_from_base_url("192.168.86.21:1234") == "192.168.86.21:1234"
+
+
+def test_host_from_base_url_falls_back_when_absent() -> None:
+    assert host_from_base_url(None) == DEFAULT_LM_STUDIO_HOST
+    assert host_from_base_url("") == DEFAULT_LM_STUDIO_HOST
 
 
 def test_list_models_filters_embeddings_and_exposes_metadata() -> None:

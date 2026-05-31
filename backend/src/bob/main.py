@@ -42,7 +42,9 @@ from bob.event_bus import EventBus, set_event_bus
 from bob.jarvis_prompt_loader import load_jarvis_prompt
 from bob.jarvis_store import JarvisStore
 from bob.llm.factory import build_jarvis_client, build_subagent_client
+from bob.llm_router import reset_manager_provider as reset_llm_manager_provider
 from bob.llm_router import router as llm_router
+from bob.llm_router import set_manager_provider as set_llm_manager_provider
 from bob.llm_router import set_switcher as set_llm_switcher
 from bob.llm_selection_store import (
     LLM_SELECTION_FILENAME,
@@ -57,7 +59,7 @@ from bob.llm_swap import (
     SubAgentClientHolder,
     resolve_cold_start_model,
 )
-from bob.lm_studio_manager import LMStudioManager
+from bob.lm_studio_manager import LMStudioManager, host_from_base_url
 from bob.logging_setup import configure_logging
 from bob.orchestrator import get_default_orchestrator
 from bob.proactivity_handler import ProactivityHandler
@@ -128,7 +130,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
     # LM Studio management manager (PRD 0012 / issue 0079-0080). Single boundary
     # onto the ``lmstudio`` SDK for cold-start resolution + the live model swap.
-    lm_studio_manager = LMStudioManager()
+    lm_studio_manager = LMStudioManager(host=host_from_base_url(settings.LLM_BASE_URL))
 
     # Cold-start resolution (issue 0080): provider is LM Studio with no model
     # pinned anywhere → adopt the model already loaded in LM Studio if any, else
@@ -249,6 +251,10 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         subagent_holder=subagent_holder,
     )
     set_llm_switcher(llm_switcher)
+    # GET /api/llm/models otherwise builds a fresh default-host manager
+    # (localhost:1234). Point it at the same host-configured manager the swap
+    # path uses, so the listing reaches the real LM Studio server (LLM_BASE_URL).
+    set_llm_manager_provider(lambda: lm_studio_manager)
 
     load_jarvis_prompt(data_dir)
 
@@ -274,6 +280,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         set_llm_switcher(None)
+        reset_llm_manager_provider()
         await orchestrator.stop_proactive_loop()
         # Issue 0045 — drain the scheduler's TaskGroup deterministically so
         # in-flight sub-agents don't leak past the lifespan teardown.
