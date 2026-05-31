@@ -11,6 +11,7 @@ import { AgentActivityPanel } from "./AgentActivityPanel";
 import { DevControls } from "./sphere/DevControls";
 import { InputField } from "./sphere/InputField";
 import { MuteToggle } from "./sphere/MuteToggle";
+import { ProviderPicker } from "./sphere/ProviderPicker";
 import { SectionsOverlay } from "./sphere/SectionsOverlay";
 import { TranscriptLine } from "./sphere/TranscriptLine";
 import { sectionRegistry } from "./sphere/sectionRegistry";
@@ -292,6 +293,13 @@ export function SphereUI() {
          * "résultat" button on a finished lane opens the SAME SectionsOverlay
          * the streamed-ui / task-result paths use, via the shared dispatcher. */}
         <AgentActivityPanel onOpenResult={(sections) => setOverlaySections(sections)} />
+        {/* PRD 0012 / issue 0079 — LLM engine picker in the top-left HUD zone.
+         * Read-only this slice: it fetches `GET /api/llm/models` on dropdown
+         * open and highlights the current selection. Only the Sphere HUD gets
+         * the picker; legacy ChatView does not. */}
+        <div className="hud-zone tl">
+          <ProviderPicker />
+        </div>
         <div className="hud-zone b">
           <TranscriptLine state={transcriptState} hidden={overlayOpen} />
           <InputField />
