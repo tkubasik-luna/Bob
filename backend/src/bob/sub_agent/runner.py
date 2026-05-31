@@ -1055,7 +1055,7 @@ class SubAgentRunner:
                 # base-class fallback replays ``chat`` as one text chunk — the
                 # path stays byte-for-byte equivalent and degraded mode (no
                 # reasoning channel) is reachable.
-                raw = await self._stream_iteration(task_id, messages)
+                raw, degraded = await self._stream_iteration(task_id, messages)
             except asyncio.CancelledError:
                 # Hard-kill from the scheduler. Mark the path so the
                 # terminal ``done`` records ``hard_killed``. Then convert
@@ -1289,7 +1289,7 @@ class SubAgentRunner:
                 # the stall guard below may re-arm a nudge for the next call.
                 validator_feedback = []
                 validator_envelope = CallEnvelope(tool_name=None, actor="sub_agent")
-                await self._handle_progress(task_id, action.thought)
+                await self._handle_progress(task_id, action.thought, degraded=degraded)
                 # RC1 + Trou A (mail-tool-loop) — consecutive ``progress`` is a
                 # stall whether or not a tool result exists yet. A weak model
                 # narrates "j'ai appelé X" without ever emitting ``done`` — and
@@ -1627,7 +1627,7 @@ class SubAgentRunner:
 
     async def _stream_iteration(
         self, task_id: str, messages: list[dict[str, Any]]
-    ) -> str:
+    ) -> tuple[str, bool]:
         """Stream one per-iteration LLM call, surfacing reasoning live.
 
         PRD 0011 / issue 0069. Drives :meth:`bob.llm_client.LLMClient.stream_chat`
@@ -1637,6 +1637,15 @@ class SubAgentRunner:
         aggregated and returned for the SAME guided-JSON parse the non-streaming
         ``chat`` path used. Reasoning is cosmetic: it never touches the returned
         string, so action parsing / validation / retry behaviour is unchanged.
+
+        Returns ``(content, degraded)``. PRD 0011 / issue 0070 — ``degraded`` is
+        the reader's per-iteration flag (``True`` when the stream carried NO
+        reasoning channel, common with local non-reasoning models). The caller
+        uses it to switch the TEXT channel to a narrated-steps fallback (the
+        sub-agent's own ``progress`` thought is emitted as the block's text) so
+        the feed is never empty. The switch is per-iteration / per-agent because
+        the flag is owned by THIS call's reader — one degraded agent does not
+        suppress another's live reasoning.
 
         ``asyncio.CancelledError`` (the scheduler's hard-kill) propagates out so
         the caller's existing handler records ``hard_killed`` — mirroring the
@@ -1658,7 +1667,7 @@ class SubAgentRunner:
                     "delta": delta,
                 }
             )
-        return reader.content
+        return reader.content, reader.degraded
 
     async def _emit_activity(self, event: InternalEvent) -> None:
         """Project an internal event into a chip and push it on the chat WS (issue 0071).
@@ -1785,8 +1794,35 @@ class SubAgentRunner:
                 return stored.projection.deliverable, (result_summary or stored.projection.summary)
         return None, result_summary
 
-    async def _handle_progress(self, task_id: str, thought: str) -> None:
-        """Persist a v2 ``progress`` thought, leave state ``running``."""
+    async def _handle_progress(
+        self, task_id: str, thought: str, *, degraded: bool = False
+    ) -> None:
+        """Persist a v2 ``progress`` thought, leave state ``running``.
+
+        PRD 0011 / issue 0070 — narrated-steps fallback. When ``degraded`` is
+        ``True`` the iteration's stream carried NO reasoning channel (a local
+        non-reasoning model), so the :class:`AgentBlock` would otherwise have no
+        text. We surface the sub-agent's own ``progress`` thought as the block's
+        text by emitting it on the SAME ``reasoning_delta`` channel issue 0069
+        renders (tagged with the same ``agent_ref``), so the feed is never empty
+        when the agent is producing thoughts. When reasoning WAS streamed
+        (``degraded`` is ``False``) we do NOT also emit the thought — the live
+        reasoning already fed the block; duplicating would double the text.
+
+        The fallback only concerns the TEXT channel. The tool-call / incident
+        chips flow through :meth:`_emit_activity` regardless of mode, and this
+        narration never touches action validation (purely cosmetic, like the
+        reasoning stream it stands in for).
+        """
+
+        if degraded and thought.strip():
+            await ws_events.emit(
+                {
+                    "type": "reasoning_delta",
+                    "agent_ref": task_id,
+                    "delta": thought,
+                }
+            )
 
         try:
             message_id = self._task_store.append_message(

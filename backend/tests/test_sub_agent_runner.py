@@ -485,7 +485,11 @@ async def test_progress_sequence_then_done_persists_messages_and_emits_events() 
     # then done emits (task_message, task_updated, task_result).
     # PRD 0011 / issue 0071 — agent-activity chips (started/stall/finished) now
     # interleave on the same WS; filter them out to assert the lifecycle order.
-    event_types = [e["type"] for e in received_ws if e["type"] != "agent_activity"]
+    # PRD 0011 / issue 0070 — in degraded mode (this scripted client streams no
+    # reasoning channel) each progress thought is also narrated as a cosmetic
+    # ``reasoning_delta``; filter those too to assert the lifecycle order.
+    cosmetic = {"agent_activity", "reasoning_delta"}
+    event_types = [e["type"] for e in received_ws if e["type"] not in cosmetic]
     assert event_types == [
         "task_message",
         "task_updated",  # progress 1

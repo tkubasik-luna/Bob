@@ -406,3 +406,93 @@ async def test_runner_emits_validation_failed_and_retry_chips_on_bad_output() ->
     assert "validation_passed" not in kinds
     task = store.get_task(task_id)
     assert task.state == "done"
+
+
+# ---------------------------------------------------------------------------
+# SubAgentRunner — narrated-steps fallback in degraded mode (PRD 0011 / issue 0070)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_degraded_progress_thought_narrated_as_reasoning_delta() -> None:
+    """No reasoning channel → the progress thought is emitted as narrated feed text.
+
+    Issue 0070. A model/endpoint that streams NO ``reasoning_content`` leaves the
+    reader ``degraded`` (no raw reasoning deltas). The feed must NOT be empty: the
+    sub-agent's own ``progress`` thought is surfaced on the SAME
+    ``reasoning_delta`` channel (tagged with the agent_ref) so the AgentBlock has
+    readable text. The streamed-vs-narrated switch is per-iteration.
+    """
+
+    store = _make_store()
+    task_id = _make_running_task(store)
+
+    # Iteration 1: a progress action with a thought, NO reasoning chunks (degraded).
+    progress = _content_chunks({"action": "progress", "thought": "Je lis le mail."})
+    done = _content_chunks(
+        {
+            "action": "done",
+            "result_summary": "fini",
+            "status": "complete",
+            "reason_code": "ok",
+            "cost": {},
+        }
+    )
+    client = _StreamingScriptedClient(streams=[progress, done])
+    runner = SubAgentRunner(
+        subagent_client=client,
+        task_store=store,
+        policy=SubAgentPolicy(max_iterations=5, wall_clock_seconds=999.0, token_cap=10_000),
+    )
+
+    emitted = await _run_capturing(runner, task_id)
+
+    # The raw channel produced NO reasoning deltas (no reasoning chunk in stream),
+    # but the narrated progress thought reached the feed as a reasoning_delta.
+    reasoning_events = [e for e in emitted if e.get("type") == "reasoning_delta"]
+    assert [e["delta"] for e in reasoning_events] == ["Je lis le mail."]
+    assert all(e["agent_ref"] == task_id for e in reasoning_events)
+
+
+@pytest.mark.asyncio
+async def test_non_degraded_progress_thought_not_duplicated_as_narration() -> None:
+    """Reasoning IS streamed → the progress thought is NOT also narrated (no dup).
+
+    Issue 0070 acceptance: when the iteration carried a live reasoning channel,
+    only the streamed reasoning deltas carry text. The progress thought must NOT
+    be re-emitted as a narrated ``reasoning_delta`` — that would double the text.
+    """
+
+    store = _make_store()
+    task_id = _make_running_task(store)
+
+    # Iteration 1: progress WITH a real reasoning channel (not degraded).
+    raw = json.dumps({"action": "progress", "thought": "Je lis le mail."})
+    mid = len(raw) // 2
+    progress = [
+        StreamChunk(kind="reasoning", reasoning_delta="reflexion live"),
+        StreamChunk(kind="text", text_delta=raw[:mid]),
+        StreamChunk(kind="text", text_delta=raw[mid:]),
+    ]
+    done = _content_chunks(
+        {
+            "action": "done",
+            "result_summary": "fini",
+            "status": "complete",
+            "reason_code": "ok",
+            "cost": {},
+        }
+    )
+    client = _StreamingScriptedClient(streams=[progress, done])
+    runner = SubAgentRunner(
+        subagent_client=client,
+        task_store=store,
+        policy=SubAgentPolicy(max_iterations=5, wall_clock_seconds=999.0, token_cap=10_000),
+    )
+
+    emitted = await _run_capturing(runner, task_id)
+
+    reasoning_events = [e for e in emitted if e.get("type") == "reasoning_delta"]
+    # ONLY the live reasoning delta carries text — the thought is not duplicated.
+    assert [e["delta"] for e in reasoning_events] == ["reflexion live"]
+    assert "Je lis le mail." not in [e["delta"] for e in reasoning_events]
