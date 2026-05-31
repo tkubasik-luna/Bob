@@ -254,9 +254,13 @@ async def test_done_action_emits_task_updated_and_task_result() -> None:
     finally:
         ws_events.set_emitter(None)
 
+    # PRD 0011 / issue 0071 — agent-activity chips (started/finished) now
+    # interleave on the same WS; this test asserts the LIFECYCLE event sequence,
+    # so filter the chips out first.
+    lifecycle = [e for e in received if e["type"] != "agent_activity"]
     # Slice #0024 adds a leading ``task_message`` for the appended done entry.
-    assert [e["type"] for e in received] == ["task_message", "task_updated", "task_result"]
-    message_evt, updated, result = received
+    assert [e["type"] for e in lifecycle] == ["task_message", "task_updated", "task_result"]
+    message_evt, updated, result = lifecycle
 
     assert message_evt["task_id"] == task_id
     assert message_evt["role"] == "assistant"
@@ -297,9 +301,12 @@ async def test_failure_path_emits_task_updated_failed_and_reason_result() -> Non
     finally:
         ws_events.set_emitter(None)
 
+    # PRD 0011 / issue 0071 — drop the interleaved agent-activity chips; this
+    # test asserts the failure LIFECYCLE event sequence.
+    lifecycle = [e for e in received if e["type"] != "agent_activity"]
     # Slice #0024 adds a leading ``task_message`` for the appended system reason.
-    assert [e["type"] for e in received] == ["task_message", "task_updated", "task_result"]
-    message_evt, updated, result = received
+    assert [e["type"] for e in lifecycle] == ["task_message", "task_updated", "task_result"]
+    message_evt, updated, result = lifecycle
     assert message_evt["role"] == "system"
     assert "kaboom" in message_evt["content"]
     assert updated["type"] == "task_updated"
@@ -363,11 +370,14 @@ async def test_ask_user_action_emits_task_updated_and_bus_event() -> None:
         ws_events.set_emitter(None)
 
     # WS: task_message for the question + task_updated (no task_result on ask_user).
-    assert [e["type"] for e in received_ws] == ["task_message", "task_updated"]
-    assert received_ws[0]["role"] == "assistant"
-    assert received_ws[0]["action"] == "ask_user"
-    assert received_ws[0]["content"] == "Formel ou amical ?"
-    assert received_ws[1]["state"] == "waiting_input"
+    # PRD 0011 / issue 0071 — drop the interleaved agent-activity chips (started,
+    # ask_user); this test asserts the lifecycle WS sequence.
+    lifecycle = [e for e in received_ws if e["type"] != "agent_activity"]
+    assert [e["type"] for e in lifecycle] == ["task_message", "task_updated"]
+    assert lifecycle[0]["role"] == "assistant"
+    assert lifecycle[0]["action"] == "ask_user"
+    assert lifecycle[0]["content"] == "Formel ou amical ?"
+    assert lifecycle[1]["state"] == "waiting_input"
 
     # Wait one event-loop tick so the bus' fire-and-forget subscriber runs.
     import asyncio
@@ -473,7 +483,9 @@ async def test_progress_sequence_then_done_persists_messages_and_emits_events() 
 
     # WS event sequence: each progress emits (task_message, task_updated),
     # then done emits (task_message, task_updated, task_result).
-    event_types = [e["type"] for e in received_ws]
+    # PRD 0011 / issue 0071 — agent-activity chips (started/stall/finished) now
+    # interleave on the same WS; filter them out to assert the lifecycle order.
+    event_types = [e["type"] for e in received_ws if e["type"] != "agent_activity"]
     assert event_types == [
         "task_message",
         "task_updated",  # progress 1

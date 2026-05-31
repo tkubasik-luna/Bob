@@ -350,9 +350,45 @@ export type ReasoningDeltaMsg = {
   delta: string;
 };
 
+/** PRD 0011 / issue 0071 — the curated agent-activity taxonomy. Mirrors
+ * `bob.sub_agent.activity_projector.AgentActivityKind`. A discrete agent action
+ * (`tool_call`, `ask_user`) or a salient incident (`stall`, `cap`, `retry`,
+ * `validation_failed`) or a lifecycle bookend (`started`, `finished`). Passing
+ * validations are suppressed server-side and never reach the wire. */
+export type AgentActivityKind =
+  | "started"
+  | "finished"
+  | "tool_call"
+  | "ask_user"
+  | "stall"
+  | "cap"
+  | "retry"
+  | "validation_failed";
+
+/** Visual state a chip renders in. Mirrors
+ * `bob.sub_agent.activity_projector.AgentActivityStatus`. */
+export type AgentActivityStatus = "running" | "ok" | "error" | "warn" | "info";
+
+/** PRD 0011 / issue 0071 — a discrete agent-activity chip, emitted on the chat
+ * WS interleaved chronologically with the `reasoning_delta` stream. Tagged by
+ * `agent_ref` (the sub-task's `task_id`) so the `activityFeedStore` can append
+ * it to the right per-agent timeline (kept ordered for the lanes work, issue
+ * 0073). The `label` is already redacted server-side (Mail subject / body), so
+ * it never carries email content. */
+export type AgentActivityMsg = {
+  type: "agent_activity";
+  /** The producing sub-task's `task_id`. */
+  agent_ref: string;
+  kind: AgentActivityKind;
+  /** Short, user-facing, redacted label for the chip. */
+  label: string;
+  status: AgentActivityStatus;
+};
+
 export type ServerMessage =
   | SessionMsg
   | ReasoningDeltaMsg
+  | AgentActivityMsg
   | AssistantMsg
   | SpeechDeltaMsg
   | UiPayloadMsg

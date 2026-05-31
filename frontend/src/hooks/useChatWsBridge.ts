@@ -48,6 +48,7 @@ export function useChatWsBridge(): UseChatWsBridgeResult {
   const setStreamingUi = useChatStore((s) => s.setStreamingUi);
   const clearStreamingAssistant = useChatStore((s) => s.clearStreamingAssistant);
   const appendReasoningDelta = useActivityFeedStore((s) => s.appendReasoningDelta);
+  const appendActivity = useActivityFeedStore((s) => s.appendActivity);
 
   // Bridge audioPlayer → store so `Bubble` can render the wave indicator
   // on the exact bubble currently being voiced. Cleared on natural end
@@ -169,6 +170,11 @@ export function useChatWsBridge(): UseChatWsBridgeResult {
           // Accumulated per `agent_ref` so `AgentBlock` renders it streaming.
           appendReasoningDelta(msg);
           break;
+        case "agent_activity":
+          // PRD 0011 / issue 0071 — a discrete activity chip, appended to the
+          // agent's timeline INTERLEAVED chronologically with the reasoning.
+          appendActivity(msg);
+          break;
       }
     },
     [
@@ -187,6 +193,7 @@ export function useChatWsBridge(): UseChatWsBridgeResult {
       setStreamingUi,
       clearStreamingAssistant,
       appendReasoningDelta,
+      appendActivity,
     ],
   );
 

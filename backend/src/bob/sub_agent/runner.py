@@ -118,6 +118,19 @@ from bob.sub_agent.actions import (
     parse_action,
     sub_agent_action_response_schema,
 )
+from bob.sub_agent.activity_projector import (
+    AskUser,
+    CapReached,
+    InternalEvent,
+    Retry,
+    StallNudge,
+    TaskFinished,
+    TaskStarted,
+    ToolCallFinished,
+    ToolCallStarted,
+    Validation,
+    project,
+)
 from bob.sub_agent.addendum_queue import AddendumEntry, AddendumQueue
 from bob.sub_agent.policy import SubAgentPolicy, default_policy
 from bob.sub_agent.reasoning_stream import ReasoningStreamReader
@@ -867,6 +880,10 @@ class SubAgentRunner:
             )
             return
 
+        # PRD 0011 / issue 0071 — a ``started`` activity chip opens the agent's
+        # timeline in the feed, interleaved with the reasoning stream.
+        await self._emit_activity(TaskStarted(agent_ref=task_id, title=task.title))
+
         started_at = self._clock()
         iteration = 0
         tokens_used = 0
@@ -920,6 +937,7 @@ class SubAgentRunner:
                 return
 
             if iteration >= self._policy.max_iterations:
+                await self._emit_activity(CapReached(agent_ref=task_id, cap="iteration"))
                 await self._emit_terminal_done(
                     task_id,
                     status="degraded",
@@ -950,6 +968,7 @@ class SubAgentRunner:
                 # frame but not the DB, an inconsistency worse than the status
                 # quo. Treating a timeout-with-data as ``degraded`` (so the card
                 # persists) is a deliberate semantic change left as a follow-up.
+                await self._emit_activity(CapReached(agent_ref=task_id, cap="wall_clock"))
                 await self._emit_terminal_done(
                     task_id,
                     status="timeout",
@@ -964,6 +983,7 @@ class SubAgentRunner:
                 return
 
             if tokens_used >= self._policy.token_cap:
+                await self._emit_activity(CapReached(agent_ref=task_id, cap="token"))
                 await self._emit_terminal_done(
                     task_id,
                     status="degraded",
@@ -1088,6 +1108,15 @@ class SubAgentRunner:
                     raw_preview=raw[:200],
                     attempt=validator_envelope.attempts,
                 )
+                # PRD 0011 / issue 0071 — the rejected envelope is a salient
+                # validation failure (``error`` chip). ``str(exc)`` is a schema /
+                # JSON error message, not tool output, but the projector redacts
+                # it anyway for defence in depth.
+                await self._emit_activity(
+                    Validation(
+                        agent_ref=task_id, ok=False, what="format de sortie", detail=str(exc)
+                    )
+                )
                 # Issue 0048 — instead of immediately failing the task
                 # on the first invalid output we feed escaped validator
                 # feedback back to the LLM under the
@@ -1160,6 +1189,16 @@ class SubAgentRunner:
                 )
                 validator_envelope.record_feedback(validator_feedback[-1]["content"])
                 validator_envelope.increment(error_code=REASON_INVALID_OUTPUT)
+                # PRD 0011 / issue 0071 — a bounded self-correction round was
+                # injected: surface a ``retry`` chip (the just-incremented attempt
+                # count is ``retries_used``).
+                await self._emit_activity(
+                    Retry(
+                        agent_ref=task_id,
+                        attempt=validator_envelope.retries_used,
+                        error_code=REASON_INVALID_OUTPUT,
+                    )
+                )
                 continue
 
             # NOTE on the validator budget reset (issue 0048 + 0062): the
@@ -1192,6 +1231,17 @@ class SubAgentRunner:
                 # terminal done(failed, invalid_output) — never a silent drop.
                 deliverable_error = _validate_deliverable(action.ui_payload)
                 if deliverable_error is not None:
+                    # PRD 0011 / issue 0071 — salient deliverable-validation
+                    # rejection (``error`` chip). The detail is redacted by the
+                    # projector before it leaves the pure layer.
+                    await self._emit_activity(
+                        Validation(
+                            agent_ref=task_id,
+                            ok=False,
+                            what="livrable",
+                            detail=deliverable_error,
+                        )
+                    )
                     policy = SUB_AGENT_DEFAULT_POLICY
                     if validator_envelope.retries_used >= policy.max_retries:
                         await self._on_validation_exhausted.on_validation_exhausted(
@@ -1222,6 +1272,13 @@ class SubAgentRunner:
                     )
                     validator_envelope.record_feedback(validator_feedback[-1]["content"])
                     validator_envelope.increment(error_code=REASON_INVALID_OUTPUT)
+                    await self._emit_activity(
+                        Retry(
+                            agent_ref=task_id,
+                            attempt=validator_envelope.retries_used,
+                            error_code=REASON_INVALID_OUTPUT,
+                        )
+                    )
                     continue
                 await self._handle_done(task_id, action, result_store)
                 return
@@ -1242,6 +1299,12 @@ class SubAgentRunner:
                 # tool result or a ``done`` resets the streak.
                 stall_count += 1
                 decision = self._stall_decision(stall_count)
+                if decision != "none":
+                    # PRD 0011 / issue 0071 — a stall is a salient incident: surface
+                    # a ``warn`` chip on both the soft nudge and the hard force.
+                    await self._emit_activity(
+                        StallNudge(agent_ref=task_id, forced=decision == "force")
+                    )
                 if decision == "force":
                     await self._force_stalled_done(
                         task_id,
@@ -1308,6 +1371,12 @@ class SubAgentRunner:
                         },
                     )
                     decision = self._stall_decision(stall_count)
+                    if decision != "none":
+                        # PRD 0011 / issue 0071 — a duplicate-call stall is salient
+                        # too: surface the same ``warn`` chip as the progress stall.
+                        await self._emit_activity(
+                            StallNudge(agent_ref=task_id, forced=decision == "force")
+                        )
                     if decision == "force":
                         await self._force_stalled_done(
                             task_id,
@@ -1341,6 +1410,17 @@ class SubAgentRunner:
                 step = await self._handle_tool_call(task_id, action, result_store)
                 validation_error = step.validation_error
                 if validation_error is not None:
+                    # PRD 0011 / issue 0071 — salient tool-arg-validation rejection
+                    # (``error`` chip). The error message is a schema diagnostic,
+                    # not tool output; the projector redacts it anyway.
+                    await self._emit_activity(
+                        Validation(
+                            agent_ref=task_id,
+                            ok=False,
+                            what=f"arguments de {action.name}",
+                            detail=validation_error.error_message,
+                        )
+                    )
                     # Issue 0062 — a pre-dispatch arg-validation / unknown-tool
                     # failure is the model's mistake, not a tool result. Route
                     # the correction under the ``system_validator`` role (NEVER
@@ -1380,6 +1460,13 @@ class SubAgentRunner:
                     validator_envelope.record_feedback(validator_feedback[-1]["content"])
                     validator_envelope.tool_name = action.name
                     validator_envelope.increment(error_code=validation_error.error_code)
+                    await self._emit_activity(
+                        Retry(
+                            agent_ref=task_id,
+                            attempt=validator_envelope.retries_used,
+                            error_code=validation_error.error_code,
+                        )
+                    )
                     continue
                 # Valid tool call dispatched — record its signature for dedup
                 # (RC4). A SUCCESSFUL result is genuine forward progress: keep it
@@ -1572,6 +1659,30 @@ class SubAgentRunner:
                 }
             )
         return reader.content
+
+    async def _emit_activity(self, event: InternalEvent) -> None:
+        """Project an internal event into a chip and push it on the chat WS (issue 0071).
+
+        PRD 0011 — the user-facing activity-chip channel. The taxonomy +
+        curation + Mail redaction all live in the pure
+        :func:`bob.sub_agent.activity_projector.project`; the runner only does
+        the IO. :func:`project` returns ``None`` for events that must be
+        SUPPRESSED (a passing validation) — those emit nothing, so the feed is
+        not flooded with green ticks.
+
+        The frame is a DEDICATED user-facing event interleaved chronologically
+        with the ``reasoning_delta`` stream on ``/ws/chat`` — a first-class
+        ``agent_activity`` event, NOT one of the ``emit_debug`` reflection
+        records the per-task overlay reads. As with ``reasoning_delta`` it rides
+        the same :func:`ws_events.emit` shim, so a copy is mirrored into the ring
+        buffer for free; the projector already redacted the label (Mail subject /
+        body), so that mirror never widens the privacy surface.
+        """
+
+        chip = project(event)
+        if chip is None:
+            return
+        await ws_events.emit(chip.to_wire(), debug_event=None)
 
     # --- Action handlers -----------------------------------------------------
 
@@ -1846,6 +1957,12 @@ class SubAgentRunner:
                 "kind": "tool_invoke",
             },
         )
+        # PRD 0011 / issue 0071 — a ``running`` tool-call chip while the dispatch
+        # is in flight; the matching ``ok`` / ``error`` chip is emitted below once
+        # it settles. A pre-dispatch validation failure (next block) does NOT
+        # reach the settle chip — the ``validation_failed`` chip in ``_run``
+        # covers that mistake instead.
+        await self._emit_activity(ToolCallStarted(agent_ref=task_id, tool_name=action.name))
 
         # Issue 0059 — pre-dispatch schema validation. Issue 0062 — a failure
         # here is the model's mistake, not a tool result: return it so the
@@ -1924,6 +2041,18 @@ class SubAgentRunner:
                 "kind": "tool_result",
             },
         )
+        # PRD 0011 / issue 0071 — settle the in-flight tool-call chip (``ok`` on a
+        # successful dispatch, ``error`` carrying the error code on a runtime tool
+        # failure). The label is the tool NAME only — never the result body — so
+        # no Mail content can leak onto this user-facing channel.
+        await self._emit_activity(
+            ToolCallFinished(
+                agent_ref=task_id,
+                tool_name=action.name,
+                ok=result.ok,
+                error_code=None if result.ok else result.error_code,
+            )
+        )
         return _ToolCallStep(dispatched=result, stored=stored)
 
     async def _handle_ask_user(self, task_id: str, question: str) -> None:
@@ -1961,6 +2090,11 @@ class SubAgentRunner:
             },
         )
         await _emit_task_message(self._task_store, task_id, message_id=message_id)
+        # PRD 0011 / issue 0071 — an ``ask_user`` chip marks the question in the
+        # feed. The question is redacted + truncated by the projector to a
+        # one-line metadata marker (the full text travels on the task message),
+        # so a subject echoed into it can never leak onto this channel.
+        await self._emit_activity(AskUser(agent_ref=task_id, question=question))
         await ws_events.emit(
             {
                 "type": "task_updated",
@@ -2247,6 +2381,12 @@ class SubAgentRunner:
                 "result": None,
             }
         await ws_events.emit(task_result_event, debug_event=debug_task_result_event)
+        # PRD 0011 / issue 0071 — a terminal ``finished`` chip closes the agent's
+        # timeline. The v2 ``status`` (complete/degraded/failed/cancelled/timeout)
+        # is mapped to the chip status by the projector.
+        await self._emit_activity(
+            TaskFinished(agent_ref=task_id, status=status, reason_code=reason_code)
+        )
         await self._bus.publish(
             "task_state_changed",
             {

@@ -20,12 +20,19 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 import pytest
+from pydantic import BaseModel
 
 from bob import ws_events
 from bob.db.migrations_runner import apply_migrations, default_migrations_dir
 from bob.llm.types import LLMResponse, StreamChunk, ToolDefinition
 from bob.llm_client import LLMClient
-from bob.sub_agent import SubAgentPolicy, SubAgentRunner
+from bob.sub_agent import (
+    SubAgentPolicy,
+    SubAgentRunner,
+    SubAgentToolDefinition,
+    SubAgentToolHandlerOutcome,
+    SubAgentToolRegistry,
+)
 from bob.sub_agent.reasoning_stream import (
     ReasoningStreamReader,
     ReasoningStreamReaderError,
@@ -269,3 +276,133 @@ async def test_validation_retry_unchanged_with_streaming() -> None:
     task = store.get_task(task_id)
     assert task.state == "done"
     assert task.result == "recovered"
+
+
+# ---------------------------------------------------------------------------
+# SubAgentRunner — agent_activity chip EMISSION (PRD 0011 / issue 0071)
+# ---------------------------------------------------------------------------
+
+
+class _EchoArgs(BaseModel):
+    value: str
+
+
+def _registry_with_echo() -> SubAgentToolRegistry:
+    async def _handler(_ctx: Any, args: BaseModel) -> SubAgentToolHandlerOutcome:
+        assert isinstance(args, _EchoArgs)
+        return SubAgentToolHandlerOutcome(status="ok", result={"echo": args.value})
+
+    return SubAgentToolRegistry(
+        [
+            SubAgentToolDefinition(
+                name="echo",
+                version="v1",
+                description="echoes value",
+                args_model=_EchoArgs,
+                handler=_handler,
+            )
+        ]
+    )
+
+
+async def _run_capturing(
+    runner: SubAgentRunner, task_id: str
+) -> list[dict[str, Any]]:
+    emitted: list[dict[str, Any]] = []
+
+    async def _capture(event: dict[str, Any]) -> None:
+        emitted.append(event)
+
+    ws_events.set_emitter(_capture)
+    try:
+        await runner.run(task_id)
+    finally:
+        ws_events.set_emitter(None)
+    return emitted
+
+
+@pytest.mark.asyncio
+async def test_runner_emits_started_toolcall_finished_chips() -> None:
+    """A tool-call run surfaces started → tool_call(running, ok) → finished chips."""
+
+    store = _make_store()
+    task_id = _make_running_task(store)
+
+    tool_call = _content_chunks({"action": "tool_call", "name": "echo", "args": {"value": "hi"}})
+    done = _content_chunks(
+        {
+            "action": "done",
+            "result_summary": "ok",
+            "status": "complete",
+            "reason_code": "ok",
+            "cost": {},
+        }
+    )
+    client = _StreamingScriptedClient(streams=[tool_call, done])
+    runner = SubAgentRunner(
+        subagent_client=client,
+        task_store=store,
+        tool_registry=_registry_with_echo(),
+        policy=SubAgentPolicy(max_iterations=5, wall_clock_seconds=999.0, token_cap=10_000),
+    )
+
+    emitted = await _run_capturing(runner, task_id)
+    chips = [e for e in emitted if e.get("type") == "agent_activity"]
+    # Every chip is tagged by the producing agent.
+    assert all(c["agent_ref"] == task_id for c in chips)
+    kinds = [(c["kind"], c["status"]) for c in chips]
+    # In chronological order: started, tool_call running, tool_call ok, finished.
+    assert kinds == [
+        ("started", "info"),
+        ("tool_call", "running"),
+        ("tool_call", "ok"),
+        ("finished", "ok"),
+    ]
+    # The tool-call chip labels carry the tool NAME, never any result body.
+    tool_labels = [c["label"] for c in chips if c["kind"] == "tool_call"]
+    assert all("echo" in label for label in tool_labels)
+    assert all("hi" not in label for label in tool_labels)
+
+
+@pytest.mark.asyncio
+async def test_runner_emits_validation_failed_and_retry_chips_on_bad_output() -> None:
+    """An invalid envelope surfaces a validation_failed chip + a retry chip.
+
+    A PASSING parse on the recovery iteration must NOT add its own validation
+    chip (aggregation / suppression), so exactly ONE validation_failed chip
+    appears across the run.
+    """
+
+    store = _make_store()
+    task_id = _make_running_task(store)
+
+    invalid = [StreamChunk(kind="text", text_delta="not json")]
+    valid = _content_chunks(
+        {
+            "action": "done",
+            "result_summary": "recovered",
+            "status": "complete",
+            "reason_code": "ok",
+            "cost": {},
+        }
+    )
+    client = _StreamingScriptedClient(streams=[invalid, valid])
+    runner = SubAgentRunner(
+        subagent_client=client,
+        task_store=store,
+        policy=SubAgentPolicy(max_iterations=5, wall_clock_seconds=999.0, token_cap=10_000),
+    )
+
+    emitted = await _run_capturing(runner, task_id)
+    chips = [e for e in emitted if e.get("type") == "agent_activity"]
+    kinds = [c["kind"] for c in chips]
+
+    assert kinds.count("validation_failed") == 1
+    assert kinds.count("retry") == 1
+    # The salient incident precedes the retry it triggered.
+    assert kinds.index("validation_failed") < kinds.index("retry")
+    # No passing-validation chip leaked in (there is no "validation_passed" kind;
+    # a PASS is suppressed at the projector).
+    assert "validation_passed" not in kinds
+    task = store.get_task(task_id)
+    assert task.state == "done"
