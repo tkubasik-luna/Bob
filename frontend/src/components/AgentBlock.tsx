@@ -80,6 +80,10 @@ export function AgentBlock({ agentRef, title, hasResult, onOpenResult }: Props) 
   const finalState = useActivityFeedStore((s) => s.finishedByAgent[agentRef]);
 
   const [expanded, setExpanded] = useState(false);
+  /** True when the windowed (non-expanded) content actually overflows the
+   * bounded height. The "voir tout" toggle is pointless on a short reasoning /
+   * a one-line answer, so it only shows when there's genuinely more to reveal. */
+  const [overflowing, setOverflowing] = useState(false);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   /** Latched intent: true while the user is pinned to the bottom (auto-scroll
    * follows new tokens), false once they scroll up to read back. Flips back to
@@ -103,6 +107,12 @@ export function AgentBlock({ agentRef, title, hasResult, onOpenResult }: Props) 
     if (!el) return;
     if (shouldAutoScroll({ stuckToBottom: stuckToBottomRef.current, expanded })) {
       el.scrollTop = el.scrollHeight;
+    }
+    // Overflow is only measurable while windowed (expanded drops the max-h, so
+    // scrollHeight == clientHeight). Keep the last windowed verdict otherwise so
+    // the "réduire" toggle stays available after expanding.
+    if (!expanded) {
+      setOverflowing(el.scrollHeight > el.clientHeight + 1);
     }
   }, [itemCount, lastText, expanded]);
 
@@ -175,13 +185,17 @@ export function AgentBlock({ agentRef, title, hasResult, onOpenResult }: Props) 
       >
         {timeline.map(renderTimelineItem)}
       </div>
-      <button
-        type="button"
-        onClick={() => setExpanded((v) => !v)}
-        className="w-full border-blue-900/40 border-t px-2 py-0.5 text-left text-[10px] text-blue-400/70 transition-colors hover:text-blue-300"
-      >
-        {expanded ? "réduire" : "voir tout"}
-      </button>
+      {/* Only offer the toggle when the windowed content overflows (or is
+          already expanded). A short answer that fits needs no "voir tout". */}
+      {(overflowing || expanded) && (
+        <button
+          type="button"
+          onClick={() => setExpanded((v) => !v)}
+          className="w-full border-blue-900/40 border-t px-2 py-0.5 text-left text-[10px] text-blue-400/70 transition-colors hover:text-blue-300"
+        >
+          {expanded ? "réduire" : "voir tout"}
+        </button>
+      )}
     </div>
   );
 }

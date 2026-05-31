@@ -97,6 +97,10 @@ export function SphereUI() {
   // rendered through the unified registry. A text-only result is a list-of-one
   // Markdown section; a mail result is one Mail section per message.
   const [overlaySections, setOverlaySections] = useState<ComponentDescriptor[] | null>(null);
+  // PRD 0011 — the agent-activity panel's footprint ("none" | "rail" | "open").
+  // Drives a `data-agent-panel` attribute so the sphere + input zone shift left
+  // when the panel is open instead of being overlapped by it.
+  const [agentPanelState, setAgentPanelState] = useState<"none" | "rail" | "open">("none");
   // PRD 0005 — Cmd+Shift+D toggles the dedicated debug window. The listener
   // attaches at mount and unattaches on unmount; the guard rejects key
   // events whose target is a text input so the user can still type `D`
@@ -269,6 +273,7 @@ export function SphereUI() {
     <SphereWsContext.Provider value={send}>
       <div
         className={`app theme-${theme} mood-${mood} state-${effectiveState} ${overlayOpen ? "has-surface surface-notes" : "surface-none"}`}
+        data-agent-panel={agentPanelState}
       >
         {/* Tauri v2 borderless drag region (#0036). The `?ui=new` window has
          * `decorations: false` so the OS chrome is gone; this transparent
@@ -291,7 +296,10 @@ export function SphereUI() {
          * badges + count); expanded = the full multi-agent lanes feed. The
          * "résultat" button on a finished lane opens the SAME SectionsOverlay
          * the streamed-ui / task-result paths use, via the shared dispatcher. */}
-        <AgentActivityPanel onOpenResult={(sections) => setOverlaySections(sections)} />
+        <AgentActivityPanel
+          onOpenResult={(sections) => setOverlaySections(sections)}
+          onStateChange={setAgentPanelState}
+        />
         <div className="hud-zone b">
           <TranscriptLine state={transcriptState} hidden={overlayOpen} />
           <InputField />
