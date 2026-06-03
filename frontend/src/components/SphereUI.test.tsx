@@ -201,9 +201,15 @@ describe("SphereUI — piste shell structure", () => {
     expect(container.querySelector(".slot-task")).not.toBeNull();
     expect(container.querySelector(".slot-core")).not.toBeNull();
     expect(container.querySelector(".slot-data")).not.toBeNull();
-    // The core slot holds the placeholder orb (SphereCanvas → `.sphere-stage`)
-    // wrapped in `.core`, plus the CORE · conscience label.
-    expect(container.querySelector(".slot-core .core .sphere-stage")).not.toBeNull();
+    // The core slot holds the conscience NEBULA orb (issue 0084 swapped the
+    // foundation's SphereCanvas placeholder for `.core-nebula` → `.cv-canvas`),
+    // plus the CORE · conscience label. WebGL2 is unavailable under jsdom, so
+    // the orb falls back to the `.hud-error` banner — either the canvas or the
+    // banner is acceptable proof the orb mounted in the slot.
+    const orbMounted =
+      container.querySelector(".slot-core .core-nebula .cv-canvas") !== null ||
+      container.querySelector(".slot-core .core-nebula .hud-error") !== null;
+    expect(orbMounted).toBe(true);
     expect(container.querySelector(".slot-core .core-label")?.textContent).toBe(
       "CORE · conscience",
     );
