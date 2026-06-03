@@ -3,7 +3,10 @@ import { useChatWsBridge } from "../hooks/useChatWsBridge";
 import { useAudioLevel } from "../sphere/useAudioLevel";
 import { type SphereDerivedState, useSphereState } from "../sphere/useSphereState";
 import { useDevTweaksStore } from "../state/devTweaksStore";
+import { useChatStore } from "../store/chatStore";
+import { useDeliverableStore } from "../store/deliverableStore";
 import type { ComponentDescriptor } from "../types/ws";
+import "./piste/idleState.css";
 import { BackgroundGrain } from "./piste/BackgroundGrain";
 import { BottomBar } from "./piste/BottomBar";
 import { CoreSlot } from "./piste/CoreSlot";
@@ -78,6 +81,28 @@ export function SphereUI() {
   // reading the latest value without triggering a parent re-render.
   const audioLevelRef = useAudioLevel();
 
+  // PRD 0014 / issue 0091 — cold-start ↔ rest orchestration. `hasActivity` is
+  // TRUE once any REAL datum exists in the session and FALSE again when it all
+  // clears. The data surfaces, read straight from the existing stores (no
+  // duplicated state):
+  //   • a message (the user's first prompt OR Bob's reply) — `messages.length`;
+  //   • an in-flight streamed turn, before its closing `assistant_msg` lands —
+  //     `streamingAssistant` (so the deck/dock reveal the instant Bob starts,
+  //     not only once the bubble is committed);
+  //   • a sub-task — `tasks` (left deck content);
+  //   • a generated deliverable — `deliverableStore.byId` (right dock content).
+  // Each selector is a narrow boolean, so the shell only re-renders when the
+  // EMPTY ↔ NON-EMPTY edge flips — not on every message/task mutation. The fade
+  // is a CSS transition keyed on the derived `.is-idle` class, so the motion
+  // follows the real event timing with no setTimeout choreography. The store
+  // map empties on `chatStore` reset / `deliverableStore.reset()` (new session),
+  // which flips `hasActivity` back to false → the shell returns to rest.
+  const hasMessages = useChatStore((s) => s.messages.length > 0);
+  const isStreaming = useChatStore((s) => s.streamingAssistant !== null);
+  const hasTasks = useChatStore((s) => Object.keys(s.tasks).length > 0);
+  const hasDeliverables = useDeliverableStore((s) => Object.keys(s.byId).length > 0);
+  const hasActivity = hasMessages || isStreaming || hasTasks || hasDeliverables;
+
   // PRD 0014 — a single overlay state holding the list of section descriptors
   // the SectionsOverlay renders. Per the PRD the overlay is now CLICK-ONLY: the
   // legacy auto-open effects (streamed `ui_payload`, last `assistant_msg`, text
@@ -127,9 +152,12 @@ export function SphereUI() {
       {/* The piste root. Carries the foundation layout/camera/panel modifiers
        * (`layout-depth cam-deep panel-frost`) plus the runtime state/theme/mood
        * classes, and toggles `has-surface` while the overlay is open so the
-       * stage recedes (see `styles/p3d.css`). */}
+       * stage recedes (see `styles/p3d.css`). Issue 0091 adds `is-idle` while the
+       * session is empty (cold start / rest): the deck + dock recede and the
+       * centred invitation shows; the fade-in on first real data is a pure CSS
+       * transition keyed on this class (see `piste/idleState.css`). */}
       <div
-        className={`piste layout-depth cam-deep panel-frost theme-${theme} mood-${mood} state-${effectiveState} ${overlayOpen ? "has-surface" : ""}`}
+        className={`piste layout-depth cam-deep panel-frost theme-${theme} mood-${mood} state-${effectiveState} ${overlayOpen ? "has-surface" : ""} ${hasActivity ? "" : "is-idle"}`}
       >
         {/* Tauri v2 borderless drag region (#0036). The `?ui=new` window has
          * `decorations: false` so the OS chrome is gone; this transparent 28px
@@ -156,6 +184,16 @@ export function SphereUI() {
               <DataSlot onOpenDeliverable={openOverlay} />
             </div>
           </div>
+        </div>
+        {/* Cold-start invitation (issue 0091). A discreet line under the orb that
+         * shows only while the session is empty (`.is-idle` reveals it via CSS);
+         * it fades out the moment the first real datum arrives. `aria-hidden` +
+         * `pointer-events:none` keep it purely decorative. Always mounted so the
+         * fade is a CSS transition (no mount/unmount flash). */}
+        <div className="piste-invite" aria-hidden="true">
+          <span className="invite-glyph" />
+          BOB · en attente
+          <span className="invite-hint">Posez une question pour commencer</span>
         </div>
         <SettingsControl />
         <BottomBar transcriptState={transcriptState} overlayOpen={overlayOpen} />

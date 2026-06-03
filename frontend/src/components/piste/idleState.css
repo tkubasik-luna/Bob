@@ -1,0 +1,118 @@
+/* idleState.css — PRD 0014 / issue 0091: cold-start / rest orchestration.
+ *
+ * The mockup always runs a synthetic thread, so it never shows a cold start.
+ * Bob's real HUD opens EMPTY (no conversation, no task, no deliverable). This
+ * file dresses that empty moment faithfully to the « Piste 3D · Nacre » spirit:
+ * the orb + identity + composer stay centred while the side panels recede, and
+ * a discreet invitation sits under the orb. The instant the first real datum
+ * lands the side panels FADE IN.
+ *
+ * Everything here keys off ONE shell class — `.piste.is-idle` — that SphereUI
+ * toggles from a `hasActivity` boolean derived from the stores. There are NO
+ * timers: the fade is a pure CSS transition on the data-driven class, so the
+ * motion tracks the real event timing (matching the acceptance criteria). When
+ * the session empties out again the class returns and the panels recede,
+ * giving a coherent rest state.
+ *
+ * Scope: every rule is under `.piste` so it stays inside the HUD window. We
+ * only wrap/dim the deck (`.slot-task`) + dock (`.slot-data`) and add the
+ * invitation — we never touch the slot internals (CoreSlot / BobCard / DataDock
+ * own those). Timing mirrors the foundation's `.has-surface` recede (0.5s ease)
+ * for visual consistency. */
+
+/* ── Side panels: fade target ───────────────────────────────────────────────
+   Both side slots carry a transition so they cross between idle (faded) and
+   active (visible) smoothly. The transform is a gentle inward settle so the
+   reveal reads as the panels "arriving" rather than just blinking on. The
+   active-state transform is the foundation's own (`p3d.css` .layout-depth);
+   we only override it while `.is-idle`, so the panels relax back to their
+   real depth position on reveal. */
+.piste .slot-task,
+.piste .slot-data {
+  transition: opacity 0.5s ease, transform 0.55s cubic-bezier(0.22, 0.61, 0.36, 1), filter 0.5s ease;
+}
+
+/* Cold start: the deck + dock are hidden + inert so the eye rests on the orb.
+   `pointer-events: none` keeps their (empty) hit-area from stealing clicks
+   while invisible. The small offset toward the centre is undone on reveal.
+   The selector carries `.layout-depth` (the Nacre piste always has it) so the
+   transform override out-specifies the foundation's `.piste.layout-depth
+   .slot-*` placement REGARDLESS of stylesheet load order — otherwise an
+   equal-specificity tie would depend on the (fragile) CSS import order. */
+.piste.is-idle.layout-depth .slot-task {
+  opacity: 0;
+  filter: saturate(0.6);
+  transform: translateY(calc(-50% + 68px)) rotateY(24deg) translateX(-22px) scale(0.97);
+  pointer-events: none;
+}
+.piste.is-idle.layout-depth .slot-data {
+  opacity: 0;
+  filter: saturate(0.6);
+  transform: translateY(-50%) rotateY(-22deg) translateX(22px) scale(0.97);
+  pointer-events: none;
+}
+
+/* ── Centred composer hint (the discreet invitation) ─────────────────────────
+   A single soft line sitting just under the orb. It is the ONLY net-new
+   element this issue adds to the shell. Visible only at cold start; it fades
+   out the moment activity begins. Centred on the orb column (the orb sits at
+   left:50% top:48%), nudged below the CORE label. Non-interactive — purely an
+   invitation. */
+.piste .piste-invite {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  /* sit below the orb (300px tall, centred at 48%) + its CORE label */
+  transform: translate(-50%, calc(150px + 64px));
+  z-index: 30;
+  pointer-events: none;
+  text-align: center;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.18em;
+  line-height: 1.7;
+  color: var(--faint);
+  text-transform: uppercase;
+  /* idle is the visible state; the default below hides it for the active shell */
+  opacity: 0;
+  transition: opacity 0.6s ease;
+}
+.piste .piste-invite .invite-glyph {
+  display: block;
+  margin: 0 auto 7px;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--accent, #c9b8e8);
+  box-shadow: 0 0 12px 2px color-mix(in oklab, var(--accent, #c9b8e8) 60%, transparent);
+  opacity: 0.85;
+}
+.piste .piste-invite .invite-hint {
+  color: var(--dim);
+  text-transform: none;
+  letter-spacing: 0.04em;
+  font-size: 10.5px;
+}
+/* Revealed only while idle. */
+.piste.is-idle .piste-invite {
+  opacity: 0.72;
+}
+
+/* ── Reduced motion ──────────────────────────────────────────────────────────
+   Honour the user's preference: keep the opacity cross-fade (cheap, no
+   movement) but drop the transform settle + slow it down so nothing slides. */
+@media (prefers-reduced-motion: reduce) {
+  .piste .slot-task,
+  .piste .slot-data {
+    transition: opacity 0.3s ease;
+  }
+  .piste.is-idle.layout-depth .slot-task {
+    transform: translateY(calc(-50% + 68px)) rotateY(24deg);
+  }
+  .piste.is-idle.layout-depth .slot-data {
+    transform: translateY(-50%) rotateY(-22deg);
+  }
+  .piste .piste-invite {
+    transition: opacity 0.3s ease;
+  }
+}

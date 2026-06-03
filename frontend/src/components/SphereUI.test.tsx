@@ -55,6 +55,7 @@ class MockSocket {
 }
 
 import { useChatStore } from "../store/chatStore";
+import { useDeliverableStore } from "../store/deliverableStore";
 import { SphereUI } from "./SphereUI";
 
 const initialState = useChatStore.getState();
@@ -142,6 +143,9 @@ describe("SphereUI — piste shell structure", () => {
     // biome-ignore lint/suspicious/noExplicitAny: minimal WS stub for the test
     globalThis.WebSocket = MockSocket as any;
     useChatStore.setState(initialState, true);
+    // Issue 0091 — the cold-start derivation also reads the deliverable store,
+    // so reset it between tests to keep the idle/active assertions isolated.
+    useDeliverableStore.getState().reset();
     installGlStub();
   });
 
@@ -236,5 +240,86 @@ describe("SphereUI — piste shell structure", () => {
     // (mockup chrome, issue 0088) — the old `.overlay-card` name is gone.
     const { container } = render(<SphereUI />);
     expect(container.querySelector(".ov-card")).toBeNull();
+  });
+});
+
+// PRD 0014 / issue 0091 — cold-start ↔ rest orchestration. With an empty
+// session the shell wears `.is-idle` (deck + dock recede, the centred
+// invitation shows); the first real datum — a message, an in-flight stream, a
+// sub-task, or a deliverable — flips the shell to active (no `.is-idle`). The
+// fade itself is CSS (untestable in jsdom); these assert the data-driven CLASS
+// toggle that drives it.
+describe("SphereUI — cold-start / idle orchestration (issue 0091)", () => {
+  beforeEach(() => {
+    originalWebSocket = globalThis.WebSocket;
+    sockets.list.length = 0;
+    // biome-ignore lint/suspicious/noExplicitAny: minimal WS stub for the test
+    globalThis.WebSocket = MockSocket as any;
+    useChatStore.setState(initialState, true);
+    useDeliverableStore.getState().reset();
+    installGlStub();
+  });
+
+  afterEach(() => {
+    globalThis.WebSocket = originalWebSocket;
+    HTMLCanvasElement.prototype.getContext = originalGetContext;
+    vi.restoreAllMocks();
+  });
+
+  test("cold start: the .piste root wears .is-idle and renders the invitation", () => {
+    // Fresh session (no message / task / deliverable) → idle.
+    const { container } = render(<SphereUI />);
+    const root = container.querySelector(".piste");
+    expect(root?.classList.contains("is-idle")).toBe(true);
+    // The discreet invitation is mounted (CSS reveals it only while idle).
+    expect(container.querySelector(".piste-invite")).not.toBeNull();
+  });
+
+  test("a first message flips the shell to active (drops .is-idle)", () => {
+    useChatStore.getState().addUserMessage("hello");
+    const { container } = render(<SphereUI />);
+    expect(container.querySelector(".piste")?.classList.contains("is-idle")).toBe(false);
+  });
+
+  test("an in-flight streamed turn (no message yet) flips the shell to active", () => {
+    // The deck/dock must reveal the instant Bob starts streaming, before the
+    // closing assistant_msg commits a message.
+    useChatStore.getState().appendSpeechDelta("m1", "thinking…");
+    const { container } = render(<SphereUI />);
+    expect(container.querySelector(".piste")?.classList.contains("is-idle")).toBe(false);
+  });
+
+  test("a sub-task flips the shell to active", () => {
+    useChatStore.getState().upsertTaskCreated({
+      type: "task_created",
+      task_id: "t1",
+      title: "Sub-task",
+      goal: "do a thing",
+      state: "pending",
+      created_at: "2026-06-04T00:00:00Z",
+    });
+    const { container } = render(<SphereUI />);
+    expect(container.querySelector(".piste")?.classList.contains("is-idle")).toBe(false);
+  });
+
+  test("a generated deliverable flips the shell to active", () => {
+    useDeliverableStore.getState().add({
+      id: "d1",
+      deliverable: [{ component: "Markdown", props: { content: "hi" } }],
+      task: { title: "Note" },
+    });
+    const { container } = render(<SphereUI />);
+    expect(container.querySelector(".piste")?.classList.contains("is-idle")).toBe(false);
+  });
+
+  test("returns to idle when the session empties out again", () => {
+    // Activity present → active; then clear everything → back to rest.
+    useChatStore.getState().addUserMessage("hello");
+    const { container, rerender } = render(<SphereUI />);
+    expect(container.querySelector(".piste")?.classList.contains("is-idle")).toBe(false);
+    useChatStore.setState(initialState, true);
+    useDeliverableStore.getState().reset();
+    rerender(<SphereUI />);
+    expect(container.querySelector(".piste")?.classList.contains("is-idle")).toBe(true);
   });
 });
