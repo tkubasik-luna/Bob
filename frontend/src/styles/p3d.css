@@ -1,0 +1,311 @@
+/* ═══════════════════════════════════════════════════════════════════════
+   p3d.css — Piste 3D · Nacre — SCOPED FOUNDATION SHEET (PRD 0014 / issue 0083)
+   ═══════════════════════════════════════════════════════════════════════
+
+   Faithful port of the FOUNDATION layers of `Design Mockup/p3d.css` (the
+   « Pistes 3D » prototype), restricted to the « Nacre » piste: tokens/palette,
+   base, layout (depth), camera (deep), panel-frost modifier, the 3D stage +
+   slot positioning (core/task/data), the top-left identity block, and the
+   background + grain. Everything is scoped under the `.piste` root so it can
+   never leak into the `legacy` (ChatView) or `debug` windows, nor collide with
+   `frontend/src/styles/hud.css`.
+
+   ─────────────────────────────────────────────────────────────────────────
+   CONVENTION FOR DOWNSTREAM ISSUES (0084–0091):
+   This sheet ships the SHELL ONLY. Component-specific styling — the conscience
+   orb (0084), the Bob/sub-task thread cards (0085/0086), the data dock cards
+   (0087), the reskinned overlay surfaces (0088), the settings modal (0089), the
+   input/transcript/mute reskin (0090) — must each ship in its OWN co-located
+   stylesheet `frontend/src/components/piste/<X>.css`, imported by that
+   component. DO NOT add component classes here; keep this file the shared,
+   never-edited foundation. The mockup component classes (`.panel`, `.core-*`
+   orb internals, `.task-*`, `.stack-*`, `.data-*`, `.mem-*`, `.artifact*`,
+   `.ov-*` overlay surfaces, `.settings-*` modal, `.set-*`) are intentionally
+   NOT ported here.
+
+   ─────────────────────────────────────────────────────────────────────────
+   SELECTOR-COLLISION RECONCILIATION with `hud.css` (loaded BEFORE this sheet):
+   - `.piste`, `.piste-*`, `.id-*`, `.stage-3d`, `.stage-cam`, `.cam-*`,
+     `.slot-*`, `.core`, `.core-label`, `.layout-depth`, `.panel-frost`:
+        ALL net-new in the codebase (no rule with these names exists in
+        hud.css), so the port keeps the mockup's authentic names verbatim and
+        scopes them under `.piste`. No clobbering possible.
+   - `:root { --font-* }` and the bare `* { box-sizing }` from the mockup base:
+        NOT ported as globals — those would leak into legacy/debug. The font
+        family is pinned on `.piste` directly; box-sizing is scoped to
+        `.piste *` instead of `*`.
+   - `panel*` / `md-*` (generic mockup component names): NOT ported here — they
+     ship with their owning issues (0085/0086/0088) in co-located sheets. The
+     lone exception is the `.panel-frost` MODIFIER (a foundation "panel-style"
+     selector), ported scoped as `.piste .panel-frost .panel`; it is inert
+     until a child `.panel` exists (0085/0086 add it).
+   - `ov-*` (overlay surfaces): the existing `SectionsOverlay` (hud.css) still
+     owns the overlay this slice renders. The mockup's `.ov-*` restyle is
+     issue 0088's job, so it is NOT ported here — this foundation sheet adds no
+     `.ov-*` rule and therefore cannot clobber the live overlay.
+   - `--accent` / `--bg` etc.: hud.css defines a DIFFERENT cyan/warm palette on
+     `:root`/`.theme-*`. We redefine the nacre palette on the `.piste` scope so
+     it wins for descendants of the piste root WITHOUT touching the global
+     `:root` tokens the overlay (and any other window) still reads.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+/* ───────────────────────────── PISTE SHELL ─────────────────────────────
+   The nacre palette (from the mockup PISTE.vars) is declared on the `.piste`
+   scope itself — not on `:root` — so it overrides hud.css tokens only inside
+   the piste subtree. `--accent3` and the sub-task lavande tokens are carried
+   forward now so 0084/0086 don't have to re-declare them. */
+.piste {
+  /* nacre palette */
+  --bg: #160f18;
+  --bg2: #211829;
+  --ink: #f4e9f1;
+  --dim: rgba(244, 233, 241, 0.62);
+  --faint: rgba(244, 233, 241, 0.34);
+  --accent: #e7b4cb;
+  --accent2: #c6a2db;
+  --accent3: #f1e3ec;
+  --line: rgba(231, 180, 203, 0.22);
+  --fill: rgba(231, 180, 203, 0.06);
+  /* sub-task lavande — distinguishes Bob's delegated lanes (0086) */
+  --sub: #b79ae0;
+  --sub-line: rgba(183, 154, 224, 0.3);
+  --sub-fill: rgba(183, 154, 224, 0.06);
+  /* energy drives halo/breathe intensity in the orb (0084 reads it) */
+  --energy: 0.5;
+
+  /* fonts — pinned on the scope rather than leaking via global :root. The
+     mockup uses Hanken Grotesk / Space Mono; fall back to the system + the
+     hud.css families so we never go unstyled if the web fonts are absent. */
+  --font-sans: "Hanken Grotesk", "Space Grotesk", system-ui, sans-serif;
+  --font-mono: "Space Mono", "JetBrains Mono", ui-monospace, monospace;
+
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+/* scoped box-sizing — replaces the mockup's global `*` reset so it can't
+   touch legacy/debug. */
+.piste * {
+  box-sizing: border-box;
+}
+
+/* ───────────────────────────── BACKGROUND + GRAIN ─────────────────────── */
+.piste-bg {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  background: radial-gradient(
+      120% 90% at 50% 38%,
+      color-mix(in oklab, var(--accent) 12%, transparent) 0%,
+      transparent 55%
+    ),
+    radial-gradient(
+      80% 70% at 50% 120%,
+      color-mix(in oklab, var(--accent2) 14%, transparent) 0%,
+      transparent 60%
+    ), linear-gradient(180deg, var(--bg2) 0%, var(--bg) 70%);
+}
+.piste-grain {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 1;
+  opacity: 0.5;
+  mix-blend-mode: overlay;
+  background-image: radial-gradient(rgba(255, 255, 255, 0.05) 0.5px, transparent 0.5px);
+  background-size: 3px 3px;
+}
+
+/* ───────────────────────────── IDENTITY (top-left) ─────────────────────── */
+.piste-id {
+  position: absolute;
+  top: 26px;
+  left: 30px;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  pointer-events: none;
+}
+.piste .id-mark {
+  display: flex;
+  align-items: baseline;
+  gap: 9px;
+}
+.piste .id-glyph {
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: radial-gradient(circle at 35% 30%, #fff, var(--accent) 60%, transparent);
+  box-shadow: 0 0 14px color-mix(in oklab, var(--accent) 70%, transparent);
+  align-self: center;
+}
+.piste .id-name {
+  font-size: 19px;
+  font-weight: 600;
+  letter-spacing: 0.22em;
+  color: var(--ink);
+}
+.piste .id-state {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  color: var(--accent);
+}
+.piste .id-tagline {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  color: var(--faint);
+  text-transform: lowercase;
+}
+
+/* ───────────────────────────── 3D STAGE ────────────────────────────────
+   The stage hosts the depth perspective; `.stage-cam` carries the slow camera
+   drift and the `preserve-3d` context the slots tilt within. Both are net-new
+   class names (no hud.css collision). */
+.piste .stage-3d {
+  position: absolute;
+  inset: 0;
+  perspective: 1500px;
+  perspective-origin: 50% 45%;
+  z-index: 10;
+}
+.piste .stage-cam {
+  position: absolute;
+  inset: 0;
+  transform-style: preserve-3d;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .piste.cam-deep .stage-cam {
+    animation: piste-cam-deep 20s ease-in-out infinite alternate;
+  }
+}
+/* prefixed `piste-` so the keyframe name can't clash with any hud.css anim */
+@keyframes piste-cam-deep {
+  from {
+    transform: rotateY(-5deg) rotateX(3deg);
+  }
+  to {
+    transform: rotateY(5deg) rotateX(1deg);
+  }
+}
+
+/* ───────────────────────────── SLOTS (core / task / data) ───────────────
+   Base: all three are absolutely positioned inside `.stage-cam`. The
+   `.layout-depth` block below drives the actual 3D placement (the « Céladon »
+   depth layout from the mockup, used by the Nacre piste). */
+.piste .slot-core,
+.piste .slot-task,
+.piste .slot-data {
+  position: absolute;
+}
+.piste .slot-core {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+}
+
+/* core placeholder box + label (orb internals ship in 0084) */
+.piste .core {
+  position: relative;
+  width: 300px;
+  height: 300px;
+}
+.piste .core-label {
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.32em;
+  color: var(--faint);
+  text-transform: uppercase;
+}
+
+/* ───────────────────────────── LAYOUT · DEPTH (Céladon) ─────────────────
+   Panels tilt into real 3D; data recedes on Z. Ported verbatim (scoped) from
+   the mockup's `.layout-depth` block — this is what positions core centre,
+   task left (tilted +24°), data right (tilted −22°). */
+.piste.layout-depth .slot-core {
+  left: 50%;
+  top: 48%;
+  transform: translate(-50%, -50%);
+}
+.piste.layout-depth .slot-task {
+  left: 44px;
+  top: 50%;
+  transform: translateY(calc(-50% + 68px)) rotateY(24deg);
+  transform-style: preserve-3d;
+}
+.piste.layout-depth .slot-data {
+  right: 40px;
+  top: 50%;
+  transform: translateY(-50%) rotateY(-22deg);
+  transform-style: preserve-3d;
+}
+
+/* ───────────────────────────── PANEL · FROST (modifier) ─────────────────
+   Foundation "panel-style" modifier. Inert until a child `.panel` exists —
+   the task/data cards (0085/0086) add `.panel`; this rule then frosts them.
+   Kept here (scoped) so downstream issues inherit the frost treatment without
+   re-declaring the foundation. */
+.piste.panel-frost .panel {
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  background: color-mix(in oklab, var(--bg2) 55%, transparent);
+  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.06);
+}
+
+/* never show scrollbars on the stage (focus-overlay safety, from the mockup) */
+.piste ::-webkit-scrollbar {
+  display: none;
+}
+
+/* ───────────────────────────── TAURI DRAG REGION (re-scope) ─────────────
+   hud.css scopes the borderless-window drag region under `.app` (issue
+   #0036); the shell root is now `.piste`, so those rules no longer match. We
+   re-declare the same contract scoped under `.piste` (identical behaviour —
+   28px top strip drags, controls opt back out via no-drag). NOT a restyle,
+   just a re-scope to the renamed root. */
+.piste .drag-region {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 28px;
+  z-index: 100;
+  -webkit-app-region: drag;
+  -webkit-user-select: none;
+  user-select: none;
+}
+.piste .drag-region * {
+  -webkit-app-region: no-drag;
+}
+.piste input,
+.piste textarea,
+.piste button {
+  -webkit-app-region: no-drag;
+}
+
+/* ───────────────────────────── OVERLAY-OPEN DIM ────────────────────────
+   When a surface (SectionsOverlay) is open the shell adds `.has-surface`; the
+   3D stage and identity recede so the surface carries the focus. Ported from
+   the mockup's `.piste.has-surface` foundation rules. The overlay surface
+   itself is still rendered by the existing `SectionsOverlay` (hud.css `.ov-*`);
+   issue 0088 reskins it. */
+.piste .stage-3d {
+  transition: opacity 0.5s ease, filter 0.5s ease;
+}
+.piste.has-surface .stage-3d {
+  opacity: 0.22;
+  filter: saturate(0.8);
+}
+.piste.has-surface .piste-id {
+  opacity: 0.4;
+  transition: opacity 0.5s ease;
+}
