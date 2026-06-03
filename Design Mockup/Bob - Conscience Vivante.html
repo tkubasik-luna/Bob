@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Bob — Conscience Vivante</title>
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=JetBrains+Mono:wght@300;400;500;600&display=swap" rel="stylesheet">
+
+<style>
+  :root {
+    --bg:        #0A0605;
+    --bg-2:      #160B09;
+    --ink:       #FFE7DD;
+    --ink-dim:   rgba(255, 231, 221, 0.55);
+    --ink-faint: rgba(255, 231, 221, 0.26);
+    --accent:    #FF7A45;
+    --accent-2:  #FFB6A0;
+    --warn:      #FFB300;
+    --err:       #FF4D4D;
+    --rule:      rgba(255, 122, 69, 0.20);
+    --rule-dim:  rgba(255, 122, 69, 0.10);
+    --fill:      rgba(255, 122, 69, 0.06);
+    --font-sans: 'Space Grotesk', system-ui, sans-serif;
+    --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+  }
+  .cv-app.tone-warn { --accent: #FFB300; --accent-2: #FFD56A; --rule: rgba(255,179,0,0.26); }
+  .cv-app.tone-err  { --accent: #FF4D4D; --accent-2: #FF8A6A; --rule: rgba(255,77,77,0.30); }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; height: 100%; background: var(--bg); }
+  body {
+    font-family: var(--font-sans);
+    color: var(--ink);
+    overflow: hidden;
+    cursor: crosshair;
+  }
+  #root { position: fixed; inset: 0; }
+
+  .cv-app { position: absolute; inset: 0; overflow: hidden; background: var(--bg); }
+  .cv-canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+
+  /* ---- corner frame ---- */
+  .cv-fr {
+    position: absolute; width: 26px; height: 26px;
+    border-color: var(--rule); pointer-events: none; z-index: 5;
+    transition: border-color 600ms ease;
+  }
+  .cv-fr.tl { top: 18px; left: 18px;  border-top: 1px solid; border-left: 1px solid; }
+  .cv-fr.tr { top: 18px; right: 18px; border-top: 1px solid; border-right: 1px solid; }
+  .cv-fr.bl { bottom: 18px; left: 18px;  border-bottom: 1px solid; border-left: 1px solid; }
+  .cv-fr.br { bottom: 18px; right: 18px; border-bottom: 1px solid; border-right: 1px solid; }
+
+  /* ---- identity ---- */
+  .cv-id { position: absolute; top: 32px; left: 36px; z-index: 6; pointer-events: none; }
+  .cv-id-mark { display: flex; align-items: baseline; gap: 9px; }
+  .cv-id-glyph { font-size: 20px; color: var(--accent); text-shadow: 0 0 14px var(--accent); transition: color 600ms ease, text-shadow 600ms ease; }
+  .cv-id-name { font-size: 17px; font-weight: 600; letter-spacing: 0.20em; }
+  .cv-id-sub { font-family: var(--font-mono); font-size: 9.5px; letter-spacing: 0.34em; color: var(--ink-faint); }
+  .cv-id-line { font-family: var(--font-mono); font-size: 9.5px; color: var(--ink-faint); letter-spacing: 0.18em; margin-top: 6px; }
+
+  /* ---- form rail ---- */
+  .cv-forms {
+    position: absolute; top: 50%; left: 36px; transform: translateY(-50%);
+    z-index: 6; width: 210px;
+    display: flex; flex-direction: column; gap: 4px;
+  }
+  .cv-forms-cap { font-family: var(--font-mono); font-size: 9px; letter-spacing: 0.34em; color: var(--ink-faint); margin-bottom: 8px; }
+  .cv-form {
+    appearance: none; border: 1px solid transparent; background: transparent;
+    color: var(--ink-dim); cursor: pointer; text-align: left;
+    display: grid; grid-template-columns: 22px 1fr; align-items: center; gap: 12px;
+    padding: 11px 12px; border-radius: 3px;
+    transition: all 200ms ease;
+  }
+  .cv-form-key { font-family: var(--font-mono); font-size: 9px; color: var(--ink-faint); border: 1px solid var(--rule-dim); padding: 3px 0; text-align: center; border-radius: 2px; }
+  .cv-form-body { display: flex; flex-direction: column; gap: 3px; }
+  .cv-form-name { font-size: 15px; font-weight: 500; letter-spacing: 0.02em; }
+  .cv-form-tag { font-family: var(--font-mono); font-size: 8.5px; letter-spacing: 0.26em; color: var(--ink-faint); }
+  .cv-form:hover { background: var(--fill); color: var(--ink); }
+  .cv-form.on {
+    border-color: var(--rule); background: var(--fill); color: var(--ink);
+    box-shadow: inset 2px 0 0 var(--accent);
+  }
+  .cv-form.on .cv-form-key { color: var(--accent); border-color: var(--rule); }
+  .cv-form.on .cv-form-tag { color: var(--accent); }
+  .cv-form-desc {
+    font-family: var(--font-sans); font-size: 11.5px; line-height: 1.5;
+    color: var(--ink-dim); margin: 14px 4px 0; text-wrap: pretty;
+    max-width: 200px;
+  }
+
+  /* ---- vitals ---- */
+  .cv-vitals {
+    position: absolute; top: 32px; right: 36px; z-index: 6;
+    width: 226px;
+    display: flex; flex-direction: column; gap: 9px;
+  }
+  .cv-vitals-head {
+    display: flex; align-items: center; justify-content: space-between;
+    font-family: var(--font-mono); font-size: 9px; letter-spacing: 0.30em;
+    color: var(--ink-faint);
+    padding-bottom: 8px; border-bottom: 1px solid var(--rule-dim);
+  }
+  .cv-vitals-pip { width: 7px; height: 7px; border-radius: 50%; background: var(--ink-faint); transition: all 300ms ease; }
+  .cv-vitals-pip.live { background: var(--accent); box-shadow: 0 0 10px var(--accent); animation: cv-pip 1.6s ease-in-out infinite; }
+  @keyframes cv-pip { 0%,100%{opacity:1} 50%{opacity:0.35} }
+
+  .cv-vt-row { display: flex; align-items: baseline; justify-content: space-between; }
+  .cv-vt-row.tight { margin-top: -4px; }
+  .cv-vt-label { font-family: var(--font-mono); font-size: 9px; letter-spacing: 0.22em; color: var(--ink-faint); }
+  .cv-vt-val { font-family: var(--font-mono); font-size: 18px; font-weight: 500; color: var(--ink); font-variant-numeric: tabular-nums; letter-spacing: 0.01em; }
+  .cv-vt-val i { font-style: normal; font-size: 9px; color: var(--ink-faint); margin-left: 2px; }
+  .vt-trace { width: 100%; height: 44px; display: block; }
+  .cv-vt-bar { height: 2px; background: var(--rule-dim); position: relative; overflow: hidden; margin-top: 4px; }
+  .cv-vt-bar span { position: absolute; inset: 0 auto 0 0; background: var(--accent); box-shadow: 0 0 8px var(--accent); transition: width 140ms linear; }
+
+  .cv-vt-gazewrap { display: flex; align-items: center; justify-content: space-between; margin-top: 6px; }
+  .vt-gaze { position: relative; width: 64px; height: 64px; border: 1px solid var(--rule-dim); border-radius: 50%; }
+  .vt-gaze-ring { position: absolute; inset: 24%; border: 1px solid var(--rule-dim); border-radius: 50%; }
+  .vt-gaze-cross-h { position: absolute; left: 8%; right: 8%; top: 50%; height: 1px; background: var(--rule-dim); }
+  .vt-gaze-cross-v { position: absolute; top: 8%; bottom: 8%; left: 50%; width: 1px; background: var(--rule-dim); }
+  .vt-gaze-pupil { position: absolute; width: 9px; height: 9px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 10px var(--accent); transition: left 120ms linear, top 120ms linear, transform 200ms ease; }
+
+  /* ---- state console ---- */
+  .cv-states {
+    position: absolute; bottom: 40px; left: 50%; transform: translateX(-50%);
+    z-index: 8;
+    display: flex; flex-direction: column; align-items: center; gap: 12px;
+  }
+  .cv-vivant {
+    appearance: none; cursor: pointer;
+    background: transparent; border: 1px solid var(--rule-dim);
+    color: var(--ink-dim);
+    font-family: var(--font-mono); font-size: 9.5px; letter-spacing: 0.22em; text-transform: uppercase;
+    padding: 7px 14px; border-radius: 3px;
+    display: inline-flex; align-items: center; gap: 9px;
+    transition: all 220ms ease;
+  }
+  .cv-vivant-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--ink-faint); transition: all 220ms ease; }
+  .cv-vivant:hover { color: var(--ink); border-color: var(--rule); }
+  .cv-vivant.on { color: var(--accent); border-color: var(--accent); box-shadow: 0 0 16px color-mix(in oklab, var(--accent) 30%, transparent); }
+  .cv-vivant.on .cv-vivant-dot { background: var(--accent); box-shadow: 0 0 8px var(--accent); animation: cv-pip 1.4s ease-in-out infinite; }
+
+  .cv-pills {
+    display: flex; gap: 5px; padding: 6px;
+    background: color-mix(in oklab, var(--bg) 66%, transparent);
+    backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+    border: 1px solid var(--rule); border-radius: 4px;
+  }
+  .cv-pill {
+    appearance: none; border: 0; background: transparent; color: var(--ink-dim);
+    font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.08em;
+    padding: 8px 12px 8px 9px; border-radius: 2px; cursor: pointer;
+    display: inline-flex; align-items: center; gap: 8px;
+    transition: all 180ms ease;
+  }
+  .cv-pill-key { font-size: 8.5px; color: var(--ink-faint); background: var(--rule-dim); padding: 2px 5px; border-radius: 2px; }
+  .cv-pill-name { white-space: nowrap; }
+  .cv-pill:hover { background: var(--fill); color: var(--ink); }
+  .cv-pill.on { background: var(--accent); color: #1a0d06; box-shadow: 0 0 18px color-mix(in oklab, var(--accent) 45%, transparent); }
+  .cv-pill.on .cv-pill-key { background: rgba(0,0,0,0.2); color: rgba(0,0,0,0.55); }
+
+  .cv-twk-hint {
+    font-family: var(--font-mono); font-size: 10px;
+    color: rgba(41,38,27,.62); letter-spacing: 0.02em; line-height: 1.7;
+    padding: 12px 0 2px; border-top: 1px solid rgba(0,0,0,0.08); margin-top: 6px;
+  }
+  .cv-twk-hint b { color: rgba(41,38,27,.85); }
+
+  /* error wobble on chrome */
+  .cv-app.state-error .cv-fr,
+  .cv-app.state-error .cv-id,
+  .cv-app.state-error .cv-vitals { animation: cv-shake 0.2s steps(2) infinite; }
+  @keyframes cv-shake { 0%{transform:translate(0,0)} 50%{transform:translate(-1px,0)} 100%{transform:translate(1px,0)} }
+  .cv-app.state-error .cv-id { left: 36px; }
+
+  @media (max-width: 900px) {
+    .cv-forms { display: none; }
+    .cv-vitals { width: 180px; }
+  }
+  @media (max-width: 680px) {
+    .cv-vitals { display: none; }
+  }
+
+  template { display: none; }
+</style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <template id="__bundler_thumbnail">
+    <svg viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+      <rect width="100" height="100" fill="#0A0605"/>
+      <circle cx="50" cy="50" r="22" fill="none" stroke="#FF7A45" stroke-width="2"/>
+      <circle cx="50" cy="50" r="9" fill="#FF7A45"/>
+      <circle cx="46" cy="46" r="3" fill="#FFE4D7"/>
+    </svg>
+  </template>
+
+  <script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+
+  <script src="conscience-shader.js"></script>
+  <script src="conscience-life.js"></script>
+  <script type="text/babel" src="tweaks-panel.jsx"></script>
+  <script type="text/babel" src="conscience.jsx"></script>
+  <script type="text/babel" src="conscience-lab.jsx"></script>
+</body>
+</html>

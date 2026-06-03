@@ -1,0 +1,457 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Watson Orb</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    background: #05070d;
+    overflow: hidden;
+    font-family: ui-sans-serif, -apple-system, "Helvetica Neue", Helvetica, Arial, sans-serif;
+  }
+  #glcanvas {
+    position: fixed;
+    inset: 0;
+    width: 100vw;
+    height: 100vh;
+    display: block;
+  }
+  /* state switch */
+  #controls {
+    position: fixed;
+    left: 50%;
+    bottom: 38px;
+    transform: translateX(-50%);
+    display: flex;
+    gap: 8px;
+    padding: 6px;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(160, 210, 255, 0.14);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+    z-index: 5;
+  }
+  .seg-btn {
+    appearance: none;
+    border: none;
+    cursor: pointer;
+    font: inherit;
+    font-size: 13px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: rgba(200, 222, 245, 0.62);
+    background: transparent;
+    padding: 9px 22px;
+    border-radius: 999px;
+    transition: color 0.35s ease, background 0.35s ease, box-shadow 0.35s ease;
+  }
+  .seg-btn:hover { color: rgba(220, 238, 255, 0.92); }
+  .seg-btn.active {
+    color: #061018;
+    background: linear-gradient(180deg, #aee2ff, #6fc6ff);
+    box-shadow: 0 0 22px rgba(120, 200, 255, 0.45), inset 0 1px 0 rgba(255,255,255,0.5);
+  }
+  #status {
+    position: fixed;
+    left: 50%;
+    bottom: 96px;
+    transform: translateX(-50%);
+    font-size: 11px;
+    letter-spacing: 0.34em;
+    text-transform: uppercase;
+    color: rgba(150, 195, 235, 0.4);
+    z-index: 5;
+    pointer-events: none;
+    transition: color 0.4s ease;
+  }
+</style>
+</head>
+<body>
+  <canvas id="glcanvas"></canvas>
+  <div id="status">Idle</div>
+  <div id="controls">
+    <button class="seg-btn active" data-mode="idle">Idle</button>
+    <button class="seg-btn" data-mode="thinking">Thinking</button>
+  </div>
+  <div id="tweaks-root"></div>
+
+  <script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+  <script type="text/babel" src="tweaks-panel.jsx"></script>
+
+  <!-- ============================ SHADERS ============================ -->
+  <script id="vert" type="x-shader/x-vertex">
+    attribute vec2 aPos;
+    void main(){ gl_Position = vec4(aPos, 0.0, 1.0); }
+  </script>
+
+  <script id="frag" type="x-shader/x-fragment">
+  precision highp float;
+
+  uniform vec2  uRes;
+  uniform float uTime;
+  uniform vec2  uMouse;
+  uniform float uState;        // 0 = idle, 1 = thinking (eased)
+
+  uniform float uRingCount;
+  uniform float uDashCount;
+  uniform float uDashLen;       // angular half-length of each dash
+  uniform float uDashThick;     // world-space thickness
+  uniform float uIdleSpeed;
+  uniform float uThinkSpeed;
+  uniform float uIdleGroup;
+  uniform float uThinkGroup;
+  uniform float uCoreGlow;
+  uniform float uIor;
+
+  uniform vec3  uDashColor;
+  uniform vec3  uCoreColor;
+  uniform vec3  uBg;
+
+  #define TAU 6.28318530718
+  #define MAX_RINGS 8
+  #define MAX_DASHES 18
+
+  const float SPHERE_R = 1.0;
+  const float CAM_Z    = 3.6;
+  const float FOV      = 0.92;
+  const float CORE_SZ  = 0.16;
+  const vec3  GLASS_TINT = vec3(0.74, 0.90, 1.0);
+
+  float hash11(float p){
+    p = fract(p * 0.1031);
+    p *= p + 33.33;
+    p *= p + p;
+    return fract(p);
+  }
+
+  mat3 rotY(float a){ float c=cos(a), s=sin(a); return mat3(c,0.0,s, 0.0,1.0,0.0, -s,0.0,c); }
+  mat3 rotX(float a){ float c=cos(a), s=sin(a); return mat3(1.0,0.0,0.0, 0.0,c,-s, 0.0,s,c); }
+
+  // shortest distance between ray (ro,rd) and segment a-b; also closest t along ray
+  float segRay(vec3 ro, vec3 rd, vec3 a, vec3 b, out float tRay){
+    vec3 ba = b - a;
+    vec3 r  = ro - a;
+    float baba = dot(ba, ba);
+    float rdba = dot(rd, ba);
+    float rdr  = dot(rd, r);
+    float bar  = dot(ba, r);
+    float denom = baba - rdba * rdba;
+    float s = (denom > 1e-6) ? clamp((bar - rdba * rdr) / denom, 0.0, 1.0) : 0.0;
+    float t = max(-rdr + s * rdba, 0.0);
+    vec3 pr = ro + rd * t;
+    vec3 ps = a + ba * s;
+    tRay = t;
+    return length(pr - ps);
+  }
+
+  // accumulate dash glow seen along a ray, only counting hits with closest t in [tNear,tFar]
+  vec3 glowField(vec3 ro, vec3 rd, float tNear, float tFar){
+    float acc = 0.0;
+    float speed = mix(uIdleSpeed, uThinkSpeed, uState);
+    float group = mix(uIdleGroup, uThinkGroup, uState);
+    float N = uDashCount;
+    float even = TAU / N;
+    float spacing = even * (1.0 - group);
+
+    for(int i = 0; i < MAX_RINGS; i++){
+      if(float(i) >= uRingCount) break;
+      float fi = float(i);
+      float h  = hash11(fi * 1.37 + 3.1);
+      float h2 = hash11(fi * 2.11 + 7.7);
+
+      // slowly precessing ring orientation
+      float pa = h * TAU + uTime * 0.05 * (0.4 + h);
+      float pb = (h2 - 0.5) * 3.2 + uTime * 0.035 * (0.5 + h2);
+      vec3 axis = normalize(vec3(sin(pb) * cos(pa), cos(pb), sin(pb) * sin(pa)));
+      vec3 ref  = abs(axis.y) < 0.9 ? vec3(0.0,1.0,0.0) : vec3(1.0,0.0,0.0);
+      vec3 u = normalize(cross(axis, ref));
+      vec3 v = cross(axis, u);
+
+      float Rr  = SPHERE_R * (1.14 + 0.16 * fi / max(uRingCount - 1.0, 1.0) + 0.05 * h);
+      float dir = mod(fi, 2.0) < 0.5 ? 1.0 : -1.0;
+      float ringPhase = uTime * speed * dir * (0.7 + 0.6 * h) + h * TAU;
+
+      for(int j = 0; j < MAX_DASHES; j++){
+        if(float(j) >= uDashCount) break;
+        float fj = float(j);
+        float centered = fj - (N - 1.0) * 0.5;
+        float drift = (1.0 - uState) * 0.30 *
+                      sin(uTime * (0.4 + 0.7 * hash11(fi * 9.1 + fj)) + hash11(fj * 3.3 + fi) * TAU);
+        float theta = ringPhase + centered * spacing + drift;
+
+        vec3 pA = Rr * (cos(theta - uDashLen) * u + sin(theta - uDashLen) * v);
+        vec3 pB = Rr * (cos(theta + uDashLen) * u + sin(theta + uDashLen) * v);
+
+        float tr;
+        float d = segRay(ro, rd, pA, pB, tr);
+        if(tr < tNear || tr > tFar) continue;
+        float g = exp(-(d * d) / (uDashThick * uDashThick));
+        acc += g;
+      }
+    }
+    return acc * uDashColor;
+  }
+
+  vec3 background(vec2 p){
+    float r = length(p);
+    vec3 col = uBg;
+    col += uDashColor * 0.05 * exp(-r * r * 2.4);   // faint halo behind orb
+    col *= 1.0 - 0.28 * r * r;                       // vignette
+    return col;
+  }
+
+  void main(){
+    vec2 p = (gl_FragCoord.xy - 0.5 * uRes) / uRes.y;
+
+    vec3 ro = vec3(0.0, 0.0, CAM_Z);
+    vec3 rd = normalize(vec3(p * FOV, -1.0));
+
+    // subtle cursor parallax (orbit the scene)
+    mat3 R = rotY(uMouse.x * 0.32) * rotX(-uMouse.y * 0.22);
+    ro = R * ro;
+    rd = R * rd;
+
+    vec3 col;
+
+    float b = dot(ro, rd);
+    float c = dot(ro, ro) - SPHERE_R * SPHERE_R;
+    float disc = b * b - c;
+    float tHit = disc > 0.0 ? -b - sqrt(disc) : -1.0;
+
+    if(tHit > 0.0){
+      vec3 frontGlow = glowField(ro, rd, 0.0, tHit);
+
+      vec3 pos = ro + rd * tHit;
+      vec3 n   = normalize(pos);
+      float fres = pow(1.0 - max(dot(-rd, n), 0.0), 4.0);
+
+      // refraction: bend the ray, then re-sample the SAME dash field through it
+      vec3 rdr = refract(rd, n, 1.0 / uIor);
+      vec3 backGlow = glowField(pos, rdr, 0.0, 12.0) * GLASS_TINT * 0.30;
+
+      // small glowing core, seen refracted through the glass
+      float tcore = max(-dot(pos, rdr), 0.0);
+      float dCore = length(pos + rdr * tcore);
+      float core  = uCoreGlow * exp(-(dCore * dCore) / (CORE_SZ * CORE_SZ));
+      core += uCoreGlow * 0.10 * exp(-dCore / (CORE_SZ * 2.4)); // tight halo
+
+      // faint refracted background through the glass body
+      vec3 through = background(p + n.xy * 0.05) * GLASS_TINT * 0.5;
+
+      vec3 glass = through + backGlow + uCoreColor * core;
+      glass += uDashColor * fres * 1.15;                 // fresnel rim
+
+      // crisp specular highlight
+      vec3 L = normalize(vec3(0.55, 0.7, 0.55));
+      vec3 hv = normalize(L - rd);
+      float spec = pow(max(dot(n, hv), 0.0), 80.0);
+      glass += vec3(1.0) * spec * 0.9;
+
+      col = glass + frontGlow;
+    } else {
+      col = background(p) + glowField(ro, rd, 0.0, 24.0);
+    }
+
+    // soft exposure tonemap (preserves near-black, rolls off highlights)
+    col = vec3(1.0) - exp(-col * 1.25);
+    // cheap dither to kill 8-bit gradient banding
+    float dither = hash11(gl_FragCoord.x * 1.7 + gl_FragCoord.y * 113.0 + uTime) - 0.5;
+    col += dither / 255.0;
+    gl_FragColor = vec4(col, 1.0);
+  }
+  </script>
+
+  <!-- ============================ APP ============================ -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // ---- WebGL renderer (vanilla) -------------------------------------
+    const canvas = document.getElementById('glcanvas');
+    const gl = canvas.getContext('webgl', { antialias: true, premultipliedAlpha: false });
+
+    function compile(type, src){
+      const s = gl.createShader(type);
+      gl.shaderSource(s, src);
+      gl.compileShader(s);
+      if(!gl.getShaderParameter(s, gl.COMPILE_STATUS)){
+        console.error('Shader error:', gl.getShaderInfoLog(s));
+      }
+      return s;
+    }
+    const prog = gl.createProgram();
+    gl.attachShader(prog, compile(gl.VERTEX_SHADER, document.getElementById('vert').textContent));
+    gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, document.getElementById('frag').textContent));
+    gl.linkProgram(prog);
+    if(!gl.getProgramParameter(prog, gl.LINK_STATUS)){
+      console.error('Link error:', gl.getProgramInfoLog(prog));
+    }
+    gl.useProgram(prog);
+
+    const buf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 3,-1, -1,3]), gl.STATIC_DRAW);
+    const aPos = gl.getAttribLocation(prog, 'aPos');
+    gl.enableVertexAttribArray(aPos);
+    gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+    const U = {};
+    ['uRes','uTime','uMouse','uState','uRingCount','uDashCount','uDashLen','uDashThick',
+     'uIdleSpeed','uThinkSpeed','uIdleGroup','uThinkGroup','uCoreGlow','uIor',
+     'uDashColor','uCoreColor','uBg'].forEach(name => { U[name] = gl.getUniformLocation(prog, name); });
+
+    function hexToRgb(hex){
+      hex = (hex || '#000000').replace('#','');
+      if(hex.length === 3) hex = hex.split('').map(c => c+c).join('');
+      const n = parseInt(hex, 16);
+      return [((n>>16)&255)/255, ((n>>8)&255)/255, (n&255)/255];
+    }
+
+    function resize(){
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const w = Math.floor(window.innerWidth * dpr);
+      const h = Math.floor(window.innerHeight * dpr);
+      if(canvas.width !== w || canvas.height !== h){
+        canvas.width = w; canvas.height = h;
+        gl.viewport(0, 0, w, h);
+      }
+    }
+    window.addEventListener('resize', resize);
+    resize();
+
+    // shared mutable render state, written by React, read by the RAF loop
+    const R = {
+      tweaks: null,
+      mode: 'idle',
+      stateVal: 0,
+      mouse: [0, 0],
+      mouseTarget: [0, 0],
+    };
+
+    window.addEventListener('pointermove', (e) => {
+      R.mouseTarget[0] = (e.clientX / window.innerWidth) * 2 - 1;
+      R.mouseTarget[1] = (e.clientY / window.innerHeight) * 2 - 1;
+    });
+    window.addEventListener('pointerleave', () => { R.mouseTarget[0] = 0; R.mouseTarget[1] = 0; });
+
+    const start = performance.now();
+    function frame(){
+      const t = (performance.now() - start) / 1000;
+      const tw = R.tweaks;
+      if(tw){
+        const target = R.mode === 'thinking' ? 1 : 0;
+        R.stateVal += (target - R.stateVal) * 0.055;
+        R.mouse[0] += (R.mouseTarget[0] - R.mouse[0]) * 0.05;
+        R.mouse[1] += (R.mouseTarget[1] - R.mouse[1]) * 0.05;
+
+        gl.uniform2f(U.uRes, canvas.width, canvas.height);
+        gl.uniform1f(U.uTime, t);
+        gl.uniform2f(U.uMouse, R.mouse[0], R.mouse[1]);
+        gl.uniform1f(U.uState, R.stateVal);
+        gl.uniform1f(U.uRingCount, tw.rings);
+        gl.uniform1f(U.uDashCount, tw.dashes);
+        gl.uniform1f(U.uDashLen, tw.dashLen);
+        gl.uniform1f(U.uDashThick, tw.dashThick);
+        gl.uniform1f(U.uIdleSpeed, tw.idleSpeed);
+        gl.uniform1f(U.uThinkSpeed, tw.thinkSpeed);
+        gl.uniform1f(U.uIdleGroup, tw.idleGroup);
+        gl.uniform1f(U.uThinkGroup, tw.thinkGroup);
+        gl.uniform1f(U.uCoreGlow, tw.coreGlow);
+        gl.uniform1f(U.uIor, tw.ior);
+        gl.uniform3fv(U.uDashColor, hexToRgb(tw.dashColor));
+        gl.uniform3fv(U.uCoreColor, hexToRgb(tw.coreColor));
+        gl.uniform3fv(U.uBg, hexToRgb(tw.bg));
+        gl.drawArrays(gl.TRIANGLES, 0, 3);
+      }
+      requestAnimationFrame(frame);
+    }
+    requestAnimationFrame(frame);
+
+    // on-screen Thinking / Idle switch
+    const statusEl = document.getElementById('status');
+    document.querySelectorAll('.seg-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('.seg-btn').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        R.mode = btn.dataset.mode;
+        statusEl.textContent = btn.dataset.mode === 'thinking' ? 'Thinking' : 'Idle';
+        statusEl.style.color = btn.dataset.mode === 'thinking'
+          ? 'rgba(174, 226, 255, 0.7)' : 'rgba(150, 195, 235, 0.4)';
+      });
+    });
+
+    // ---- Tweaks panel (React) -----------------------------------------
+    const TWEAK_DEFAULTS = /*EDITMODE-BEGIN*/{
+      "rings": 2,
+      "dashes": 8,
+      "dashLen": 0.3,
+      "dashThick": 0.022,
+      "idleSpeed": 0.58,
+      "thinkSpeed": 0.62,
+      "idleGroup": 0,
+      "thinkGroup": 0.82,
+      "coreGlow": 1.3,
+      "ior": 1.25,
+      "dashColor": "#7fd4ff",
+      "coreColor": "#ffffff",
+      "bg": "#05070d"
+    }/*EDITMODE-END*/;
+
+    function App(){
+      const [t, setTweak] = useTweaks(TWEAK_DEFAULTS);
+      useEffect(() => { R.tweaks = t; }, [t]);
+
+      return (
+        <TweaksPanel>
+          <TweakSection label="Dashes" />
+          <TweakSlider label="Rings" value={t.rings} min={1} max={8} step={1}
+                       onChange={(v) => setTweak('rings', v)} />
+          <TweakSlider label="Dashes / ring" value={t.dashes} min={2} max={16} step={1}
+                       onChange={(v) => setTweak('dashes', v)} />
+          <TweakSlider label="Dash length" value={t.dashLen} min={0.03} max={0.30} step={0.005}
+                       onChange={(v) => setTweak('dashLen', v)} />
+          <TweakSlider label="Dash thickness" value={t.dashThick} min={0.008} max={0.06} step={0.002}
+                       onChange={(v) => setTweak('dashThick', v)} />
+
+          <TweakSection label="Motion · Idle" />
+          <TweakSlider label="Speed" value={t.idleSpeed} min={0.0} max={0.6} step={0.01}
+                       onChange={(v) => setTweak('idleSpeed', v)} />
+          <TweakSlider label="Grouping" value={t.idleGroup} min={0.0} max={0.95} step={0.01}
+                       onChange={(v) => setTweak('idleGroup', v)} />
+
+          <TweakSection label="Motion · Thinking" />
+          <TweakSlider label="Speed" value={t.thinkSpeed} min={0.1} max={1.6} step={0.01}
+                       onChange={(v) => setTweak('thinkSpeed', v)} />
+          <TweakSlider label="Grouping" value={t.thinkGroup} min={0.0} max={0.95} step={0.01}
+                       onChange={(v) => setTweak('thinkGroup', v)} />
+
+          <TweakSection label="Glass & core" />
+          <TweakSlider label="Core glow" value={t.coreGlow} min={0.3} max={3.0} step={0.05}
+                       onChange={(v) => setTweak('coreGlow', v)} />
+          <TweakSlider label="Refraction" value={t.ior} min={1.0} max={1.8} step={0.01}
+                       onChange={(v) => setTweak('ior', v)} />
+
+          <TweakSection label="Color" />
+          <TweakColor label="Dashes" value={t.dashColor}
+                      options={['#7fd4ff','#5ad1c8','#9fb8ff','#c7e9ff']}
+                      onChange={(v) => setTweak('dashColor', v)} />
+          <TweakColor label="Core" value={t.coreColor}
+                      options={['#ffffff','#dff2ff','#bfe6ff']}
+                      onChange={(v) => setTweak('coreColor', v)} />
+          <TweakColor label="Background" value={t.bg}
+                      options={['#05070d','#0a1120','#000000','#0d0b14']}
+                      onChange={(v) => setTweak('bg', v)} />
+        </TweaksPanel>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('tweaks-root')).render(<App />);
+  </script>
+</body>
+</html>

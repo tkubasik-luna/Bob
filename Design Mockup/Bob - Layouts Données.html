@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Bob — Layouts · Données générées</title>
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Hanken+Grotesk:wght@300;400;500;600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="data-layouts.css">
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #1a1418; }
+  #root { position: fixed; inset: 0; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+
+<script type="text/babel" src="p3d-content.jsx"></script>
+<script type="text/babel" src="design-canvas.jsx"></script>
+<script type="text/babel" src="data-layouts.jsx"></script>
+
+<script type="text/babel" data-presets="react">
+  const AB_W = 680, AB_H = 560;
+  function Root() {
+    return (
+      <DesignCanvas>
+        <DCSection
+          id="data-layouts"
+          title="Données générées — pistes de layout"
+          subtitle="Mêmes artefacts générés (courriels · docs · contacts · actions · vidéos), 4 façons de les disposer autour du core. Ouvre-en une en plein écran pour juger en grand."
+        >
+          <DCArtboard id="orbit" label="A · Orbite gravitaire — récence = proximité" width={AB_W} height={AB_H}><LayoutOrbit /></DCArtboard>
+          <DCArtboard id="timeline" label="B · Fil temporel — enfilé dans le temps" width={AB_W} height={AB_H}><LayoutTimeline /></DCArtboard>
+          <DCArtboard id="memory" label="C · Mémoire vive — plateau de 5 tenus en mémoire" width={AB_W} height={AB_H}><LayoutMemory /></DCArtboard>
+          <DCArtboard id="constellation" label="D · Constellation reliée — petit graphe" width={AB_W} height={AB_H}><LayoutConstellation /></DCArtboard>
+        </DCSection>
+      </DesignCanvas>
+    );
+  }
+  ReactDOM.createRoot(document.getElementById('root')).render(<Root />);
+</script>
+</body>
+</html>
