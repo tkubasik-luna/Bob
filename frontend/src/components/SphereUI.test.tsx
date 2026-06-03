@@ -215,13 +215,17 @@ describe("SphereUI — piste shell structure", () => {
     );
   });
 
-  test("renders the provisional bottom input (transcript + field)", () => {
+  test("renders the nacre bottom bar (transcript + field bottom-centre, mute bottom-right)", () => {
     const { container } = render(<SphereUI />);
-    // Transcript line + input field live in the bottom zone. The mute toggle
-    // renders as a sibling (self-positioned fixed element).
-    expect(container.querySelector(".hud-zone.b .hud-transcript")).not.toBeNull();
-    expect(container.querySelector(".hud-zone.b .hud-input")).not.toBeNull();
-    expect(container.querySelector(".hud-mute")).not.toBeNull();
+    // Issue 0090 — the provisional `.hud-zone.b` placement is replaced by the
+    // nacre `BottomBar`: the live voice caption + always-visible composer sit
+    // in the bottom-centre column; the mute glyph sits in its own bottom-right
+    // column. The leaves keep their `.hud-*` class names (styling only).
+    expect(
+      container.querySelector(".p3d-bottom .p3d-bottom-center .hud-transcript"),
+    ).not.toBeNull();
+    expect(container.querySelector(".p3d-bottom .p3d-bottom-center .hud-input")).not.toBeNull();
+    expect(container.querySelector(".p3d-bottom .p3d-bottom-mute .hud-mute")).not.toBeNull();
   });
 
   test("does NOT auto-open the overlay (click-only per PRD 0014)", () => {

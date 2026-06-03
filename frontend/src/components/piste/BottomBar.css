@@ -1,0 +1,217 @@
+/* ═══════════════════════════════════════════════════════════════════════
+   BottomBar.css — Piste 3D · Nacre bottom zone (PRD 0014 / issue 0090).
+
+   Co-located styling for `BottomBar.tsx`: the bottom-centre voice caption +
+   always-visible composer, and the bottom-right mute glyph, in the « Nacre »
+   visual language. Ported from `Design Mockup/p3d.css` (the frosted-pill
+   treatment of `.settings-btn` / `.set-input` / `.set-field-row`) and reusing
+   the nacre tokens already declared on the `.piste` scope by the foundation
+   sheet (`styles/p3d.css`): `--bg2`, `--ink`, `--dim`, `--faint`, `--accent`,
+   `--line`, `--fill`, `--font-sans`, `--font-mono`.
+
+   SCOPING / COLLISION NOTE — this file is loaded AFTER both `hud.css` and the
+   foundation `p3d.css` (Vite module-graph order: it's imported by BottomBar,
+   which mounts under SphereUI). The three leaves (`InputField`,
+   `TranscriptLine`, `MuteToggle`) keep their original `hud.css` class names
+   (`.hud-input*`, `.hud-transcript*`, `.hud-mute`) so their markup + tests are
+   untouched; we re-skin them here by RAISING SPECIFICITY: every override is
+   anchored under `.piste .p3d-bottom …`, which outranks the bare `.hud-*`
+   rules in `hud.css`. Nothing here leaks outside the piste subtree.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+/* ───────────────────────────── FOOTER CONTAINER ────────────────────────
+   A full-width strip pinned to the bottom of the piste. It is a passthrough
+   for pointer events (`none`) so the inert margins never steal clicks from
+   the 3D stage; only the interactive children (`.p3d-bottom-center`,
+   `.p3d-bottom-mute`) opt back in. z-index sits above the receded stage so
+   the composer stays reachable while a surface overlay dims the scene. */
+.piste .p3d-bottom {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 45;
+  padding: 0 0 26px;
+  pointer-events: none;
+}
+
+/* ───────────────────────────── BOTTOM-CENTRE COLUMN ────────────────────
+   Voice caption stacked above the composer, horizontally centred. The width
+   is clamped so the column never reaches the side slots (task at left:44px,
+   data at right:40px, both vertically centred): on a typical HUD window the
+   ~560px max keeps a wide gutter on either side. */
+.piste .p3d-bottom-center {
+  position: absolute;
+  left: 50%;
+  bottom: 26px;
+  transform: translateX(-50%);
+  width: min(560px, 52vw);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  pointer-events: auto;
+}
+
+/* ───────────────────────────── TRANSCRIPT (voice caption) ──────────────
+   Minimal single line above the composer, active during the voice/TTS turn.
+   We keep the leaf's `.hud-transcript*` structure and only re-skin it nacre:
+   sans body with a soft accent halo, mono-uppercase hint, mono thinking dots.
+   `min-height` reserves the line so the composer doesn't jump as the caption
+   appears/disappears; `transcript-in` (declared globally in hud.css) still
+   drives the fade-in on the text slot. */
+.piste .p3d-bottom-center .hud-transcript {
+  width: 100%;
+  text-align: center;
+  pointer-events: none;
+  min-height: 22px;
+}
+.piste .p3d-bottom-center .hud-transcript-text {
+  font-family: var(--font-sans);
+  font-size: 15px;
+  font-weight: 400;
+  line-height: 1.45;
+  letter-spacing: 0.01em;
+  color: var(--ink);
+  text-wrap: pretty;
+  text-shadow: 0 0 18px color-mix(in oklab, var(--accent) 32%, transparent);
+}
+.piste .p3d-bottom-center .hud-transcript-hint {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.28em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+.piste .p3d-bottom-center .hud-transcript-thinking {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.28em;
+  text-transform: uppercase;
+  color: var(--accent);
+  text-shadow: 0 0 10px color-mix(in oklab, var(--accent) 55%, transparent);
+}
+/* the bouncing ellipsis keeps its hud.css `dot-bounce` keyframe + delays;
+   we only resize the glyphs to sit with the smaller nacre caption. */
+.piste .p3d-bottom-center .hud-transcript-thinking .dot {
+  font-size: 20px;
+  line-height: 0;
+}
+
+/* ───────────────────────────── COMPOSER (input) ────────────────────────
+   Minimal, always visible. A frosted nacre pill mirroring the mockup's
+   `.settings-btn` / `.set-field-row` surface: soft fill, hairline pink rule,
+   backdrop blur, accent focus glow. The leaf's `.hud-input` wrapper carries a
+   provisional `margin-top` in hud.css — we neutralise it here since the column
+   gap already spaces the caption from the field. */
+.piste .p3d-bottom-center .hud-input {
+  width: 100%;
+  margin: 0;
+  pointer-events: auto;
+}
+.piste .p3d-bottom-center .hud-input-field {
+  display: block;
+  width: 100%;
+  resize: none;
+  padding: 11px 16px;
+  border-radius: 16px;
+  border: 1px solid var(--line);
+  background: color-mix(in oklab, var(--bg2) 64%, transparent);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.45;
+  letter-spacing: 0.01em;
+  outline: none;
+  max-height: calc(1.45em * 4 + 22px);
+  overflow-y: auto;
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05);
+  transition: border-color 0.25s ease, box-shadow 0.25s ease, background 0.25s ease;
+}
+.piste .p3d-bottom-center .hud-input-field::placeholder {
+  color: var(--faint);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+}
+.piste .p3d-bottom-center .hud-input-field:hover {
+  border-color: color-mix(in oklab, var(--accent) 34%, transparent);
+}
+.piste .p3d-bottom-center .hud-input-field:focus {
+  border-color: color-mix(in oklab, var(--accent) 55%, transparent);
+  background: color-mix(in oklab, var(--bg2) 74%, transparent);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06), 0 0 0 3px
+    color-mix(in oklab, var(--accent) 13%, transparent), 0 0 24px
+    color-mix(in oklab, var(--accent) 18%, transparent);
+}
+
+/* ───────────────────────────── MUTE (bottom-right) ─────────────────────
+   Self-positioned column pinned bottom-right, decoupled from the centred
+   composer so toggling never shifts it. The glyph button is re-skinned to a
+   minimal nacre circle echoing `.settings-btn`: faint glyph that lifts to ink
+   with a hairline accent ring on hover. */
+.piste .p3d-bottom-mute {
+  position: absolute;
+  right: 28px;
+  bottom: 26px;
+  pointer-events: auto;
+}
+.piste .p3d-bottom-mute .hud-mute {
+  position: static;
+  inset: auto;
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  border-radius: 50%;
+  border: 1px solid var(--line);
+  background: color-mix(in oklab, var(--bg2) 60%, transparent);
+  color: var(--faint);
+  cursor: pointer;
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  transition: color 0.25s ease, border-color 0.25s ease, background 0.25s ease;
+}
+.piste .p3d-bottom-mute .hud-mute:hover {
+  color: var(--ink);
+  border-color: color-mix(in oklab, var(--accent) 40%, transparent);
+}
+/* voice ON: a soft accent tint so the live state reads at a glance, mirroring
+   the mockup's `aria-pressed`/"on" affordances. The leaf sets
+   `aria-pressed={voiceEnabled}`, so we hang the lit state off that attribute. */
+.piste .p3d-bottom-mute .hud-mute[aria-pressed="true"] {
+  color: var(--accent);
+  border-color: color-mix(in oklab, var(--accent) 45%, transparent);
+}
+
+/* ───────────────────────────── OVERLAY-OPEN ────────────────────────────
+   When a surface is open the shell adds `.has-surface` and recedes the stage
+   (foundation p3d.css). The transcript already unmounts (`hidden=overlayOpen`)
+   so the caption is gone; soften the composer + mute too so the surface owns
+   the focus, while keeping the input reachable. */
+.piste.has-surface .p3d-bottom-center .hud-input,
+.piste.has-surface .p3d-bottom-mute {
+  opacity: 0.55;
+  transition: opacity 0.5s ease;
+}
+.piste.has-surface .p3d-bottom-center .hud-input:focus-within {
+  opacity: 1;
+}
+
+/* ───────────────────────────── REDUCED MOTION ──────────────────────────
+   Honour the user's motion preference for the caption fade-in (the leaf's
+   text slot animates via hud.css `transcript-in`). */
+@media (prefers-reduced-motion: reduce) {
+  .piste .p3d-bottom-center .hud-transcript-text {
+    animation: none;
+  }
+}
