@@ -1,0 +1,543 @@
+/* SettingsControl.css — co-located styles for the top-right « RÉGLAGES » modal
+ * (PRD 0014 / issue 0089).
+ *
+ * Ported verbatim from `Design Mockup/p3d.css` (the `.settings-*` / `.set-*`
+ * block, lines ~63–208) so the modal matches `screenshots/p3d-settings.png`.
+ * The CSS custom properties (--ink, --dim, --faint, --line, --bg, --bg2,
+ * --accent, --font-mono, --font-sans) are defined on the `.piste` shell in the
+ * foundation sheet `src/styles/p3d.css`, so they resolve here.
+ *
+ * Additions over the static mockup (driven by the live wiring this issue ports
+ * from ProviderPicker):
+ *   - `.set-model.is-loading` / `.is-error` — model-row swap states,
+ *   - `.set-ctx*` — the context-length slider + Apply (feature 0013), styled in
+ *     the same nacre language since the mockup's SettingsControl had no slider.
+ */
+
+/* ── gear button — top-right ─────────────────────────────────────────────── */
+.settings-zone {
+  position: absolute;
+  top: 24px;
+  right: 26px;
+  z-index: 60;
+}
+.settings-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  padding: 8px 13px 8px 11px;
+  border-radius: 999px;
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--dim);
+  background: color-mix(in oklab, var(--bg2) 70%, transparent);
+  border: 1px solid var(--line);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  transition: color 0.25s ease, border-color 0.25s ease, transform 0.25s ease;
+}
+.settings-btn:hover {
+  color: var(--ink);
+  border-color: color-mix(in oklab, var(--accent) 40%, transparent);
+}
+.settings-btn.is-open {
+  color: var(--ink);
+  border-color: color-mix(in oklab, var(--accent) 50%, transparent);
+}
+.settings-gear {
+  width: 15px;
+  height: 15px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  transition: transform 0.5s cubic-bezier(0.34, 1.28, 0.4, 1);
+}
+.settings-btn:hover .settings-gear,
+.settings-btn.is-open .settings-gear {
+  transform: rotate(60deg);
+}
+.settings-cap {
+  line-height: 1;
+}
+
+/* ── modal — scrim + panel ───────────────────────────────────────────────── */
+.settings-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 55;
+  background: transparent;
+}
+.settings-panel {
+  position: absolute;
+  top: calc(100% + 10px);
+  right: 0;
+  z-index: 60;
+  width: 326px;
+  padding: 16px 18px 18px;
+  border-radius: 16px;
+  background: color-mix(in oklab, var(--bg2) 78%, transparent);
+  border: 1px solid var(--line);
+  box-shadow: 0 30px 80px rgba(0, 0, 0, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  opacity: 1;
+  animation: settings-in 0.3s cubic-bezier(0.34, 1.28, 0.4, 1);
+}
+@keyframes settings-in {
+  from {
+    transform: translateY(-8px) scale(0.98);
+  }
+  to {
+    transform: none;
+  }
+}
+.settings-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding-bottom: 13px;
+  margin-bottom: 14px;
+  border-bottom: 1px solid var(--line);
+}
+.settings-title {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.26em;
+  color: var(--ink);
+}
+.settings-close {
+  margin-left: auto;
+  background: none;
+  border: 0;
+  cursor: pointer;
+  color: var(--faint);
+  font-size: 13px;
+  line-height: 1;
+  padding: 2px;
+  transition: color 0.2s ease;
+}
+.settings-close:hover {
+  color: var(--ink);
+}
+.settings-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.settings-section + .settings-section {
+  margin-top: 16px;
+  padding-top: 15px;
+  border-top: 1px solid var(--line);
+}
+.settings-label {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 0.22em;
+  color: var(--faint);
+}
+
+/* shared engine label fragments (also used by the status rows below) */
+.eng-name {
+  color: var(--ink);
+}
+
+/* ── segmented provider toggle — Claude CLI ↔ LM Studio ───────────────────── */
+.set-seg {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px;
+  padding: 4px;
+  border-radius: 12px;
+  background: color-mix(in oklab, var(--bg) 55%, transparent);
+  border: 1px solid var(--line);
+}
+.set-seg-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 10px 8px;
+  border: 0;
+  border-radius: 9px;
+  cursor: pointer;
+  background: transparent;
+  color: var(--dim);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  transition: background 0.28s ease, color 0.28s ease, box-shadow 0.28s ease;
+}
+.set-seg-btn:hover {
+  color: var(--ink);
+}
+.set-seg-btn:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+.set-seg-btn.on {
+  color: var(--ink);
+  background: color-mix(in oklab, var(--accent) 22%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--accent) 45%, transparent), 0 4px 14px
+    color-mix(in oklab, var(--accent) 22%, transparent);
+}
+.set-seg-glyph {
+  font-size: 12px;
+  opacity: 0.85;
+}
+
+/* ── the engine detail block beneath the toggle — swaps per provider ──────── */
+.set-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  opacity: 1;
+  animation: set-detail-in 0.32s cubic-bezier(0.34, 1.28, 0.4, 1);
+}
+@keyframes set-detail-in {
+  from {
+    transform: translateY(-4px);
+  }
+  to {
+    transform: none;
+  }
+}
+
+.set-status {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.set-status .eng-name {
+  color: var(--ink);
+  letter-spacing: 0.02em;
+}
+.set-status-state {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 8.5px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+.set-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--faint);
+  flex: 0 0 auto;
+}
+.set-dot.is-ok {
+  background: #7fcba0;
+  box-shadow: 0 0 8px #7fcba0;
+}
+.set-dot.is-off {
+  background: #d77a7a;
+  box-shadow: 0 0 8px rgba(215, 122, 122, 0.6);
+}
+.set-status.is-ok .set-status-state {
+  color: #7fcba0;
+}
+.set-status.is-off .set-status-state {
+  color: #d9a0a0;
+}
+
+/* ── URL field — LM Studio server endpoint ───────────────────────────────── */
+.set-field {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+.set-field-row {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  border-radius: 11px;
+  overflow: hidden;
+  background: color-mix(in oklab, var(--bg) 55%, transparent);
+  border: 1px solid var(--line);
+  transition: border-color 0.22s ease, box-shadow 0.22s ease;
+}
+.set-field-row:focus-within {
+  border-color: color-mix(in oklab, var(--accent) 55%, transparent);
+  box-shadow: 0 0 0 3px color-mix(in oklab, var(--accent) 14%, transparent);
+}
+.set-field-proto {
+  padding: 0 10px;
+  align-self: stretch;
+  display: flex;
+  align-items: center;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.05em;
+  color: var(--faint);
+  background: color-mix(in oklab, var(--accent) 8%, transparent);
+  border-right: 1px solid var(--line);
+}
+.set-input {
+  flex: 1;
+  min-width: 0;
+  padding: 10px 11px;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  letter-spacing: 0.01em;
+}
+.set-input::placeholder {
+  color: var(--faint);
+}
+.set-field-hint {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  color: var(--faint);
+}
+.set-field-hint b {
+  color: var(--dim);
+  font-weight: 400;
+}
+.set-presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.set-preset {
+  padding: 5px 9px;
+  border-radius: 999px;
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.02em;
+  color: var(--dim);
+  background: transparent;
+  border: 1px solid var(--line);
+  transition: color 0.2s ease, border-color 0.2s ease, background 0.2s ease;
+}
+.set-preset:hover {
+  color: var(--ink);
+  border-color: color-mix(in oklab, var(--accent) 40%, transparent);
+}
+.set-preset.on {
+  color: var(--ink);
+  background: color-mix(in oklab, var(--accent) 16%, transparent);
+  border-color: color-mix(in oklab, var(--accent) 45%, transparent);
+}
+
+/* ── local model picker ──────────────────────────────────────────────────── */
+.set-models-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+}
+.set-models-count {
+  font-family: var(--font-mono);
+  font-size: 8.5px;
+  letter-spacing: 0.12em;
+  color: var(--faint);
+}
+.set-models {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  max-height: 184px;
+  overflow-y: auto;
+  padding-right: 4px;
+  margin-right: -4px;
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in oklab, var(--accent) 30%, transparent) transparent;
+}
+.set-models::-webkit-scrollbar {
+  width: 5px;
+}
+.set-models::-webkit-scrollbar-thumb {
+  background: color-mix(in oklab, var(--accent) 30%, transparent);
+  border-radius: 999px;
+}
+.set-model {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  cursor: pointer;
+  background: transparent;
+  text-align: left;
+  transition: background 0.2s ease, border-color 0.2s ease;
+}
+.set-model:hover {
+  background: color-mix(in oklab, var(--accent) 7%, transparent);
+}
+.set-model:disabled {
+  cursor: default;
+}
+.set-model.on {
+  background: color-mix(in oklab, var(--accent) 14%, transparent);
+  border-color: color-mix(in oklab, var(--accent) 40%, transparent);
+}
+.set-model-mark {
+  grid-column: 1;
+  grid-row: 1 / span 2;
+  font-size: 10px;
+  color: var(--faint);
+  align-self: center;
+}
+.set-model.on .set-model-mark {
+  color: var(--accent);
+}
+.set-model-name {
+  font-family: var(--font-sans);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.set-model.on .set-model-name {
+  color: var(--ink);
+}
+.set-model-spec {
+  grid-column: 2;
+  grid-row: 2;
+  font-family: var(--font-mono);
+  font-size: 8.5px;
+  letter-spacing: 0.06em;
+  color: var(--faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.set-model-ram {
+  grid-column: 3;
+  grid-row: 1 / span 2;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  color: var(--faint);
+  white-space: nowrap;
+}
+
+/* swap states (live wiring) — loading pulses the row, error tints it red */
+.set-model.is-loading {
+  opacity: 0.8;
+}
+.set-model.is-loading .set-model-ram {
+  color: var(--accent);
+}
+.set-model.is-error {
+  border-color: color-mix(in oklab, #d77a7a 45%, transparent);
+  background: color-mix(in oklab, #d77a7a 8%, transparent);
+}
+.set-model.is-error .set-model-mark,
+.set-model.is-error .set-model-spec,
+.set-model.is-error .set-model-ram {
+  color: #d9a0a0;
+}
+
+/* ── context-length slider + Apply (feature 0013) ─────────────────────────── */
+.set-ctx {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 11px;
+  margin-top: 1px;
+  border-top: 1px solid var(--line);
+}
+.set-ctx-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+}
+.set-ctx-val {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  color: var(--ink);
+}
+.set-ctx-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 4px;
+  border-radius: 999px;
+  cursor: pointer;
+  background: color-mix(in oklab, var(--accent) 22%, transparent);
+  outline: none;
+}
+.set-ctx-slider:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+.set-ctx-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--accent3);
+  border: 1px solid color-mix(in oklab, var(--accent) 60%, transparent);
+  box-shadow: 0 0 8px color-mix(in oklab, var(--accent) 50%, transparent);
+}
+.set-ctx-slider::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--accent3);
+  border: 1px solid color-mix(in oklab, var(--accent) 60%, transparent);
+  box-shadow: 0 0 8px color-mix(in oklab, var(--accent) 50%, transparent);
+}
+.set-ctx-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.set-ctx-max {
+  font-family: var(--font-mono);
+  font-size: 8.5px;
+  letter-spacing: 0.1em;
+  color: var(--faint);
+}
+.set-ctx-apply {
+  padding: 6px 13px;
+  border-radius: 999px;
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--ink);
+  background: color-mix(in oklab, var(--accent) 18%, transparent);
+  border: 1px solid color-mix(in oklab, var(--accent) 45%, transparent);
+  transition: background 0.2s ease, border-color 0.2s ease;
+}
+.set-ctx-apply:hover {
+  background: color-mix(in oklab, var(--accent) 26%, transparent);
+}
+.set-ctx-apply:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+.set-ctx-error {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 0.02em;
+  color: #d9a0a0;
+}
