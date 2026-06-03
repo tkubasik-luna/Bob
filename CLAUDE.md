@@ -17,3 +17,4 @@ Personal AI assistant. Tauri + React frontend, FastAPI backend, LM Studio (or an
 - [0011 Adaptive Composite UI](docs/features/0010-adaptive-composite-ui.md) — Stacked-sections overlay: deliverable is `ComponentDescriptor[]`, multi-mail cards, per-section drop validation, defensive payload codec.
 - [0012 Agent Activity Feed](docs/features/0011-agent-activity-feed.md) — Live per-agent reasoning feed in the HUD: token streaming + narrated fallback, chips, collapsable right rail, retention + rehydrate.
 - [0013 LLM Provider & Model Picker](docs/features/0012-llm-provider-model-picker.md) — Live HUD picker: switch Claude CLI ↔ LM Studio, pick/load local models, tune context length — no backend restart.
+- [0014 Refonte HUD « Piste 3D · Nacre »](docs/features/0014-hud-piste-3d-nacre.md) — In-place `new` HUD reskin: conscience orb + left thread-deck + right data dock + typed overlay + settings modal.
