@@ -11,29 +11,40 @@ type MailCardProps = {
    * browser). Tests pass a `vi.fn()` to assert OPEN clicks route through the
    * right channel with the card's `gmailWebUrl`. */
   openExternal?: (url: string) => void;
-  /** Test seam — `READ ALOUD` is a no-op placeholder for MVP (same contract as
-   * the former `MailOverlay`). Tests pass a `vi.fn()` to assert the button is
-   * wired without faking a TTS runtime. Defaults to a no-op. */
+  /** Test seam — the per-card `READ ALOUD` action. Defaults to speaking the
+   * mail (sender → subject → body) through the browser Web Speech API
+   * (`speakMail`), so the inline action is wired to TTS like the overlay's
+   * global `LIRE À VOIX HAUTE`. Tests pass a `vi.fn()` to assert the button
+   * routes the mail without faking a synthesis runtime. */
   onReadAloud?: (mail: MailProps) => void;
 };
 
 /**
- * Chrome-free body of a single Gmail message, rendered through the section
- * registry inside `SectionsOverlay`. This is the port of the former
- * `MailOverlay` body MINUS the overlay chrome (no corner-brackets, no header,
- * no global footer / dismiss paths — those live ONCE in `SectionsOverlay`).
+ * Mail surface — chrome-free body of a single Gmail message, rendered through
+ * the section registry inside `SectionsOverlay`. Re-skinned to the Piste 3D ·
+ * Nacre mockup `MailSurface` (`Design Mockup/p3d-overlay.jsx`): avatar +
+ * sender/role + address/time, an optional flag pill, the subject, the body
+ * snippet, and attachment chips. It is the body ONLY — no corner-brackets, no
+ * header, no global footer / dismiss paths (those live ONCE in
+ * `SectionsOverlay`).
  *
- * A list of mails therefore renders as a vertical stack of self-contained
- * `MailCard`s inside the single shared overlay shell (PRD 0010 / issue 0067 —
+ * A list of mails therefore renders as a vertical stack of self-contained mail
+ * surfaces inside the single shared overlay shell (feature 0011 / issue 0067 —
  * fixes the "3 derniers mails" bug where only one card ever appeared).
  *
- * Each card carries its own INLINE actions: `OPEN` (browses to `gmailWebUrl`
- * via the test seam) and `READ ALOUD` (a no-op placeholder for MVP). These are
- * per-card so the user can act on any mail in the stack independently.
+ * Beyond the mockup MailSurface, each card keeps its own INLINE actions so the
+ * user can act on ANY mail in a multi-mail stack independently (the shell's
+ * global `OUVRIR` only targets the first): `OPEN` browses to `gmailWebUrl`, and
+ * `READ ALOUD` speaks the mail via the Web Speech API. Neither dismisses the
+ * overlay.
  *
- * PRD: prd/0010-adaptive-composite-ui.md — Issue: issues/0067-multi-mail-sections.md
+ * PRD: prd/0014-hud-piste-3d-nacre.md — Issue: issues/0088-overlay-reskin-typed-surfaces.md
  */
-export function MailCard({ props, openExternal = openExternal_, onReadAloud }: MailCardProps) {
+export function MailCard({
+  props,
+  openExternal = openExternal_,
+  onReadAloud = speakMail,
+}: MailCardProps) {
   const mail = asMailProps(props);
   if (mail === null) return null;
 
@@ -43,7 +54,7 @@ export function MailCard({ props, openExternal = openExternal_, onReadAloud }: M
   const attachments = mail.attachments ?? [];
 
   const onOpenClick = () => openExternal(mail.gmailWebUrl);
-  const onReadAloudClick = () => onReadAloud?.(mail);
+  const onReadAloudClick = () => onReadAloud(mail);
 
   return (
     <div className="ov-email">
@@ -135,6 +146,24 @@ function asMailProps(props: Record<string, unknown>): MailProps | null {
 function openExternal_(url: string): void {
   if (typeof window === "undefined") return;
   window.open(url, "_blank", "noopener,noreferrer");
+}
+
+/** Speak a mail through the browser Web Speech API — the default `onReadAloud`
+ * for the per-card `READ ALOUD` action. Reads sender → subject → body in
+ * French, mirroring the overlay's global `LIRE À VOIX HAUTE`. A no-op when the
+ * runtime lacks `speechSynthesis` (jsdom under test, older webviews). */
+function speakMail(mail: MailProps): void {
+  if (typeof window === "undefined") return;
+  const synth = window.speechSynthesis;
+  if (!synth || typeof SpeechSynthesisUtterance === "undefined") return;
+  const text = [`Courriel de ${mail.from.name}.`, mail.subject, mail.bodyPreview]
+    .filter((s) => s.length > 0)
+    .join(" ");
+  if (text.length === 0) return;
+  synth.cancel();
+  const utterance = new SpeechSynthesisUtterance(text);
+  utterance.lang = "fr-FR";
+  synth.speak(utterance);
 }
 
 /** Derive 1-2 uppercase initials from `name` (preferred) or the local part of

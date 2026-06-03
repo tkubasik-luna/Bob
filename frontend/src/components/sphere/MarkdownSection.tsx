@@ -6,28 +6,36 @@ type MarkdownSectionProps = {
    * `content`; a non-string / missing value renders as an empty article rather
    * than crashing the overlay (PRD 0010 robustness bar). */
   props: Record<string, unknown>;
+  /** When true, render the `react-markdown` output WITHOUT the wrapping
+   * `.ov-md` article — the caller (e.g. `DocSurface`) supplies its own `.ov-md`
+   * wrapper plus a meta strip. Defaults to false so standalone use keeps the
+   * self-contained article. */
+  bare?: boolean;
 };
 
 /**
- * Markdown body of a `Markdown` section, rendered through the section registry
- * inside `SectionsOverlay`. This is the chrome-free port of the former
- * `MarkdownOverlay` body: the same `react-markdown` + `remark-gfm` setup wired
- * to the mockup `.md-*` classes already styled in `hud.css`. The surrounding
- * corner-bracket frame / header / footer / dismiss paths now live ONCE in
+ * Markdown body of a `Markdown` section. Now wrapped by `DocSurface` (PRD 0014
+ * / issue 0088) so it renders inside the mockup's Document chrome, but still
+ * usable standalone: the same `react-markdown` + `remark-gfm` setup wired to
+ * the mockup `.md-*` classes (styled in `SectionsOverlay.css` under `.p3d-ov`).
+ * The corner-bracket frame / header / footer / dismiss paths live ONCE in
  * `SectionsOverlay`, so a list of sections shares a single shell.
+ *
+ * When `bare`, the outer `.ov-md` article is omitted so `DocSurface` can own
+ * the wrapper (one `.ov-md` element per Document, with its meta strip).
  *
  * PRD: prd/0010-adaptive-composite-ui.md — Issue: issues/0066-sections-list-pipeline-markdown.md
  */
-export function MarkdownSection({ props }: MarkdownSectionProps) {
+export function MarkdownSection({ props, bare = false }: MarkdownSectionProps) {
   const raw = props.content;
   const content = typeof raw === "string" ? raw : "";
-  return (
-    <article className="ov-md">
-      <ReactMarkdown remarkPlugins={[remarkGfm]} components={MD_COMPONENTS}>
-        {content}
-      </ReactMarkdown>
-    </article>
+  const md = (
+    <ReactMarkdown remarkPlugins={[remarkGfm]} components={MD_COMPONENTS}>
+      {content}
+    </ReactMarkdown>
   );
+  if (bare) return md;
+  return <article className="ov-md">{md}</article>;
 }
 
 /** Components map handed to `ReactMarkdown` so the rendered tree picks up the

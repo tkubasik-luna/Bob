@@ -232,8 +232,9 @@ describe("SphereUI — piste shell structure", () => {
     // The shell mounts with no overlay, and an overlay-worthy assistant message
     // must NOT auto-open it anymore — the overlay opens only via a slot's
     // `openOverlay` callback (issue 0088). Regression guard against the removed
-    // auto-open effects.
+    // auto-open effects. The reskinned overlay shell is now `.ov-card`
+    // (mockup chrome, issue 0088) — the old `.overlay-card` name is gone.
     const { container } = render(<SphereUI />);
-    expect(container.querySelector(".overlay-card")).toBeNull();
+    expect(container.querySelector(".ov-card")).toBeNull();
   });
 });

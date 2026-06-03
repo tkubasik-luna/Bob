@@ -1,0 +1,565 @@
+/* SectionsOverlay.css — Piste 3D · Nacre fullscreen overlay chrome (PRD 0014 /
+ * issue 0088). Verbatim port of the mockup's `ov-*` rules from
+ * `Design Mockup/p3d.css`, tinted nacre by the shared CSS variables already
+ * defined on `.piste` in `styles/p3d.css` (`--accent`, `--ink`, `--dim`, …).
+ *
+ * Reconciliation with the legacy overlay CSS: the old shell rules in
+ * `styles/hud.css` target `.overlay-stage` / `.overlay-card` / `.overlay-beam`
+ * — DIFFERENT class names — so switching the JSX to the mockup's
+ * `.ov-stage` / `.ov-card` / `.ov-scrim` / `.ov-beam` sidesteps them entirely
+ * (the dead `.overlay-*` rules simply never match anymore). For the INNER
+ * surfaces (`.ov-header`, `.ov-body`, `.ov-footer`, `.ov-email`, `.ov-doc`,
+ * `.ov-md`, …) hud.css DOES carry same-named rules, so every rule below is
+ * scoped under the `.p3d-ov` wrapper (added to the stage element). The extra
+ * class bumps specificity so the mockup rules SUPERSEDE the bare `.ov-*` rules
+ * in hud.css per the PRD — without editing hud.css. */
+
+.p3d-ov.ov-stage {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.p3d-ov .ov-scrim {
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(
+    120% 90% at 50% 45%,
+    color-mix(in oklab, var(--bg) 62%, transparent),
+    color-mix(in oklab, var(--bg) 86%, transparent)
+  );
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  animation: ov-scrim-in 0.32s ease forwards;
+}
+@keyframes ov-scrim-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.p3d-ov .ov-beam {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 2px;
+  height: 62vh;
+  transform: translate(-50%, -50%);
+  background: linear-gradient(
+    180deg,
+    transparent 0%,
+    color-mix(in oklab, var(--accent) 55%, transparent) 20%,
+    color-mix(in oklab, var(--accent) 80%, transparent) 50%,
+    color-mix(in oklab, var(--accent) 55%, transparent) 80%,
+    transparent 100%
+  );
+  filter: blur(1.5px);
+  opacity: 0.5;
+  pointer-events: none;
+}
+@media (prefers-reduced-motion: no-preference) {
+  .p3d-ov .ov-beam {
+    animation: ov-beam-in 0.52s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  }
+}
+@keyframes ov-beam-in {
+  from {
+    transform: translate(-50%, -50%) scaleY(0.2);
+    opacity: 0;
+  }
+  to {
+    transform: translate(-50%, -50%) scaleY(1);
+    opacity: 0.5;
+  }
+}
+
+.p3d-ov .ov-card {
+  position: relative;
+  z-index: 1;
+  opacity: 1;
+  width: min(720px, 88vw);
+  max-height: min(660px, 84vh);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border-radius: 18px;
+  color: var(--ink);
+  background: linear-gradient(
+      180deg,
+      color-mix(in oklab, var(--accent) 6%, transparent) 0%,
+      transparent 56%
+    ),
+    radial-gradient(
+      120% 80% at 50% 0%,
+      color-mix(in oklab, var(--accent2) 8%, transparent) 0%,
+      transparent 52%
+    ), color-mix(in oklab, var(--bg2) 80%, transparent);
+  border: 1px solid color-mix(in oklab, var(--accent) 30%, transparent);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  box-shadow: 0 40px 110px rgba(0, 0, 0, 0.62), 0 0 60px
+    color-mix(in oklab, var(--accent) 18%, transparent), inset 0 1px 0 rgba(255, 255, 255, 0.08);
+}
+@media (prefers-reduced-motion: no-preference) {
+  .p3d-ov .ov-card {
+    animation: ov-card-in 0.4s cubic-bezier(0.16, 1, 0.3, 1) both;
+  }
+}
+/* Visible end-state is the base style — animate only transform/filter FROM
+ * hidden, so a play-pending animation (PDF/screenshot/non-compositing) never
+ * holds the card invisible. */
+@keyframes ov-card-in {
+  from {
+    transform: translateY(10px) scale(0.97);
+    filter: blur(6px);
+  }
+  to {
+    transform: none;
+    filter: blur(0);
+  }
+}
+
+.p3d-ov .ov-corner {
+  position: absolute;
+  width: 15px;
+  height: 15px;
+  border-color: var(--accent);
+  pointer-events: none;
+  opacity: 0.9;
+}
+.p3d-ov .ov-corner.tl {
+  top: 7px;
+  left: 7px;
+  border-top: 1.5px solid;
+  border-left: 1.5px solid;
+}
+.p3d-ov .ov-corner.tr {
+  top: 7px;
+  right: 7px;
+  border-top: 1.5px solid;
+  border-right: 1.5px solid;
+}
+.p3d-ov .ov-corner.bl {
+  bottom: 7px;
+  left: 7px;
+  border-bottom: 1.5px solid;
+  border-left: 1.5px solid;
+}
+.p3d-ov .ov-corner.br {
+  bottom: 7px;
+  right: 7px;
+  border-bottom: 1.5px solid;
+  border-right: 1.5px solid;
+}
+
+/* header */
+.p3d-ov .ov-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 13px 18px;
+  border-bottom: 1px solid var(--line);
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.2em;
+}
+.p3d-ov .ov-header-left,
+.p3d-ov .ov-header-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.p3d-ov .ov-source-tag {
+  color: var(--accent);
+  text-shadow: 0 0 10px color-mix(in oklab, var(--accent) 60%, transparent);
+}
+.p3d-ov .ov-divider {
+  color: var(--faint);
+}
+.p3d-ov .ov-type-chip {
+  color: var(--ink);
+  padding: 3px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: var(--fill);
+}
+.p3d-ov .ov-id-tag {
+  color: var(--faint);
+}
+.p3d-ov .ov-close {
+  appearance: none;
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--dim);
+  width: 24px;
+  height: 24px;
+  border-radius: 7px;
+  cursor: pointer;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.16s ease;
+}
+.p3d-ov .ov-close:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+  box-shadow: 0 0 12px color-mix(in oklab, var(--accent) 40%, transparent);
+}
+.p3d-ov .ov-close-glyph {
+  font-size: 11px;
+  line-height: 1;
+  font-family: var(--font-mono);
+}
+
+/* body + footer */
+.p3d-ov .ov-body {
+  padding: 22px 24px;
+  overflow-y: auto;
+  flex: 1 1 auto;
+}
+.p3d-ov .ov-body::-webkit-scrollbar {
+  width: 5px;
+  display: block;
+}
+.p3d-ov .ov-body::-webkit-scrollbar-thumb {
+  background: color-mix(in oklab, var(--accent) 30%, transparent);
+  border-radius: 999px;
+}
+
+/* The body holds an ordered STACK of section descriptors (feature 0011): a
+ * composite deliverable renders as a vertical column of surfaces inside the one
+ * shell. Each `.ov-section` is one registry-rendered descriptor. */
+.p3d-ov .ov-sections {
+  display: flex;
+  flex-direction: column;
+  gap: 26px;
+}
+.p3d-ov .ov-section + .ov-section {
+  padding-top: 26px;
+  border-top: 1px solid var(--line);
+}
+
+.p3d-ov .ov-footer {
+  display: flex;
+  border-top: 1px solid var(--line);
+}
+.p3d-ov .ov-action {
+  appearance: none;
+  background: transparent;
+  border: 0;
+  border-right: 1px solid var(--line);
+  color: var(--dim);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.2em;
+  padding: 13px 18px;
+  cursor: pointer;
+  flex: 1;
+  justify-content: center;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  transition: all 0.18s ease;
+}
+.p3d-ov .ov-action:last-child {
+  border-right: 0;
+}
+.p3d-ov .ov-action-key {
+  font-size: 9px;
+  color: var(--faint);
+  background: var(--fill);
+  padding: 2px 6px;
+  border-radius: 5px;
+  min-width: 18px;
+  text-align: center;
+}
+.p3d-ov .ov-action:hover {
+  background: var(--fill);
+  color: var(--ink);
+}
+.p3d-ov .ov-action-primary {
+  color: var(--accent);
+}
+.p3d-ov .ov-action-primary:hover {
+  background: color-mix(in oklab, var(--accent) 88%, #2a1830);
+  color: var(--bg);
+}
+.p3d-ov .ov-action-primary:hover .ov-action-key {
+  background: rgba(0, 0, 0, 0.2);
+  color: rgba(0, 0, 0, 0.6);
+}
+
+/* avatars (shared by mail) */
+.p3d-ov .ov-avatar {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--font-mono);
+  font-weight: 700;
+  color: #fff;
+  border-radius: 12px;
+  width: 46px;
+  height: 46px;
+  font-size: 14px;
+  letter-spacing: 0.04em;
+}
+.p3d-ov .ov-avatar-grad-1 {
+  background: linear-gradient(135deg, var(--accent), var(--accent2));
+}
+.p3d-ov .ov-avatar-grad-2 {
+  background: linear-gradient(135deg, var(--accent2), #8e74c4);
+}
+
+/* ── EMAIL ── */
+.p3d-ov .ov-email {
+  display: flex;
+  flex-direction: column;
+  gap: 15px;
+}
+.p3d-ov .ov-email-meta {
+  display: grid;
+  grid-template-columns: 46px 1fr auto;
+  gap: 14px;
+  align-items: center;
+}
+.p3d-ov .ov-email-from {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.p3d-ov .ov-email-name {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--ink);
+}
+.p3d-ov .ov-email-role {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  color: var(--faint);
+}
+.p3d-ov .ov-email-addr {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--dim);
+  margin-top: 4px;
+}
+.p3d-ov .ov-email-flags {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+.p3d-ov .ov-flag {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 0.18em;
+  padding: 4px 8px;
+  border-radius: 6px;
+  color: var(--accent);
+  border: 1px solid color-mix(in oklab, var(--accent) 40%, transparent);
+  background: var(--fill);
+}
+.p3d-ov .ov-email-subject {
+  margin: 0;
+  font-size: 22px;
+  font-weight: 600;
+  line-height: 1.25;
+  color: var(--ink);
+  text-wrap: balance;
+}
+.p3d-ov .ov-email-body {
+  margin: 0;
+  font-size: 14.5px;
+  line-height: 1.6;
+  color: var(--dim);
+  text-wrap: pretty;
+}
+.p3d-ov .ov-email-attachments {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 4px;
+}
+.p3d-ov .ov-attach {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 11px;
+  border-radius: 9px;
+  border: 1px solid var(--line);
+  background: var(--fill);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--dim);
+}
+.p3d-ov .ov-attach-icon {
+  color: var(--accent);
+}
+.p3d-ov .ov-attach-name {
+  color: var(--ink);
+}
+.p3d-ov .ov-attach-size {
+  color: var(--faint);
+}
+
+/* Per-card inline actions inside a Mail surface — distinct from the shell's
+ * global footer (these never dismiss the overlay). */
+.p3d-ov .ov-email-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 4px;
+}
+.p3d-ov .ov-email-actions .ov-action {
+  flex: 0 0 auto;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  padding: 9px 13px;
+}
+.p3d-ov .ov-email-actions .ov-action:last-child {
+  border-right: 1px solid var(--line);
+}
+
+/* ── DOCUMENT (markdown notes) ──
+ * The Document surface reuses the existing react-markdown renderer
+ * (`MarkdownView` via `MarkdownSection`), styled with the mockup's `.ov-md` /
+ * `.md-*` doc classes. */
+.p3d-ov .ov-md {
+  font-family: var(--font-sans);
+  color: var(--ink);
+  font-size: 14px;
+  line-height: 1.65;
+  max-width: 60ch;
+  margin: 0 auto;
+}
+.p3d-ov .ov-md-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--faint);
+  margin: 0 0 22px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--line);
+}
+.p3d-ov .ov-md-filename {
+  color: var(--accent);
+}
+.p3d-ov .ov-md-divider {
+  opacity: 0.5;
+}
+.p3d-ov .ov-md .md-h {
+  font-weight: 600;
+  color: var(--ink);
+  line-height: 1.25;
+  margin: 0 0 0.45em;
+  text-wrap: balance;
+}
+.p3d-ov .ov-md .md-h1 {
+  font-size: 25px;
+}
+.p3d-ov .ov-md .md-h2 {
+  font-size: 17px;
+  margin-top: 1.4em;
+}
+.p3d-ov .ov-md .md-h3 {
+  font-size: 14px;
+  margin-top: 1.2em;
+  letter-spacing: 0.02em;
+}
+.p3d-ov .ov-md .md-p {
+  margin: 0 0 0.9em;
+  color: var(--dim);
+  text-wrap: pretty;
+}
+.p3d-ov .ov-md .md-p em,
+.p3d-ov .ov-md .md-quote em,
+.p3d-ov .ov-md li em {
+  color: var(--dim);
+  font-style: italic;
+}
+.p3d-ov .ov-md strong {
+  color: var(--ink);
+  font-weight: 600;
+}
+.p3d-ov .ov-md code,
+.p3d-ov .ov-md .md-inline-code {
+  font-family: var(--font-mono);
+  font-size: 0.86em;
+  color: var(--accent);
+  background: color-mix(in oklab, var(--accent) 12%, transparent);
+  padding: 1px 6px;
+  border-radius: 5px;
+}
+.p3d-ov .ov-md .md-ul,
+.p3d-ov .ov-md .md-ol {
+  margin: 0 0 1em;
+  padding-left: 20px;
+  color: var(--dim);
+}
+.p3d-ov .ov-md .md-ul li,
+.p3d-ov .ov-md .md-ol li {
+  margin-bottom: 5px;
+  text-wrap: pretty;
+}
+.p3d-ov .ov-md .md-quote {
+  margin: 1.1em 0;
+  padding: 4px 0 4px 16px;
+  border-left: 2px solid var(--accent);
+  color: var(--dim);
+  font-style: italic;
+}
+.p3d-ov .ov-md .md-pre {
+  margin: 0 0 1em;
+  padding: 12px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--fill);
+  overflow-x: auto;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.p3d-ov .ov-md .md-pre code {
+  background: transparent;
+  padding: 0;
+  color: var(--ink);
+}
+.p3d-ov .ov-md .md-hr {
+  border: 0;
+  border-top: 1px solid var(--line);
+  margin: 1.4em 0;
+}
+.p3d-ov .ov-md .md-link {
+  color: var(--accent);
+  text-decoration: none;
+  border-bottom: 1px solid color-mix(in oklab, var(--accent) 40%, transparent);
+}
+.p3d-ov .ov-md .md-link:hover {
+  border-bottom-color: var(--accent);
+}
+
+/* The unsupported-section fallback keeps its own utility-class styling from
+ * NotImplementedSection; we just make sure it sits comfortably in the stack. */
+.p3d-ov .ov-section-unsupported {
+  max-width: 60ch;
+  margin: 0 auto;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .p3d-ov .ov-scrim,
+  .p3d-ov .ov-beam,
+  .p3d-ov .ov-card {
+    animation: none;
+  }
+}

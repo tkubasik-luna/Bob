@@ -1,18 +1,17 @@
 import type { ComponentType } from "react";
+import { DocSurface } from "./DocSurface";
 import { MailCard } from "./MailCard";
-import { MarkdownSection } from "./MarkdownSection";
 
 /** A section renderer + its auto-open weight.
  *
  * - `Component` receives the descriptor's `props` bag (validated server-side,
  *   so unknown keys are tolerated here).
  * - `structured` flags a non-text, layout-bearing section (a Mail card, a map,
- *   …). It drives the `SphereUI` auto-open heuristic: a list with ≥1 structured
- *   section opens unconditionally, while a text-only list (Markdown) defers to
- *   the `shouldOverlayResponse` text heuristic. The `Markdown` entry is
- *   `structured: false` (text-only); `Mail` is `structured: true` so a list
- *   containing a mail auto-opens the overlay regardless of the text heuristic
- *   (issue 0067). */
+ *   …). Historically it drove the `SphereUI` auto-open heuristic; the overlay
+ *   is now CLICK-ONLY (PRD 0014 / issue 0088 — auto-open removed in the
+ *   foundation), so the flag is retained as descriptive metadata for any future
+ *   consumer rather than gating open. The `Markdown` entry is `structured:
+ *   false` (text-only Document); `Mail` is `structured: true`. */
 export type SectionEntry = {
   Component: ComponentType<{ props: Record<string, unknown> }>;
   structured: boolean;
@@ -28,6 +27,8 @@ export type SectionEntry = {
  * PRD: prd/0010-adaptive-composite-ui.md — Issue: issues/0067-multi-mail-sections.md
  */
 export const sectionRegistry: Record<string, SectionEntry> = {
-  Markdown: { Component: MarkdownSection, structured: false },
+  // `Markdown` renders through the Document surface (mockup `DocSurface`), which
+  // reuses the existing react-markdown renderer for the body (PRD 0014 / 0088).
+  Markdown: { Component: DocSurface, structured: false },
   Mail: { Component: MailCard, structured: true },
 };
