@@ -1,0 +1,293 @@
+/* DataDock.css — co-located styles for the « DONNÉES GÉNÉRÉES » dock
+   (PRD 0014 / issue 0087).
+
+   Ported from the mockup `Design Mockup/p3d.css` (the DATA FIELD + « MÉMOIRE
+   VIVE » blocks) and the shared panel-head classes, all RE-SCOPED under
+   `.piste` so they only style the HUD `?ui=new` window and never collide with
+   the legacy `hud.css` palette/positioning. The design tokens (`--accent`,
+   `--bg2`, `--ink`, `--faint`, `--line`, `--font-mono`, `--accent3`) are the
+   foundation ones declared on `.piste` in `styles/p3d.css`.
+
+   This file is imported by `DataDock.tsx` (Vite bundles the side-effect import).
+   Per the issue's hard rules, the dock's component CSS lives HERE — never in
+   `styles/p3d.css`. */
+
+/* ── PANEL CHROME (shared mockup classes, scoped) ─────────────────────────
+   The dock reuses the mockup's generic `.panel` + header classes. They aren't
+   in the foundation p3d.css (the task/data slots own them), so we port them
+   here scoped to `.piste`. */
+.piste .panel {
+  width: 322px;
+  border-radius: 18px;
+  padding: 14px 15px 12px;
+  color: var(--ink);
+  background: color-mix(in oklab, var(--bg2) 78%, transparent);
+  border: 1px solid var(--line);
+}
+.piste .panel-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding-bottom: 11px;
+  margin-bottom: 11px;
+  border-bottom: 1px solid var(--line);
+}
+.piste .panel-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--faint);
+}
+.piste .panel-dot[data-live="true"] {
+  background: var(--accent);
+  box-shadow: 0 0 8px var(--accent);
+  animation: p3d-data-pulse 2.2s ease-in-out infinite;
+}
+@keyframes p3d-data-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+.piste .panel-title {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.22em;
+  color: var(--ink);
+  white-space: nowrap;
+}
+.piste .panel-phase {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.14em;
+  color: var(--accent);
+  white-space: nowrap;
+}
+
+/* ── DATA PANEL — transparent tray ────────────────────────────────────────
+   The dock panel itself is transparent: the cards float on the recessed slot,
+   no frosted rectangle behind them (matches the mockup + the p3d-default
+   screenshot). The `.panel.data-panel` double-class selector (specificity
+   0,4,0) reliably beats the foundation's `.piste.panel-frost .panel` frost
+   rule regardless of stylesheet import order. */
+.piste .data-panel {
+  width: auto;
+  background: transparent;
+  border: 0;
+  padding: 0;
+}
+.piste.panel-frost .panel.data-panel {
+  background: transparent;
+  box-shadow: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+.piste .data-panel .panel-head {
+  width: 252px;
+}
+.piste .data-panel .panel-title {
+  white-space: nowrap;
+}
+
+/* the dock is a flat vertical tray inside the tilted slot — kill the per-card
+   3D rasterization the depth layout would otherwise apply; the panel still
+   tilts as a whole via `slot-data`'s rotateY (foundation). */
+.piste .data-field {
+  position: relative;
+  width: 360px;
+  height: 440px;
+}
+.piste.layout-depth .slot-data .data-field.mem-field {
+  perspective: none;
+  transform-style: flat;
+  height: 412px;
+}
+/* drop the depth panel's drop-shadow — with a transparent dock it would paint
+   an empty tray rectangle below the cards. */
+.piste.layout-depth .data-panel.mem-dock {
+  box-shadow: none;
+}
+
+/* the vertical accent rail the cards hang off. */
+.piste .mem-rail {
+  position: absolute;
+  left: 2px;
+  top: 10px;
+  bottom: 26px;
+  width: 2px;
+  border-radius: 2px;
+  background: linear-gradient(
+    180deg,
+    color-mix(in oklab, var(--accent) 52%, transparent),
+    color-mix(in oklab, var(--accent) 6%, transparent)
+  );
+}
+
+/* ── DATA CARD ────────────────────────────────────────────────────────────
+   One artefact card. The dock positions the outer `.p3d-data-card-slot` (top /
+   z-index) so the card itself only owns its look + the arrival animation. */
+.piste .p3d-data-card-slot {
+  position: absolute;
+  left: 20px;
+  transition: top 0.62s cubic-bezier(0.34, 1.1, 0.4, 1);
+  will-change: top;
+}
+.piste .mem-card {
+  position: relative;
+  width: 278px;
+  padding: 9px 12px 10px;
+  border-radius: 13px;
+  background: color-mix(in oklab, var(--bg2) 94%, transparent);
+  border: 1px solid var(--line);
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.4);
+  cursor: pointer;
+  transition: opacity 0.5s ease, transform 0.5s ease, border-color 0.2s ease;
+  will-change: opacity, transform;
+}
+.piste .mem-card:hover {
+  border-color: color-mix(in oklab, var(--accent) 45%, var(--line));
+}
+.piste .mem-card:focus-visible {
+  outline: 1px solid color-mix(in oklab, var(--accent) 70%, transparent);
+  outline-offset: 2px;
+}
+
+/* the left tick + soft glow. */
+.piste .mem-tick {
+  position: absolute;
+  left: -18px;
+  top: 13px;
+  bottom: 13px;
+  width: 2px;
+  border-radius: 2px;
+  background: color-mix(in oklab, var(--accent) 60%, transparent);
+  box-shadow: 0 0 7px color-mix(in oklab, var(--accent) 45%, transparent);
+}
+.piste .art-glow {
+  position: absolute;
+  inset: 0;
+  border-radius: 13px;
+  pointer-events: none;
+  box-shadow: 0 0 22px color-mix(in oklab, var(--accent) 14%, transparent);
+}
+
+/* the icon + text row. */
+.piste .art-row {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: center;
+  gap: 9px;
+}
+.piste .art-icon {
+  width: 26px;
+  height: 26px;
+  display: grid;
+  place-items: center;
+  border-radius: 8px;
+  background: color-mix(in oklab, var(--accent) 16%, transparent);
+}
+.piste .art-icon svg {
+  width: 15px;
+  height: 15px;
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 1.3;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+/* the action glyph is a filled bolt (no stroke), like the mockup. */
+.piste .a-action .art-icon svg {
+  fill: var(--accent);
+  stroke: none;
+}
+.piste .art-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.piste .art-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.piste .art-sub {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 0.05em;
+  color: var(--faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.piste .art-type {
+  display: block;
+  margin-top: 6px;
+  font-family: var(--font-mono);
+  font-size: 8px;
+  letter-spacing: 0.24em;
+  color: var(--accent);
+  opacity: 0.8;
+}
+.piste .mem-rank {
+  position: absolute;
+  right: 12px;
+  top: 11px;
+  font-family: var(--font-mono);
+  font-size: 8px;
+  letter-spacing: 0.16em;
+  color: var(--faint);
+}
+
+/* ── ARRIVAL ANIMATION (fresh) ────────────────────────────────────────────
+   A new deliverable lands with a pop + a tick flash; flips to `seen` (no
+   animation) once the user opens it. */
+.piste .mem-card.is-fresh {
+  animation: p3d-mem-pop 0.55s cubic-bezier(0.34, 1.4, 0.4, 1) both;
+}
+@keyframes p3d-mem-pop {
+  from {
+    opacity: 0;
+    transform: translateY(-10px) scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.piste .mem-card.is-fresh .mem-tick {
+  animation: p3d-mem-tick-flash 0.9s ease-out both;
+}
+@keyframes p3d-mem-tick-flash {
+  from {
+    background: var(--accent3);
+    box-shadow: 0 0 14px var(--accent);
+  }
+  /* settle back to the tick's resting look (same as `.mem-tick`'s base). */
+  to {
+    background: color-mix(in oklab, var(--accent) 60%, transparent);
+    box-shadow: 0 0 7px color-mix(in oklab, var(--accent) 45%, transparent);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .piste .p3d-data-card-slot {
+    transition: none;
+  }
+  .piste .mem-card {
+    transition: opacity 0.3s ease;
+  }
+  .piste .mem-card.is-fresh {
+    animation: none;
+  }
+  .piste .mem-card.is-fresh .mem-tick {
+    animation: none;
+  }
+}
