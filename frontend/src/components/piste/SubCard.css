@@ -1,0 +1,183 @@
+/* ═══════════════════════════════════════════════════════════════════════
+   SubCard.css — Piste 3D · Nacre, ONE sub-task card (PRD 0014 / issue 0086).
+
+   Ported verbatim (then SCOPED under `.piste`) from the design source
+   `Design Mockup/p3d.css` — the SUB-TASK chrome `DeckCard`/`SubBody` use:
+   the lavender secondary panel, the ◇ glyph + « par BOB » tag, the collapsed
+   spec line, and the réflexion / outil / rendu body.
+
+   Ownership split (PRD 0014 — "réconciliation CSS"):
+     - the shell sheet (`styles/p3d.css`) owns the `.piste` palette vars
+       (`--sub`, `--sub-line`, `--sub-fill`, …) + the depth stage;
+     - `BobCard.css` owns the BOB front-card chrome + the shared panel base +
+       the task-step / invoked classes;
+     - `TaskSlot.css` owns the DECK FRAME (`.task-stack`, `.stack-card`, the
+       rank glide, front/back collapse, pin / `+N` chrome);
+     - THIS sheet owns ONLY the sub-card's own lavender classes, so it stays
+       disjoint from the sibling slots' styles.
+
+   Every rule is prefixed with `.piste` so the port can't bleed into the legacy
+   ChatView / debug windows that share the generic `panel*` / `sub-*` names.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+/* ── SOUS-TÂCHE — secondary panel (calls a tool) ───────────────────────── */
+.piste .stack-card.is-sub .panel.sub-panel {
+  width: 300px;
+  margin-left: 24px;
+  border-color: var(--sub-line);
+  background: color-mix(in oklab, var(--bg2) 64%, transparent);
+}
+/* lavender side-rail — the « delegated lane » dropping from Bob */
+.piste .stack-card.is-sub .panel.sub-panel::before {
+  content: "";
+  position: absolute;
+  left: -14px;
+  top: 16px;
+  bottom: 16px;
+  width: 2px;
+  border-radius: 2px;
+  background: linear-gradient(
+    180deg,
+    color-mix(in oklab, var(--sub) 60%, transparent),
+    color-mix(in oklab, var(--sub) 8%, transparent)
+  );
+}
+.piste .stack-card.is-sub.is-front .panel.sub-panel {
+  box-shadow: 0 34px 84px rgba(0, 0, 0, 0.56), 0 0 0 1px
+    color-mix(in oklab, var(--sub) 38%, transparent);
+}
+.piste .sub-glyph {
+  color: var(--sub);
+  font-size: 11px;
+  line-height: 1;
+  flex: 0 0 auto;
+}
+.piste .is-sub .panel-title {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  color: var(--ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.piste .is-sub .panel-phase {
+  color: var(--sub);
+}
+.piste .sub-by {
+  font-family: var(--font-mono);
+  font-size: 8px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--sub);
+  padding: 2px 7px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in oklab, var(--sub) 36%, transparent);
+  white-space: nowrap;
+}
+/* collapsed sub tab shows what it's about */
+.piste .sub-spec-line {
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.06em;
+  color: var(--faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ── SUB BODY — réflexion / outil / rendu ──────────────────────────────── */
+.piste .sub-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.piste .sub-think {
+  margin: 0;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--dim);
+  font-style: italic;
+  text-wrap: pretty;
+}
+
+.piste .sub-tool {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: var(--sub-fill);
+  border: 1px solid var(--sub-line);
+}
+.piste .sub-tool-line {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.piste .sub-tool-mark {
+  width: 6px;
+  height: 6px;
+  border-radius: 1px;
+  background: var(--sub);
+  box-shadow: 0 0 6px var(--sub);
+  flex: 0 0 auto;
+}
+.piste .sub-tool.is-run .sub-tool-mark {
+  animation: bob-pulse 0.9s ease-in-out infinite;
+}
+.piste .sub-tool.is-ok .sub-tool-mark {
+  background: #7fcba0;
+  box-shadow: 0 0 6px #7fcba0;
+}
+.piste .sub-tool-name {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink);
+  letter-spacing: 0.02em;
+}
+.piste .sub-tool-run {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--sub);
+}
+.piste .sub-tool-args {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--faint);
+  margin-left: 13px;
+  letter-spacing: 0.02em;
+  text-wrap: pretty;
+}
+.piste .sub-tool-res {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--dim);
+  margin-left: 13px;
+  text-wrap: pretty;
+}
+
+.piste .sub-ret {
+  display: flex;
+  gap: 7px;
+  align-items: baseline;
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--ink);
+  text-wrap: pretty;
+}
+.piste .sub-ret-arrow {
+  color: var(--sub);
+  flex: 0 0 auto;
+  font-family: var(--font-mono);
+}
+
+/* `.bgtask-chk` + `bob-pulse`/`caret` keyframes are defined in BobCard.css
+   (shared, scoped under `.piste`); the sub-card reuses them. */

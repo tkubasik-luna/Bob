@@ -1,10 +1,31 @@
-// BobCard.tsx — Piste 3D · Nacre, the BOB thread card (PRD 0014 / issue 0085).
+// BobCard.tsx — Piste 3D · Nacre, the BOB thread card (PRD 0014 / issues 0085,
+// 0086).
 //
-// The front card of the (future) thread deck (issue 0086 wraps a deck around
-// it). It is the live fil of Bob's MAIN orchestrator turn, bound to the same
-// real data the right-rail agent feed uses — keyed on the FIXED
+// The front-capable card of the thread deck (issue 0086 wraps the deck around
+// it in `TaskSlot`). It is the live fil of Bob's MAIN orchestrator turn, bound
+// to the same real data the right-rail agent feed uses — keyed on the FIXED
 // `agent_ref="jarvis"` (see `orchestrator.JARVIS_AGENT_REF`), exactly as
-// sub-tasks bind to their own `task_id`. No props from the shell.
+// sub-tasks bind to their own `task_id`.
+//
+// Issue 0086 — DECK INTEGRATION. The card no longer owns the outer
+// `.stack-card` wrapper (the deck wrapper + the rank transform + the
+// click→promote live in `TaskSlot`); BobCard renders ONLY its inner
+// `.panel.bob-panel`. Two thin props from the deck:
+//   front  — whether this is the rank-0 (front) card. Back cards collapse to a
+//            header tab via the deck CSS, so the body still renders and the
+//            wrapper class does the collapse.
+//   behind — how many cards are stacked behind it; the front bob card surfaces
+//            this as the `+N tâches` overflow badge (mockup `panel-stackn`).
+//   pinned — this card is the front because the user pinned it → « épinglé » tag.
+//   inDeck — Bob is the deck's anchor, so it renders even with no own content
+//            (TaskSlot only mounts the deck once a thread exists).
+// When called with no props (`<BobCard/>`) it renders as a standalone front
+// card with no overflow badge — the issue-0085 behaviour, preserved.
+//
+// Idle: `BobCard` returns nothing until there IS a thread (no prompt / activity
+// / answer), so a bare `<BobCard/>` keeps the idle scene empty exactly like the
+// mockup. In the deck, `TaskSlot` only mounts the deck once a thread exists, so
+// this null only bites the standalone idle path.
 //
 // Sections, faithful to the mockup `BobBody` (`Design Mockup/p3d-panels.jsx`)
 // and screenshots `p3d-settings.png` / `01-piste.png`:
@@ -25,25 +46,53 @@
 // Co-located styling: `BobCard.css` ports the relevant panel/Bob classes from
 // `Design Mockup/p3d.css` (scoped under `.piste`).
 
-import { reflectionNarrator } from "../../lib/reflectionNarrator";
+import { type Reflection, reflectionNarrator } from "../../lib/reflectionNarrator";
 import {
   type AgentPerf,
   type AgentTimelineItem,
   useActivityFeedStore,
 } from "../../store/activityFeedStore";
-import { useChatStore } from "../../store/chatStore";
-import type { Task } from "../../types/ws";
+import { type StreamingAssistant, useChatStore } from "../../store/chatStore";
+import type { ChatMessage, Task } from "../../types/ws";
 import { MarkdownView } from "../MarkdownView";
 import "./BobCard.css";
 
 /** The fixed lane key the orchestrator tags Bob's main thread with — the mirror
- * of a sub-task's `task_id`. Pinned in `orchestrator.JARVIS_AGENT_REF`. */
-const JARVIS_REF = "jarvis";
+ * of a sub-task's `task_id`. Pinned in `orchestrator.JARVIS_AGENT_REF`.
+ * Exported so the deck (`TaskSlot`) can derive bob's front-selection signals
+ * from the SAME lane this card renders. */
+export const JARVIS_REF = "jarvis";
 
 /** Bob's own phase chain (the mockup's `BOB_ORDER`), in the orchestrator's
  * vocabulary. Derived from real signals below, then drives the per-step
- * is-active / is-done classes and the head stat word. */
-type BobPhase = "think" | "summon" | "wait" | "answer" | "done" | "error";
+ * is-active / is-done classes and the head stat word. Exported so the deck
+ * (`TaskSlot`) reuses the same derivation for bob's front-selection signals. */
+export type BobPhase = "think" | "summon" | "wait" | "answer" | "done" | "error";
+
+/**
+ * Map bob's phase to the deck's front-selection signals (issue 0086). PURE so
+ * `TaskSlot` derives them from the SAME `deriveBobPhase` this card uses, with no
+ * drift:
+ *   - `live`     — bob is still working (not settled / errored); a settled bob
+ *                  never auto-fronts over a live sub-task.
+ *   - `activity` — a small recency rank. Bob floats to the FRONT while it is the
+ *                  one doing work (thinking → `summon`/`answer`) and RECEDES to a
+ *                  low rank while it is merely holding the fil (`wait`) so the
+ *                  live sub-task doing a tool call surfaces instead — exactly the
+ *                  mockup's `frontIdAt` behaviour. The scale is arbitrary; it is
+ *                  only compared against the sub-tasks' epoch-ms activity, which
+ *                  is always far larger, so a working bob still loses the front
+ *                  to a sub-task that is actively calling a tool (which is what
+ *                  we want) UNLESS no sub-task is live.
+ */
+export function bobDeckSignal(phase: BobPhase): { live: boolean; activity: number } {
+  const live = phase !== "done" && phase !== "error";
+  // `wait` (holding the fil while subs run) recedes; active work floats up. The
+  // values stay below any real epoch-ms so a live sub-task wins the front while
+  // it works; when no sub is live, `autoFrontId` rests on bob regardless.
+  const activity = phase === "wait" ? 0 : 1;
+  return { live, activity };
+}
 
 /** Phase → head stat word (mirrors the mockup's `BOB_STAT`). */
 const BOB_STAT: Record<BobPhase, string> = {
@@ -83,7 +132,7 @@ function isRendered(state: Task["state"]): boolean {
  *   - `summon` — sub-tasks exist and were just spawned (none returned yet).
  *   - `think`  — default: Bob is reasoning (or about to delegate).
  */
-function deriveBobPhase(args: {
+export function deriveBobPhase(args: {
   waiting: boolean;
   hasAnswer: boolean;
   answering: boolean;
@@ -109,17 +158,51 @@ function deriveBobPhase(args: {
   return "think";
 }
 
-export function BobCard() {
-  // ── Chat-store signals ────────────────────────────────────────────────────
-  const messages = useChatStore((s) => s.messages);
-  const streamingAssistant = useChatStore((s) => s.streamingAssistant);
-  const tasksMap = useChatStore((s) => s.tasks);
-  const waiting = useChatStore((s) => s.isWaitingResponse);
+/** The raw store slices the bob thread is derived from. A subset so both the
+ * card and the deck (`TaskSlot`) can pass exactly what they subscribe to. */
+export type BobThreadInput = {
+  messages: ChatMessage[];
+  streamingAssistant: StreamingAssistant | null;
+  tasks: Task[];
+  waiting: boolean;
+  timeline: AgentTimelineItem[] | undefined;
+  settledAnswer: string | undefined;
+};
 
-  // ── Jarvis-lane signals (same store the right-rail feed reads) ─────────────
-  const timeline = useActivityFeedStore((s) => s.timelineByAgent[JARVIS_REF]);
-  const settledAnswer = useActivityFeedStore((s) => s.answerByAgent[JARVIS_REF]);
-  const perf = useActivityFeedStore((s) => s.perfByAgent[JARVIS_REF]);
+/** Everything the card renders + the deck needs, derived purely from the store
+ * slices. PURE: a function of its inputs only (no store reads / React), so the
+ * deck can reuse the SAME `phase` / `hasContent` the card renders from with no
+ * risk of drift. */
+export type BobThread = {
+  prompt: string;
+  answerText: string;
+  answering: boolean;
+  hasAnswer: boolean;
+  reflection: Reflection;
+  reasoningStreaming: boolean;
+  /** Sub-tasks Bob invoked, in spawn order. */
+  tasks: Task[];
+  phase: BobPhase;
+  /** Whether the card has anything to show (idle gate). */
+  hasContent: boolean;
+};
+
+/**
+ * Derive Bob's whole thread state from the raw store slices. Lifted out of the
+ * component (issue 0086) so `TaskSlot` can compute bob's deck signals (phase →
+ * live/activity) and the idle gate from the exact same derivation the card
+ * renders, instead of duplicating it. Pure + exported for that reuse and for
+ * unit-testing without React.
+ */
+export function deriveBobThread(input: BobThreadInput): BobThread {
+  const {
+    messages,
+    streamingAssistant,
+    tasks: tasksMapValues,
+    waiting,
+    timeline,
+    settledAnswer,
+  } = input;
 
   // The thread's tail tells us the turn state: a trailing USER message means a
   // reply is still pending (don't surface a stale prior answer), a trailing
@@ -150,10 +233,7 @@ export function BobCard() {
 
   // Sub-tasks Bob invoked, in spawn order (createdAt). The store keys by id; we
   // order so the invoked list is stable as states flip.
-  const tasks = Object.values(tasksMap).sort((a, b) => a.createdAt.localeCompare(b.createdAt));
-  const hasTasks = tasks.length > 0;
-  const returned = tasks.filter((t) => isRendered(t.state)).length;
-  const allReturned = hasTasks && returned === tasks.length;
+  const tasks = [...tasksMapValues].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
 
   // ── Réflexion: real reasoning primes, else narrated fallback ───────────────
   const reflection = reflectionNarrator(timeline);
@@ -169,7 +249,60 @@ export function BobCard() {
   // activity, or an answer (covers the proactive-synthesis-without-prompt case).
   const hasContent =
     prompt.length > 0 || hasAnswer || (timeline?.length ?? 0) > 0 || reflection.kind !== "empty";
-  if (!hasContent) return null;
+
+  return {
+    prompt,
+    answerText,
+    answering,
+    hasAnswer,
+    reflection,
+    reasoningStreaming,
+    tasks,
+    phase,
+    hasContent,
+  };
+}
+
+export function BobCard({
+  front = true,
+  behind = 0,
+  pinned = false,
+  inDeck = false,
+}: { front?: boolean; behind?: number; pinned?: boolean; inDeck?: boolean } = {}) {
+  // ── Store signals (same slices the right-rail feed + deck read) ────────────
+  const messages = useChatStore((s) => s.messages);
+  const streamingAssistant = useChatStore((s) => s.streamingAssistant);
+  const tasksMap = useChatStore((s) => s.tasks);
+  const waiting = useChatStore((s) => s.isWaitingResponse);
+  const timeline = useActivityFeedStore((s) => s.timelineByAgent[JARVIS_REF]);
+  const settledAnswer = useActivityFeedStore((s) => s.answerByAgent[JARVIS_REF]);
+  const perf = useActivityFeedStore((s) => s.perfByAgent[JARVIS_REF]);
+
+  // Single derivation shared with the deck (`TaskSlot`) — no drift.
+  const { prompt, answerText, answering, hasAnswer, reflection, reasoningStreaming, tasks, phase } =
+    deriveBobThread({
+      messages,
+      streamingAssistant,
+      tasks: Object.values(tasksMap),
+      waiting,
+      timeline,
+      settledAnswer,
+    });
+
+  const hasTasks = tasks.length > 0;
+  const returned = tasks.filter((t) => isRendered(t.state)).length;
+  const allReturned = hasTasks && returned === tasks.length;
+
+  // The card renders nothing until there IS a thread (idle scene stays empty).
+  // In the deck (`inDeck`), Bob is the deck's anchor card, so it still renders
+  // its header even with no own content — e.g. a reconnect that rehydrated the
+  // sub-tasks into `chatStore.tasks` WITHOUT replaying Bob's prompt / lane (the
+  // chat history is not replayed). The « Tâches en arrière-plan » list then
+  // carries the card; the header alone anchors the pile otherwise. Standalone
+  // (`<BobCard/>`, `inDeck=false`) keeps the issue-0085 idle null.
+  const hasContent =
+    prompt.length > 0 || hasAnswer || (timeline?.length ?? 0) > 0 || reflection.kind !== "empty";
+  if (!hasContent && !inDeck) return null;
 
   const working = phase !== "done" && phase !== "error";
   const thinkActive = phase === "think";
@@ -177,68 +310,70 @@ export function BobCard() {
   const answerActive = phase === "answer";
 
   return (
-    <div className="stack-card is-bob is-front">
-      <div className="panel bob-panel">
-        <div className="panel-head">
-          <span className="bob-orb" data-live={working} />
-          <span className="panel-title">BOB</span>
-          <span className="bob-role">fil de conscience</span>
-          <span className="panel-phase">{BOB_STAT[phase]}</span>
-        </div>
+    <div className="panel bob-panel">
+      <div className="panel-head">
+        <span className="bob-orb" data-live={working} />
+        <span className="panel-title">BOB</span>
+        <span className="bob-role">fil de conscience</span>
+        {pinned && <span className="panel-pin">épinglé</span>}
+        {/* `+N tâches` overflow badge — only on the FRONT bob card, only when
+            cards are stacked behind it (mockup `panel-stackn`). */}
+        {front && behind > 0 && <span className="panel-stackn">+{behind} tâches</span>}
+        <span className="panel-phase">{BOB_STAT[phase]}</span>
+      </div>
 
-        {prompt && <div className="task-prompt">{prompt}</div>}
+      {prompt && <div className="task-prompt">{prompt}</div>}
 
-        <div className="task-scroll">
-          {/* RÉFLEXION — streamed reasoning, or narrated fallback */}
-          {reflection.kind !== "empty" && (
-            <section className={`task-step ${thinkActive ? "is-active" : "is-done"}`}>
-              <div className="step-key">
-                <span className="step-pip" />
-                <span className="step-label">Réflexion</span>
-                <span className="step-meta">{reasoningStreaming ? "en cours…" : "monologue"}</span>
-              </div>
-              <p className="think-body">
-                {reflection.text}
-                {reasoningStreaming && <span className="caret" />}
-              </p>
-            </section>
-          )}
+      <div className="task-scroll">
+        {/* RÉFLEXION — streamed reasoning, or narrated fallback */}
+        {reflection.kind !== "empty" && (
+          <section className={`task-step ${thinkActive ? "is-active" : "is-done"}`}>
+            <div className="step-key">
+              <span className="step-pip" />
+              <span className="step-label">Réflexion</span>
+              <span className="step-meta">{reasoningStreaming ? "en cours…" : "monologue"}</span>
+            </div>
+            <p className="think-body">
+              {reflection.text}
+              {reasoningStreaming && <span className="caret" />}
+            </p>
+          </section>
+        )}
 
-          {/* TÂCHES EN ARRIÈRE-PLAN — live sub-tasks (omitted when none) */}
-          {hasTasks && (
-            <section className={`task-step ${summonActive ? "is-active" : "is-done"}`}>
-              <div className="step-key">
-                <span className="step-pip" />
-                <span className="step-label">Tâches en arrière-plan</span>
-                <span className="step-meta">
-                  {allReturned ? `${tasks.length} rendus` : `${returned}/${tasks.length} rendus`}
-                </span>
-              </div>
-              <div className="invoked">
-                {tasks.map((t) => (
-                  <InvokedRow key={t.id} task={t} />
-                ))}
-              </div>
-            </section>
-          )}
+        {/* TÂCHES EN ARRIÈRE-PLAN — live sub-tasks (omitted when none) */}
+        {hasTasks && (
+          <section className={`task-step ${summonActive ? "is-active" : "is-done"}`}>
+            <div className="step-key">
+              <span className="step-pip" />
+              <span className="step-label">Tâches en arrière-plan</span>
+              <span className="step-meta">
+                {allReturned ? `${tasks.length} rendus` : `${returned}/${tasks.length} rendus`}
+              </span>
+            </div>
+            <div className="invoked">
+              {tasks.map((t) => (
+                <InvokedRow key={t.id} task={t} />
+              ))}
+            </div>
+          </section>
+        )}
 
-          {/* RÉPONSE — streamed synthesis, markdown (existing renderer) */}
-          {hasAnswer && (
-            <section className={`task-step ${answerActive ? "is-active" : "is-done"}`}>
-              <div className="step-key">
-                <span className="step-pip" />
-                <span className="step-label">Réponse</span>
-              </div>
-              <div className="answer-box">
-                <MarkdownView props={{ content: answerText }} />
-                {answering && <span className="caret caret-ink" />}
-              </div>
-            </section>
-          )}
+        {/* RÉPONSE — streamed synthesis, markdown (existing renderer) */}
+        {hasAnswer && (
+          <section className={`task-step ${answerActive ? "is-active" : "is-done"}`}>
+            <div className="step-key">
+              <span className="step-pip" />
+              <span className="step-label">Réponse</span>
+            </div>
+            <div className="answer-box">
+              <MarkdownView props={{ content: answerText }} />
+              {answering && <span className="caret caret-ink" />}
+            </div>
+          </section>
+        )}
 
-          {/* PERF — real tok/s · ttft · ctx, once the turn settles */}
-          {phase === "done" && <PerfFooter perf={perf} />}
-        </div>
+        {/* PERF — real tok/s · ttft · ctx, once the turn settles */}
+        {phase === "done" && <PerfFooter perf={perf} />}
       </div>
     </div>
   );

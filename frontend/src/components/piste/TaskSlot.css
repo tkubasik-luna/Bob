@@ -1,0 +1,120 @@
+/* ═══════════════════════════════════════════════════════════════════════
+   TaskSlot.css — Piste 3D · Nacre, the THREAD-DECK FRAME (PRD 0014 / issue
+   0086).
+
+   Ported verbatim (then SCOPED under `.piste`) from `Design Mockup/p3d.css` —
+   the deck shell every card kind shares: the `.task-stack` pile container, the
+   `.stack-card` rank glide, the front/back collapse, and the pin / `+N` chrome.
+
+   Ownership split (PRD 0014 — "réconciliation CSS"):
+     - the shell sheet (`styles/p3d.css`) tilts the whole slot into depth
+       (`.layout-depth .slot-task`, +24°) and owns the palette vars;
+     - `BobCard.css` owns the BOB card chrome + the shared `panel` base;
+     - `SubCard.css` owns the lavender SUB card chrome;
+     - THIS sheet owns the DECK FRAME shared by both, so the rank transforms /
+       glide / collapse live in exactly one place.
+
+   The component (`TaskSlot.tsx`) sets each card's `transform` / `z-index` /
+   `opacity` inline from the pure `threadDeck` model; CSS only ANIMATES the move
+   (the cubic glide) and styles the front/back states.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+/* ── TASK STACK — the pile container ───────────────────────────────────── */
+.piste .task-stack {
+  position: relative;
+  width: 322px;
+  height: 472px;
+  transform-style: preserve-3d;
+}
+
+/* a card in the pile — rank-driven inline transform; CSS animates the move */
+.piste .stack-card {
+  position: absolute;
+  top: 8px;
+  left: 0;
+  width: 322px;
+  transform-style: preserve-3d;
+  transform-origin: 50% 0%;
+  transition: transform 0.85s cubic-bezier(0.34, 1.28, 0.4, 1), opacity 0.6s ease, filter 0.6s ease;
+  will-change: transform, opacity;
+}
+.piste .stack-card.is-back {
+  cursor: pointer;
+  filter: saturate(0.82) brightness(0.9);
+}
+.piste .stack-card .panel {
+  transition: max-height 0.7s cubic-bezier(0.4, 0, 0.2, 1), transform 0.4s ease, box-shadow 0.5s
+    ease;
+  overflow: hidden;
+}
+/* back cards collapse to a clean header-only tab, masked at the fold */
+.piste .stack-card.is-back .panel {
+  max-height: 54px;
+  padding-bottom: 14px;
+  -webkit-mask-image: linear-gradient(to bottom, #000 72%, transparent 100%);
+  mask-image: linear-gradient(to bottom, #000 72%, transparent 100%);
+}
+.piste .stack-card.is-back .panel-head {
+  border-bottom: 0;
+  margin-bottom: 0;
+  padding-bottom: 0;
+}
+/* hide the heavy body while collapsed → a back card is a clean header tab.
+   (display:none, not opacity — opacity leaves layout height that bleeds
+   through the indented/translucent front card.) */
+.piste .stack-card.is-back .task-prompt,
+.piste .stack-card.is-back .task-scroll,
+.piste .stack-card.is-back .sub-body {
+  display: none;
+}
+.piste .stack-card.is-back:hover {
+  filter: saturate(0.95) brightness(1.02);
+}
+.piste .stack-card.is-back:hover .panel {
+  transform: translateY(-5px);
+  box-shadow: 0 30px 70px rgba(0, 0, 0, 0.5), 0 0 0 1px
+    color-mix(in oklab, var(--accent) 30%, transparent);
+}
+/* front card — expanded + emphasised (generic; bob/sub add their own tint) */
+.piste .stack-card.is-front .panel {
+  max-height: 540px;
+  box-shadow: 0 40px 95px rgba(0, 0, 0, 0.62), 0 0 0 1px
+    color-mix(in oklab, var(--accent) 24%, transparent), inset 0 1px 0 rgba(255, 255, 255, 0.08);
+}
+.piste .stack-card.is-pinned .panel {
+  box-shadow: 0 40px 95px rgba(0, 0, 0, 0.62), 0 0 0 1px var(--accent), 0 0 26px
+    color-mix(in oklab, var(--accent) 30%, transparent);
+}
+.piste .panel-pin {
+  font-family: var(--font-mono);
+  font-size: 8px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--accent);
+  padding: 2px 6px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in oklab, var(--accent) 40%, transparent);
+  white-space: nowrap;
+}
+.piste .panel-pin + .panel-phase {
+  margin-left: 8px;
+}
+.piste .panel-stackn {
+  font-family: var(--font-mono);
+  font-size: 8.5px;
+  letter-spacing: 0.1em;
+  color: var(--faint);
+  padding: 2px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  white-space: nowrap;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .piste .stack-card {
+    transition: opacity 0.3s ease;
+  }
+  .piste .stack-card .panel {
+    transition: none;
+  }
+}

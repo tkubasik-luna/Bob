@@ -11,9 +11,10 @@
    collide with the legacy HUD sheet. Prefixing every rule with `.piste` keeps
    the port confined to the new window so it can't bleed into ChatView / debug.
 
-   0086 owns the DECK (multi-card transforms / glide / promotion). Here the card
-   is the single FRONT card, so only `.is-front` chrome is ported; the rank-
-   driven transforms land with the deck.
+   0086 added the DECK: the multi-card frame (positioning, rank-driven glide,
+   front/back collapse, pin / `+N` chrome) lives in `TaskSlot.css` so it is
+   shared by bob + sub cards alike. THIS sheet keeps only the BOB chrome
+   (`.is-bob` / `.is-bob.is-front`) drawn on top of that frame.
    ═══════════════════════════════════════════════════════════════════════ */
 
 /* ── PANEL (base) ──────────────────────────────────────────────────────── */
@@ -214,15 +215,11 @@
   font-weight: 500;
 }
 
-/* ── STACK CARD — front-card chrome only (deck transforms land in 0086) ──── */
-.piste .stack-card {
-  position: relative;
-  width: 322px;
-}
-.piste .stack-card.is-front .panel {
-  box-shadow: 0 40px 95px rgba(0, 0, 0, 0.62), 0 0 0 1px
-    color-mix(in oklab, var(--accent) 24%, transparent), inset 0 1px 0 rgba(255, 255, 255, 0.08);
-}
+/* ── STACK CARD ───────────────────────────────────────────────────────────
+   The generic deck FRAME (`.stack-card` positioning, rank glide, front/back
+   collapse, pin / `+N` chrome) is owned by `TaskSlot.css` (issue 0086) so it is
+   shared by every card kind. This sheet keeps only the BOB-specific chrome the
+   `.is-bob` card draws on top of that frame. */
 
 /* ── BOB — primary chrome (orchestrator) ───────────────────────────────── */
 .piste .stack-card.is-bob .panel.bob-panel {
