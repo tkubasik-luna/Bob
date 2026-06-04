@@ -22,6 +22,7 @@
 // server-side and may be absent. The card always shows the tool NAME + the
 // sub-task STATE; args/result render only when present — never an empty row.
 
+import { useState } from "react";
 import { deriveAgentPhase } from "../../lib/agentPhase";
 import { buildSubFlow } from "../../lib/threadFlow";
 import { type AgentTimelineItem, useActivityFeedStore } from "../../store/activityFeedStore";
@@ -136,7 +137,12 @@ export function SubCard({
                 <span className="sub-tool-name">{chip.label}</span>
                 {!toolOk && <span className="sub-tool-run">appel…</span>}
               </div>
-              {chip.args && <div className="sub-tool-args">{chip.args}</div>}
+              {chip.args &&
+                (isRetrieval ? (
+                  <RetrievalArgs text={chip.args} />
+                ) : (
+                  <div className="sub-tool-args">{chip.args}</div>
+                ))}
               {chip.result && (
                 <div className="sub-tool-res">
                   <span className="bgtask-chk">✓</span>
@@ -156,6 +162,29 @@ export function SubCard({
         )}
       </div>
     </div>
+  );
+}
+
+/** The tool-retrieval chip's args (advertised tools + scoreboard) can run long
+ * once many tools are connected. Collapsed it stays a compact one-liner (CSS
+ * ellipsis — the « … » the user wanted gone); click toggles to the full wrapped
+ * list. `stopPropagation` so toggling never re-promotes the deck card. */
+function RetrievalArgs({ text }: { text: string }) {
+  const [expanded, setExpanded] = useState(false);
+  return (
+    <button
+      type="button"
+      className={`sub-tool-args is-retrieval-args${expanded ? " is-expanded" : ""}`}
+      aria-expanded={expanded}
+      title={expanded ? "Réduire" : "Tout afficher"}
+      onClick={(e) => {
+        e.stopPropagation();
+        setExpanded((v) => !v);
+      }}
+    >
+      <span className="ret-args-text">{text}</span>
+      <span className="ret-args-chev">{expanded ? "▾" : "▸"}</span>
+    </button>
   );
 }
 

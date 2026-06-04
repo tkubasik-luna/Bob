@@ -98,6 +98,25 @@ def test_tool_retrieval_maps_to_info_chip_with_scoreboard() -> None:
     assert "web_search (9)" in chip.args  # scoreboard explains the choice
 
 
+def test_tool_retrieval_args_not_truncated_for_long_fleet() -> None:
+    # A wide advertised set (many MCP tools) must ship in FULL — the chip is
+    # expandable in the HUD, so no « … » and no dropped tool name (tool names +
+    # integer scores are known-safe metadata, not redactable free text).
+    advertised = (
+        "maps_directions",
+        "web_search",
+        "maps_search_places",
+        "gmail_search",
+        "web_fetch",
+        "weather_forecast",
+    )
+    chip = project(ToolRetrieval(agent_ref=AGENT, advertised=advertised))
+    assert chip is not None and chip.args is not None
+    assert "…" not in chip.args
+    for name in advertised:
+        assert name in chip.args
+
+
 def test_tool_call_finished_ok_and_error() -> None:
     ok = project(ToolCallFinished(agent_ref=AGENT, tool_name="gmail_search", ok=True))
     assert ok is not None and ok.kind == "tool_call" and ok.status == "ok"

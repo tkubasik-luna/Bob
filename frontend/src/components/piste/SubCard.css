@@ -203,6 +203,49 @@
   letter-spacing: 0.02em;
   text-wrap: pretty;
 }
+/* PRD 0015 / issue 0092 — the tool-retrieval chip's args (advertised tools +
+   scoreboard) are a CLICK-TO-EXPAND cell: collapsed = one-line ellipsis, so the
+   card stays compact; expanded = the full list wraps. Reset the <button> chrome
+   so it reads as the same faint mono metadata row as a plain `.sub-tool-args`. */
+.piste .sub-tool-args.is-retrieval-args {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  width: 100%;
+  margin-top: 0;
+  padding: 0;
+  background: none;
+  border: 0;
+  text-align: left;
+  cursor: pointer;
+}
+.piste .sub-tool-args.is-retrieval-args .ret-args-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  line-height: 1.45;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.piste .sub-tool-args.is-retrieval-args.is-expanded .ret-args-text {
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+  text-wrap: pretty;
+}
+.piste .sub-tool-args.is-retrieval-args .ret-args-chev {
+  flex: 0 0 auto;
+  color: var(--sub);
+  font-size: 9px;
+  line-height: 1.45;
+  opacity: 0.7;
+}
+.piste .sub-tool-args.is-retrieval-args:hover .ret-args-chev,
+.piste .sub-tool-args.is-retrieval-args:hover .ret-args-text {
+  color: var(--dim);
+  opacity: 1;
+}
+
 .piste .sub-tool-res {
   display: flex;
   align-items: center;

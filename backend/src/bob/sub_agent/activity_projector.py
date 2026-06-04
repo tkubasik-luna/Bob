@@ -316,7 +316,7 @@ InternalEvent = (
 _REDACTED_PLACEHOLDER = "<redacted>"
 
 
-def _redact_free_text(text: str) -> str:
+def _redact_free_text(text: str, *, limit: int | None = 80) -> str:
     """Scrub a free-text label fragment of anything that could carry Mail content.
 
     The projector NEVER folds a raw tool result / email body into a label — it
@@ -326,11 +326,15 @@ def _redact_free_text(text: str) -> str:
     truncate hard and strip newlines so a chip stays a one-line metadata marker.
     The full text still travels on its own dedicated channel (the ``ask_user``
     task message / the validator feedback) — the chip is observability only.
+
+    ``limit=None`` skips the hard truncation (still collapses whitespace) — used
+    for fragments that are KNOWN safe metadata (tool names + integer scores), so
+    the full list reaches the HUD and the user can expand the cell to read it.
     """
 
     collapsed = " ".join(text.split())
-    if len(collapsed) > 80:
-        collapsed = collapsed[:80].rstrip() + "…"
+    if limit is not None and len(collapsed) > limit:
+        collapsed = collapsed[:limit].rstrip() + "…"
     return collapsed
 
 
@@ -470,8 +474,10 @@ def project(event: InternalEvent) -> AgentActivity | None:
             agent_ref=event.agent_ref,
             kind="tool_retrieval",
             label=label,
+            # ``detail`` is tool NAMES + integer scores only — no free text, so it
+            # ships in full (``limit=None``); the HUD chip is expandable, no « … ».
+            args=_redact_free_text(detail, limit=None),
             status="info",
-            args=_redact_free_text(detail),
         )
 
     if isinstance(event, AskUser):
