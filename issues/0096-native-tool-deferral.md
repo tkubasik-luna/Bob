@@ -1,3 +1,18 @@
+## Status: SHIPPED then REVERTED (2026-06-04)
+
+Shipped in c3076d5, **reverted** in 813268a. The acceptance criteria below were
+built against a false premise: the `claude` CLI Bob shells out to exposes **no
+live `defer_loading` / `mcp_toolset` wire** — it runs `--tools ""` and reads its
+tool list only from the prompt. So "delegate discovery to the platform" only
+ever dropped deferred tools from the prompt catalogue and made them uncallable
+(it broke MCP tools on Claude CLI). The path was removed and tool advertisement
+now runs the single `select_tools` lexical gate (issue 0092) on **every**
+provider, with the same knobs — Claude CLI gates identically to LM Studio.
+A real deferral wire would require the CLI to dispatch tools itself, bypassing
+Bob's dispatch/blackboard (PRD 0010) — a separate, much larger change, not a
+capability flag. The acceptance criteria below are kept for the historical
+record only.
+
 ## Parent
 
 prd/0015-mcp-tool-scaling.md

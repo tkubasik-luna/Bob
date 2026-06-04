@@ -19,13 +19,13 @@ the HUD dock. Everything works fully on LM Studio; the LLM never speaks MCP.
 - **New module `bob.sub_agent.tool_retrieval`** — pure `select_tools(registry,
   goal, *, k, min_score)` (field-weighted lexical score over name+tags+desc,
   accent-stripped, French stop-words removed, `always_on ∪ {score ≥ min_score}`
-  capped at `k`, no zero-score pad, empty → `always_on` fallback). Also
-  `ToolDeferralPlan` + `build_tool_deferral_plan` (issue 0096).
+  capped at `k`, no zero-score pad, empty → `always_on` fallback).
 - **`SubAgentToolDefinition`** gains optional `always_on: bool` and
   `tags: tuple[str, ...]`. Gmail/web tools carry retrieval tags.
-- **Runner** — `_advertise_tools` branches on provider: LM Studio →
-  `select_tools` feeds the prompt catalogue (dispatch unchanged, advertised ⊂
-  dispatchable); native Anthropic → skip retrieval, build a deferral plan.
+- **Runner** — `_advertise_tools` runs `select_tools` to feed the prompt
+  catalogue on **every** provider (dispatch unchanged, advertised ⊂
+  dispatchable). One gate, no provider branch — see the "Issue 0096 reverted"
+  note below.
 - **New package `bob.connectors.mcp`** — `errors` (`mcp_*` taxonomy),
   `models` (`MCPServerConfig`, `MCPToolOverride`), `manager` (`MCPManager`:
   stdio + streamable-HTTP transports, per-call timeout, restart-on-crash;
@@ -38,8 +38,6 @@ the HUD dock. Everything works fully on LM Studio; the LLM never speaks MCP.
   manifest (per-server transport/expose/per-tool overrides), `MCP_CALL_TIMEOUT_SECONDS`.
   `.env.example` documents a `weather`/`get_forecast` manifest example.
 - **FastAPI lifespan** (`main.py`) wires `MCPRuntime` startup/shutdown.
-- **`llm_client.supports_native_tool_deferral()`** capability seam
-  (`ClaudeCliClient` → `True`, LM Studio inherits `False`).
 - **Weather skill pack** in `context/prompt_fragments.py` (`SUB_AGENT_SKILL_PACKS`,
   triggers météo/temps/weather/prévision) + one Jarvis capability line in
   `prompts/system_chat.md` (no tool name leaked).
@@ -60,12 +58,19 @@ the HUD dock. Everything works fully on LM Studio; the LLM never speaks MCP.
   component to a doc card. `terminal: true` tools converge; the runner rebuilds
   the card from the stored tool result on every exit path (PRD 0010 anti-stall).
 - Existing **Gmail and Tavily connectors are not migrated** — kept as-is.
-- **Issue 0096 is partially stubbed**: the provider-keyed gate, deferral-plan
-  builder, and resolved-provider capability keying are wired and tested, but
-  threading `defer_loading`/`mcp_toolset` onto the live `claude` CLI argv is
-  deferred (the current `ClaudeCliClient` runs `--tools ""` via the Hermes codec;
-  attaching native params needs a larger CLI-client refactor). The hard
-  requirement — the local LM-Studio path being byte-for-byte unchanged — is met.
+- **Issue 0096 was reverted** (2026-06-04, commit `813268a`): the native
+  Anthropic tool-deferral path is gone. Its premise — a live
+  `defer_loading`/`mcp_toolset` wire — never existed through Bob's CLI
+  invocation (it runs `--tools ""` and reads tools only from the prompt), so a
+  "deferred" tool was simply dropped from the catalogue and made uncallable.
+  `select_tools` now runs on **every** provider with the same knobs, so Claude
+  CLI gates identically to LM Studio and stays a reproducible debug reference;
+  the gated prompt catalogue is the only scaling lever on a prompt-only backend.
+  A real native-deferral wire would mean the CLI dispatching tools itself,
+  bypassing Bob's dispatch/blackboard — a separate, larger change, not a flag.
+  Removed: `supports_native_tool_deferral`, `ToolDeferralPlan` +
+  `build_tool_deferral_plan`, `runner.last_deferral_plan`, the
+  `native_anthropic_deferral` chip path.
 
 ## Issues
 
@@ -73,4 +78,4 @@ the HUD dock. Everything works fully on LM Studio; the LLM never speaks MCP.
 - `issues/0093-mcp-adapter-manager-core.md` — MCP adapter + manager + generic projector core — commit cb85285
 - `issues/0094-mcp-manifest-lifecycle.md` — config-driven manifest + startup/shutdown lifecycle — commit 6b5ed8b
 - `issues/0095-weather-end-to-end.md` — weather end-to-end acceptance case + skill pack — commit 1336ac2
-- `issues/0096-native-tool-deferral.md` — provider-gated native Anthropic tool deferral (partial/stubbed) — commit c3076d5
+- `issues/0096-native-tool-deferral.md` — provider-gated native Anthropic tool deferral — shipped c3076d5, **reverted** 813268a (no live deferral wire; unified on `select_tools`)

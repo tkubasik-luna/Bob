@@ -52,8 +52,12 @@ Under the hood, two capabilities are added:
 
 The MCP integration is independent of the LLM provider: the model never speaks
 MCP, so everything works identically on full LM Studio. Native Anthropic tool
-deferral (`defer_loading` / Tool Search Tool) is an optional, provider-gated
-upgrade layered on top — never required.
+deferral (`defer_loading` / Tool Search Tool) was specified as an optional,
+provider-gated upgrade — **but it was shipped then reverted** (commit 813268a):
+the `claude` CLI exposes no live deferral wire through Bob's invocation, so it
+only dropped tools from the prompt catalogue and made them uncallable. Tool
+advertisement now runs the single `select_tools` gate on every provider; see the
+"provider-aware deferral" module note below.
 
 ## User Stories
 
@@ -192,12 +196,16 @@ upgrade layered on top — never required.
 - Jarvis's system prompt gains a single capability line for weather, leaking no
   tool name (mirrors the gmail/web routing pattern).
 
-### Module: provider-aware deferral (new, optional, gated)
-- When the provider is native Anthropic, the router may skip server-side
-  retrieval and pass `defer_loading` / `mcp_toolset` deferral to the API. For
-  LM Studio (OpenAI-compatible) this path does not exist and server-side
-  retrieval is used. This layer is optional and has zero impact on the local
-  path.
+### Module: provider-aware deferral (REVERTED — see 813268a)
+- Originally: when the provider is native Anthropic, the router skips
+  server-side retrieval and passes `defer_loading` / `mcp_toolset` deferral to
+  the API; LM Studio uses server-side retrieval.
+- **Reverted.** Bob's `claude` CLI invocation has no live deferral wire (it runs
+  `--tools ""` and reads tools only from the prompt), so "defer" dropped tools
+  from the catalogue and made them uncallable. `select_tools` now runs on every
+  provider with the same knobs — Claude CLI gates identically to LM Studio. A
+  real deferral wire would mean the CLI dispatching tools itself, bypassing
+  Bob's dispatch/blackboard — a separate, larger change.
 
 ### Architectural invariants
 - The LLM never speaks MCP; MCP is strictly a backend↔tool-server protocol.
@@ -250,18 +258,19 @@ Tests for **all** modules:
   thin, and intentionally kept.
 - A typed weather UI card. The generic Markdown card is the shipped surface; a
   typed `Weather` card is a noted later upgrade.
-- The native Anthropic tool-deferral path is specified but optional and may be
-  deferred to a follow-up; it must never be on the critical path for local use.
+- The native Anthropic tool-deferral path was specified, shipped, then reverted
+  (813268a) — no live deferral wire exists through Bob's CLI invocation. Tool
+  advertisement is the single `select_tools` gate on every provider.
 
 ## Further Notes
 
 - Delivery is sliced as tracer bullets with a dependency DAG: retrieval/gating
   (foundation) and the MCP adapter core run in parallel; the manifest + lifecycle
   wiring follows the adapter; the weather end-to-end case depends on both
-  retrieval and the manifest; the optional native-deferral layer follows the
-  manifest. The retrieval/gating slice has standalone value even with no MCP
-  tools, because a thinner advertised surface already improves local-model
-  reliability.
+  retrieval and the manifest; the optional native-deferral layer followed the
+  manifest (shipped then reverted — 813268a). The retrieval/gating slice has
+  standalone value even with no MCP tools, because a thinner advertised surface
+  already improves local-model reliability.
 - The weather case is the chosen acceptance vehicle precisely because it
   exercises every layer end-to-end on a real, single-shot tool.
 - First-order constraint throughout: full LM Studio operation. Any Anthropic-only
