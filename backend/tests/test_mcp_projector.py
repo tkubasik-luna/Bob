@@ -11,7 +11,7 @@ Locks the generic MCP projection contract reused by every uncurated tool:
 
 from __future__ import annotations
 
-from bob.connectors.mcp.projector import project_mcp_default
+from bob.connectors.mcp.projector import make_mcp_projector, project_mcp_default
 from bob.ui_registry import validate_component_descriptor
 
 
@@ -57,3 +57,25 @@ def test_malformed_result_does_not_crash() -> None:
     # Falls back to a generic tool label and empty text → no card, no raise.
     assert proj.deliverable is None
     assert proj.terminal is False
+
+
+# --- terminal-aware factory (issue 0094) ------------------------------------
+
+
+def test_make_projector_non_terminal_is_the_default_function() -> None:
+    # The common (non-terminal) case stays the single shared function — no
+    # gratuitous wrapper.
+    assert make_mcp_projector(terminal=False) is project_mcp_default
+
+
+def test_make_terminal_projector_marks_result_converged() -> None:
+    projector = make_mcp_projector(terminal=True)
+    proj = projector({"tool": "get_forecast", "text": "Sunny, 25C."})
+    # A single-shot lookup converges — the result IS the answer.
+    assert proj.terminal is True
+    # The projection shape is otherwise identical to the generic one.
+    assert proj.deliverable is not None
+    card = proj.deliverable[0]
+    assert card["component"] == "Markdown"
+    assert "Sunny, 25C." in card["props"]["content"]
+    assert validate_component_descriptor(card) == []

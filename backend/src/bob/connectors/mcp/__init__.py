@@ -14,8 +14,11 @@ protocol, so everything works identically on full LM Studio.
   tool's JSON Schema; handler folds the result + ``mcp_*`` errors).
 - :mod:`bob.connectors.mcp.projector` — :func:`project_mcp_default`, the generic
   text→Markdown-card projection reused by every uncurated MCP tool.
-- :mod:`bob.connectors.mcp.registration` — :func:`register_mcp_tools`, the
-  single-server end-to-end glue.
+- :mod:`bob.connectors.mcp.registration` — :func:`register_mcp_tools`
+  (single-server) + :func:`register_mcp_managers` (multi-server fleet) glue.
+- :mod:`bob.connectors.mcp.lifecycle` — :class:`MCPRuntime`, the
+  FastAPI-lifespan-facing owner of the configured fleet (connect-at-startup /
+  close-at-shutdown), built from the parsed ``mcp_servers`` manifest.
 - :mod:`bob.connectors.mcp.errors` — the ``mcp_*`` failure taxonomy (mirrors
   ``web_search_*``).
 
@@ -33,24 +36,36 @@ from bob.connectors.mcp.errors import (
     MCPToolError,
     MCPUnreachableError,
 )
+from bob.connectors.mcp.lifecycle import MCPRuntime
 from bob.connectors.mcp.manager import MCPManager, MCPSession, SessionFactory
-from bob.connectors.mcp.models import MCPServerConfig, MCPTransport, extract_text_content
-from bob.connectors.mcp.projector import project_mcp_default
-from bob.connectors.mcp.registration import register_mcp_tools
+from bob.connectors.mcp.models import (
+    MCPServerConfig,
+    MCPToolOverride,
+    MCPTransport,
+    extract_text_content,
+    parse_mcp_servers,
+)
+from bob.connectors.mcp.projector import make_mcp_projector, project_mcp_default
+from bob.connectors.mcp.registration import register_mcp_managers, register_mcp_tools
 
 __all__ = [
     "MCPError",
     "MCPManager",
     "MCPMissingServerError",
+    "MCPRuntime",
     "MCPServerConfig",
     "MCPSession",
     "MCPToolCuration",
     "MCPToolError",
+    "MCPToolOverride",
     "MCPTransport",
     "MCPUnreachableError",
     "SessionFactory",
     "extract_text_content",
+    "make_mcp_projector",
+    "parse_mcp_servers",
     "project_mcp_default",
+    "register_mcp_managers",
     "register_mcp_tools",
     "wrap",
 ]

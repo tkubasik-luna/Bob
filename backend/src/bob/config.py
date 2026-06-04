@@ -12,10 +12,13 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Any, Literal
 
-from pydantic import model_validator
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+if TYPE_CHECKING:
+    from bob.connectors.mcp.models import MCPServerConfig
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 _ENV_FILE = _REPO_ROOT / ".env"
@@ -182,6 +185,51 @@ class Settings(BaseSettings):
     # advertised for a matching goal; they only bite once an MCP fleet lands.
     TOOL_RETRIEVAL_K: int = 8
     TOOL_RETRIEVAL_MIN_SCORE: int = 1
+
+    # MCP server manifest (PRD 0015 / issue 0094). A first-order, config-driven
+    # list of MCP servers Bob connects to as a *client* at boot. A developer
+    # branches a new tool by adding an entry here — no code. Each entry is a dict:
+    #
+    #   {
+    #     "name": "weather",            # stable id; tool refs + logs key on it
+    #     "transport": "stdio",         # "stdio" (subprocess) | "http" (remote)
+    #     "command": "uvx", "args": [...],   # stdio invocation
+    #     "url": "https://...",          # http endpoint
+    #     "env": {"API_KEY": "..."},
+    #     "expose": ["get_forecast"],   # allowlist — ONLY these tools are wrapped
+    #     "tools": {                      # per-tool curation overrides
+    #       "get_forecast": {
+    #         "description_fr": "Donne la météo d'une ville.",
+    #         "args": ["city"],          # narrowed argument subset
+    #         "tags": ["météo", "weather", "temps"],   # boost retrieval (0092)
+    #         "terminal": true           # single-shot lookup converges
+    #       }
+    #     }
+    #   }
+    #
+    # Mirrors how ``TAVILY_API_KEY`` gates Tavily: the manifest is OPTIONAL and
+    # boot-green. Empty / absent ⇒ no MCP tools. A server that is down / absent at
+    # boot is logged actionably and registers nothing while its peers register
+    # normally — the boot never crashes. Set via env as a JSON list
+    # (``MCP_SERVERS=[{"name": ...}]``). Parse into typed configs with
+    # :meth:`mcp_server_configs`. ``MCP_CALL_TIMEOUT_SECONDS`` bounds each
+    # outbound MCP tool call so a slow / wedged server surfaces a structured
+    # ``mcp_unreachable`` error instead of hanging the sub-agent.
+    MCP_SERVERS: list[dict[str, Any]] = Field(default_factory=list)
+    MCP_CALL_TIMEOUT_SECONDS: float = 30.0
+
+    def mcp_server_configs(self) -> tuple[MCPServerConfig, ...]:
+        """Parse :attr:`MCP_SERVERS` into typed :class:`MCPServerConfig` records.
+
+        Lenient (see :func:`bob.connectors.mcp.models.parse_mcp_servers`): a
+        malformed entry is dropped rather than crashing the boot. Imported lazily
+        so the config module never pulls in the MCP connector package (the
+        gmail/tavily lazy-import pattern).
+        """
+
+        from bob.connectors.mcp.models import parse_mcp_servers
+
+        return parse_mcp_servers(self.MCP_SERVERS)
 
 
 @lru_cache(maxsize=1)

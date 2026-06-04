@@ -24,6 +24,7 @@ factory yielding a fake session with canned ``list_tools`` / ``call_tool``.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager, AsyncExitStack
 from datetime import timedelta
@@ -74,10 +75,21 @@ tavily ``client_factory`` seams).
 class MCPManager:
     """Lifecycle owner for one configured MCP server session.
 
-    Single-server, minimal-config by design (issue 0093). The full multi-server
-    manifest + startup/shutdown wiring is issue 0094; this manager exposes the
-    primitives that wiring will drive: :meth:`connect`, :meth:`list_tools`,
-    :meth:`call_tool`, :meth:`aclose`.
+    Owns the session of ONE server; the multi-server manifest + startup/shutdown
+    wiring (issue 0094) drives a pool of these via
+    :class:`bob.connectors.mcp.lifecycle.MCPRuntime`. The primitives that wiring
+    uses: :meth:`connect`, :meth:`list_tools`, :meth:`call_tool`, :meth:`aclose`.
+
+    Robustness (issue 0094):
+
+    - **per-call timeout** — :meth:`call_tool` wraps the session call in an
+      :func:`asyncio.wait_for` wall-clock guard *and* forwards the SDK's own
+      ``read_timeout_seconds``, so a slow / wedged server surfaces a structured
+      :class:`MCPUnreachableError` (→ ``mcp_unreachable``) rather than hanging.
+    - **restart on crash** — when a call fails with a transport error the manager
+      tears the dead session down (so the next call is not stuck on a zombie) and
+      re-:meth:`connect`-s once; if the retried call also fails it surfaces the
+      structured error. The boot never crashes.
     """
 
     def __init__(
@@ -88,6 +100,7 @@ class MCPManager:
         session_factory: SessionFactory | None = None,
     ) -> None:
         self._config = config
+        self._call_timeout_seconds = call_timeout_seconds
         self._call_timeout = timedelta(seconds=call_timeout_seconds)
         self._session_factory = session_factory or _default_session_factory
         self._exit_stack: AsyncExitStack | None = None
@@ -96,6 +109,10 @@ class MCPManager:
     @property
     def name(self) -> str:
         return self._config.name
+
+    @property
+    def config(self) -> MCPServerConfig:
+        return self._config
 
     @property
     def connected(self) -> bool:
@@ -164,10 +181,16 @@ class MCPManager:
         - :class:`MCPMissingServerError` — the manager is not connected (the
           server failed to boot or was never wired);
         - :class:`MCPUnreachableError` — the call raised a transport exception
-          (subprocess died, timeout, connection reset);
+          (subprocess died, connection reset) or blew the per-call timeout;
         - the ``isError`` classification is left to the adapter handler, which
           owns the result→outcome folding (it inspects ``CallToolResult.isError``
           via :func:`extract_text_content`).
+
+        On a transport failure the manager tears the (now-suspect) session down
+        and re-:meth:`connect`-s once before retrying — a crashed subprocess is
+        restarted transparently when it comes back, and a still-dead server
+        surfaces the structured error instead of leaving a zombie session that
+        every later call would trip over.
         """
 
         if self._session is None:
@@ -175,19 +198,60 @@ class MCPManager:
                 f"MCP server '{self._config.name}' is not connected; cannot call '{name}'."
             )
         try:
-            return await self._session.call_tool(
-                name,
-                arguments,
-                read_timeout_seconds=self._call_timeout,
-            )
+            return await self._invoke(name, arguments)
         except (MCPError, MCPToolError):
             # A fake/test session may already speak the taxonomy — pass through.
             raise
         except Exception as exc:
-            _logger.warning("mcp.call_failed", server=self._config.name, tool=name, error=str(exc))
-            raise MCPUnreachableError(
-                f"MCP call to '{name}' on '{self._config.name}' failed: {exc}"
-            ) from exc
+            _logger.warning(
+                "mcp.call_failed",
+                server=self._config.name,
+                tool=name,
+                error=str(exc),
+                hint="tearing the session down and attempting one restart",
+            )
+            # Restart-on-crash: drop the suspect session, reconnect once, retry.
+            await self.aclose()
+            if not await self.connect():
+                raise MCPUnreachableError(
+                    f"MCP call to '{name}' on '{self._config.name}' failed and the "
+                    f"server could not be restarted: {exc}"
+                ) from exc
+            try:
+                return await self._invoke(name, arguments)
+            except (MCPError, MCPToolError):
+                raise
+            except Exception as retry_exc:
+                _logger.warning(
+                    "mcp.call_failed_after_restart",
+                    server=self._config.name,
+                    tool=name,
+                    error=str(retry_exc),
+                )
+                raise MCPUnreachableError(
+                    f"MCP call to '{name}' on '{self._config.name}' failed after "
+                    f"restart: {retry_exc}"
+                ) from retry_exc
+
+    async def _invoke(self, name: str, arguments: dict[str, Any]) -> Any:
+        """Run one session call under the wall-clock timeout guard.
+
+        The SDK's own ``read_timeout_seconds`` is forwarded AND the call is
+        wrapped in :func:`asyncio.wait_for` so a session that ignores the SDK
+        hint (or wedges before honouring it) still aborts at the per-call cap.
+        A :class:`asyncio.TimeoutError` is normalised to the transport-failure
+        path so the caller's restart-on-crash logic owns the retry.
+        """
+
+        assert self._session is not None  # guarded by call_tool
+        return await asyncio.wait_for(
+            self._session.call_tool(
+                name,
+                arguments,
+                read_timeout_seconds=self._call_timeout,
+            ),
+            timeout=self._call_timeout_seconds,
+        )
 
     async def aclose(self) -> None:
         """Close the session + transport. Idempotent; safe when never connected."""

@@ -183,3 +183,100 @@ async def test_aclose_closes_transport_and_is_idempotent() -> None:
     # Second close is a no-op (never connected again).
     await manager.aclose()
     assert closed == [True]
+
+
+# --- per-call timeout + restart-on-crash (issue 0094) -----------------------
+
+
+async def test_slow_call_hits_timeout_and_returns_structured_error() -> None:
+    """A call that outlives the per-call cap surfaces a structured error."""
+
+    import asyncio
+
+    class _SlowSession(_FakeSession):
+        async def call_tool(
+            self,
+            name: str,
+            arguments: dict[str, Any] | None = None,
+            read_timeout_seconds: timedelta | None = None,
+        ) -> Any:
+            await asyncio.sleep(10)  # far beyond the tiny timeout below
+            return {"never": "reached"}
+
+    manager = MCPManager(
+        _CONFIG,
+        call_timeout_seconds=0.01,
+        session_factory=_factory(_SlowSession()),
+    )
+    assert await manager.connect() is True
+    with pytest.raises(MCPUnreachableError):
+        await manager.call_tool("alpha", {})
+
+
+async def test_crash_mid_flight_restarts_and_succeeds_on_retry() -> None:
+    """A subprocess that crashes once is restarted and the retry succeeds.
+
+    The fake session raises on its FIRST call (the crash), then succeeds — the
+    manager tears the dead session down, reconnects, and retries transparently.
+    """
+
+    class _CrashOnceSession(_FakeSession):
+        def __init__(self) -> None:
+            super().__init__()
+            self._calls = 0
+
+        async def call_tool(
+            self,
+            name: str,
+            arguments: dict[str, Any] | None = None,
+            read_timeout_seconds: timedelta | None = None,
+        ) -> Any:
+            self._calls += 1
+            if self._calls == 1:
+                raise ConnectionResetError("subprocess died mid-flight")
+            return {"ok": True, "attempt": self._calls}
+
+        async def list_tools(self) -> Any:
+            return _FakeListToolsResult([])
+
+    session = _CrashOnceSession()
+    connects: list[int] = []
+
+    @asynccontextmanager
+    async def _cm(_config: MCPServerConfig) -> Any:
+        connects.append(1)
+        yield session
+
+    manager = MCPManager(_CONFIG, session_factory=lambda config: _cm(config))
+    assert await manager.connect() is True
+    result = await manager.call_tool("alpha", {})
+    assert result == {"ok": True, "attempt": 2}
+    # The transport was re-opened once (restart-on-crash): 1 initial + 1 restart.
+    assert len(connects) == 2
+
+
+async def test_crash_with_dead_server_surfaces_structured_error() -> None:
+    """A crash whose server never comes back surfaces ``mcp_unreachable``."""
+
+    # A factory that succeeds on the first connect, then refuses (server stayed
+    # down) — so the restart attempt fails and the structured error surfaces.
+    state = {"opened": 0}
+
+    @asynccontextmanager
+    async def _cm(_config: MCPServerConfig) -> Any:
+        state["opened"] += 1
+        if state["opened"] > 1:
+            raise ConnectionError("server still down")
+        yield _FakeSession(call_exc=ConnectionResetError("died"))
+
+    manager = MCPManager(_CONFIG, session_factory=lambda config: _cm(config))
+    assert await manager.connect() is True
+    with pytest.raises(MCPUnreachableError):
+        await manager.call_tool("alpha", {})
+    # Never crashed the process; the manager is left cleanly disconnected.
+    assert manager.connected is False
+
+
+def test_config_accessor_exposes_server_config() -> None:
+    manager = MCPManager(_CONFIG)
+    assert manager.config is _CONFIG

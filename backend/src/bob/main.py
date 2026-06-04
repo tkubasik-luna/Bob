@@ -31,6 +31,7 @@ from bob import orchestrator as orchestrator_module
 from bob import task_scheduler as task_scheduler_module
 from bob import task_store as task_store_module
 from bob.config import get_settings
+from bob.connectors.mcp import MCPRuntime
 from bob.db.migrations_runner import apply_migrations, default_migrations_dir
 from bob.debug_log import (
     install_file_sink,
@@ -163,6 +164,24 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     subagent_holder = SubAgentClientHolder(build_subagent_client(settings, seeded_selection))
     subagent_policy = default_policy()
     subagent_registry = build_default_subagent_registry()
+
+    # MCP fleet (PRD 0015 / issue 0094). Connect every configured MCP server,
+    # discover + curate + wrap its tools, and register them into the sub-agent
+    # registry the runner factory reads. Gated like ``TAVILY_API_KEY``: an empty
+    # manifest registers nothing and boots green; a down / absent server is
+    # logged actionably and registers nothing while its peers register normally.
+    # Done BEFORE any sub-agent task can run so the MCP tools are dispatchable.
+    mcp_runtime = MCPRuntime(
+        settings.mcp_server_configs(),
+        call_timeout_seconds=settings.MCP_CALL_TIMEOUT_SECONDS,
+    )
+    try:
+        await mcp_runtime.startup(subagent_registry)
+    except Exception:
+        # Defensive: registration already swallows per-server failures, but a
+        # truly unexpected error must never take the boot down.
+        _logger.exception("mcp.runtime.startup_failed")
+
     live_runners: dict[str, SubAgentRunner] = {}
 
     def _runner_factory(task_id: str) -> Coroutine[Any, Any, None]:
@@ -285,6 +304,9 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         # Issue 0045 — drain the scheduler's TaskGroup deterministically so
         # in-flight sub-agents don't leak past the lifespan teardown.
         await scheduler.stop()
+        # Issue 0094 — close every MCP session so no zombie subprocess survives
+        # the process. Best-effort: each aclose swallows its own teardown error.
+        await mcp_runtime.aclose()
         orchestrator_module.set_default_orchestrator(None)
         set_event_bus(None)
         task_scheduler_module.set_default_scheduler(None)

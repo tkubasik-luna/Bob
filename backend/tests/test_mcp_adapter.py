@@ -25,6 +25,8 @@ from bob.connectors.mcp import (
     MCPManager,
     MCPServerConfig,
     MCPToolCuration,
+    MCPToolOverride,
+    register_mcp_managers,
     register_mcp_tools,
     wrap,
 )
@@ -149,6 +151,63 @@ def test_curation_overrides_description_and_restricts_args() -> None:
     assert defn.description == "Donne la météo."
     # "days" was dropped by the expose allowlist.
     assert list(defn.args_model.model_fields.keys()) == ["place"]
+
+
+def test_curation_carries_tags_onto_definition() -> None:
+    # Issue 0094 — curated tags land on the produced tool definition so
+    # ``select_tools`` (issue 0092) can surface it for a matching goal.
+    curation = MCPToolCuration(tags=("météo", "weather"))
+    defn = wrap(_FakeTool(), _manager(_FakeSession()), curation=curation)
+    assert defn.tags == ("météo", "weather")
+
+
+def test_curation_terminal_selects_terminal_projector() -> None:
+    # Issue 0094 — a terminal curation makes the wrapped tool converge.
+    from bob.sub_agent.result_store import ToolResultStore
+
+    curation = MCPToolCuration(terminal=True)
+    defn = wrap(_FakeTool(), _manager(_FakeSession()), curation=curation)
+    store = ToolResultStore()
+    stored = store.put(
+        tool_name=defn.name,
+        tool_version=defn.version,
+        result={"tool": defn.name, "text": "Sunny.", "is_error": False},
+        projector=defn.result_projector,
+    )
+    assert stored.projection.terminal is True
+
+
+def test_uncurated_tool_is_non_terminal() -> None:
+    from bob.sub_agent.result_store import ToolResultStore
+
+    defn = wrap(_FakeTool(), _manager(_FakeSession()))
+    store = ToolResultStore()
+    stored = store.put(
+        tool_name=defn.name,
+        tool_version=defn.version,
+        result={"tool": defn.name, "text": "Sunny.", "is_error": False},
+        projector=defn.result_projector,
+    )
+    assert stored.projection.terminal is False
+
+
+def test_curation_from_override_folds_manifest_fields() -> None:
+    # Issue 0094 — the manifest's per-tool override folds into the adapter's
+    # curation with the field rename (description_fr → description, args →
+    # expose_args).
+    override = MCPToolOverride(
+        description_fr="Donne la météo.",
+        args=("place",),
+        tags=("météo",),
+        terminal=True,
+    )
+    curation = MCPToolCuration.from_override(override)
+    assert curation.description == "Donne la météo."
+    assert curation.expose_args == ("place",)
+    assert curation.tags == ("météo",)
+    assert curation.terminal is True
+    # None → the empty curation (upstream tool kept verbatim).
+    assert MCPToolCuration.from_override(None) == MCPToolCuration()
 
 
 # --- handler / dispatch -----------------------------------------------------
@@ -280,3 +339,98 @@ async def test_register_mcp_tools_skips_name_collision() -> None:
     names = await register_mcp_tools(manager, registry)
     assert names == []  # collision skipped, no raise
     assert len(registry) == 1
+
+
+# --- manifest-driven registration (issue 0094) ------------------------------
+
+
+class _TwoToolSession(_FakeSession):
+    async def list_tools(self) -> Any:
+        class _R:
+            tools: ClassVar[list[Any]] = [_FakeTool(), _FakeTool(name="get_alerts")]
+
+        return _R()
+
+
+def _manager_for(config: MCPServerConfig, session: _FakeSession) -> MCPManager:
+    @asynccontextmanager
+    async def _cm(_config: MCPServerConfig) -> Any:
+        yield session
+
+    return MCPManager(config, session_factory=lambda config: _cm(config))
+
+
+async def test_register_honours_expose_allowlist() -> None:
+    """Only allowlisted tools are wrapped; the rest are dropped."""
+
+    config = MCPServerConfig(name="demo", transport="stdio", command="x", expose=("get_weather",))
+    manager = _manager_for(config, _TwoToolSession(call_result=_CallResult("x")))
+    registry = SubAgentToolRegistry()
+    names = await register_mcp_tools(manager, registry)
+    assert names == ["get_weather"]
+    assert registry.get("get_alerts") is None
+
+
+async def test_register_applies_manifest_overrides() -> None:
+    """The server config's per-tool override is folded into the definition."""
+
+    config = MCPServerConfig(
+        name="demo",
+        transport="stdio",
+        command="x",
+        expose=("get_weather",),
+        tools={
+            "get_weather": MCPToolOverride(
+                description_fr="Donne la météo.",
+                args=("place",),
+                tags=("météo",),
+                terminal=True,
+            )
+        },
+    )
+    manager = _manager_for(config, _FakeSession(call_result=_CallResult("x")))
+    registry = SubAgentToolRegistry()
+    await register_mcp_tools(manager, registry)
+    defn = registry.get("get_weather")
+    assert defn is not None
+    assert defn.description == "Donne la météo."
+    assert list(defn.args_model.model_fields.keys()) == ["place"]
+    assert defn.tags == ("météo",)
+
+
+async def test_explicit_curation_wins_over_manifest() -> None:
+    config = MCPServerConfig(
+        name="demo",
+        transport="stdio",
+        command="x",
+        tools={"get_weather": MCPToolOverride(description_fr="Manifest desc.")},
+    )
+    manager = _manager_for(config, _FakeSession(call_result=_CallResult("x")))
+    registry = SubAgentToolRegistry()
+    await register_mcp_tools(
+        manager,
+        registry,
+        curations={"get_weather": MCPToolCuration(description="Explicit desc.")},
+    )
+    defn = registry.get("get_weather")
+    assert defn is not None
+    assert defn.description == "Explicit desc."
+
+
+async def test_register_mcp_managers_multi_server() -> None:
+    """The multi-server helper registers each server's exposed tools."""
+
+    weather_cfg = MCPServerConfig(name="weather", transport="stdio", command="w")
+    stocks_cfg = MCPServerConfig(name="stocks", transport="stdio", command="s")
+    weather = _manager_for(weather_cfg, _FakeSession(call_result=_CallResult("x")))
+    stocks = _manager_for(
+        stocks_cfg,
+        type("_S", (_FakeSession,), {})(call_result=_CallResult("y")),
+    )
+    registry = SubAgentToolRegistry()
+    summary = await register_mcp_managers([weather, stocks], registry)
+    # Both servers expose the same fake tool name "get_weather"; the second
+    # collides and is skipped (name-collision gating), proving per-server order
+    # is honoured without crashing.
+    assert summary["weather"] == ["get_weather"]
+    assert summary["stocks"] == []

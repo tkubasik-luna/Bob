@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from bob.sub_agent.result_store import ProjectedResult
+from bob.sub_agent.result_store import ProjectedResult, ToolResultProjector
 
 #: Cap on the tool text echoed into the transcript digest (the model's working
 #: material; the full text is never re-sent — the store holds it server-side).
@@ -45,8 +45,37 @@ def project_mcp_default(result: dict[str, Any]) -> ProjectedResult:
     - **summary** (→ spoken): a deterministic French line naming the tool.
     - **terminal**: ``False`` by default — an uncurated MCP tool feeds a later
       synthesis. Per-tool curation overrides this for single-shot tools (issue
-      0094); this generic projector never converges.
+      0094) via :func:`make_mcp_projector`; this generic projector never converges.
     """
+
+    return _project(result, terminal=False)
+
+
+def make_mcp_projector(*, terminal: bool) -> ToolResultProjector:
+    """Build an MCP projector with a fixed ``terminal`` verdict (issue 0094).
+
+    A per-tool manifest override (``terminal: true``) means the tool is a
+    single-shot lookup (a weather forecast, a stock quote) whose result *is* the
+    answer — the run should converge on it rather than loop for more tool calls.
+    :func:`wrap` selects this factory's projector when the curation marks the
+    tool terminal; an uncurated tool keeps :func:`project_mcp_default`
+    (``terminal=False``). The projection shape is otherwise identical.
+
+    Returns :func:`project_mcp_default` itself when ``terminal`` is ``False`` so
+    the common (non-terminal) case stays the single shared function.
+    """
+
+    if not terminal:
+        return project_mcp_default
+
+    def _project_terminal(result: dict[str, Any]) -> ProjectedResult:
+        return _project(result, terminal=True)
+
+    return _project_terminal
+
+
+def _project(result: dict[str, Any], *, terminal: bool) -> ProjectedResult:
+    """Shared projection body; ``terminal`` is the only branch (issue 0094)."""
 
     tool = result.get("tool")
     tool = tool if isinstance(tool, str) and tool else "outil"
@@ -78,8 +107,8 @@ def project_mcp_default(result: dict[str, Any]) -> ProjectedResult:
         digest=digest,
         deliverable=deliverable,
         summary=summary,
-        terminal=False,
+        terminal=terminal,
     )
 
 
-__all__ = ["project_mcp_default"]
+__all__ = ["make_mcp_projector", "project_mcp_default"]

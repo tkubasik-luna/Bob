@@ -14,9 +14,11 @@ MCP. :func:`wrap` produces a :class:`SubAgentToolDefinition` whose:
 - ``result_projector`` defaults to :func:`project_mcp_default` (generic Markdown
   card) — no per-tool projector code.
 
-A minimal :class:`MCPToolCuration` lets a caller override the French description
-and restrict the advertised argument subset. The full manifest (allowlist,
-per-tool ``terminal`` / typed projector) is issue 0094 — kept out here.
+A :class:`MCPToolCuration` lets a caller override the French description,
+restrict the advertised argument subset, attach retrieval ``tags``, and mark the
+tool ``terminal`` (single-shot). The manifest layer (issue 0094) folds each
+server's per-tool :class:`bob.connectors.mcp.models.MCPToolOverride` into this
+curation via :meth:`MCPToolCuration.from_override`.
 """
 
 from __future__ import annotations
@@ -34,8 +36,8 @@ from bob.connectors.mcp.errors import (
     MCPUnreachableError,
 )
 from bob.connectors.mcp.manager import MCPManager
-from bob.connectors.mcp.models import extract_text_content
-from bob.connectors.mcp.projector import project_mcp_default
+from bob.connectors.mcp.models import MCPToolOverride, extract_text_content
+from bob.connectors.mcp.projector import make_mcp_projector
 from bob.sub_agent.result_store import ToolResultProjector
 from bob.sub_agent.tool_registry import (
     SubAgentToolDefinition,
@@ -63,7 +65,7 @@ _JSON_TYPE_MAP: dict[str, type] = {
 
 @dataclass(frozen=True)
 class MCPToolCuration:
-    """Minimal per-tool curation for :func:`wrap` (issue 0093 scope).
+    """Per-tool curation applied by :func:`wrap`.
 
     - ``description`` — French override advertised to the model (the raw
       upstream description is often terse English). ``None`` keeps the MCP
@@ -71,14 +73,38 @@ class MCPToolCuration:
     - ``expose_args`` — when set, restricts the built ``args_model`` to this
       subset of the schema's properties (the escape hatch when an upstream
       schema is too broad). ``None`` keeps the full property set.
-    - ``terminal`` — reserved; the generic projector is non-terminal and a
-      per-tool ``terminal`` override lands with the manifest (issue 0094). Kept
-      here so the curation shape is forward-stable.
+    - ``tags`` — retrieval keywords carried onto the produced
+      :class:`SubAgentToolDefinition` so
+      :func:`bob.sub_agent.tool_retrieval.select_tools` can surface this tool
+      for a matching goal (issue 0092 cross-module behaviour).
+    - ``terminal`` — when ``True`` the produced tool uses the terminal-aware
+      projector (:func:`bob.connectors.mcp.projector.make_mcp_projector`) so a
+      single-shot lookup converges instead of looping for more tool calls.
     """
 
     description: str | None = None
     expose_args: tuple[str, ...] | None = None
+    tags: tuple[str, ...] = ()
     terminal: bool = False
+
+    @classmethod
+    def from_override(cls, override: MCPToolOverride | None) -> MCPToolCuration:
+        """Fold a manifest :class:`MCPToolOverride` into a :class:`MCPToolCuration`.
+
+        ``None`` yields the empty curation (the upstream tool kept verbatim). The
+        field rename (``description_fr`` → ``description``, ``args`` →
+        ``expose_args``) keeps the manifest vocabulary (issue 0094) decoupled
+        from the adapter's internal curation shape.
+        """
+
+        if override is None:
+            return cls()
+        return cls(
+            description=override.description_fr,
+            expose_args=override.args,
+            tags=override.tags,
+            terminal=override.terminal,
+        )
 
 
 def _build_args_model(tool_name: str, input_schema: dict[str, Any] | None) -> type[BaseModel]:
@@ -241,13 +267,19 @@ def wrap(
             result={"tool": name, "text": text, "is_error": False},
         )
 
+    # A caller-supplied projector wins; otherwise the curation's ``terminal``
+    # flag picks the terminal-aware default (a single-shot lookup converges)
+    # versus the non-terminal generic projector.
+    result_projector = projector or make_mcp_projector(terminal=curation.terminal)
+
     return SubAgentToolDefinition(
         name=name,
         version=version,
         description=description,
         args_model=args_model,
         handler=_handler,
-        result_projector=projector or project_mcp_default,
+        result_projector=result_projector,
+        tags=curation.tags,
     )
 
 
