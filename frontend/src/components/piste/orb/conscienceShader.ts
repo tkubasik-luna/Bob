@@ -411,8 +411,10 @@ vec4 renderNeb3D(vec2 frag){
     float lum=max(max(col.r,col.g),col.b);
     alpha=clamp(0.16 + 0.55*fres + lum, 0.0, 1.0);
   } else {
-    vec3 halo=uAccent*0.05*exp(-length(p)*length(p)*2.4);     // faint halo behind orb
-    col=halo + nebGlow(ro,rd,0.0,24.0,cometCount,trailScale,thick);
+    // No background halo behind the orb — it tinted the whole square canvas
+    // quad (the "fond" the user wants gone). Only the comet trails render here;
+    // everywhere else stays fully transparent.
+    col=nebGlow(ro,rd,0.0,24.0,cometCount,trailScale,thick);
     alpha=clamp(max(max(col.r,col.g),col.b)*1.5, 0.0, 1.0);   // only the glow shows; rest is transparent
   }
 

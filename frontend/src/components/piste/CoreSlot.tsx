@@ -17,8 +17,9 @@
 // part of the prop surface for compatibility but don't apply to the nebula
 // (which has its own nacre palette + form); they're intentionally unused here.
 //
-// The orb mood drives the `--energy` CSS var on `.core` (halo / breathe
-// intensity) via the reducer's `energy` output.
+// The orb mood drives the `--energy` CSS var on `.core` (reserved for glow
+// intensity) via the reducer's `energy` output. There is no backdrop disc
+// behind the orb — the canvas is transparent and stands alone.
 
 import { type OrbState, deriveOrbState } from "../../lib/orbState";
 import type { SphereCanvasProps } from "../../sphere/SphereCanvas";
@@ -78,10 +79,10 @@ export function CoreSlot(props: CoreSlotProps): JSX.Element {
 
   return (
     <>
-      {/* `.core` carries the 300×300 depth footprint and the `--energy` var that
-          drives the halo / breathe intensity. The nebula canvas fills it. */}
+      {/* `.core` carries the 300×300 depth footprint and the `--energy` var
+          (reserved for glow intensity). The nebula canvas fills it — no
+          backdrop disc behind the orb (removed per design: no "fond"). */}
       <div className="core core-nebula" style={{ "--energy": energy } as React.CSSProperties}>
-        <div className="nebula-halo" />
         <ConscienceOrb state={state} motion={motion} glow={glow} audioLevelRef={audioLevelRef} />
       </div>
       <div className="core-label">CORE · conscience</div>

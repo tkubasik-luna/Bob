@@ -10,42 +10,24 @@
    leaves the orb internals to this issue).
 
    Collision check (vs `styles/p3d.css` + `styles/hud.css`):
-   - `.core-nebula`, `.nebula-halo`, `.cv-canvas`: net-new (no rule with these
-     names exists in either sheet), kept verbatim from the mockup, scoped under
-     `.piste`.
-   - `@keyframes breathe`: net-new in the codebase. Prefixed to `p3d-breathe`
-     so it can never clash with any future `breathe` animation elsewhere.
+   - `.core-nebula`, `.cv-canvas`: net-new (no rule with these names exists in
+     either sheet), kept verbatim from the mockup, scoped under `.piste`.
    - `.core` / `.core-label`: OWNED by the foundation `styles/p3d.css` — NOT
      redefined here. We only add the `.core-nebula` MODIFIER layout on top.
    - `.hud-error` (WebGL2 fallback banner): already styled by `styles/hud.css`;
      reused as-is, not redefined.
    ═══════════════════════════════════════════════════════════════════════ */
 
-/* `.core-nebula` stacks the halo + the WebGL canvas in one grid cell so they
-   overlay centred (mockup `display:grid; place-items:center`). The foundation
-   `.core` already sets the 300×300 footprint + `--energy`. */
+/* `.core-nebula` centres the WebGL canvas in one grid cell (mockup
+   `display:grid; place-items:center`). The foundation `.core` already sets the
+   300×300 footprint + `--energy`. No backdrop disc behind the orb — the canvas
+   stands alone (the rose halo was removed: user wants no "fond"). */
 .piste .core-nebula {
   display: grid;
   place-items: center;
 }
 .piste .core-nebula > * {
   grid-area: 1 / 1;
-}
-
-/* Soft rose halo behind the orb — breathes slowly, brighter with energy. */
-.piste .nebula-halo {
-  width: 340px;
-  height: 340px;
-  border-radius: 50%;
-  background: radial-gradient(
-    circle,
-    color-mix(in oklab, var(--accent) 26%, transparent) 0%,
-    transparent 62%
-  );
-  filter: blur(26px);
-  /* energy lifts the resting opacity so a working orb glows a touch hotter */
-  opacity: calc(0.5 + var(--energy) * 0.4);
-  animation: p3d-breathe 7s ease-in-out infinite;
 }
 
 /* The WebGL canvas overspills the 300px `.core` box (mockup is 400px) so the
@@ -55,21 +37,4 @@
   width: 400px;
   height: 400px;
   display: block;
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .piste .nebula-halo {
-    animation: none;
-  }
-}
-
-/* Ported from the mockup's `breathe` keyframe; prefixed to avoid any clash. */
-@keyframes p3d-breathe {
-  0%,
-  100% {
-    transform: scale(1);
-  }
-  50% {
-    transform: scale(1.045);
-  }
 }
