@@ -591,11 +591,66 @@ WEB_SEARCH_SKILL_PACK = SkillPack(
         "actualité",
         "actualités",
         "news",
-        "météo",
         "wikipedia",
         "wikipédia",
         "sur le net",
     ),
+)
+
+
+WEATHER_SKILL_PACK = SkillPack(
+    id="weather_recipe",
+    version=1,
+    fragment=PromptFragment(
+        id="weather_recipe",
+        version=1,
+        template=(
+            "Special case — weather lookup. When the goal asks about the weather "
+            "(météo, temps, prévision, forecast) for a place and/or a date:\n"
+            '  1. (optional) ``progress(thought="recherche météo")``.\n'
+            "  2. Extract the PLACE (a city / region) and the DATE from the goal. "
+            "If the goal says « demain », « ce week-end », « lundi prochain », "
+            "translate it to the concrete date relative to today's date given "
+            "above. If no place is stated, ask for it via "
+            '``done(status="failed", ui_payload=null, '
+            'result_summary="Pour quelle ville veux-tu la météo ?")`` rather '
+            "than guessing.\n"
+            "  3. Call the forecast tool advertised below with the place "
+            "(and date when given). It is a SINGLE-SHOT lookup: as soon as it "
+            "returns a result the weather card and the spoken summary are built "
+            "AUTOMATICALLY and the task ends — you neither write ``done`` nor "
+            "copy the result. (If you ever regain control after the result, "
+            "finish with ``done`` carrying the result's ``result_ref`` and a "
+            "ONE-LINE French forecast as ``result_summary`` — e.g. « À Paris "
+            "demain : ensoleillé, 22 °C. » — no ``ui_payload`` needed.)\n"
+            "  NEVER invent a forecast from memory — only report what the tool "
+            "returned.\n"
+            "\n"
+            "If the forecast tool returns an ERROR (not a result), conclude with "
+            '``done(status="failed", ui_payload=null)`` whose ``result_summary`` '
+            "is read aloud VERBATIM. Use this exact French sentence for any "
+            "tool error (``mcp_unreachable`` / ``mcp_missing_server`` / "
+            "``mcp_tool_error`` / ``mcp_tool_failed`` / ``invalid_args``):\n"
+            "  « Le service météo est indisponible pour le moment — réessaie "
+            "dans un instant. »\n"
+            "Stick to this French sentence word for word."
+        ),
+        description=(
+            "Weather-lookup recipe for the manifest-driven, terminal MCP "
+            "forecast tool (issue 0095). Mirrors the gmail/web packs' shape: "
+            "English instructions, a verbatim French error sentence read aloud "
+            "via TTS. Covers (a) extracting the place + date from the goal "
+            "(resolving relative dates against today's date), (b) the happy "
+            "path — a single-shot forecast call CONVERGES deterministically "
+            "(the weather card + spoken summary are built from the stored "
+            "terminal projection; the model rarely needs to emit ``done``), and "
+            "(c) the single tool-ERROR branch with a pinned « service météo "
+            "indisponible » French speech. The tool NAME is intentionally left "
+            "to the advertised catalogue — the recipe never hard-codes it, so a "
+            "manifest rename does not desync the prompt."
+        ),
+    ),
+    triggers=("météo", "meteo", "temps", "weather", "prévision", "prevision"),
 )
 
 
@@ -604,6 +659,7 @@ WEB_SEARCH_SKILL_PACK = SkillPack(
 SUB_AGENT_SKILL_PACKS: tuple[SkillPack, ...] = (
     GMAIL_SEARCH_SKILL_PACK,
     WEB_SEARCH_SKILL_PACK,
+    WEATHER_SKILL_PACK,
 )
 
 

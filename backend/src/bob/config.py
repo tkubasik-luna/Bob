@@ -199,9 +199,9 @@ class Settings(BaseSettings):
     #     "expose": ["get_forecast"],   # allowlist — ONLY these tools are wrapped
     #     "tools": {                      # per-tool curation overrides
     #       "get_forecast": {
-    #         "description_fr": "Donne la météo d'une ville.",
-    #         "args": ["city"],          # narrowed argument subset
-    #         "tags": ["météo", "weather", "temps"],   # boost retrieval (0092)
+    #         "description_fr": "Donne la météo (prévision) pour un lieu et une date.",
+    #         "args": ["place", "date"], # narrowed argument subset
+    #         "tags": ["météo", "weather", "temps", "prévision"],  # retrieval (0092)
     #         "terminal": true           # single-shot lookup converges
     #       }
     #     }
