@@ -7,10 +7,11 @@ import { describe, expect, test } from "vitest";
  *
  * The `?ui=new` Sphere window runs borderless (`decorations: false`) so the
  * cinematic look isn't broken by OS chrome — the user drags it via the
- * 28px CSS drag region rendered by `SphereUI`. The `?ui=legacy` window must
- * keep its native chrome so the legacy `ChatView` remains usable during the
- * dev transition. These tests read the actual `tauri.conf.json` so the
- * Tauri runtime config stays in sync with the frontend assumptions.
+ * 28px CSS drag region rendered by `SphereUI`. The legacy `?ui=legacy`
+ * (`ChatView`) window was decommissioned once the Piste 3D HUD shipped, so
+ * the config must no longer declare it. These tests read the actual
+ * `tauri.conf.json` so the Tauri runtime config stays in sync with the
+ * frontend assumptions.
  *
  * NOTE: vitest's `include` glob is `src/**` so this file lives under
  * `frontend/src/test/`, not next to `tauri.conf.json` itself. The path
@@ -57,19 +58,11 @@ describe("tauri.conf.json", () => {
     expect(win.transparent !== true).toBe(true);
   });
 
-  test("the `legacy` window keeps its native OS chrome", () => {
-    const config = loadTauriConfig();
-    const win = findWindow(config, "legacy");
-    // Either `decorations` is unset (Tauri default = true) or explicitly
-    // `true`. The only forbidden value is `false`, which would strip the
-    // legacy chrome we still rely on for the `ChatView` window.
-    expect(win.decorations).not.toBe(false);
-  });
-
-  test("both `legacy` and `new` windows are declared", () => {
+  test("the legacy window is gone; `new` + `debug` remain", () => {
     const config = loadTauriConfig();
     const labels = config.app.windows.map((w) => w.label);
-    expect(labels).toContain("legacy");
+    expect(labels).not.toContain("legacy");
     expect(labels).toContain("new");
+    expect(labels).toContain("debug");
   });
 });
