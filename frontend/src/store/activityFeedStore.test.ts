@@ -309,3 +309,67 @@ describe("activityFeedStore — rehydrate from TaskStore snapshot (issue 0077)",
     });
   });
 });
+
+describe("jarvis turn segmentation (PRD 0014)", () => {
+  it("captures the pending turn start at the current jarvis timeline length", () => {
+    const store = useActivityFeedStore.getState();
+    store.markJarvisTurnStart();
+    expect(useActivityFeedStore.getState().jarvisTurnPending).toBe(0);
+    // Stream one turn's worth of items into the jarvis lane.
+    store.appendReasoningDelta(delta("jarvis", "réflexion"));
+    store.flushReasoning();
+    store.appendActivity(activity("jarvis", "délègue : t1", { status: "ok" }));
+    // The next turn's boundary sits AFTER those two items.
+    store.markJarvisTurnStart();
+    expect(useActivityFeedStore.getState().jarvisTurnPending).toBe(2);
+  });
+
+  it("commits a segment bound to the assistant msg_id and clears the pending", () => {
+    const store = useActivityFeedStore.getState();
+    store.markJarvisTurnStart();
+    store.commitJarvisTurn("A1");
+    const s = useActivityFeedStore.getState();
+    expect(s.jarvisSegments).toEqual([{ msgId: "A1", start: 0 }]);
+    expect(s.jarvisTurnPending).toBeNull();
+  });
+
+  it("is a no-op when committing with no pending turn (proactive push)", () => {
+    const store = useActivityFeedStore.getState();
+    store.commitJarvisTurn("P1");
+    expect(useActivityFeedStore.getState().jarvisSegments).toEqual([]);
+  });
+
+  it("does not double-bind a replayed msg_id, but releases the pending", () => {
+    const store = useActivityFeedStore.getState();
+    store.markJarvisTurnStart();
+    store.commitJarvisTurn("A1");
+    store.markJarvisTurnStart();
+    store.commitJarvisTurn("A1"); // replayed assistant_msg — same id
+    const s = useActivityFeedStore.getState();
+    expect(s.jarvisSegments).toEqual([{ msgId: "A1", start: 0 }]);
+    expect(s.jarvisTurnPending).toBeNull();
+  });
+
+  it("captures successive turn starts in order", () => {
+    const store = useActivityFeedStore.getState();
+    store.markJarvisTurnStart();
+    store.commitJarvisTurn("A1");
+    store.appendActivity(activity("jarvis", "délègue : t1", { status: "ok" }));
+    store.markJarvisTurnStart();
+    store.commitJarvisTurn("A2");
+    expect(useActivityFeedStore.getState().jarvisSegments).toEqual([
+      { msgId: "A1", start: 0 },
+      { msgId: "A2", start: 1 },
+    ]);
+  });
+
+  it("reset() clears segments + pending", () => {
+    const store = useActivityFeedStore.getState();
+    store.markJarvisTurnStart();
+    store.commitJarvisTurn("A1");
+    store.reset();
+    const s = useActivityFeedStore.getState();
+    expect(s.jarvisSegments).toEqual([]);
+    expect(s.jarvisTurnPending).toBeNull();
+  });
+});

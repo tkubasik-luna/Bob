@@ -159,6 +159,17 @@ export function rehydrateFinishedLanes(
   return { agentOrder, finishedByAgent };
 }
 
+/** The fixed lane key Bob's MAIN orchestrator turn streams on (mirror of
+ * `orchestrator.JARVIS_AGENT_REF` / the front's `BobCard.JARVIS_REF`). The
+ * per-turn segmentation below is a Jarvis-lane concept, so it is pinned here. */
+const JARVIS_LANE = "jarvis";
+
+/** PRD 0014 — one captured Jarvis turn boundary: the assistant `msg_id` that
+ * closed the turn, and the index into the Jarvis timeline where the turn began
+ * (its first reasoning/chip item). A turn's slice runs from its `start` to the
+ * next segment's `start` (or the live `jarvisTurnPending` / timeline end). */
+export type JarvisSegment = { msgId: string; start: number };
+
 type ActivityFeedState = {
   /** Ordered, interleaved timeline (reasoning segments + chips) per `agent_ref`.
    * The single source the `AgentBlock` renders from. */
@@ -178,6 +189,15 @@ type ActivityFeedState = {
    * chain-of-thought timeline. Jarvis sets it via `agent_answer`; sub-agents via
    * the `task_result` deliverable. Rendered as a dedicated answer block. */
   answerByAgent: Record<string, string>;
+  /** PRD 0014 — committed Jarvis turn boundaries, in occurrence order. Each
+   * binds an assistant `msg_id` to the Jarvis-timeline index where that turn's
+   * reasoning/chips began, so the `BobCard` can split the flat (accumulating)
+   * lane back into per-turn blocks. Empty until the first turn settles. */
+  jarvisSegments: JarvisSegment[];
+  /** PRD 0014 — the Jarvis-timeline index captured at the CURRENT turn's
+   * `thinking: start`, awaiting the closing `assistant_msg` to bind it. `null`
+   * between turns. Drives the live (in-flight) turn's slice. */
+  jarvisTurnPending: number | null;
   /** Append a `reasoning_delta` suffix. COALESCED: the delta is buffered and
    * applied on the next animation-frame flush, not synchronously per token. */
   appendReasoningDelta: (msg: ReasoningDeltaMsg) => void;
@@ -186,6 +206,16 @@ type ActivityFeedState = {
   /** Record an agent's settled reply (from `agent_answer` or a sub-task's
    * `task_result`). A blank/whitespace text is ignored (no empty block). */
   setAnswer: (agentRef: string, text: string) => void;
+  /** PRD 0014 — open a new Jarvis turn: capture the current Jarvis timeline
+   * length as the pending turn start (flushing buffered reasoning first so the
+   * boundary sits AFTER the previous turn's last reasoning). Called on
+   * `thinking: start`. */
+  markJarvisTurnStart: () => void;
+  /** PRD 0014 — bind the pending Jarvis turn start to the assistant `msg_id`
+   * that closed the turn, committing a segment. No-op when no turn is pending
+   * (a proactive push with no `thinking: start`) or the `msg_id` is already
+   * bound (replayed frame). Called on `assistant_msg`. */
+  commitJarvisTurn: (msgId: string) => void;
   /** Append an activity chip as its own ordered timeline item. Applies
    * immediately (after draining any pending reasoning to preserve order). */
   appendActivity: (msg: AgentActivityMsg) => void;
@@ -253,10 +283,34 @@ export const useActivityFeedStore = create<ActivityFeedState>((set) => ({
   finishedByAgent: {},
   perfByAgent: {},
   answerByAgent: {},
+  jarvisSegments: [],
+  jarvisTurnPending: null,
   setAnswer: (agentRef, text) =>
     set((state) => {
       if (!text.trim() || state.answerByAgent[agentRef] === text) return state;
       return { answerByAgent: { ...state.answerByAgent, [agentRef]: text } };
+    }),
+  markJarvisTurnStart: () => {
+    // Drain buffered reasoning so the boundary sits AFTER the previous turn's
+    // last reasoning item, not before it (a delta arriving across the turn gap
+    // would otherwise be attributed to the new turn).
+    useActivityFeedStore.getState().flushReasoning();
+    set((state) => ({ jarvisTurnPending: state.timelineByAgent[JARVIS_LANE]?.length ?? 0 }));
+  },
+  commitJarvisTurn: (msgId) =>
+    set((state) => {
+      // No turn pending (a proactive push with no `thinking: start`) → nothing
+      // to bind. A pending start with no concrete msg never strands the next
+      // turn because `markJarvisTurnStart` overwrites it.
+      if (state.jarvisTurnPending === null) return state;
+      // Already bound (a replayed `assistant_msg`) → just release the pending.
+      if (state.jarvisSegments.some((s) => s.msgId === msgId)) {
+        return { jarvisTurnPending: null };
+      }
+      return {
+        jarvisSegments: [...state.jarvisSegments, { msgId, start: state.jarvisTurnPending }],
+        jarvisTurnPending: null,
+      };
     }),
   setPerf: (msg) =>
     set((state) => ({
@@ -356,19 +410,23 @@ export const useActivityFeedStore = create<ActivityFeedState>((set) => ({
   clearAgent: (agentRef) =>
     set((state) => {
       pendingReasoning.delete(agentRef);
+      // Dropping the Jarvis lane also drops its per-turn segmentation.
+      const jarvisClear =
+        agentRef === JARVIS_LANE ? { jarvisSegments: [], jarvisTurnPending: null } : {};
       // A dropped lane has no finished state / perf footer to remember.
       const { [agentRef]: _finished, ...restFinished } = state.finishedByAgent;
       const { [agentRef]: _perf, ...restPerf } = state.perfByAgent;
       const { [agentRef]: _answer, ...restAnswer } = state.answerByAgent;
       if (!(agentRef in state.timelineByAgent)) {
         if (!state.agentOrder.includes(agentRef) && !(agentRef in state.finishedByAgent)) {
-          return state;
+          return agentRef === JARVIS_LANE ? jarvisClear : state;
         }
         return {
           agentOrder: state.agentOrder.filter((r) => r !== agentRef),
           finishedByAgent: restFinished,
           perfByAgent: restPerf,
           answerByAgent: restAnswer,
+          ...jarvisClear,
         };
       }
       const { [agentRef]: _removed, ...rest } = state.timelineByAgent;
@@ -378,6 +436,7 @@ export const useActivityFeedStore = create<ActivityFeedState>((set) => ({
         finishedByAgent: restFinished,
         perfByAgent: restPerf,
         answerByAgent: restAnswer,
+        ...jarvisClear,
       };
     }),
   reset: () => {
@@ -392,6 +451,8 @@ export const useActivityFeedStore = create<ActivityFeedState>((set) => ({
       finishedByAgent: {},
       perfByAgent: {},
       answerByAgent: {},
+      jarvisSegments: [],
+      jarvisTurnPending: null,
     });
   },
 }));

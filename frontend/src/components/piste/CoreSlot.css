@@ -25,6 +25,13 @@
 .piste .core-nebula {
   display: grid;
   place-items: center;
+  /* The orb is purely decorative (no click handlers) and its canvas is 400px —
+     it OVERSPILLS the 300px `.core` box and, being a later DOM sibling than
+     `.slot-task`/`.slot-data` at the same Z plane, paints + hit-tests ON TOP of
+     the thread deck / data dock. Without this, the transparent canvas pixels
+     swallow clicks over the deck's right edge (cards fail to pin). Click-through
+     so the cards behind stay fully interactive. */
+  pointer-events: none;
 }
 .piste .core-nebula > * {
   grid-area: 1 / 1;

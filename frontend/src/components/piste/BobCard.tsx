@@ -27,25 +27,33 @@
 // mockup. In the deck, `TaskSlot` only mounts the deck once a thread exists, so
 // this null only bites the standalone idle path.
 //
-// Sections, faithful to the mockup `BobBody` (`Design Mockup/p3d-panels.jsx`)
-// and screenshots `p3d-settings.png` / `01-piste.png`:
-//   prompt  — the last user message (italic header; omitted on a proactive
-//             synthesis that has no prompt).
-//   Réflexion — the streamed `reasoning_delta` of the Jarvis lane when present;
-//             otherwise a line narrated from the chip stream by the pure
-//             `reflectionNarrator` (degraded / non-reasoning backend).
-//   Tâches en arrière-plan — the live sub-tasks Bob invoked (name + tool +
-//             state / ✓ rendu). Omitted entirely when Bob delegated nothing, so
-//             a simple question stays an épuré thread.
-//   Réponse — the synthesised reply, streamed live (`streamingAssistant.speech`)
-//             then settled (`agent_answer` / the persisted assistant bubble),
-//             rendered through the EXISTING markdown renderer (MarkdownView).
+// PRD 0014 (chat transcript) — the body is a STACK of per-turn blocks, newest
+// last, like a chat: a new turn APPENDS below the previous instead of replacing
+// it. The session is split into turns by `buildConversation` (a turn's Jarvis
+// réflexion/chip slice is keyed by the assistant `msg_id`; see the per-turn
+// segmentation in `activityFeedStore` + `lib/conversationTurns`). Only the
+// in-flight turn animates (caret / pulse); settled turns read `is-done`.
+//
+// Each turn block, faithful to the mockup `BobBody` (`Design Mockup/…`):
+//   prompt  — that turn's user message (italic; omitted on a proactive
+//             synthesis with no prompt).
+//   flow    — the turn's réflexion runs + delegated-task groups, INTERLEAVED in
+//             arrival order (PRD 0014, `lib/threadFlow`): a thought streamed
+//             after a delegation renders after it, not hoisted above. Réflexion
+//             is the real `reasoning_delta` when present, else a line narrated
+//             from the chip stream (degraded / non-reasoning backend).
+//   Réponse — that turn's reply (streamed `streamingAssistant.speech` for the
+//             live turn, else the settled assistant bubble), through the
+//             EXISTING markdown renderer (MarkdownView).
 //   perf footer — real tok/s · ttft · ctx (the Jarvis `agent_perf` frame),
-//             shown once the turn settles (phase `done`).
+//             shown once the latest turn settles (phase `done`).
 //
 // Co-located styling: `BobCard.css` ports the relevant panel/Bob classes from
 // `Design Mockup/p3d.css` (scoped under `.piste`).
 
+import { useCallback, useEffect, useLayoutEffect, useRef } from "react";
+import { isAtBottom } from "../../lib/autoScroll";
+import { type ConversationTurn, buildConversation } from "../../lib/conversationTurns";
 import { type Reflection, reflectionNarrator } from "../../lib/reflectionNarrator";
 import {
   type AgentPerf,
@@ -277,37 +285,93 @@ export function BobCard({
   const timeline = useActivityFeedStore((s) => s.timelineByAgent[JARVIS_REF]);
   const settledAnswer = useActivityFeedStore((s) => s.answerByAgent[JARVIS_REF]);
   const perf = useActivityFeedStore((s) => s.perfByAgent[JARVIS_REF]);
+  const segments = useActivityFeedStore((s) => s.jarvisSegments);
+  const turnPending = useActivityFeedStore((s) => s.jarvisTurnPending);
 
-  // Single derivation shared with the deck (`TaskSlot`) — no drift.
-  const { prompt, answerText, answering, hasAnswer, reflection, reasoningStreaming, tasks, phase } =
-    deriveBobThread({
-      messages,
-      streamingAssistant,
-      tasks: Object.values(tasksMap),
-      waiting,
-      timeline,
-      settledAnswer,
-    });
+  const allTasks = Object.values(tasksMap);
 
-  const hasTasks = tasks.length > 0;
-  const returned = tasks.filter((t) => isRendered(t.state)).length;
-  const allReturned = hasTasks && returned === tasks.length;
+  // Current-turn phase + live signals (shared derivation with the deck via the
+  // same pure function — no drift). Drives the header word and the in-flight
+  // turn's active styling.
+  const { reasoningStreaming, answering, hasAnswer, phase } = deriveBobThread({
+    messages,
+    streamingAssistant,
+    tasks: allTasks,
+    waiting,
+    timeline,
+    settledAnswer,
+  });
+
+  // ── Chat transcript (PRD 0014): the session split into per-turn blocks, each
+  // a prompt + its chronological réflexion/tâches flow + its réponse, stacked
+  // newest-last like a chat. A new turn appends BELOW the old ones instead of
+  // replacing them. ──────────────────────────────────────────────────────────
+  const conversation = buildConversation({
+    messages,
+    timeline,
+    tasks: allTasks,
+    segments,
+    pending: turnPending,
+    streamingSpeech: streamingAssistant?.speech ?? "",
+  });
+
+  // Auto-scroll the transcript to the newest turn while the user is stuck to the
+  // bottom; pause when they scroll up to read back (standard chat-log behaviour).
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  const contentRef = useRef<HTMLDivElement | null>(null);
+  const stuckRef = useRef(true);
+  const onScroll = useCallback(() => {
+    const el = scrollRef.current;
+    if (el) {
+      stuckRef.current = isAtBottom({
+        scrollTop: el.scrollTop,
+        clientHeight: el.clientHeight,
+        scrollHeight: el.scrollHeight,
+      });
+    }
+  }, []);
+  const pinToBottom = useCallback(() => {
+    const el = scrollRef.current;
+    if (el && stuckRef.current) el.scrollTop = el.scrollHeight;
+  }, []);
+  // Pre-paint pin on every content change — `scrollSignal` aggregates the
+  // message / timeline / streaming lengths so the layout effect re-runs as each
+  // lands, scrolling before the browser paints (no flash of the old position).
+  const scrollSignal =
+    messages.length + (timeline?.length ?? 0) + (streamingAssistant?.speech.length ?? 0);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: scrollSignal is the intended re-run trigger; pinToBottom is stable.
+  useLayoutEffect(() => {
+    pinToBottom();
+  }, [scrollSignal]);
+  // The layout effect alone misses growth that lands AFTER the effect — a settled
+  // MarkdownView reflows taller than the streamed text, code blocks highlight
+  // async, fonts swap. A ResizeObserver on the scroll CONTENT re-pins on every
+  // such size change, so the newest turn always wins the bottom while stuck.
+  useEffect(() => {
+    const content = contentRef.current;
+    if (!content || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(() => pinToBottom());
+    ro.observe(content);
+    return () => ro.disconnect();
+  }, [pinToBottom]);
 
   // The card renders nothing until there IS a thread (idle scene stays empty).
   // In the deck (`inDeck`), Bob is the deck's anchor card, so it still renders
   // its header even with no own content — e.g. a reconnect that rehydrated the
-  // sub-tasks into `chatStore.tasks` WITHOUT replaying Bob's prompt / lane (the
-  // chat history is not replayed). The « Tâches en arrière-plan » list then
-  // carries the card; the header alone anchors the pile otherwise. Standalone
-  // (`<BobCard/>`, `inDeck=false`) keeps the issue-0085 idle null.
-  const hasContent =
-    prompt.length > 0 || hasAnswer || (timeline?.length ?? 0) > 0 || reflection.kind !== "empty";
+  // sub-tasks into `chatStore.tasks` WITHOUT replaying the chat history; the
+  // rehydrated « Tâches » block then carries the card. Standalone keeps the
+  // issue-0085 idle null.
+  const hasContent = conversation.length > 0 || (timeline?.length ?? 0) > 0 || hasAnswer;
   if (!hasContent && !inDeck) return null;
 
   const working = phase !== "done" && phase !== "error";
-  const thinkActive = phase === "think";
-  const summonActive = phase === "summon" || phase === "wait";
-  const answerActive = phase === "answer";
+  const live: LiveSignals = {
+    reasoningStreaming,
+    answering,
+    thinkActive: phase === "think",
+    summonActive: phase === "summon" || phase === "wait",
+    answerActive: phase === "answer",
+  };
 
   return (
     <div className="panel bob-panel">
@@ -322,60 +386,116 @@ export function BobCard({
         <span className="panel-phase">{BOB_STAT[phase]}</span>
       </div>
 
-      {prompt && <div className="task-prompt">{prompt}</div>}
+      <div className="task-scroll" ref={scrollRef} onScroll={onScroll}>
+        <div className="task-scroll-inner" ref={contentRef}>
+          {/* CHAT TRANSCRIPT — one block per turn, stacked newest-last. Only the
+              in-flight turn glows; settled turns read as `is-done`. */}
+          {conversation.map((turn) => (
+            <TurnBlock key={turn.key} turn={turn} live={turn.inFlight ? live : null} />
+          ))}
 
-      <div className="task-scroll">
-        {/* RÉFLEXION — streamed reasoning, or narrated fallback */}
-        {reflection.kind !== "empty" && (
-          <section className={`task-step ${thinkActive ? "is-active" : "is-done"}`}>
-            <div className="step-key">
-              <span className="step-pip" />
-              <span className="step-label">Réflexion</span>
-              <span className="step-meta">{reasoningStreaming ? "en cours…" : "monologue"}</span>
-            </div>
-            <p className="think-body">
-              {reflection.text}
-              {reasoningStreaming && <span className="caret" />}
-            </p>
-          </section>
-        )}
+          {/* PERF — real tok/s · ttft · ctx, once the latest turn settles */}
+          {phase === "done" && <PerfFooter perf={perf} />}
+        </div>
+      </div>
+    </div>
+  );
+}
 
-        {/* TÂCHES EN ARRIÈRE-PLAN — live sub-tasks (omitted when none) */}
-        {hasTasks && (
-          <section className={`task-step ${summonActive ? "is-active" : "is-done"}`}>
+/** The live signals that drive the IN-FLIGHT turn's active styling (caret,
+ * pulsing pip, « en cours… »). Settled past turns render with `null`. */
+type LiveSignals = {
+  reasoningStreaming: boolean;
+  answering: boolean;
+  thinkActive: boolean;
+  summonActive: boolean;
+  answerActive: boolean;
+};
+
+/**
+ * One turn in the BOB chat transcript: the user prompt, its chronological
+ * réflexion/tâches flow (PRD 0014), and its réponse. Only the in-flight turn
+ * (`live` non-null) animates; settled turns read fully `is-done`.
+ */
+function TurnBlock({ turn, live }: { turn: ConversationTurn; live: LiveSignals | null }) {
+  let lastReflectionIdx = -1;
+  let lastTasksIdx = -1;
+  turn.flow.forEach((node, i) => {
+    if (node.kind === "reflection") lastReflectionIdx = i;
+    else lastTasksIdx = i;
+  });
+
+  return (
+    <article className="bob-turn">
+      {turn.prompt && <div className="task-prompt">{turn.prompt}</div>}
+
+      {turn.flow.map((node, i) => {
+        if (node.kind === "reflection") {
+          const streaming =
+            !!live &&
+            node.source === "reasoning" &&
+            live.reasoningStreaming &&
+            i === lastReflectionIdx;
+          const active =
+            !!live &&
+            i === lastReflectionIdx &&
+            (streaming || (node.source === "narrated" && live.thinkActive));
+          return (
+            <section
+              key={`${node.kind}-${i}`}
+              className={`task-step ${active ? "is-active" : "is-done"}`}
+            >
+              <div className="step-key">
+                <span className="step-pip" />
+                <span className="step-label">Réflexion</span>
+                <span className="step-meta">{streaming ? "en cours…" : "monologue"}</span>
+              </div>
+              <p className="think-body">
+                {node.text}
+                {streaming && <span className="caret" />}
+              </p>
+            </section>
+          );
+        }
+        const groupReturned = node.tasks.filter((t) => isRendered(t.state)).length;
+        const groupAll = groupReturned === node.tasks.length;
+        const active = !!live && live.summonActive && i === lastTasksIdx;
+        return (
+          <section
+            key={`${node.kind}-${i}`}
+            className={`task-step ${active ? "is-active" : "is-done"}`}
+          >
             <div className="step-key">
               <span className="step-pip" />
               <span className="step-label">Tâches en arrière-plan</span>
               <span className="step-meta">
-                {allReturned ? `${tasks.length} rendus` : `${returned}/${tasks.length} rendus`}
+                {groupAll
+                  ? `${node.tasks.length} rendus`
+                  : `${groupReturned}/${node.tasks.length} rendus`}
               </span>
             </div>
             <div className="invoked">
-              {tasks.map((t) => (
+              {node.tasks.map((t) => (
                 <InvokedRow key={t.id} task={t} />
               ))}
             </div>
           </section>
-        )}
+        );
+      })}
 
-        {/* RÉPONSE — streamed synthesis, markdown (existing renderer) */}
-        {hasAnswer && (
-          <section className={`task-step ${answerActive ? "is-active" : "is-done"}`}>
-            <div className="step-key">
-              <span className="step-pip" />
-              <span className="step-label">Réponse</span>
-            </div>
-            <div className="answer-box">
-              <MarkdownView props={{ content: answerText }} />
-              {answering && <span className="caret caret-ink" />}
-            </div>
-          </section>
-        )}
-
-        {/* PERF — real tok/s · ttft · ctx, once the turn settles */}
-        {phase === "done" && <PerfFooter perf={perf} />}
-      </div>
-    </div>
+      {turn.answerText && (
+        <section className={`task-step ${live?.answerActive ? "is-active" : "is-done"}`}>
+          <div className="step-key">
+            <span className="step-pip" />
+            <span className="step-label">Réponse</span>
+          </div>
+          <div className="answer-box">
+            <MarkdownView props={{ content: turn.answerText }} />
+            {live?.answering && <span className="caret caret-ink" />}
+          </div>
+        </section>
+      )}
+    </article>
   );
 }
 

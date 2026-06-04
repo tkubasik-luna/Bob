@@ -53,6 +53,8 @@ export function useChatWsBridge(): UseChatWsBridgeResult {
   const setAnswer = useActivityFeedStore((s) => s.setAnswer);
   const markAgentFinished = useActivityFeedStore((s) => s.markAgentFinished);
   const rehydrateFromTasks = useActivityFeedStore((s) => s.rehydrateFromTasks);
+  const markJarvisTurnStart = useActivityFeedStore((s) => s.markJarvisTurnStart);
+  const commitJarvisTurn = useActivityFeedStore((s) => s.commitJarvisTurn);
 
   // Bridge audioPlayer → store so `Bubble` can render the wave indicator
   // on the exact bubble currently being voiced. Cleared on natural end
@@ -86,6 +88,12 @@ export function useChatWsBridge(): UseChatWsBridgeResult {
           break;
         case "thinking":
           setWaiting(msg.state === "start");
+          // PRD 0014 — open a new Jarvis turn so the BobCard chat transcript can
+          // split the flat (accumulating) jarvis lane into per-turn blocks. The
+          // pending start binds to this turn's `assistant_msg` below.
+          if (msg.state === "start") {
+            markJarvisTurnStart();
+          }
           break;
         case "assistant_msg":
           // A user-turn reply supersedes any in-flight audio (the user moved
@@ -102,6 +110,9 @@ export function useChatWsBridge(): UseChatWsBridgeResult {
           // every PCM frame is dropped — i.e. no voice at task exit.
           if (msg.msg_id) {
             currentMsgIdRef.current = msg.msg_id;
+            // PRD 0014 — bind the pending Jarvis turn start to this reply's id so
+            // the transcript can resolve this turn's reasoning/tasks slice.
+            commitJarvisTurn(msg.msg_id);
           }
           addAssistantMessage(msg.speech, msg.ui, msg.msg_id, msg.proactive);
           // PRD 0006 / issue 0049 — the persisted bubble takes over from
@@ -254,6 +265,8 @@ export function useChatWsBridge(): UseChatWsBridgeResult {
       setAnswer,
       markAgentFinished,
       rehydrateFromTasks,
+      markJarvisTurnStart,
+      commitJarvisTurn,
     ],
   );
 

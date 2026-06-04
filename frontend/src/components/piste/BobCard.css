@@ -68,18 +68,41 @@
   opacity: 0.92;
 }
 .piste .task-scroll {
-  display: flex;
-  flex-direction: column;
-  gap: 9px;
   max-height: min(52vh, 440px);
   overflow-y: auto;
   overflow-x: hidden;
-  padding-right: 8px;
+  /* Top/bottom padding == the 18px mask fade below, so the first/last lines rest
+     OUTSIDE the gradient (the empty padding takes the fade instead). Without it
+     the auto-scroll-to-bottom parks the perf footer half-inside the fade. */
+  padding: 18px 8px 18px 0;
   margin-right: -8px;
   scrollbar-width: thin;
   scrollbar-color: var(--line) transparent;
-  -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 18px), transparent 100%);
-  mask-image: linear-gradient(to bottom, #000 calc(100% - 18px), transparent 100%);
+  /* Symmetric fade: top AND bottom. The card auto-scrolls to the newest turn, so
+     a long réflexion pins to the bottom and its top scrolls under the head — a
+     top fade softens that edge instead of hard-clipping the text mid-line. */
+  -webkit-mask-image: linear-gradient(
+    to bottom,
+    transparent 0,
+    #000 18px,
+    #000 calc(100% - 18px),
+    transparent 100%
+  );
+  mask-image: linear-gradient(
+    to bottom,
+    transparent 0,
+    #000 18px,
+    #000 calc(100% - 18px),
+    transparent 100%
+  );
+}
+/* The flex stack of turns lives on an inner wrapper so a ResizeObserver can
+   watch its size (it grows with each turn / markdown reflow) while the outer
+   `.task-scroll` owns the scroll viewport + mask + padding. */
+.piste .task-scroll-inner {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
 }
 .piste .task-scroll::-webkit-scrollbar {
   width: 6px;
@@ -157,6 +180,23 @@
 }
 .piste .caret-ink {
   background: var(--ink);
+}
+
+/* ── CHAT TRANSCRIPT — one block per turn, stacked newest-last (PRD 0014) ─── */
+.piste .bob-turn {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+/* A divider + breathing room between successive turns, so the thread reads as a
+   chat log rather than one continuous flow. */
+.piste .bob-turn + .bob-turn {
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+/* Inside a turn the flex gap handles spacing — drop the prompt's own margin. */
+.piste .bob-turn .task-prompt {
+  margin-bottom: 0;
 }
 
 /* RÉPONSE — wraps the existing MarkdownView; pull it back into the mockup's

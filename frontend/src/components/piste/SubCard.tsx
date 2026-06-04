@@ -23,7 +23,7 @@
 // sub-task STATE; args/result render only when present — never an empty row.
 
 import { deriveAgentPhase } from "../../lib/agentPhase";
-import { reflectionNarrator } from "../../lib/reflectionNarrator";
+import { buildSubFlow } from "../../lib/threadFlow";
 import { type AgentTimelineItem, useActivityFeedStore } from "../../store/activityFeedStore";
 import type { Task } from "../../types/ws";
 import "./SubCard.css";
@@ -65,18 +65,21 @@ export function SubCard({
   const phase = deriveAgentPhase(timeline, terminalState(task.state));
   const working = phase.status === "running";
 
-  // ── Réflexion — real reasoning primes, else a line narrated from the chips ──
-  const reflection = reflectionNarrator(timeline);
+  // ── Chronological body (PRD 0014): réflexion runs + each tool call, in
+  // arrival order — no longer collapsed to the single latest tool. ────────────
+  const flow = buildSubFlow(timeline);
+  let lastReflectionIdx = -1;
+  let lastToolIdx = -1;
+  flow.forEach((node, i) => {
+    if (node.kind === "reflection") lastReflectionIdx = i;
+    else lastToolIdx = i;
+  });
 
-  // ── Outil — the latest tool_call chip (name + redacted args/result) ─────────
+  // The collapsed (back) tab still summarises with the latest tool's name; a
+  // redaction / pre-tool fallback names it neutrally so the row is never empty.
   const toolChip = latestToolChip(timeline);
-  // Redaction fallback: no chip yet → name the step neutrally so the row is
-  // never empty (still backed by the card's STATE in the header).
   const toolName = toolChip?.label ?? "outil";
   const toolShown = toolChip !== undefined;
-  const toolOk = toolChip?.status === "ok" || task.state === "done";
-  const toolArgs = toolChip?.args;
-  const toolResult = toolChip?.result;
 
   // ── Rendu — the sub-agent's settled reply (↳). The persisted task `result`
   // is the canonical handle; the lane `answer` is the live fallback before the
@@ -102,31 +105,40 @@ export function SubCard({
       )}
 
       <div className="sub-body">
-        {/* RÉFLEXION */}
-        {reflection.kind !== "empty" && reflection.text.trim() && (
-          <p className="sub-think">
-            {reflection.text}
-            {working && reflection.kind === "reasoning" && <span className="caret" />}
-          </p>
-        )}
-
-        {/* OUTIL — name + args + result (args/result only when not redacted) */}
-        {toolShown && (
-          <div className={`sub-tool ${toolOk ? "is-ok" : "is-run"}`}>
-            <div className="sub-tool-line">
-              <span className="sub-tool-mark" />
-              <span className="sub-tool-name">{toolName}</span>
-              {!toolOk && <span className="sub-tool-run">appel…</span>}
-            </div>
-            {toolArgs && <div className="sub-tool-args">{toolArgs}</div>}
-            {toolResult && (
-              <div className="sub-tool-res">
-                <span className="bgtask-chk">✓</span>
-                {toolResult}
+        {/* CHRONOLOGICAL FLOW — réflexion runs + each tool call, in arrival
+            order (PRD 0014). A running call shows « appel… »; a settled one
+            settles in place with its redacted args/result. */}
+        {flow.map((node, i) => {
+          if (node.kind === "reflection") {
+            const streaming = working && node.source === "reasoning" && i === lastReflectionIdx;
+            return (
+              <p key={`${node.kind}-${i}`} className="sub-think">
+                {node.text}
+                {streaming && <span className="caret" />}
+              </p>
+            );
+          }
+          const chip = node.chip;
+          // Per-chip status; the tail tool also reads as settled once the task
+          // itself is done (covers a finish chip that was redacted / never came).
+          const toolOk = chip.status === "ok" || (i === lastToolIdx && task.state === "done");
+          return (
+            <div key={`${node.kind}-${i}`} className={`sub-tool ${toolOk ? "is-ok" : "is-run"}`}>
+              <div className="sub-tool-line">
+                <span className="sub-tool-mark" />
+                <span className="sub-tool-name">{chip.label}</span>
+                {!toolOk && <span className="sub-tool-run">appel…</span>}
               </div>
-            )}
-          </div>
-        )}
+              {chip.args && <div className="sub-tool-args">{chip.args}</div>}
+              {chip.result && (
+                <div className="sub-tool-res">
+                  <span className="bgtask-chk">✓</span>
+                  {chip.result}
+                </div>
+              )}
+            </div>
+          );
+        })}
 
         {/* RENDU — the sub-agent's settled reply (↳) */}
         {hasRendu && (

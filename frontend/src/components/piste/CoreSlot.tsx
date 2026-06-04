@@ -3,7 +3,7 @@
 // The centre slot holds the conscience orb. Issue 0083 rendered the legacy
 // `<SphereCanvas/>` here as a PLACEHOLDER; this slice swaps the internals for
 // the ported conscience NEBULA orb (`orb/ConscienceOrb` — WebGL form 3, nacre
-// rose/lavender), keeping the `CORE · conscience` label beneath.
+// rose/lavender). The orb stands alone — no label in front of it.
 //
 // Prop surface is UNCHANGED — `CoreSlotProps = SphereCanvasProps` — so the
 // shell binding in `SphereUI` (`<CoreSlot {...orbProps} />`) still type-checks.
@@ -77,15 +77,12 @@ export function CoreSlot(props: CoreSlotProps): JSX.Element {
   // binding contract but intentionally unused — see the file header.)
   const audioLevelRef = props.audioLevelRef;
 
+  // `.core` carries the 300×300 depth footprint and the `--energy` var
+  // (reserved for glow intensity). The nebula canvas fills it — no backdrop disc
+  // behind the orb (removed per design: no "fond") and no label in front of it.
   return (
-    <>
-      {/* `.core` carries the 300×300 depth footprint and the `--energy` var
-          (reserved for glow intensity). The nebula canvas fills it — no
-          backdrop disc behind the orb (removed per design: no "fond"). */}
-      <div className="core core-nebula" style={{ "--energy": energy } as React.CSSProperties}>
-        <ConscienceOrb state={state} motion={motion} glow={glow} audioLevelRef={audioLevelRef} />
-      </div>
-      <div className="core-label">CORE · conscience</div>
-    </>
+    <div className="core core-nebula" style={{ "--energy": energy } as React.CSSProperties}>
+      <ConscienceOrb state={state} motion={motion} glow={glow} audioLevelRef={audioLevelRef} />
+    </div>
   );
 }

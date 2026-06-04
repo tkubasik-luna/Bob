@@ -213,18 +213,11 @@
   gap: 14px;
 }
 
-/* core placeholder box + label (orb internals ship in 0084) */
+/* core box — the conscience orb fills it (internals in 0084), no label */
 .piste .core {
   position: relative;
   width: 300px;
   height: 300px;
-}
-.piste .core-label {
-  font-family: var(--font-mono);
-  font-size: 9.5px;
-  letter-spacing: 0.32em;
-  color: var(--faint);
-  text-transform: uppercase;
 }
 
 /* ───────────────────────────── LAYOUT · DEPTH (Céladon) ─────────────────

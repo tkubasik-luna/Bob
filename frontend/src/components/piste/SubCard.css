@@ -92,6 +92,46 @@
   display: flex;
   flex-direction: column;
   gap: 8px;
+  /* Own scroll viewport, like the BOB card (`BobCard.css .task-scroll`). The
+     front card's `.panel` caps at 540px and clips overflow (`TaskSlot.css`),
+     so a long fil (réflexion + tool chain + rendu) would otherwise get hidden
+     with NO way to reach it. Same max-height + symmetric mask fade + thin
+     scrollbar, tinted lavender (`--sub`) to match the sub chrome. Back cards
+     keep `display:none` here (`TaskSlot.css`), so the collapse is unaffected. */
+  max-height: min(52vh, 440px);
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 18px 8px 18px 0;
+  margin-right: -8px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--sub-line) transparent;
+  -webkit-mask-image: linear-gradient(
+    to bottom,
+    transparent 0,
+    #000 18px,
+    #000 calc(100% - 18px),
+    transparent 100%
+  );
+  mask-image: linear-gradient(
+    to bottom,
+    transparent 0,
+    #000 18px,
+    #000 calc(100% - 18px),
+    transparent 100%
+  );
+}
+.piste .sub-body::-webkit-scrollbar {
+  width: 6px;
+}
+.piste .sub-body::-webkit-scrollbar-track {
+  background: transparent;
+}
+.piste .sub-body::-webkit-scrollbar-thumb {
+  background: color-mix(in oklab, var(--sub) 30%, transparent);
+  border-radius: 999px;
+}
+.piste .sub-body::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in oklab, var(--sub) 50%, transparent);
 }
 .piste .sub-think {
   margin: 0;
