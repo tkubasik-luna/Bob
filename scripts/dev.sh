@@ -96,14 +96,18 @@ if [[ -n "$PROVIDER_OVERRIDE" ]]; then
   fi
 fi
 
-# Charge .env pour le shell courant (sans écraser les vars déjà définies)
-set -a
-# shellcheck disable=SC1091
-source .env
-set +a
+# NE PAS `source .env` : bash retire les guillemets des valeurs JSON (ex:
+# MCP_SERVERS) et `set -a` les exporterait mal-formées dans l'environnement, ce
+# qui ferait planter le parsing pydantic au boot (os.environ prime sur .env).
+# Le backend lit .env directement (pydantic-settings) ; ce script n'a besoin que
+# de l'hôte/port, qu'on extrait ligne à ligne. Les overrides provider/URL sont
+# déjà exportés plus haut.
+env_value() { grep -E "^$1=" .env | head -1 | cut -d= -f2- || true; }
 
-HOST="${BACKEND_HOST:-127.0.0.1}"
-PORT="${BACKEND_PORT:-8000}"
+HOST="${BACKEND_HOST:-$(env_value BACKEND_HOST)}"
+PORT="${BACKEND_PORT:-$(env_value BACKEND_PORT)}"
+HOST="${HOST:-127.0.0.1}"
+PORT="${PORT:-8000}"
 
 PIDS=()
 cleanup() {
