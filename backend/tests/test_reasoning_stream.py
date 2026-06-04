@@ -305,9 +305,7 @@ def _registry_with_echo() -> SubAgentToolRegistry:
     )
 
 
-async def _run_capturing(
-    runner: SubAgentRunner, task_id: str
-) -> list[dict[str, Any]]:
+async def _run_capturing(runner: SubAgentRunner, task_id: str) -> list[dict[str, Any]]:
     emitted: list[dict[str, Any]] = []
 
     async def _capture(event: dict[str, Any]) -> None:
@@ -351,9 +349,12 @@ async def test_runner_emits_started_toolcall_finished_chips() -> None:
     # Every chip is tagged by the producing agent.
     assert all(c["agent_ref"] == task_id for c in chips)
     kinds = [(c["kind"], c["status"]) for c in chips]
-    # In chronological order: started, tool_call running, tool_call ok, finished.
+    # In chronological order: started, the goal-driven tool-retrieval marker
+    # (PRD 0015 / issue 0092, emitted once before the first turn), tool_call
+    # running, tool_call ok, finished.
     assert kinds == [
         ("started", "info"),
+        ("tool_retrieval", "info"),
         ("tool_call", "running"),
         ("tool_call", "ok"),
         ("finished", "ok"),

@@ -26,6 +26,7 @@ from bob.sub_agent.activity_projector import (
     TaskStarted,
     ToolCallFinished,
     ToolCallStarted,
+    ToolRetrieval,
     Validation,
     project,
     redact_payload,
@@ -77,6 +78,38 @@ def test_tool_call_started_is_running() -> None:
     assert chip.kind == "tool_call"
     assert chip.status == "running"
     assert "gmail_search" in chip.label
+
+
+def test_tool_retrieval_maps_to_info_chip_with_scoreboard() -> None:
+    chip = project(
+        ToolRetrieval(
+            agent_ref=AGENT,
+            advertised=("web_search", "web_fetch"),
+            scoreboard=(("web_search", 9), ("web_fetch", 3), ("gmail_search", 0)),
+        )
+    )
+    assert chip is not None
+    assert chip.agent_ref == AGENT
+    assert chip.kind == "tool_retrieval"
+    assert chip.status == "info"
+    assert "2" in chip.label  # advertised count
+    assert chip.args is not None
+    assert "web_search" in chip.args and "web_fetch" in chip.args
+    assert "web_search (9)" in chip.args  # scoreboard explains the choice
+
+
+def test_tool_retrieval_native_deferral_label() -> None:
+    chip = project(
+        ToolRetrieval(
+            agent_ref=AGENT,
+            advertised=("say",),
+            provider_path="native_anthropic_deferral",
+        )
+    )
+    assert chip is not None
+    assert chip.kind == "tool_retrieval"
+    assert chip.status == "info"
+    assert "chargés" in chip.label
 
 
 def test_tool_call_finished_ok_and_error() -> None:

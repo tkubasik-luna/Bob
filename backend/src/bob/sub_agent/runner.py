@@ -129,6 +129,7 @@ from bob.sub_agent.activity_projector import (
     TaskStarted,
     ToolCallFinished,
     ToolCallStarted,
+    ToolRetrieval,
     Validation,
     agent_perf_frame,
     project,
@@ -864,6 +865,13 @@ class SubAgentRunner:
         # native path built (``None`` on the LM Studio path) for observability.
         self._native_tool_deferral: bool = subagent_client.supports_native_tool_deferral()
         self._last_deferral_plan: ToolDeferralPlan | None = None
+        # PRD 0015 / issue 0092 — the tool-retrieval chip event built by
+        # ``_advertise_tools`` (sync) for the async ``_run`` loop to emit, plus a
+        # dedupe signature: retrieval is keyed on the task goal so the advertised
+        # set is identical every turn — emit one chip per distinct set, not one
+        # per turn (mirrors the goal-stable nature of the gate).
+        self._pending_tool_retrieval: ToolRetrieval | None = None
+        self._last_advertised_signature: tuple[str, ...] | None = None
 
     @property
     def addendum_queue(self) -> AddendumQueue:
@@ -1085,6 +1093,19 @@ class SubAgentRunner:
             # Consume the addenda once they have been folded into the
             # prompt — they should not appear on the next iteration too.
             pending_addenda = []
+
+            # PRD 0015 / issue 0092 — surface the tool-retrieval gate as a chip in
+            # the agent feed, like a tool call. ``_build_messages`` (sync) staged
+            # the event; emit it here (async) once per DISTINCT advertised set —
+            # the gate is goal-keyed so this is effectively one chip per task.
+            pending_retrieval = self._pending_tool_retrieval
+            self._pending_tool_retrieval = None
+            if (
+                pending_retrieval is not None
+                and pending_retrieval.advertised != self._last_advertised_signature
+            ):
+                self._last_advertised_signature = pending_retrieval.advertised
+                await self._emit_activity(pending_retrieval)
 
             # Re-inject any pending validator feedback under the dedicated
             # ``system_validator`` role (issue 0048). Empty list on the
@@ -1669,6 +1690,7 @@ class SubAgentRunner:
                 k=settings.TOOL_RETRIEVAL_K,
                 min_score=settings.TOOL_RETRIEVAL_MIN_SCORE,
             )
+            board = score_tools(self._tool_registry, task.goal)
             # PRD 0015 / issue 0092 — make the retrieval decision observable: the
             # advertised subset + the full lexical scoreboard for this goal, so a
             # "why did/didn't tool X show up?" question is answerable from logs.
@@ -1685,10 +1707,18 @@ class SubAgentRunner:
                     "kind": "tools_advertised",
                     "provider_path": "openai_compatible",
                     "advertised": [d.name for d in advertised],
-                    "scoreboard": score_tools(self._tool_registry, task.goal),
+                    "scoreboard": board,
                     "k": settings.TOOL_RETRIEVAL_K,
                     "min_score": settings.TOOL_RETRIEVAL_MIN_SCORE,
                 },
+            )
+            # Stage the user-facing chip for ``_run`` to emit (sync method → no
+            # await here). Dedupe is by advertised signature in ``_run``.
+            self._pending_tool_retrieval = ToolRetrieval(
+                agent_ref=task.id,
+                advertised=tuple(d.name for d in advertised),
+                scoreboard=tuple((name, score) for name, score in board),
+                provider_path="openai_compatible",
             )
             return advertised
 
@@ -1717,6 +1747,12 @@ class SubAgentRunner:
                 "loaded": list(plan.loaded),
                 "deferred": list(plan.deferred),
             },
+        )
+        self._pending_tool_retrieval = ToolRetrieval(
+            agent_ref=task.id,
+            advertised=tuple(plan.loaded),
+            scoreboard=(),
+            provider_path="native_anthropic_deferral",
         )
         return advertised
 

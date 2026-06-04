@@ -175,6 +175,11 @@ export function buildSubFlow(timeline: readonly AgentTimelineItem[] | undefined)
         }
       }
       nodes.push({ kind: "tool", chip: item });
+    } else if (item.kind === "chip" && item.activityKind === "tool_retrieval") {
+      // PRD 0015 / issue 0092 — the goal-driven tool-retrieval gate. A single
+      // neutral (`info`) chip emitted once per task before the first call; render
+      // it inline like a tool node so the user sees which tools were advertised.
+      nodes.push({ kind: "tool", chip: item });
     }
   }
 

@@ -63,6 +63,7 @@ AgentActivityKind = Literal[
     "started",
     "finished",
     "tool_call",
+    "tool_retrieval",
     "ask_user",
     "stall",
     "cap",
@@ -203,6 +204,29 @@ class ToolCallFinished:
 
 
 @dataclass(frozen=True)
+class ToolRetrieval:
+    """The goal-driven tool-retrieval gate ran for this task (PRD 0015 / issue 0092).
+
+    Surfaces the same way a tool call does — a chip in the agent feed — so the
+    user/dev sees WHICH tools were advertised to the model for the task goal
+    (and, on the local path, the relevance scoreboard behind that choice). The
+    retrieval is keyed on the task goal, so it is emitted ONCE per task (the
+    runner dedupes identical advertised sets across turns).
+
+    ``advertised`` is the ordered set of tool names whose schemas went into the
+    prompt; ``scoreboard`` is the full ``(name, score)`` lexical board on the
+    OpenAI-compatible path (empty on the native-Anthropic deferral path).
+    ``provider_path`` distinguishes the two gates. Tool names carry no Mail
+    content, so the label/args need no redaction beyond the shared scrub.
+    """
+
+    agent_ref: str
+    advertised: tuple[str, ...]
+    scoreboard: tuple[tuple[str, int], ...] = ()
+    provider_path: str = "openai_compatible"
+
+
+@dataclass(frozen=True)
 class AskUser:
     """The sub-agent asked the user a question (legacy ``ask_user`` flow)."""
 
@@ -267,6 +291,7 @@ InternalEvent = (
     | TaskFinished
     | ToolCallStarted
     | ToolCallFinished
+    | ToolRetrieval
     | AskUser
     | StallNudge
     | CapReached
@@ -392,14 +417,10 @@ def project(event: InternalEvent) -> AgentActivity | None:
         label = "Démarré"
         if event.title:
             label = f"Démarré : {_redact_free_text(event.title)}"
-        return AgentActivity(
-            agent_ref=event.agent_ref, kind="started", label=label, status="info"
-        )
+        return AgentActivity(agent_ref=event.agent_ref, kind="started", label=label, status="info")
 
     if isinstance(event, TaskFinished):
-        status: AgentActivityStatus = (
-            "ok" if event.status in ("complete", "degraded") else "error"
-        )
+        status: AgentActivityStatus = "ok" if event.status in ("complete", "degraded") else "error"
         label = {
             "complete": "Terminé",
             "degraded": "Terminé (dégradé)",
@@ -407,9 +428,7 @@ def project(event: InternalEvent) -> AgentActivity | None:
             "cancelled": "Annulé",
             "timeout": "Expiré",
         }.get(event.status, event.status)
-        return AgentActivity(
-            agent_ref=event.agent_ref, kind="finished", label=label, status=status
-        )
+        return AgentActivity(agent_ref=event.agent_ref, kind="finished", label=label, status=status)
 
     if isinstance(event, ToolCallStarted):
         return AgentActivity(
@@ -440,6 +459,25 @@ def project(event: InternalEvent) -> AgentActivity | None:
             args=args,
         )
 
+    if isinstance(event, ToolRetrieval):
+        n = len(event.advertised)
+        if event.provider_path == "native_anthropic_deferral":
+            label = f"Outils chargés ({n})"
+        else:
+            label = f"Sélection d'outils ({n})"
+        # ``args`` row: the advertised names, then a compact scoreboard so the
+        # chip explains WHY (highest-scoring first). Tool names only — safe.
+        advertised = " · ".join(event.advertised) if event.advertised else "aucun"
+        board = " · ".join(f"{name} ({score})" for name, score in event.scoreboard)
+        detail = advertised if not board else f"{advertised}  —  scores: {board}"
+        return AgentActivity(
+            agent_ref=event.agent_ref,
+            kind="tool_retrieval",
+            label=label,
+            status="info",
+            args=_redact_free_text(detail),
+        )
+
     if isinstance(event, AskUser):
         return AgentActivity(
             agent_ref=event.agent_ref,
@@ -450,9 +488,7 @@ def project(event: InternalEvent) -> AgentActivity | None:
 
     if isinstance(event, StallNudge):
         label = "Boucle détectée — terminaison forcée" if event.forced else "Boucle détectée"
-        return AgentActivity(
-            agent_ref=event.agent_ref, kind="stall", label=label, status="warn"
-        )
+        return AgentActivity(agent_ref=event.agent_ref, kind="stall", label=label, status="warn")
 
     if isinstance(event, CapReached):
         label = {
@@ -460,9 +496,7 @@ def project(event: InternalEvent) -> AgentActivity | None:
             "wall_clock": "Limite de temps atteinte",
             "token": "Limite de tokens atteinte",
         }.get(event.cap, f"Limite atteinte ({event.cap})")
-        return AgentActivity(
-            agent_ref=event.agent_ref, kind="cap", label=label, status="warn"
-        )
+        return AgentActivity(agent_ref=event.agent_ref, kind="cap", label=label, status="warn")
 
     if isinstance(event, Retry):
         return AgentActivity(

@@ -171,6 +171,16 @@
   background: #7fcba0;
   box-shadow: 0 0 6px #7fcba0;
 }
+/* PRD 0015 / issue 0092 — the tool-retrieval gate: a neutral selection marker,
+   visually distinct from a running (pulse) or settled-ok (green) tool call. */
+.piste .sub-tool.is-retrieval .sub-tool-mark {
+  background: #8fa6d6;
+  box-shadow: 0 0 6px #8fa6d6;
+  border-radius: 50%;
+}
+.piste .sub-tool.is-retrieval .sub-tool-name {
+  opacity: 0.82;
+}
 .piste .sub-tool-name {
   font-family: var(--font-mono);
   font-size: 11px;

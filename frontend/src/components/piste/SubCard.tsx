@@ -119,11 +119,18 @@ export function SubCard({
             );
           }
           const chip = node.chip;
+          // The tool-retrieval gate is a neutral one-shot marker (no running →
+          // settled pair), so it always reads as settled — never « appel… ».
+          const isRetrieval = chip.activityKind === "tool_retrieval";
           // Per-chip status; the tail tool also reads as settled once the task
           // itself is done (covers a finish chip that was redacted / never came).
-          const toolOk = chip.status === "ok" || (i === lastToolIdx && task.state === "done");
+          const toolOk =
+            isRetrieval || chip.status === "ok" || (i === lastToolIdx && task.state === "done");
           return (
-            <div key={`${node.kind}-${i}`} className={`sub-tool ${toolOk ? "is-ok" : "is-run"}`}>
+            <div
+              key={`${node.kind}-${i}`}
+              className={`sub-tool ${isRetrieval ? "is-retrieval" : toolOk ? "is-ok" : "is-run"}`}
+            >
               <div className="sub-tool-line">
                 <span className="sub-tool-mark" />
                 <span className="sub-tool-name">{chip.label}</span>

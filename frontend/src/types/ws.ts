@@ -376,6 +376,7 @@ export type AgentActivityKind =
   | "started"
   | "finished"
   | "tool_call"
+  | "tool_retrieval"
   | "ask_user"
   | "stall"
   | "cap"

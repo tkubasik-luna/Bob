@@ -150,6 +150,26 @@ describe("buildSubFlow", () => {
     ]);
   });
 
+  it("renders a tool_retrieval chip as its own flow node (issue 0092)", () => {
+    const retrieval: AgentTimelineItem = {
+      kind: "chip",
+      activityKind: "tool_retrieval",
+      label: "Sélection d'outils (1)",
+      status: "info",
+      args: "web_search  —  scores: web_search (9) · gmail_search (0)",
+    };
+    expect(
+      buildSubFlow([retrieval, reasoning("Je cherche l'actu."), tool("web_search", "ok")]),
+    ).toEqual([
+      { kind: "tool", chip: retrieval },
+      { kind: "reflection", text: "Je cherche l'actu.", source: "reasoning" },
+      {
+        kind: "tool",
+        chip: { kind: "chip", activityKind: "tool_call", label: "web_search", status: "ok" },
+      },
+    ]);
+  });
+
   it("coalesces a running + settled chip of the same tool into one block", () => {
     expect(
       buildSubFlow([
