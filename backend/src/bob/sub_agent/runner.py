@@ -147,8 +147,6 @@ from bob.sub_agent.tool_registry import (
     build_default_subagent_registry,
 )
 from bob.sub_agent.tool_retrieval import (
-    ToolDeferralPlan,
-    build_tool_deferral_plan,
     score_tools,
     select_tools,
 )
@@ -896,17 +894,6 @@ class SubAgentRunner:
         self._on_validation_exhausted: OnValidationExhausted = (
             on_validation_exhausted or SubAgentOnValidationExhausted(runner=self)
         )
-        # PRD 0015 / issue 0096 — native-Anthropic tool deferral. Decided ONCE
-        # from the resolved provider via the client capability query (mirrors the
-        # ``_envelope_schema`` guided-JSON gate above): on a deferral-capable
-        # provider the runner skips the server-side ``select_tools`` retrieval
-        # and hands the platform a deferral plan instead. ``False`` on every
-        # OpenAI-compatible provider (LM Studio) so that path is byte-for-byte
-        # the issue-0092 server-side retrieval — this layer is never on the local
-        # critical path. ``_last_deferral_plan`` records the most recent plan the
-        # native path built (``None`` on the LM Studio path) for observability.
-        self._native_tool_deferral: bool = subagent_client.supports_native_tool_deferral()
-        self._last_deferral_plan: ToolDeferralPlan | None = None
         # PRD 0015 / issue 0092 — the tool-retrieval chip event built by
         # ``_advertise_tools`` (sync) for the async ``_run`` loop to emit, plus a
         # dedupe signature: retrieval is keyed on the task goal so the advertised
@@ -924,19 +911,6 @@ class SubAgentRunner:
     @property
     def policy(self) -> SubAgentPolicy:
         return self._policy
-
-    @property
-    def last_deferral_plan(self) -> ToolDeferralPlan | None:
-        """The deferral plan built on the most recent native-Anthropic prompt.
-
-        PRD 0015 / issue 0096. ``None`` until the first prompt is built and
-        ``None`` forever on an OpenAI-compatible (LM Studio) provider — that path
-        runs server-side retrieval and never builds a plan. The native path sets
-        it on every :meth:`_build_messages` so callers / tests can inspect the
-        kept-loaded vs deferred split and the request-shaped deferral params.
-        """
-
-        return self._last_deferral_plan
 
     def request_cancel(self) -> None:
         """Set the cooperative cancellation flag.
@@ -1700,107 +1674,65 @@ class SubAgentRunner:
     def _advertise_tools(self, task: Task) -> list[SubAgentToolDefinition]:
         """Pick the tools whose schemas go into the prompt for this ``task``.
 
-        Provider-keyed gate (PRD 0015 / issues 0092 + 0096):
+        Single server-side lexical gate (PRD 0015 / issue 0092), identical on
+        EVERY provider. :func:`bob.sub_agent.tool_retrieval.select_tools` scores
+        the registry against the goal and advertises only the goal-RETRIEVED
+        subset (+ the ``always_on`` core) so the prompt catalogue stays bounded
+        as the registry scales. This is the only scaling lever Bob has on the
+        Claude CLI: it runs ``--tools ""`` and takes its tool list ONLY from the
+        prompt, so the catalogue size IS the per-turn tool-token cost. Claude is
+        the reliable debug reference, so it deliberately runs the SAME gate, same
+        knobs (``TOOL_RETRIEVAL_K`` / ``TOOL_RETRIEVAL_MIN_SCORE``) as LM Studio
+        — the retrieval decision is reproducible across providers.
 
-        - **OpenAI-compatible (LM Studio)** — the default. Runs the server-side
-          lexical retrieval gate :func:`bob.sub_agent.tool_retrieval.select_tools`
-          and advertises only the goal-RETRIEVED subset so a weak local model is
-          not drowned in irrelevant schemas as the registry scales. This branch
-          is BYTE-FOR-BYTE the issue-0092 behaviour: same call, same args, same
-          knobs — no deferral params anywhere.
-        - **native Anthropic (claude_cli)** — issue 0096 (+ fix). The strong
-          Anthropic model has no need for the issue-0092 lexical cap (that gate
-          only exists to stop a WEAK local model drowning in schemas), so the
-          server-side retrieval is SKIPPED and the WHOLE fleet is advertised in
-          the prompt catalogue. This is load-bearing, not cosmetic: the
-          ``claude`` CLI Bob shells out to runs ``--tools ""`` and gets its tool
-          list ONLY from the prompt — there is no live ``defer_loading`` /
-          ``mcp_toolset`` wire — so a tool left out of the catalogue is invisible
-          AND uncallable. Advertising only the ``always_on`` core silently
-          dropped every other tool (all MCP tools, ``web_search``, …) on this
-          provider. :func:`build_tool_deferral_plan` is still built + stashed: it
-          keeps the loaded/deferred split observable and is the seam a real
-          native-deferral wire would consume later.
+        (Issue 0096's "native Anthropic tool deferral" branch was removed: the
+        ``claude`` CLI exposes no live ``defer_loading`` / ``mcp_toolset`` wire
+        through Bob's invocation, so "defer" only ever dropped tools from the
+        catalogue and made them uncallable. A real deferral wire — letting the
+        platform load schemas lazily — would mean the CLI dispatching tools
+        itself, bypassing Bob's dispatch / blackboard; that is a separate,
+        much larger change, not a capability flag.)
 
-        Dispatch is unaffected on BOTH branches: ``_validate_tool_args`` /
-        ``_handle_tool_call`` resolve any REGISTERED tool by name (advertised ⊂
-        dispatchable), so a tool the model calls without its schema being in the
-        catalogue still runs.
+        Dispatch is unaffected: ``_validate_tool_args`` / ``_handle_tool_call``
+        resolve any REGISTERED tool by name (advertised ⊂ dispatchable), so a
+        tool the model calls without its schema being in the catalogue still
+        runs.
         """
 
-        if not self._native_tool_deferral:
-            settings = get_settings()
-            self._last_deferral_plan = None
-            advertised = select_tools(
-                self._tool_registry,
-                task.goal,
-                k=settings.TOOL_RETRIEVAL_K,
-                min_score=settings.TOOL_RETRIEVAL_MIN_SCORE,
-            )
-            board = score_tools(self._tool_registry, task.goal)
-            # PRD 0015 / issue 0092 — make the retrieval decision observable: the
-            # advertised subset + the full lexical scoreboard for this goal, so a
-            # "why did/didn't tool X show up?" question is answerable from logs.
-            emit_debug(
-                category="task",
-                severity="debug",
-                source="bob.sub_agent_runner._advertise_tools",
-                summary=(
-                    f"Catalogue annoncé ({len(advertised)} outils, "
-                    f"retrieval lexical) pour « {task.goal[:60]} »"
-                ),
-                payload={
-                    "task_id": task.id,
-                    "kind": "tools_advertised",
-                    "provider_path": "openai_compatible",
-                    "advertised": [d.name for d in advertised],
-                    "scoreboard": board,
-                    "k": settings.TOOL_RETRIEVAL_K,
-                    "min_score": settings.TOOL_RETRIEVAL_MIN_SCORE,
-                },
-            )
-            # Stage the user-facing chip for ``_run`` to emit (sync method → no
-            # await here). Dedupe is by advertised signature in ``_run``.
-            self._pending_tool_retrieval = ToolRetrieval(
-                agent_ref=task.id,
-                advertised=tuple(d.name for d in advertised),
-                scoreboard=tuple((name, score) for name, score in board),
-                provider_path="openai_compatible",
-            )
-            return advertised
-
-        # Native Anthropic: the strong model needs no lexical cap, AND the CLI
-        # has no live defer_loading wire (it runs ``--tools ""`` + prompt
-        # catalogue), so a tool not rendered into the catalogue is uncallable.
-        # Advertise the WHOLE fleet — anything less silently drops every
-        # non-``always_on`` tool (all MCP tools) on this provider. The plan is
-        # still built + stashed for the loaded/deferred observability + future
-        # real-deferral seam.
-        plan = build_tool_deferral_plan(self._tool_registry)
-        self._last_deferral_plan = plan
-        advertised = list(self._tool_registry)
+        settings = get_settings()
+        advertised = select_tools(
+            self._tool_registry,
+            task.goal,
+            k=settings.TOOL_RETRIEVAL_K,
+            min_score=settings.TOOL_RETRIEVAL_MIN_SCORE,
+        )
+        board = score_tools(self._tool_registry, task.goal)
+        # PRD 0015 / issue 0092 — make the retrieval decision observable: the
+        # advertised subset + the full lexical scoreboard for this goal, so a
+        # "why did/didn't tool X show up?" question is answerable from logs.
         emit_debug(
             category="task",
             severity="debug",
             source="bob.sub_agent_runner._advertise_tools",
             summary=(
-                f"Catalogue annoncé ({len(advertised)} outils, fleet complète, "
-                f"deferral natif sans gate lexical) pour « {task.goal[:60]} »"
+                f"Catalogue annoncé ({len(advertised)} outils, "
+                f"retrieval lexical) pour « {task.goal[:60]} »"
             ),
             payload={
                 "task_id": task.id,
                 "kind": "tools_advertised",
-                "provider_path": "native_anthropic_deferral",
                 "advertised": [d.name for d in advertised],
-                "loaded": list(plan.loaded),
-                "deferred": list(plan.deferred),
+                "scoreboard": board,
+                "k": settings.TOOL_RETRIEVAL_K,
+                "min_score": settings.TOOL_RETRIEVAL_MIN_SCORE,
             },
         )
+        # Stage the user-facing chip for ``_run`` to emit (sync method → no
+        # await here). Dedupe is by advertised signature in ``_run``.
         self._pending_tool_retrieval = ToolRetrieval(
             agent_ref=task.id,
             advertised=tuple(d.name for d in advertised),
-            scoreboard=(),
-            provider_path="native_anthropic_deferral",
+            scoreboard=tuple((name, score) for name, score in board),
         )
         return advertised
 

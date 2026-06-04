@@ -32,7 +32,6 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from dataclasses import dataclass, field
 
 from bob.sub_agent.tool_registry import SubAgentToolDefinition
 
@@ -301,80 +300,3 @@ def score_tools(registry: object, goal: str) -> list[tuple[str, int]]:
     ]
     scored.sort(key=lambda pair: (-pair[1], pair[0]))
     return scored
-
-
-# ---------------------------------------------------------------------------
-# Native Anthropic tool deferral — PRD 0015 / issue 0096.
-#
-# On the native Anthropic provider the runner does NOT run the server-side
-# lexical gate above (:func:`select_tools`). Instead the WHOLE fleet is handed
-# to the platform and the schemas the model does not immediately need are marked
-# *deferred* (``defer_loading`` for individual tools, ``mcp_toolset`` deferral
-# for an MCP server) so the model pulls a tool's schema only when it decides to
-# call it. The split is the inverse of the always-on idea: ``always_on`` tools
-# (the frequently-used / kept-loaded core) are sent loaded; every other tool is
-# deferred. This module owns ONLY the pure split + the request-shaped params; it
-# is provider-agnostic and never touches the wire — the LM Studio path never
-# calls it.
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class ToolDeferralPlan:
-    """Pure split of a tool fleet into kept-loaded vs deferred (issue 0096).
-
-    Built by :func:`build_tool_deferral_plan` from a registry. Carries:
-
-    - ``loaded`` — names of the always-loaded core (the ``always_on`` tools); the
-      model sees their schemas up front. The frequently-used / always-on set.
-    - ``deferred`` — names of every other tool; the platform loads each schema
-      lazily, only when the model elects to call it (``defer_loading``).
-    - ``params`` — the request-shaped deferral params attached to the native
-      Anthropic call (``{"defer_loading": [...]}``). This is the thin seam the
-      request builder consumes; today it is built deterministically here and is
-      not yet threaded onto the live ``claude`` CLI argv (see issue report —
-      the CLI runs ``--tools ""`` and uses the Hermes codec). MCP-server-level
-      deferral (``mcp_toolset``) keys off the same split once MCP tools carry a
-      server tag; until then the plan defers MCP tools individually like any
-      other, which is behaviourally equivalent.
-
-    Frozen + deterministic: names are sorted so the plan (and any cache key built
-    from it) is byte-stable across runs regardless of registration order.
-    """
-
-    loaded: tuple[str, ...] = ()
-    deferred: tuple[str, ...] = ()
-    params: dict[str, object] = field(default_factory=dict)
-
-
-def build_tool_deferral_plan(registry: object) -> ToolDeferralPlan:
-    """Build the native-Anthropic deferral plan for ``registry`` — pure + deterministic.
-
-    Splits the fleet into the always-loaded core (``always_on`` tools — the
-    frequently-used / kept-loaded set the model always sees) and the deferred
-    remainder (every other tool, loaded lazily by the platform). Returns a
-    :class:`ToolDeferralPlan` whose ``params`` is the request-shaped
-    ``{"defer_loading": [<deferred names>]}`` bag the native request builder
-    attaches. ``defer_loading`` is omitted entirely when nothing is deferred (an
-    all-always-on or empty registry) so the request stays minimal.
-
-    NO I/O, NO model, NO new dependency — mirrors :func:`select_tools`.
-    ``registry`` is anything iterable over :class:`SubAgentToolDefinition` (the
-    :class:`bob.sub_agent.tool_registry.SubAgentToolRegistry` qualifies); typed
-    loosely so this pure helper never imports the registry's concrete shape.
-
-    CRITICAL: this is NEVER called on the OpenAI-compatible (LM Studio) path —
-    that path stays byte-for-byte on :func:`select_tools` (issue 0092). The gate
-    lives in :meth:`bob.sub_agent.runner.SubAgentRunner._build_messages`, keyed
-    off the resolved provider via
-    :meth:`bob.llm_client.LLMClient.supports_native_tool_deferral`.
-    """
-
-    definitions: list[SubAgentToolDefinition] = list(registry)  # type: ignore[call-overload]
-    loaded = tuple(sorted(d.name for d in definitions if d.always_on))
-    deferred = tuple(sorted(d.name for d in definitions if not d.always_on))
-
-    params: dict[str, object] = {}
-    if deferred:
-        params["defer_loading"] = list(deferred)
-    return ToolDeferralPlan(loaded=loaded, deferred=deferred, params=params)

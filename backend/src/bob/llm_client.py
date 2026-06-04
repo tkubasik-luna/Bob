@@ -251,27 +251,6 @@ class LLMClient(ABC):
 
         return False
 
-    def supports_native_tool_deferral(self) -> bool:
-        """Whether the resolved provider does native Anthropic tool deferral.
-
-        PRD 0015 / issue 0096. The native Anthropic platform can be handed the
-        WHOLE tool fleet and told to *defer* loading the schemas it does not
-        immediately need (``defer_loading`` for individual tools / ``mcp_toolset``
-        deferral for an MCP server), so the model pulls a tool's schema only when
-        it decides to call it. On such a provider the sub-agent runner SKIPS the
-        server-side lexical retrieval gate (:func:`select_tools`, issue 0092) and
-        delegates discovery to the platform instead.
-
-        Returns ``False`` here — the conservative default. Only the native
-        Anthropic provider (:class:`ClaudeCliClient`) overrides it to ``True``.
-        Every OpenAI-compatible provider (LM Studio and friends) has NO such
-        platform feature, so it inherits ``False`` and stays BYTE-FOR-BYTE on the
-        issue-0092 server-side retrieval path — this capability is never on the
-        critical path for the local configuration.
-        """
-
-        return False
-
     @abstractmethod
     async def chat(
         self,
@@ -1264,20 +1243,6 @@ class ClaudeCliClient(LLMClient):
             capability_for_backend("claude_cli"),
             settings.LLM_TOOL_MODE,
         )
-
-    def supports_native_tool_deferral(self) -> bool:
-        """The Claude CLI is the native Anthropic provider — deferral capable.
-
-        PRD 0015 / issue 0096. ``claude_cli`` resolves to the native Anthropic
-        platform, which supports ``defer_loading`` / ``mcp_toolset`` deferral, so
-        the sub-agent runner delegates tool discovery to the platform and SKIPS
-        the server-side :func:`bob.sub_agent.tool_retrieval.select_tools` gate
-        (issue 0092). Distinct from :meth:`supports_guided_json` (which stays
-        ``False`` here — the CLI has no constrained decoding): the two
-        capabilities are orthogonal, so do NOT collapse them.
-        """
-
-        return True
 
     def _isolation_args(self) -> list[str]:
         """Extra argv that quarantine the CLI from the user's ``~/.claude``.

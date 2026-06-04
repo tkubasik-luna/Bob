@@ -214,16 +214,15 @@ class ToolRetrieval:
     runner dedupes identical advertised sets across turns).
 
     ``advertised`` is the ordered set of tool names whose schemas went into the
-    prompt; ``scoreboard`` is the full ``(name, score)`` lexical board on the
-    OpenAI-compatible path (empty on the native-Anthropic deferral path).
-    ``provider_path`` distinguishes the two gates. Tool names carry no Mail
-    content, so the label/args need no redaction beyond the shared scrub.
+    prompt; ``scoreboard`` is the full ``(name, score)`` lexical board behind
+    that choice. The gate is the same on every provider (issue 0092), so there is
+    no provider distinction to carry. Tool names carry no Mail content, so the
+    label/args need no redaction beyond the shared scrub.
     """
 
     agent_ref: str
     advertised: tuple[str, ...]
     scoreboard: tuple[tuple[str, int], ...] = ()
-    provider_path: str = "openai_compatible"
 
 
 @dataclass(frozen=True)
@@ -461,10 +460,7 @@ def project(event: InternalEvent) -> AgentActivity | None:
 
     if isinstance(event, ToolRetrieval):
         n = len(event.advertised)
-        if event.provider_path == "native_anthropic_deferral":
-            label = f"Outils chargés ({n})"
-        else:
-            label = f"Sélection d'outils ({n})"
+        label = f"Sélection d'outils ({n})"
         # ``args`` row: the advertised names, then a compact scoreboard so the
         # chip explains WHY (highest-scoring first). Tool names only — safe.
         advertised = " · ".join(event.advertised) if event.advertised else "aucun"

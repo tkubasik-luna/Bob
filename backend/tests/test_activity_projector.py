@@ -98,20 +98,6 @@ def test_tool_retrieval_maps_to_info_chip_with_scoreboard() -> None:
     assert "web_search (9)" in chip.args  # scoreboard explains the choice
 
 
-def test_tool_retrieval_native_deferral_label() -> None:
-    chip = project(
-        ToolRetrieval(
-            agent_ref=AGENT,
-            advertised=("say",),
-            provider_path="native_anthropic_deferral",
-        )
-    )
-    assert chip is not None
-    assert chip.kind == "tool_retrieval"
-    assert chip.status == "info"
-    assert "chargés" in chip.label
-
-
 def test_tool_call_finished_ok_and_error() -> None:
     ok = project(ToolCallFinished(agent_ref=AGENT, tool_name="gmail_search", ok=True))
     assert ok is not None and ok.kind == "tool_call" and ok.status == "ok"
