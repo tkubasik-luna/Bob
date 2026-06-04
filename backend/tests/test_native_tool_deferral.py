@@ -279,10 +279,12 @@ def test_anthropic_path_skips_select_tools_and_attaches_deferral() -> None:
     assert plan.deferred == ("web_search",)
     assert plan.params == {"defer_loading": ["web_search"]}
 
-    # The kept-loaded core is advertised in the prompt; the deferred tool's
-    # schema is NOT pre-loaded into the catalogue (the platform loads it lazily).
+    # The CLI gets its tool list ONLY from the prompt (no live defer_loading
+    # wire), so the WHOLE fleet is advertised in the catalogue — the "deferred"
+    # tool included, else it would be invisible AND uncallable. The plan still
+    # records the loaded/deferred split for observability.
     assert "gmail_search" in system
-    assert "web_search" not in system
+    assert "web_search" in system
 
 
 def test_lm_studio_path_runs_select_tools_and_attaches_no_deferral() -> None:

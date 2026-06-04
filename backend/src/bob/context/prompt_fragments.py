@@ -349,7 +349,7 @@ SYSTEM_BLOCK_PERSONALITY_REMINDER = PromptFragment(
 
 SUB_AGENT_V2_SYSTEM_PROMPT = PromptFragment(
     id="sub_agent_v2_system",
-    version=7,
+    version=8,
     template=(
         "You are an autonomous sub-agent. Your goal: {goal}.\n"
         "Reason internally in English. ALL user-facing text you write — "
@@ -383,7 +383,13 @@ SUB_AGENT_V2_SYSTEM_PROMPT = PromptFragment(
         "\n"
         "Reply with the JSON object ONLY, no surrounding text. The "
         "deliverable Markdown lives INSIDE the ``ui_payload`` string — the "
-        "envelope stays pure JSON."
+        "envelope stays pure JSON.\n"
+        "After the closing brace of that ONE JSON object, STOP — emit nothing "
+        "more. To call a tool, emit ONLY the ``tool_call`` envelope and stop: "
+        "the system runs the tool and returns its result to you in a following "
+        "``tool`` message. NEVER execute a tool yourself, NEVER invent a tool "
+        "result, and NEVER write ``<function_calls>``, ``<function_results>``, "
+        "``<invoke>`` or any other tool-execution syntax."
     ),
     description=(
         "Base system prompt for sub-agents under the v2 contract (PRD 0006 / "
@@ -398,7 +404,12 @@ SUB_AGENT_V2_SYSTEM_PROMPT = PromptFragment(
         "(``tool#1``) so the base contract names no specific tool. v7 switches "
         "the contract + internal reasoning to English (better CoT / tool-call "
         "accuracy on small local models) while pinning all user-facing output "
-        "(``result_summary``, ``ui_payload``) to French."
+        "(``result_summary``, ``ui_payload``) to French. v8 adds the stop-after-"
+        "one-object + no-self-execution clause: a native-tool-use model (sonnet "
+        "on the Claude CLI path) otherwise emits the valid envelope and then "
+        "appends hallucinated ``<function_calls>``/``<function_results>`` blocks "
+        "with a fabricated tool result (paired with the parser's raw_decode "
+        "salvage in :func:`bob.sub_agent.runner._decode_leading_json`)."
     ),
 )
 

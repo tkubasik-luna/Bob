@@ -1713,6 +1713,44 @@ def test_golden_envelope_fixture_coverage() -> None:
     assert _ENVELOPE_FAILS, "expected at least one failing envelope fixture"
 
 
+def test_envelope_salvages_tool_call_before_hallucinated_function_results() -> None:
+    """The Puygros bug: a native-tool-use model (sonnet on the Claude CLI path)
+    emits the valid ``tool_call`` envelope and then KEEPS GOING — appending
+    ``<function_calls>``/``<function_results>`` blocks with a fabricated result.
+
+    Strict ``json.loads`` rejected the whole reply ("Extra data, line 3") and the
+    correct ``maps_directions`` call was discarded, so the real tool never ran and
+    the model fell back to inventing the answer. ``_normalise_payload`` now
+    salvages the leading envelope via ``raw_decode`` so the genuine call dispatches
+    and Bob feeds back the REAL tool result.
+    """
+
+    raw = (
+        '{"action": "tool_call", "name": "maps_directions", '
+        '"args": {"origin": "Chambéry, Savoie, France", '
+        '"destination": "Puygros, 73190, Savoie, France", "mode": "driving"}}\n\n'
+        "<function_calls>\n"
+        '<invoke name="maps_directions">\n'
+        "<parameter name=\"origin\">Chambéry, Savoie, France</parameter>\n"
+        "</invoke>\n"
+        "</function_calls>\n"
+        "<function_results>\n"
+        '{"status": "OK", "distance": "14.4 km", "duration": "18 mins"}\n'
+        "</function_results>"
+    )
+
+    normalised = _normalise_payload(raw)
+
+    assert normalised.action is not None
+    assert normalised.action.action == "tool_call"
+    assert normalised.action.name == "maps_directions"
+    assert normalised.action.args == {
+        "origin": "Chambéry, Savoie, France",
+        "destination": "Puygros, 73190, Savoie, France",
+        "mode": "driving",
+    }
+
+
 # ---------------------------------------------------------------------------
 # Guided-JSON envelope (PRD 0008 / issue 0060).
 #
@@ -1965,21 +2003,25 @@ async def test_guided_path_avoids_fenced_envelope_failure_mode() -> None:
     Regression for ``backend/logs/orchestration.jsonl`` (2026-05-28): a local
     model emitted a markdown-fenced envelope, ``json.loads`` choked and the task
     died ``llm_failed``. We reproduce the SHAPE of that win: the non-guided path
-    still FAILS on a fenced-with-trailing-prose envelope (the tolerant strip
-    can't save it), but the guided path never sees that shape — under constrained
-    decode the reply is clean JSON. We assert the contrast directly: the same
-    runner construction yields a parse failure off the raw fenced string via the
-    non-guided normaliser, while the guided run with a clean reply succeeds.
+    still FAILS on a prose-PREFIXED envelope (text BEFORE the JSON — ``raw_decode``
+    starts at column 1 and cannot salvage a leading non-JSON span), but the guided
+    path never sees that shape — under constrained decode the reply is clean JSON.
+    We assert the contrast directly: the same runner construction yields a parse
+    failure off the prose-prefixed string via the non-guided normaliser, while the
+    guided run with a clean reply succeeds. (Trailing junk AFTER a valid object is
+    now salvaged — see ``envelope/prose-suffix`` — so the failing shape here is a
+    leading-prose one, which still genuinely defeats the parser.)
     """
 
-    # The fenced-with-trailing-prose shape that defeats the non-guided strip
-    # (locked by the 0057 path-3 ``envelope/fenced-trailing-prose`` fixture).
-    fenced_with_prose = (
-        "```json\n" + json.dumps({"action": "progress", "thought": "x"}) + "\n```\nDone thinking."
+    # Prose BEFORE the JSON defeats the non-guided parse: the leading span is not
+    # JSON, so ``raw_decode`` fails at column 1 (locked by the path-3
+    # ``envelope/prose-prefix`` fixture).
+    prose_prefixed = (
+        "Here is my next action:\n" + json.dumps({"action": "progress", "thought": "x"})
     )
     # Non-guided normaliser still raises on it (unchanged fallback behaviour).
     with pytest.raises(SubAgentActionParseError):
-        _normalise_payload(fenced_with_prose)
+        _normalise_payload(prose_prefixed)
 
     # Guided backend: the model is constrained, so the reply is clean JSON and
     # the run completes — the fenced failure mode is simply not produced.

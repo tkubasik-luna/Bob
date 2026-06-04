@@ -640,7 +640,7 @@ def _salvage_display(raw: str) -> str:
 
     text = _strip_code_fence(raw).strip()
     try:
-        payload = json.loads(text)
+        payload, _trailing = _decode_leading_json(text)
     except json.JSONDecodeError:
         return raw.strip()
     if isinstance(payload, dict):
@@ -694,6 +694,32 @@ class _ToolCallStep:
     stored: StoredResult | None = None
 
 
+def _decode_leading_json(payload_text: str) -> tuple[Any, int]:
+    """Decode the LEADING JSON value in ``payload_text``; tolerate a trailing tail.
+
+    The sub-agent envelope contract is a SINGLE JSON object, but a native-tool-
+    use model (sonnet via the Claude CLI) routinely emits the valid
+    ``{"action": …}`` object and then KEEPS GOING — appending native
+    ``<function_calls>`` / ``<function_results>`` blocks, complete with a
+    hallucinated tool result, as if it were executing the tool itself. A strict
+    :func:`json.loads` rejects the whole reply with "Extra data" and the
+    otherwise-valid action (e.g. a correct ``maps_directions`` ``tool_call``) is
+    thrown away, so the real tool never dispatches.
+    :meth:`json.JSONDecoder.raw_decode` recovers the leading object and reports
+    how many bytes of trailing garbage followed it, so the caller can dispatch
+    the real action AND log the hallucination. Mirrors the Hermes codec's
+    ``raw_decode`` tolerance (:func:`bob.llm.tooling.hermes._try_json`).
+
+    Returns ``(payload, trailing_chars)``. Raises :class:`json.JSONDecodeError`
+    when the LEADING value itself is malformed — the genuine parse failure that
+    still routes to the retry loop with the SAME error message as before.
+    """
+
+    stripped = payload_text.strip()
+    payload, end = json.JSONDecoder().raw_decode(stripped)
+    return payload, len(stripped) - end
+
+
 def _normalise_payload(raw: str) -> _NormalisedPayload:
     """Normalise an LLM response string into a v1 action payload.
 
@@ -707,11 +733,27 @@ def _normalise_payload(raw: str) -> _NormalisedPayload:
 
     payload_text = _strip_code_fence(raw)
     try:
-        payload = json.loads(payload_text)
+        payload, trailing = _decode_leading_json(payload_text)
     except json.JSONDecodeError as exc:
         raise SubAgentActionParseError(
             f"invalid JSON: {exc.msg} (line {exc.lineno}, column {exc.colno})"
         ) from exc
+    if trailing > 0:
+        # The leading envelope was valid but the model kept generating — almost
+        # always a native-tool-use model (sonnet on the Claude CLI path) emitting
+        # hallucinated ``<function_calls>`` / ``<function_results>`` after its
+        # JSON action. We keep the real action and discard the tail; log it so the
+        # fabrication stays observable rather than silently swallowed.
+        emit_debug(
+            category="task",
+            severity="warn",
+            source="bob.sub_agent_runner._normalise_payload",
+            summary=(
+                f"Enveloppe JSON suivie de {trailing} caractères parasites "
+                "ignorés (probable résultat d'outil halluciné)"
+            ),
+            payload={"kind": "envelope_trailing_discarded", "trailing_chars": trailing},
+        )
 
     if not isinstance(payload, dict):
         raise SubAgentActionParseError(
@@ -1666,14 +1708,19 @@ class SubAgentRunner:
           not drowned in irrelevant schemas as the registry scales. This branch
           is BYTE-FOR-BYTE the issue-0092 behaviour: same call, same args, same
           knobs — no deferral params anywhere.
-        - **native Anthropic (claude_cli)** — issue 0096. The platform supports
-          native tool deferral, so server-side retrieval is SKIPPED entirely:
-          :func:`build_tool_deferral_plan` splits the WHOLE fleet into a
-          kept-loaded core (``always_on``) + a deferred remainder and the request
-          builder is handed the ``defer_loading`` / ``mcp_toolset`` params. The
-          model still SEES every tool (deferred schemas load lazily), so this
-          branch advertises the kept-loaded core in the prompt catalogue and
-          stashes the plan on the runner for the request seam + tests.
+        - **native Anthropic (claude_cli)** — issue 0096 (+ fix). The strong
+          Anthropic model has no need for the issue-0092 lexical cap (that gate
+          only exists to stop a WEAK local model drowning in schemas), so the
+          server-side retrieval is SKIPPED and the WHOLE fleet is advertised in
+          the prompt catalogue. This is load-bearing, not cosmetic: the
+          ``claude`` CLI Bob shells out to runs ``--tools ""`` and gets its tool
+          list ONLY from the prompt — there is no live ``defer_loading`` /
+          ``mcp_toolset`` wire — so a tool left out of the catalogue is invisible
+          AND uncallable. Advertising only the ``always_on`` core silently
+          dropped every other tool (all MCP tools, ``web_search``, …) on this
+          provider. :func:`build_tool_deferral_plan` is still built + stashed: it
+          keeps the loaded/deferred split observable and is the seam a real
+          native-deferral wire would consume later.
 
         Dispatch is unaffected on BOTH branches: ``_validate_tool_args`` /
         ``_handle_tool_call`` resolve any REGISTERED tool by name (advertised ⊂
@@ -1722,35 +1769,36 @@ class SubAgentRunner:
             )
             return advertised
 
-        # Native Anthropic: delegate discovery to the platform's deferral. The
-        # kept-loaded core is the ``always_on`` set; everything else is deferred.
+        # Native Anthropic: the strong model needs no lexical cap, AND the CLI
+        # has no live defer_loading wire (it runs ``--tools ""`` + prompt
+        # catalogue), so a tool not rendered into the catalogue is uncallable.
+        # Advertise the WHOLE fleet — anything less silently drops every
+        # non-``always_on`` tool (all MCP tools) on this provider. The plan is
+        # still built + stashed for the loaded/deferred observability + future
+        # real-deferral seam.
         plan = build_tool_deferral_plan(self._tool_registry)
         self._last_deferral_plan = plan
-        loaded_names = set(plan.loaded)
-        advertised = [d for d in self._tool_registry if d.name in loaded_names]
-        # Issue 0096 — server-side retrieval is SKIPPED on this path; record the
-        # kept-loaded vs deferred split instead so the deferral decision is just
-        # as observable as the lexical gate above.
+        advertised = list(self._tool_registry)
         emit_debug(
             category="task",
             severity="debug",
             source="bob.sub_agent_runner._advertise_tools",
             summary=(
-                f"Catalogue annoncé ({len(plan.loaded)} core chargés, "
-                f"{len(plan.deferred)} différés, deferral natif) "
-                f"pour « {task.goal[:60]} »"
+                f"Catalogue annoncé ({len(advertised)} outils, fleet complète, "
+                f"deferral natif sans gate lexical) pour « {task.goal[:60]} »"
             ),
             payload={
                 "task_id": task.id,
                 "kind": "tools_advertised",
                 "provider_path": "native_anthropic_deferral",
+                "advertised": [d.name for d in advertised],
                 "loaded": list(plan.loaded),
                 "deferred": list(plan.deferred),
             },
         )
         self._pending_tool_retrieval = ToolRetrieval(
             agent_ref=task.id,
-            advertised=tuple(plan.loaded),
+            advertised=tuple(d.name for d in advertised),
             scoreboard=(),
             provider_path="native_anthropic_deferral",
         )

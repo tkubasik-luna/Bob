@@ -347,14 +347,14 @@ _DONE: dict[str, Any] = {
 
 #: Sub-agent envelope fixtures and the CURRENT ``_normalise_payload`` behaviour.
 #:
-#: Well-formed + cleanly-fenced envelopes parse. Prose-wrapped (prefix OR
-#: trailing) envelopes and a fenced envelope with trailing prose AFTER the close
-#: fence do NOT parse today — ``_strip_code_fence`` only strips a fence whose last
-#: line is the closer, and ``json.loads`` then chokes on the surrounding prose,
-#: raising ``SubAgentActionParseError`` (→ runner forces
-#: ``done(failed, invalid_output)``). A non-``json`` fence language is also left
-#: untouched and fails to parse. The guided-JSON phase (issue 0060) is expected
-#: to flip the ``parses=False`` cases to ``True``.
+#: Well-formed + cleanly-fenced envelopes parse. A VALID leading JSON object
+#: followed by a trailing tail (prose, or a native-tool-use model's hallucinated
+#: ``<function_calls>``/``<function_results>`` blocks) ALSO parses now: the runner
+#: salvages the leading object via ``raw_decode`` and discards the tail. What
+#: still fails: prose BEFORE the JSON, and a fenced envelope ``_strip_code_fence``
+#: can't unwrap (trailing prose after the close fence, or a non-``json`` fence
+#: language) — the leading ``` defeats ``raw_decode`` → ``SubAgentActionParseError``
+#: (→ runner forces ``done(failed, invalid_output)``).
 ENVELOPE_FIXTURES: tuple[EnvelopeFixture, ...] = (
     EnvelopeFixture(
         id="envelope/tool-call-clean",
@@ -400,17 +400,27 @@ ENVELOPE_FIXTURES: tuple[EnvelopeFixture, ...] = (
         parses=False,
     ),
     EnvelopeFixture(
-        # Prose AFTER the JSON → json.loads "Extra data" → does NOT parse today.
+        # Prose AFTER a VALID leading JSON object → the envelope is salvaged via
+        # ``raw_decode`` and the trailing tail discarded. This is the
+        # native-tool-use hallucination fix: sonnet (Claude CLI) emits the valid
+        # envelope then keeps generating ``<function_calls>``/``<function_results>``
+        # blocks; the leading action must survive. PARSES today.
         id="envelope/prose-suffix",
         raw=_envelope(_PROGRESS) + "\nLet me know if that helps.",
-        parses=False,
+        parses=True,
+        expected_action="progress",
+        expected_fields={"thought": "thinking about the goal"},
     ),
     EnvelopeFixture(
-        # Fence WITH trailing prose after the close fence: _strip_code_fence
-        # can't strip it (last line isn't the closer) → does NOT parse today.
+        # Fence WITH trailing prose after the close fence: ``_strip_code_fence``
+        # strips the opening fence line, leaving ``{json}\n```\nDone thinking.`` —
+        # a valid leading object + tail, which ``raw_decode`` now salvages.
+        # PARSES today (was a fail before the trailing-tolerance fix).
         id="envelope/fenced-trailing-prose",
         raw=_fenced(_PROGRESS) + "\nDone thinking.",
-        parses=False,
+        parses=True,
+        expected_action="progress",
+        expected_fields={"thought": "thinking about the goal"},
     ),
     EnvelopeFixture(
         # Non-``json`` fence language is left untouched by _strip_code_fence →
