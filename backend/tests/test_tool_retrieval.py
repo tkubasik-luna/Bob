@@ -19,7 +19,7 @@ from bob.sub_agent.tool_registry import (
     SubAgentToolRegistry,
     build_default_subagent_registry,
 )
-from bob.sub_agent.tool_retrieval import select_tools
+from bob.sub_agent.tool_retrieval import score_tools, select_tools
 
 
 class _Args(BaseModel):
@@ -293,3 +293,28 @@ def test_default_registry_mail_goal_excludes_web() -> None:
     tools = select_tools(registry, "Trouve le dernier mail de Paul", k=8, min_score=1)
     names = _names(tools)
     assert names == ["gmail_search"]
+
+
+# ---------------------------------------------------------------------------
+# score_tools — the debug scoreboard helper (observability, not selection).
+# ---------------------------------------------------------------------------
+
+
+def test_score_tools_reports_every_tool_descending() -> None:
+    """``score_tools`` returns one ``(name, score)`` per tool, score-descending."""
+
+    board = score_tools(_registry(), "Donne-moi l'actu et la météo")
+    # Every registered tool is present, exactly once.
+    assert {name for name, _ in board} == {"gmail_search", "web_search", "web_fetch"}
+    scores = [score for _, score in board]
+    assert scores == sorted(scores, reverse=True)
+    # web_search owns the matching tags (actu/météo) → it tops the board.
+    assert board[0][0] == "web_search"
+    assert board[0][1] > 0
+
+
+def test_score_tools_ties_broken_by_name() -> None:
+    """Zero-relevance goal → all scores tie at 0, ordered by ascending name."""
+
+    board = score_tools(_registry(), "azerty qwerty zzz")
+    assert board == [("gmail_search", 0), ("web_fetch", 0), ("web_search", 0)]

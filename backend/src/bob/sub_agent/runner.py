@@ -148,6 +148,7 @@ from bob.sub_agent.tool_registry import (
 from bob.sub_agent.tool_retrieval import (
     ToolDeferralPlan,
     build_tool_deferral_plan,
+    score_tools,
     select_tools,
 )
 from bob.task_store import Task, TaskStore, TaskStoreError
@@ -1662,19 +1663,62 @@ class SubAgentRunner:
         if not self._native_tool_deferral:
             settings = get_settings()
             self._last_deferral_plan = None
-            return select_tools(
+            advertised = select_tools(
                 self._tool_registry,
                 task.goal,
                 k=settings.TOOL_RETRIEVAL_K,
                 min_score=settings.TOOL_RETRIEVAL_MIN_SCORE,
             )
+            # PRD 0015 / issue 0092 — make the retrieval decision observable: the
+            # advertised subset + the full lexical scoreboard for this goal, so a
+            # "why did/didn't tool X show up?" question is answerable from logs.
+            emit_debug(
+                category="task",
+                severity="debug",
+                source="bob.sub_agent_runner._advertise_tools",
+                summary=(
+                    f"Catalogue annoncé ({len(advertised)} outils, "
+                    f"retrieval lexical) pour « {task.goal[:60]} »"
+                ),
+                payload={
+                    "task_id": task.id,
+                    "kind": "tools_advertised",
+                    "provider_path": "openai_compatible",
+                    "advertised": [d.name for d in advertised],
+                    "scoreboard": score_tools(self._tool_registry, task.goal),
+                    "k": settings.TOOL_RETRIEVAL_K,
+                    "min_score": settings.TOOL_RETRIEVAL_MIN_SCORE,
+                },
+            )
+            return advertised
 
         # Native Anthropic: delegate discovery to the platform's deferral. The
         # kept-loaded core is the ``always_on`` set; everything else is deferred.
         plan = build_tool_deferral_plan(self._tool_registry)
         self._last_deferral_plan = plan
         loaded_names = set(plan.loaded)
-        return [d for d in self._tool_registry if d.name in loaded_names]
+        advertised = [d for d in self._tool_registry if d.name in loaded_names]
+        # Issue 0096 — server-side retrieval is SKIPPED on this path; record the
+        # kept-loaded vs deferred split instead so the deferral decision is just
+        # as observable as the lexical gate above.
+        emit_debug(
+            category="task",
+            severity="debug",
+            source="bob.sub_agent_runner._advertise_tools",
+            summary=(
+                f"Catalogue annoncé ({len(plan.loaded)} core chargés, "
+                f"{len(plan.deferred)} différés, deferral natif) "
+                f"pour « {task.goal[:60]} »"
+            ),
+            payload={
+                "task_id": task.id,
+                "kind": "tools_advertised",
+                "provider_path": "native_anthropic_deferral",
+                "loaded": list(plan.loaded),
+                "deferred": list(plan.deferred),
+            },
+        )
+        return advertised
 
     def _build_messages(
         self,

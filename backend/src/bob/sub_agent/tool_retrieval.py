@@ -284,6 +284,25 @@ def select_tools(
     return [*always_on, *(definition for _score, definition in capped)]
 
 
+def score_tools(registry: object, goal: str) -> list[tuple[str, int]]:
+    """Return ``(tool_name, score)`` for every tool, descending — debug only.
+
+    Exposes the full lexical scoreboard :func:`select_tools` computes internally
+    so callers (the runner's debug log) can show WHY a tool was advertised or
+    dropped for a goal. ``always_on`` tools are reported with their genuine
+    lexical score even though selection keeps them regardless. Pure, no I/O;
+    ties broken by ascending name, mirroring :func:`select_tools`.
+    """
+
+    goal_tokens = frozenset(_tokenize(goal))
+    scored = [
+        (definition.name, _score_tool(definition, goal_tokens))
+        for definition in registry  # type: ignore[attr-defined]
+    ]
+    scored.sort(key=lambda pair: (-pair[1], pair[0]))
+    return scored
+
+
 # ---------------------------------------------------------------------------
 # Native Anthropic tool deferral — PRD 0015 / issue 0096.
 #
