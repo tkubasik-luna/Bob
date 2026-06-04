@@ -32,6 +32,14 @@ const TYPE_ICON: Record<DeliverableCardType, ReactNode> = {
       <path d="M5.6 8h5M5.6 10.4h5" />
     </svg>
   ),
+  web: (
+    <svg viewBox="0 0 16 16">
+      <title>Web</title>
+      <circle cx="8" cy="8" r="6.3" />
+      <path d="M1.7 8h12.6M8 1.7v12.6" />
+      <path d="M8 1.7c2 1.8 3 4 3 6.3s-1 4.5-3 6.3c-2-1.8-3-4-3-6.3s1-4.5 3-6.3z" />
+    </svg>
+  ),
   video: (
     <svg viewBox="0 0 16 16">
       <title>Vidéo</title>
@@ -67,6 +75,7 @@ const TYPE_ICON: Record<DeliverableCardType, ReactNode> = {
 const TYPE_LABEL: Record<DeliverableCardType, string> = {
   mail: "COURRIEL",
   doc: "DOCUMENT",
+  web: "WEB",
   video: "VIDÉO",
   contact: "CONTACT",
   action: "ACTION",

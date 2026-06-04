@@ -40,6 +40,22 @@ export type MailProps = {
   gmailWebUrl: string;
 };
 
+/** Props for the `WebResults` UI component — a ranked list of web search
+ * results. Mirrors `backend/src/bob/ui_registry.py::WEB_RESULTS`. `answer` and
+ * each result `snippet` are optional (the backend omits them when absent). */
+export type WebResultsProps = {
+  /** The search query that produced these results. */
+  query: string;
+  /** Tavily's optional direct, synthesised answer to the query. */
+  answer?: string;
+  /** Ranked results, each opening its `url` in the browser via OPEN. */
+  results: {
+    title: string;
+    url: string;
+    snippet?: string;
+  }[];
+};
+
 /** Discriminated union of the components the LLM can emit. The
  * `component` field selects the variant; `props` is typed accordingly so
  * `SphereUI`'s dispatcher gets exhaustiveness checks for free.
@@ -51,6 +67,7 @@ export type MailProps = {
 export type ComponentDescriptor =
   | { component: "Markdown"; props: MarkdownProps }
   | { component: "Mail"; props: MailProps }
+  | { component: "WebResults"; props: WebResultsProps }
   | { component: string; props: Record<string, unknown> };
 
 // Client → server

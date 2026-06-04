@@ -521,9 +521,90 @@ GMAIL_SEARCH_SKILL_PACK = SkillPack(
 )
 
 
+WEB_SEARCH_SKILL_PACK = SkillPack(
+    id="web_search_recipe",
+    version=1,
+    fragment=PromptFragment(
+        id="web_search_recipe",
+        version=1,
+        template=(
+            "Special case — web research. When the goal needs information from "
+            "the internet (facts, current events, prices, definitions — anything "
+            "not in the user's mailbox):\n"
+            '  1. (optional) ``progress(thought="recherche web")``.\n'
+            "  2. Call ``web_search`` with a FOCUSED query: rephrase the goal "
+            "into good search keywords, do NOT paste the whole sentence. Leave "
+            "``max_results`` unset (server default) unless the goal needs "
+            "breadth. NEVER call ``web_fetch`` before ``web_search``.\n"
+            "  3. Read the results. Two outcomes:\n"
+            "     a. The answer is already clear from the snippets (or the "
+            "result's ``answer``). Conclude WITHOUT fetching: "
+            '``done(status="done", result_ref="web_search#1", '
+            'result_summary="<one-line French answer>")``. The sources card is '
+            "rebuilt AUTOMATICALLY from ``result_ref`` — do NOT hand-build "
+            "``ui_payload``.\n"
+            "     b. One result must be read in full (long article, deep "
+            "detail). Call ``web_fetch`` on the SINGLE most relevant ``url``, "
+            "read the returned text, then synthesise: "
+            '``done(status="done", ui_payload={"component":"Markdown",'
+            '"props":{"content":"<written answer in French, citing sources as '
+            '[titre](url)>"}}, result_summary="<short spoken French summary>")``.'
+            "\n"
+            "  NEVER fetch more than 2 urls. Quote facts from the results — do "
+            "NOT invent or rely on memory for anything the search can confirm.\n"
+            "\n"
+            "If a web tool returns an ERROR (not a result), conclude with "
+            '``done(status="failed", ui_payload=null)`` whose ``result_summary`` '
+            "is read aloud VERBATIM. Use these exact French sentences:\n"
+            "  - ``web_search_missing_key`` / ``web_fetch_missing_key`` : "
+            "« La recherche web n'est pas configurée — ajoute une clé Tavily "
+            "(TAVILY_API_KEY) dans le fichier .env. » — ``TAVILY_API_KEY`` MUST "
+            "appear literally.\n"
+            "  - ``web_search_unauthorized`` / ``web_fetch_unauthorized`` : "
+            "« Ma clé de recherche web a été refusée — vérifie la clé Tavily. »\n"
+            "  - ``web_search_rate_limited`` / ``web_fetch_rate_limited`` : "
+            "« J'ai atteint la limite de recherches web — réessaie dans un "
+            "moment. »\n"
+            "  - ``web_search_api_unreachable`` / ``web_fetch_api_unreachable`` "
+            ": « Je n'ai pas pu joindre le service de recherche — réessaie dans "
+            "un moment. »\n"
+            "  - ``web_search_failed`` / ``web_fetch_failed`` : « Je n'ai pas pu "
+            "effectuer la recherche web. »\n"
+            "Stick to these French sentences word for word."
+        ),
+        description=(
+            "Web-research recipe for the Tavily-backed ``web_search`` / "
+            "``web_fetch`` tools. Covers (a) building a focused query, (b) the "
+            "two happy paths — converge on the search via ``result_ref`` (the "
+            "WebResults card is rebuilt deterministically) for a snippet-"
+            "answerable goal, or ``web_fetch`` + Markdown synthesis for a "
+            "read-in-full goal — and (c) the five tool-ERROR branches with "
+            "pinned French speech read aloud via TTS. Mirrors the gmail recipe's "
+            "shape (English instructions, verbatim French error sentences)."
+        ),
+    ),
+    triggers=(
+        "web",
+        "internet",
+        "en ligne",
+        "google",
+        "actualité",
+        "actualités",
+        "news",
+        "météo",
+        "wikipedia",
+        "wikipédia",
+        "sur le net",
+    ),
+)
+
+
 #: Ordered registry of sub-agent skill packs. :func:`select_skill_packs`
 #: filters it by goal; the runner appends the survivors to the system prompt.
-SUB_AGENT_SKILL_PACKS: tuple[SkillPack, ...] = (GMAIL_SEARCH_SKILL_PACK,)
+SUB_AGENT_SKILL_PACKS: tuple[SkillPack, ...] = (
+    GMAIL_SEARCH_SKILL_PACK,
+    WEB_SEARCH_SKILL_PACK,
+)
 
 
 def select_skill_packs(goal: str) -> list[SkillPack]:

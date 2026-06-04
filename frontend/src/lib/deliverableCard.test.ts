@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { ComponentDescriptor, MailProps } from "../types/ws";
+import type { ComponentDescriptor, MailProps, WebResultsProps } from "../types/ws";
 import { type DeliverableCardTask, toCard } from "./deliverableCard";
 
 /** Build a Mail descriptor with sane defaults; override what a case cares
@@ -21,6 +21,17 @@ function mail(overrides: Partial<MailProps> = {}): ComponentDescriptor {
 /** Build a Markdown descriptor. */
 function markdown(content: string): ComponentDescriptor {
   return { component: "Markdown", props: { content } };
+}
+
+/** Build a WebResults descriptor. */
+function webResults(overrides: Partial<WebResultsProps> = {}): ComponentDescriptor {
+  const props: WebResultsProps = {
+    query: "python gil",
+    answer: "The GIL is a mutex.",
+    results: [{ title: "Understanding the GIL", url: "https://x.com", snippet: "…" }],
+    ...overrides,
+  };
+  return { component: "WebResults", props };
 }
 
 const task = (title: string, goal?: string): DeliverableCardTask => ({ title, goal });
@@ -112,5 +123,22 @@ describe("deliverableCard.toCard", () => {
   it("prefers goal over the content summary when both are present", () => {
     const card = toCard([mail({ subject: "SUBJECT" })], task("T", "GOAL WINS"));
     expect(card.sub).toBe("GOAL WINS");
+  });
+
+  it("single WebResults → web type, answer-driven content summary when no goal", () => {
+    const card = toCard([webResults()], task("Recherche web"));
+    expect(card.type).toBe("web");
+    expect(card.title).toBe("Recherche web");
+    expect(card.sub).toBe("The GIL is a mutex.");
+  });
+
+  it("WebResults content summary falls back to the first result title when no answer", () => {
+    const card = toCard([webResults({ answer: undefined })], task("Recherche"));
+    expect(card.sub).toBe("Understanding the GIL");
+  });
+
+  it("WebResults + Markdown (synthesis) → composite glyph", () => {
+    const card = toCard([webResults(), markdown("## Synthèse")], task("Recherche"));
+    expect(card.type).toBe("composite");
   });
 });

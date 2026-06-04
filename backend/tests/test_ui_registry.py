@@ -25,7 +25,7 @@ def test_response_schema_contains_v0_components_in_oneof() -> None:
     inner = ui_registry.get_response_schema()["schema"]
     one_of = inner["properties"]["ui"]["items"]["oneOf"]
     names = {variant["properties"]["component"]["const"] for variant in one_of}
-    assert names == {"ChatMessage", "Markdown", "Mail"}
+    assert names == {"ChatMessage", "Markdown", "Mail", "WebResults"}
 
 
 def test_components_description_lists_v0_components() -> None:
@@ -97,7 +97,7 @@ def test_build_registry_supports_extra_components() -> None:
         variant["properties"]["component"]["const"]
         for variant in inner["properties"]["ui"]["items"]["oneOf"]
     }
-    assert names == {"ChatMessage", "Markdown", "Mail", "Banner"}
+    assert names == {"ChatMessage", "Markdown", "Mail", "WebResults", "Banner"}
 
     payload: dict[str, object] = {
         "speech": "hi",

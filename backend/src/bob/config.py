@@ -155,6 +155,21 @@ class Settings(BaseSettings):
     GMAIL_CREDENTIALS_PATH: Path = Path.home() / ".bob" / "gmail" / "credentials.json"
     GMAIL_TOKEN_PATH: Path = Path.home() / ".bob" / "gmail" / "token.json"
 
+    # Tavily web search — backs the ``web_search`` / ``web_fetch`` sub-agent
+    # tools (Tavily Search / Extract REST endpoints). ``TAVILY_API_KEY`` is a
+    # free-tier key from https://app.tavily.com. It is intentionally OPTIONAL
+    # (no model_validator requirement): when unset the tool handlers return an
+    # actionable ``web_search_missing_key`` / ``web_fetch_missing_key`` error
+    # instead of crashing, so the backend boots and the suite passes without a
+    # key (it is only needed at call time). ``TAVILY_BASE_URL`` is overridable
+    # for a proxy / self-host; ``TAVILY_TIMEOUT_SECONDS`` bounds each outbound
+    # HTTP call; ``WEB_SEARCH_MAX_RESULTS`` caps results when a call omits its
+    # own ``max_results``.
+    TAVILY_API_KEY: str | None = None
+    TAVILY_BASE_URL: str = "https://api.tavily.com"
+    TAVILY_TIMEOUT_SECONDS: float = 15.0
+    WEB_SEARCH_MAX_RESULTS: int = 5
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

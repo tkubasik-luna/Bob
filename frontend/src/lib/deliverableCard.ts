@@ -17,12 +17,19 @@ import type { ComponentDescriptor } from "../types/ws";
 
 /** The data-dock icon vocabulary, mirroring the mockup's `DATA_TYPE_LABEL`
  * keys (`Design Mockup/p3d-content.jsx`). The HUD only generates Mail (Gmail
- * connector) and Markdown (synthesis) sections today, so `mail` / `doc` are the
- * live types; `composite` is the glyph for a heterogeneous stack (≥2 distinct
- * section types). The remaining mockup types (`video` / `contact` / `action`)
- * are kept in the union so the icon set + CSS can grow without a type change
- * when the backend starts emitting them. */
-export type DeliverableCardType = "mail" | "doc" | "video" | "contact" | "action" | "composite";
+ * connector), Markdown (synthesis), and WebResults (web search) sections today,
+ * so `mail` / `doc` / `web` are the live types; `composite` is the glyph for a
+ * heterogeneous stack (≥2 distinct section types). The remaining mockup types
+ * (`video` / `contact` / `action`) are kept in the union so the icon set + CSS
+ * can grow without a type change when the backend starts emitting them. */
+export type DeliverableCardType =
+  | "mail"
+  | "doc"
+  | "web"
+  | "video"
+  | "contact"
+  | "action"
+  | "composite";
 
 /** The minimal task shape the projection reads — a structural subset of
  * `types/ws.ts::Task` so callers can pass a `chatStore` task straight through,
@@ -56,6 +63,8 @@ function sectionType(descriptor: ComponentDescriptor): DeliverableCardType {
       return "mail";
     case "Markdown":
       return "doc";
+    case "WebResults":
+      return "web";
     default:
       // Forward-compat: a component the frontend doesn't model yet still
       // produces a card (rendered as a generic document artefact).
@@ -103,6 +112,13 @@ function contentSummary(sections: ComponentDescriptor[]): string {
       .map((l) => l.trim())
       .find((l) => l.length > 0);
     return line ?? "";
+  }
+  if (first.component === "WebResults") {
+    // Prefer the direct answer; else the top result's title.
+    const answer = first.props.answer?.trim();
+    if (answer) return answer;
+    const top = first.props.results[0];
+    return top ? top.title.trim() : "";
   }
   return "";
 }

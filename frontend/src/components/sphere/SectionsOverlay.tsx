@@ -194,6 +194,17 @@ function firstOpenableUrl(sections: ComponentDescriptor[]): string | null {
       const url = (section.props as Record<string, unknown>).gmailWebUrl;
       if (typeof url === "string" && url.length > 0) return url;
     }
+    if (section.component === "WebResults") {
+      const results = (section.props as Record<string, unknown>).results;
+      if (Array.isArray(results)) {
+        for (const result of results) {
+          if (result && typeof result === "object") {
+            const url = (result as Record<string, unknown>).url;
+            if (typeof url === "string" && url.length > 0) return url;
+          }
+        }
+      }
+    }
   }
   return null;
 }

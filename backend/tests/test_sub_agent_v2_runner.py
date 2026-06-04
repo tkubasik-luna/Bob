@@ -554,18 +554,14 @@ async def test_addendum_drained_only_at_iteration_boundary() -> None:
 
 
 def test_default_subagent_registry_exposes_gmail_search() -> None:
-    """Issue 0055: ``gmail_search`` is the first real sub-agent tool wired in.
-
-    ``web_search`` / ``web_fetch`` remain unwired until a real HTTP backend
-    lands — their handlers still raise ``NotImplementedError``. The default
-    registry now exposes ``gmail_search`` so research sub-tasks can answer
-    email-lookup goals via the Mail overlay.
+    """Issue 0055 + web-search: the default registry exposes ``gmail_search``
+    plus the Tavily-backed ``web_search`` / ``web_fetch`` tools, so research
+    sub-tasks can answer both email-lookup and web-research goals.
     """
 
     registry = build_default_subagent_registry()
-    assert registry.names() == ["gmail_search"]
-    # Scaffolding for the web tools remains available so a future slice can
-    # re-register them without re-deriving the tool shape.
+    assert registry.names() == ["gmail_search", "web_search", "web_fetch"]
+    # The web tools carry their canonical shape (qualified name + args model).
     web_search = build_web_search_tool()
     assert web_search.qualified_name == "v1.web_search"
     assert web_search.args_model is WebSearchArgs

@@ -16,11 +16,23 @@ const mail = (over: Record<string, unknown> = {}): ComponentDescriptor => ({
     ...over,
   },
 });
+const webResults = (over: Record<string, unknown> = {}): ComponentDescriptor => ({
+  component: "WebResults",
+  props: {
+    query: "python gil",
+    answer: "The GIL is a mutex.",
+    results: [
+      { title: "Understanding the GIL", url: "https://realpython.com/python-gil/", snippet: "…" },
+    ],
+    ...over,
+  },
+});
 
 describe("overlayChip", () => {
   test("single-type stacks map to the mockup chip label", () => {
     expect(overlayChip([md("a")])).toBe("FICHIER");
     expect(overlayChip([mail()])).toBe("BOÎTE");
+    expect(overlayChip([webResults()])).toBe("WEB");
   });
 
   test("a mixed-type stack falls back to SURFACE", () => {
@@ -59,6 +71,14 @@ describe("overlaySpeechText", () => {
   test("reads a mail as sender → subject → body", () => {
     const text = overlaySpeechText([mail()]);
     expect(text).toBe("Courriel de Marie. Q3 forecast Deck for Thursday.");
+  });
+
+  test("reads web results as the direct answer + the top result titles (no urls)", () => {
+    const text = overlaySpeechText([webResults()]);
+    expect(text).toContain("The GIL is a mutex.");
+    expect(text).toContain("Understanding the GIL");
+    // URLs read poorly aloud — they are not spoken.
+    expect(text).not.toContain("realpython.com");
   });
 
   test("joins a composite stack with blank lines, skipping empty + unknown sections", () => {

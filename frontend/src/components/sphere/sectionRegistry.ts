@@ -1,6 +1,7 @@
 import type { ComponentType } from "react";
 import { DocSurface } from "./DocSurface";
 import { MailCard } from "./MailCard";
+import { WebResultsCard } from "./WebResultsCard";
 
 /** A section renderer + its auto-open weight.
  *
@@ -31,4 +32,6 @@ export const sectionRegistry: Record<string, SectionEntry> = {
   // reuses the existing react-markdown renderer for the body (PRD 0014 / 0088).
   Markdown: { Component: DocSurface, structured: false },
   Mail: { Component: MailCard, structured: true },
+  // Web search results (PRD: web-search) — a ranked list of clickable sources.
+  WebResults: { Component: WebResultsCard, structured: true },
 };

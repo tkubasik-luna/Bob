@@ -334,6 +334,43 @@ MAIL = UIComponent(
     },
 )
 
+WEB_RESULTS = UIComponent(
+    name="WebResults",
+    description=(
+        "A ranked list of web search results rendered as an overlay card. "
+        "Drives the `WebResultsCard` frontend surface: the search `query`, an "
+        "optional Tavily `answer` (a direct synthesised reply), and an ordered "
+        "`results` list of {title, url, snippet} rows — each row opens its "
+        "source URL in the browser via the OPEN action."
+    ),
+    props_schema={
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["query", "results"],
+        "properties": {
+            "query": {"type": "string"},
+            # Tavily's optional direct answer. Absent (not null) when Tavily
+            # could not synthesise one — the projector omits the key entirely.
+            "answer": {"type": "string"},
+            "results": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["title", "url"],
+                    "properties": {
+                        "title": {"type": "string"},
+                        # http(s) prefix asserted the same dep-free way as the
+                        # Mail `gmailWebUrl` so a free-form string can't slip in.
+                        "url": {"type": "string", "pattern": r"^https?://.+"},
+                        "snippet": {"type": "string"},
+                    },
+                },
+            },
+        },
+    },
+)
+
 
 def build_registry(extra_components: dict[str, UIComponent] | None = None) -> UIRegistry:
     """Construct a :class:`UIRegistry` containing the V0 components.
@@ -346,6 +383,7 @@ def build_registry(extra_components: dict[str, UIComponent] | None = None) -> UI
         CHAT_MESSAGE.name: CHAT_MESSAGE,
         MARKDOWN.name: MARKDOWN,
         MAIL.name: MAIL,
+        WEB_RESULTS.name: WEB_RESULTS,
     }
     if extra_components:
         components.update(extra_components)

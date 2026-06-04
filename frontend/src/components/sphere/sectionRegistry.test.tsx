@@ -4,6 +4,7 @@ import { DocSurface } from "./DocSurface";
 import { MailCard } from "./MailCard";
 import { MarkdownSection } from "./MarkdownSection";
 import { NotImplementedSection } from "./NotImplementedSection";
+import { WebResultsCard } from "./WebResultsCard";
 import { sectionRegistry } from "./sectionRegistry";
 
 describe("sectionRegistry", () => {
@@ -20,6 +21,13 @@ describe("sectionRegistry", () => {
     const entry = sectionRegistry.Mail;
     expect(entry).toBeDefined();
     expect(entry.Component).toBe(MailCard);
+    expect(entry.structured).toBe(true);
+  });
+
+  test("maps `WebResults` to the WebResultsCard renderer as a structured section", () => {
+    const entry = sectionRegistry.WebResults;
+    expect(entry).toBeDefined();
+    expect(entry.Component).toBe(WebResultsCard);
     expect(entry.structured).toBe(true);
   });
 

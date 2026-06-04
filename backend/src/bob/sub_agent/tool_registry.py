@@ -12,11 +12,13 @@ Tool definitions live here:
   the sub-agent runtime to :mod:`bob.connectors.gmail` so research
   sub-tasks can answer email-lookup goals and feed the ``Mail`` UI
   component.
-- ``web_search(query)`` / ``web_fetch(url)`` — historical placeholders
-  whose handlers still raise ``NotImplementedError``. Builders remain
-  available for the day a real HTTP backend lands; the default registry
-  does not register them because advertising a never-succeeding tool
-  wastes an LLM round-trip per research task.
+- ``web_search(query)`` / ``web_fetch(url)`` — Tavily-backed web search +
+  page extraction (PRD: web-search). Both are registered and non-terminal: a
+  research sub-agent searches, optionally fetches the best result, then
+  synthesises a Markdown answer. Each is gated on ``TAVILY_API_KEY`` and folds
+  every failure into a structured ``web_search_*`` / ``web_fetch_*`` error code
+  (missing key, bad key, quota, network, malformed) so a sub-agent can speak a
+  precise French sentence instead of stalling.
 
 The :class:`SubAgentToolHandlerContext` mirrors
 :class:`bob.tools.dispatcher.ToolHandlerContext` but for the sub-agent
@@ -43,6 +45,7 @@ from typing import Any, Literal, Protocol
 import structlog
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
+from bob.config import get_settings
 from bob.llm.tooling import ToolSpec
 from bob.sub_agent.result_store import ProjectedResult, ToolResultProjector
 
@@ -257,7 +260,7 @@ class SubAgentToolDispatcher:
 
 
 # ---------------------------------------------------------------------------
-# Tool definitions — web_search + web_fetch placeholders.
+# Tool definitions — web_search + web_fetch (Tavily-backed, PRD: web-search).
 # ---------------------------------------------------------------------------
 
 
@@ -265,37 +268,275 @@ class WebSearchArgs(BaseModel):
     """Validated arguments for ``web_search``."""
 
     query: str = Field(..., min_length=1, description="Search query string.")
+    max_results: int | None = Field(
+        default=None,
+        ge=1,
+        le=10,
+        description=(
+            "Optional cap on the number of results (1-10). Defaults to the "
+            "server's WEB_SEARCH_MAX_RESULTS when omitted."
+        ),
+    )
 
 
 class WebFetchArgs(BaseModel):
     """Validated arguments for ``web_fetch``."""
 
-    url: str = Field(..., min_length=1, description="Absolute URL to fetch.")
+    url: str = Field(..., min_length=1, description="Absolute http(s) URL to fetch.")
+
+    @model_validator(mode="after")
+    def _require_http_url(self) -> WebFetchArgs:
+        if not self.url.strip().lower().startswith(("http://", "https://")):
+            raise ValueError("url must be an absolute http(s) URL")
+        return self
+
+
+#: web_search digest caps (transcript context control). Unlike Gmail, web_search
+#: is NON-terminal: the model reads the snippets to answer directly or to choose
+#: a URL to ``web_fetch``, so the snippets ARE kept in the digest — only their
+#: count + per-snippet length are capped so a large ``max_results`` cannot bloat
+#: the transcript. The WebResults card carries the full snippet set regardless.
+_WEB_SEARCH_DIGEST_MAX_RESULTS = 8
+_WEB_SEARCH_DIGEST_SNIPPET_CHARS = 300
+#: web_fetch caps — the extracted page text handed to the model (bounds context;
+#: the page is fetched once and never re-sent) and the smaller excerpt rendered
+#: in the Markdown "page I read" card (the anti-stall deliverable).
+_WEB_FETCH_DIGEST_CONTENT_CHARS = 6000
+_WEB_FETCH_CARD_EXCERPT_CHARS = 1500
 
 
 async def _web_search_handler(
     _ctx: SubAgentToolHandlerContext,
-    _args: BaseModel,
+    args: BaseModel,
 ) -> SubAgentToolHandlerOutcome:
-    """Placeholder — real HTTP call is intentionally deferred.
+    """Execute a Tavily web search and surface ranked results.
 
-    Raises :class:`NotImplementedError` so a sub-agent that actually
-    tries to call this tool surfaces the gap loudly rather than
-    silently returning empty results. The dispatcher folds the
-    exception into ``error/handler_failed``; tests stub the handler
-    via a custom registry.
+    Bridges the sub-agent runtime to :mod:`bob.connectors.tavily`. Every failure
+    mode (no key, bad key, quota, network/5xx, malformed) is folded into a
+    structured ``web_search_*`` error code — the dispatcher contract is "never
+    raise out of a handler"; the sub-agent then speaks the mapped French
+    sentence from the skill pack.
     """
 
-    raise NotImplementedError("web_search is a placeholder; real backend lands in a later slice")
+    assert isinstance(args, WebSearchArgs)  # for mypy / runtime safety
+
+    # Lazy import: keeps registry construction free of the httpx import and lets
+    # unrelated unit tests skip the dependency (gmail connector pattern).
+    from bob.connectors.tavily import (
+        ApiUnreachableError,
+        MissingApiKeyError,
+        RateLimitedError,
+        TavilyClient,
+        TavilyError,
+        UnauthorizedError,
+        to_web_results_props,
+    )
+
+    settings = get_settings()
+    max_results = args.max_results or settings.WEB_SEARCH_MAX_RESULTS
+    client = TavilyClient(
+        settings.TAVILY_API_KEY,
+        base_url=settings.TAVILY_BASE_URL,
+        timeout=settings.TAVILY_TIMEOUT_SECONDS,
+    )
+
+    try:
+        results = await client.search(args.query, max_results=max_results)
+    except MissingApiKeyError as exc:
+        _logger.warning("web_search.missing_key", error=str(exc))
+        return SubAgentToolHandlerOutcome(
+            status="error", error_code="web_search_missing_key", error_message=str(exc)
+        )
+    except UnauthorizedError as exc:
+        _logger.warning("web_search.unauthorized", error=str(exc))
+        return SubAgentToolHandlerOutcome(
+            status="error", error_code="web_search_unauthorized", error_message=str(exc)
+        )
+    except RateLimitedError as exc:
+        _logger.warning("web_search.rate_limited", error=str(exc))
+        return SubAgentToolHandlerOutcome(
+            status="error", error_code="web_search_rate_limited", error_message=str(exc)
+        )
+    except ApiUnreachableError as exc:
+        _logger.warning("web_search.api_unreachable", error=str(exc))
+        return SubAgentToolHandlerOutcome(
+            status="error", error_code="web_search_api_unreachable", error_message=str(exc)
+        )
+    except TavilyError as exc:
+        _logger.warning("web_search.failed", error=str(exc))
+        return SubAgentToolHandlerOutcome(
+            status="error", error_code="web_search_failed", error_message=str(exc)
+        )
+
+    # Store the card-ready props (built once here) + a count; the projector
+    # reshapes these into digest / deliverable / summary without re-importing
+    # the connector (pure projection — mirrors ``project_gmail_search``).
+    return SubAgentToolHandlerOutcome(
+        status="ok",
+        result={
+            "count": len(results.results),
+            "props": to_web_results_props(results),
+        },
+    )
 
 
 async def _web_fetch_handler(
     _ctx: SubAgentToolHandlerContext,
-    _args: BaseModel,
+    args: BaseModel,
 ) -> SubAgentToolHandlerOutcome:
-    """Placeholder — symmetric to :func:`_web_search_handler`."""
+    """Extract the readable text of a single URL via Tavily — symmetric to search.
 
-    raise NotImplementedError("web_fetch is a placeholder; real backend lands in a later slice")
+    Used after ``web_search`` when a result is worth reading in full. Error
+    mapping mirrors the search handler with ``web_fetch_*`` codes; a page with
+    no extractable content (paywall / bot-block) surfaces as ``web_fetch_failed``.
+    """
+
+    assert isinstance(args, WebFetchArgs)  # for mypy / runtime safety
+
+    from bob.connectors.tavily import (
+        ApiUnreachableError,
+        MissingApiKeyError,
+        RateLimitedError,
+        TavilyClient,
+        TavilyError,
+        UnauthorizedError,
+    )
+
+    settings = get_settings()
+    client = TavilyClient(
+        settings.TAVILY_API_KEY,
+        base_url=settings.TAVILY_BASE_URL,
+        timeout=settings.TAVILY_TIMEOUT_SECONDS,
+    )
+
+    try:
+        page = await client.extract(args.url)
+    except MissingApiKeyError as exc:
+        _logger.warning("web_fetch.missing_key", error=str(exc))
+        return SubAgentToolHandlerOutcome(
+            status="error", error_code="web_fetch_missing_key", error_message=str(exc)
+        )
+    except UnauthorizedError as exc:
+        _logger.warning("web_fetch.unauthorized", error=str(exc))
+        return SubAgentToolHandlerOutcome(
+            status="error", error_code="web_fetch_unauthorized", error_message=str(exc)
+        )
+    except RateLimitedError as exc:
+        _logger.warning("web_fetch.rate_limited", error=str(exc))
+        return SubAgentToolHandlerOutcome(
+            status="error", error_code="web_fetch_rate_limited", error_message=str(exc)
+        )
+    except ApiUnreachableError as exc:
+        _logger.warning("web_fetch.api_unreachable", error=str(exc))
+        return SubAgentToolHandlerOutcome(
+            status="error", error_code="web_fetch_api_unreachable", error_message=str(exc)
+        )
+    except TavilyError as exc:
+        _logger.warning("web_fetch.failed", error=str(exc))
+        return SubAgentToolHandlerOutcome(
+            status="error", error_code="web_fetch_failed", error_message=str(exc)
+        )
+
+    return SubAgentToolHandlerOutcome(
+        status="ok",
+        result={"url": page.url, "content": page.content},
+    )
+
+
+def project_web_search(result: dict[str, Any]) -> ProjectedResult:
+    """Project a ``web_search`` result into its transcript / UI / summary forms.
+
+    - **digest** (→ transcript): ``query`` + ``count`` + a capped list of
+      ``{title, url, snippet}`` (snippets KEPT but length-capped — they are the
+      model's working material), plus Tavily's direct ``answer`` when present.
+    - **deliverable** (→ overlay): a single ``WebResults`` card built from the
+      stored card props, or ``None`` when there were no results.
+    - **summary** (→ spoken): Tavily's ``answer`` when present, else a count line.
+    - **terminal**: ``False`` — web_search is the START of a research chain (the
+      model may ``web_fetch`` + synthesise), so the runner does NOT converge on
+      it. The card is still emitted so a stall right after the search surfaces
+      the sources instead of an empty overlay (PRD 0010 anti-stall bar).
+    """
+
+    props = result.get("props")
+    props = props if isinstance(props, dict) else {}
+    query = props.get("query")
+    answer = props.get("answer")
+    answer = answer if isinstance(answer, str) and answer.strip() else None
+    results_list = props.get("results")
+    results_list = results_list if isinstance(results_list, list) else []
+    count = len(results_list)
+
+    digest_results: list[dict[str, Any]] = []
+    for item in results_list[:_WEB_SEARCH_DIGEST_MAX_RESULTS]:
+        if not isinstance(item, dict):
+            continue
+        snippet = item.get("snippet")
+        snippet = snippet if isinstance(snippet, str) else ""
+        if len(snippet) > _WEB_SEARCH_DIGEST_SNIPPET_CHARS:
+            snippet = snippet[:_WEB_SEARCH_DIGEST_SNIPPET_CHARS] + "…"
+        digest_results.append(
+            {"title": item.get("title"), "url": item.get("url"), "snippet": snippet}
+        )
+    digest: dict[str, Any] = {"query": query, "count": count, "results": digest_results}
+    if answer:
+        digest["answer"] = answer
+
+    deliverable = [{"component": "WebResults", "props": props}] if count > 0 else None
+
+    if answer:
+        summary = answer
+    elif count > 0:
+        summary = f"{count} résultat(s) web pour « {query} »."
+    else:
+        summary = f"Aucun résultat web pour « {query} »."
+
+    return ProjectedResult(
+        digest=digest,
+        deliverable=deliverable,
+        summary=summary,
+        terminal=False,
+    )
+
+
+def project_web_fetch(result: dict[str, Any]) -> ProjectedResult:
+    """Project a ``web_fetch`` result into transcript / UI / summary forms.
+
+    - **digest** (→ transcript): ``url`` + the extracted text capped at
+      :data:`_WEB_FETCH_DIGEST_CONTENT_CHARS` (the model's synthesis material;
+      ``truncated`` flags when the page was longer).
+    - **deliverable** (→ overlay): a Markdown "page I read" card (source + a
+      shorter excerpt). Present so a stall right after a fetch still shows a
+      card — the runner finalises a forced exit from ``last()`` (PRD 0010).
+    - **terminal**: ``False`` — a fetch feeds a later synthesis; never converges.
+    """
+
+    url = result.get("url")
+    url = url if isinstance(url, str) else ""
+    content = result.get("content")
+    content = content if isinstance(content, str) else ""
+
+    digest_content = content
+    truncated = False
+    if len(digest_content) > _WEB_FETCH_DIGEST_CONTENT_CHARS:
+        digest_content = digest_content[:_WEB_FETCH_DIGEST_CONTENT_CHARS] + "…"
+        truncated = True
+    digest: dict[str, Any] = {"url": url, "content": digest_content, "truncated": truncated}
+
+    excerpt = content[:_WEB_FETCH_CARD_EXCERPT_CHARS]
+    if len(content) > _WEB_FETCH_CARD_EXCERPT_CHARS:
+        excerpt = excerpt + "…"
+    card_md = (f"**Source :** {url}\n\n{excerpt}" if url else excerpt).strip()
+    deliverable = [{"component": "Markdown", "props": {"content": card_md}}] if card_md else None
+
+    summary = f"Page lue : {url}" if url else "Page lue."
+
+    return ProjectedResult(
+        digest=digest,
+        deliverable=deliverable,
+        summary=summary,
+        terminal=False,
+    )
 
 
 def build_web_search_tool() -> SubAgentToolDefinition:
@@ -310,6 +551,7 @@ def build_web_search_tool() -> SubAgentToolDefinition:
         ),
         args_model=WebSearchArgs,
         handler=_web_search_handler,
+        result_projector=project_web_search,
     )
 
 
@@ -325,6 +567,7 @@ def build_web_fetch_tool() -> SubAgentToolDefinition:
         ),
         args_model=WebFetchArgs,
         handler=_web_fetch_handler,
+        result_projector=project_web_fetch,
     )
 
 
@@ -734,18 +977,25 @@ def build_gmail_search_tool() -> SubAgentToolDefinition:
 def build_default_subagent_registry() -> SubAgentToolRegistry:
     """Construct the default sub-agent tool registry.
 
-    Currently exposes the ``gmail_search`` tool (issue 0055) so research
-    sub-tasks can answer email-lookup goals. ``web_search`` / ``web_fetch``
-    remain unwired — they raise ``NotImplementedError`` until a real HTTP
-    backend lands. The builders stay available
-    (:func:`build_web_search_tool` / :func:`build_web_fetch_tool`) and
-    should be re-registered here once a real backend exists.
+    Exposes ``gmail_search`` (issue 0055) for email-lookup goals plus
+    ``web_search`` / ``web_fetch`` (Tavily-backed, PRD: web-search) so research
+    sub-tasks can search the web and read pages. The web tools are non-terminal:
+    a sub-agent searches, optionally fetches the best result, and synthesises a
+    Markdown answer (the recipe lives in the ``web_search`` skill pack). When
+    ``TAVILY_API_KEY`` is unset they return an actionable
+    ``web_search_missing_key`` error rather than failing the boot.
 
     Other slices may extend via :meth:`SubAgentToolRegistry.register` or by
     constructing a custom registry directly (tests do this).
     """
 
-    return SubAgentToolRegistry([build_gmail_search_tool()])
+    return SubAgentToolRegistry(
+        [
+            build_gmail_search_tool(),
+            build_web_search_tool(),
+            build_web_fetch_tool(),
+        ]
+    )
 
 
 __all__ = [

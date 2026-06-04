@@ -11,6 +11,7 @@ import type { ComponentDescriptor } from "../../types/ws";
 const CHIP_BY_COMPONENT: Record<string, string> = {
   Markdown: "FICHIER",
   Mail: "BOÎTE",
+  WebResults: "WEB",
 };
 
 /** Header chip text for a stack of sections. A single-type stack shows that
@@ -60,6 +61,19 @@ export function overlaySpeechText(sections: ComponentDescriptor[]): string {
       const subject = typeof props.subject === "string" ? props.subject : "";
       const body = typeof props.bodyPreview === "string" ? props.bodyPreview : "";
       const lead = [name ? `Courriel de ${name}.` : "", subject, body]
+        .filter((s) => s.length > 0)
+        .join(" ");
+      if (lead.length > 0) parts.push(lead);
+    } else if (section.component === "WebResults") {
+      // Read Tavily's direct answer (if any), then the top result titles — the
+      // snippets/urls are not spoken (they read poorly aloud).
+      const answer = typeof props.answer === "string" ? props.answer : "";
+      const results = Array.isArray(props.results) ? props.results : [];
+      const titles = results
+        .map((r) => (r && typeof r === "object" ? (r as Record<string, unknown>).title : null))
+        .filter((t): t is string => typeof t === "string" && t.length > 0)
+        .slice(0, 5);
+      const lead = [answer, titles.length > 0 ? `Résultats : ${titles.join(" ; ")}.` : ""]
         .filter((s) => s.length > 0)
         .join(" ");
       if (lead.length > 0) parts.push(lead);
