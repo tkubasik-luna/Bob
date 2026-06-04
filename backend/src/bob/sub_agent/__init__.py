@@ -65,6 +65,7 @@ from bob.sub_agent.tool_registry import (
     build_web_fetch_tool,
     build_web_search_tool,
 )
+from bob.sub_agent.tool_retrieval import select_tools
 
 __all__ = [
     "REASON_HARD_KILLED",
@@ -104,4 +105,5 @@ __all__ = [
     "build_web_search_tool",
     "default_policy",
     "parse_action",
+    "select_tools",
 ]

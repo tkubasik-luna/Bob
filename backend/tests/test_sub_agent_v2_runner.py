@@ -761,6 +761,145 @@ async def test_tool_call_dispatches_through_subagent_registry() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Tool retrieval gating — advertised subset vs dispatchable set (issue 0092)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_runner_advertises_retrieved_subset_only() -> None:
+    """Issue 0092: the prompt catalogue carries only the goal-RETRIEVED subset.
+
+    A mail-shaped goal over a registry holding a mail tool + a web tool
+    advertises ONLY the mail tool — the web tool's schema must NOT leak into the
+    system prompt, so a weak model is not drowned in irrelevant tools.
+    """
+
+    from pydantic import BaseModel
+
+    class _MailArgs(BaseModel):
+        label: str
+
+    class _WebArgs(BaseModel):
+        query: str
+
+    async def _ok(_ctx: Any, _args: BaseModel) -> SubAgentToolHandlerOutcome:
+        return SubAgentToolHandlerOutcome(status="ok", result={})
+
+    registry = SubAgentToolRegistry(
+        [
+            SubAgentToolDefinition(
+                name="gmail_search",
+                version="v1",
+                description="Recherche dans la boîte Gmail.",
+                args_model=_MailArgs,
+                handler=_ok,
+                tags=("mail", "email", "gmail", "inbox"),
+            ),
+            SubAgentToolDefinition(
+                name="web_search",
+                version="v1",
+                description="Cherche le web.",
+                args_model=_WebArgs,
+                handler=_ok,
+                tags=("web", "internet", "actualité", "météo"),
+            ),
+        ]
+    )
+
+    store = _make_store()
+    task_id = _make_running_task(store, goal="Trouve le dernier mail de Paul")
+    runner = SubAgentRunner(
+        subagent_client=_ScriptedClient(),
+        task_store=store,
+        event_bus=EventBus(),
+        policy=SubAgentPolicy(max_iterations=1, wall_clock_seconds=999.0, token_cap=10_000),
+        tool_registry=registry,
+        clock=_ControllableClock(),
+    )
+
+    system = runner._build_messages(store.get_task(task_id), [])[0]["content"]
+    assert "gmail_search" in system  # retrieved (mail goal)
+    assert "web_search" not in system  # NOT advertised — irrelevant to a mail goal
+
+
+@pytest.mark.asyncio
+async def test_unadvertised_tool_still_dispatches_by_name() -> None:
+    """Issue 0092: advertised set ⊂ dispatchable set.
+
+    A web tool that the mail goal does NOT advertise must still RESOLVE on
+    dispatch when the model calls it by name — retrieval gates the prompt
+    catalogue only, never the dispatcher (which resolves the full registry).
+    """
+
+    from pydantic import BaseModel
+
+    class _MailArgs(BaseModel):
+        label: str
+
+    class _WebArgs(BaseModel):
+        query: str
+
+    web_calls: list[BaseModel] = []
+
+    async def _mail_handler(_ctx: Any, _args: BaseModel) -> SubAgentToolHandlerOutcome:
+        return SubAgentToolHandlerOutcome(status="ok", result={})
+
+    async def _web_handler(_ctx: Any, args: BaseModel) -> SubAgentToolHandlerOutcome:
+        web_calls.append(args)
+        return SubAgentToolHandlerOutcome(status="ok", result={"hits": 1})
+
+    registry = SubAgentToolRegistry(
+        [
+            SubAgentToolDefinition(
+                name="gmail_search",
+                version="v1",
+                description="Recherche dans la boîte Gmail.",
+                args_model=_MailArgs,
+                handler=_mail_handler,
+                tags=("mail", "email", "gmail", "inbox"),
+            ),
+            SubAgentToolDefinition(
+                name="web_search",
+                version="v1",
+                description="Cherche le web.",
+                args_model=_WebArgs,
+                handler=_web_handler,
+                tags=("web", "internet", "actualité", "météo"),
+            ),
+        ]
+    )
+
+    store = _make_store()
+    # Mail-shaped goal → only gmail_search is advertised, but the scripted model
+    # calls the UN-advertised web_search by name; it must still dispatch.
+    task_id = _make_running_task(store, goal="Trouve le dernier mail de Paul")
+    client = _ScriptedClient(
+        chat_values=[
+            json.dumps({"action": "tool_call", "name": "web_search", "args": {"query": "x"}}),
+            _done_v2_payload(result_summary="done"),
+        ]
+    )
+    runner = SubAgentRunner(
+        subagent_client=client,
+        task_store=store,
+        event_bus=EventBus(),
+        policy=SubAgentPolicy(),
+        tool_registry=registry,
+        clock=_ControllableClock(),
+    )
+
+    await runner.run(task_id)
+
+    # The un-advertised tool actually ran (handler invoked) and the task converged.
+    assert len(web_calls) == 1
+    task = store.get_task(task_id)
+    assert task.state == "done"
+    tool_msgs = [m for m in store.get_task_messages(task_id) if m.role == "tool"]
+    assert len(tool_msgs) == 1
+    assert "web_search" in tool_msgs[0].content
+
+
+# ---------------------------------------------------------------------------
 # Tool argument schema injection + pre-dispatch validation (issue 0059)
 # ---------------------------------------------------------------------------
 
@@ -841,7 +980,11 @@ async def test_prompt_injects_tool_arg_schema() -> None:
     """
 
     store = _make_store()
-    task_id = _make_running_task(store)
+    # Issue 0092: the catalogue now carries the goal-RETRIEVED subset, not the
+    # full registry — so the goal must be mail-shaped for ``gmail_search`` to be
+    # advertised (and thus for its arg schema to appear). The schema-injection
+    # contract under test (real field names + JSON Schema marker) is unchanged.
+    task_id = _make_running_task(store, goal="Trouve le dernier mail de Paul")
 
     client = _ScriptedClient(chat_values=[_done_v2_payload(result_summary="done")])
     runner = SubAgentRunner(

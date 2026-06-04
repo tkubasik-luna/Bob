@@ -113,6 +113,19 @@ class SubAgentToolDefinition:
     #: :func:`bob.sub_agent.result_store.default_projector`, i.e. pre-0009
     #: behaviour (full result in transcript, no card, never converges).
     result_projector: ToolResultProjector | None = None
+    #: PRD 0015 / issue 0092 — when ``True`` this tool is always advertised to
+    #: the model regardless of goal relevance (the "core" the model can never be
+    #: stripped down past). :func:`bob.sub_agent.tool_retrieval.select_tools`
+    #: unions the always-on set with the goal-scored survivors and uses it as
+    #: the fallback when retrieval finds nothing relevant. Default ``False`` so
+    #: tagging is opt-in and backward compatible.
+    always_on: bool = False
+    #: PRD 0015 / issue 0092 — retrieval keywords folded into the lexical score
+    #: alongside ``name`` + ``description`` (mid field weight). Lets a tool be
+    #: surfaced by intent words it does not literally contain in its name /
+    #: description (e.g. ``"météo"`` for ``web_search``). Default empty tuple so
+    #: existing definitions stay valid without changes.
+    tags: tuple[str, ...] = ()
 
     @property
     def qualified_name(self) -> str:
@@ -552,6 +565,23 @@ def build_web_search_tool() -> SubAgentToolDefinition:
         args_model=WebSearchArgs,
         handler=_web_search_handler,
         result_projector=project_web_search,
+        # PRD 0015 / issue 0092 — retrieval tags surface web_search for web /
+        # news / weather / factual-lookup goals it does not literally name.
+        tags=(
+            "web",
+            "internet",
+            "recherche",
+            "search",
+            "actu",
+            "actualité",
+            "actualités",
+            "news",
+            "météo",
+            "weather",
+            "google",
+            "wikipedia",
+            "wikipédia",
+        ),
     )
 
 
@@ -568,6 +598,18 @@ def build_web_fetch_tool() -> SubAgentToolDefinition:
         args_model=WebFetchArgs,
         handler=_web_fetch_handler,
         result_projector=project_web_fetch,
+        # PRD 0015 / issue 0092 — fetch is the read-in-full follow-up to a web
+        # search, so it shares the web cluster's tags (page / url / article).
+        tags=(
+            "web",
+            "internet",
+            "page",
+            "url",
+            "article",
+            "lire",
+            "contenu",
+            "fetch",
+        ),
     )
 
 
@@ -971,6 +1013,21 @@ def build_gmail_search_tool() -> SubAgentToolDefinition:
         # PRD 0009 — the runner builds the Mail card + spoken summary from this
         # projection deterministically; the model no longer hand-builds it.
         result_projector=project_gmail_search,
+        # PRD 0015 / issue 0092 — retrieval tags so a mail-lookup goal
+        # (« dernier mail », « email de … », « ma boîte ») scores gmail_search
+        # high while excluding the web cluster.
+        tags=(
+            "mail",
+            "email",
+            "e-mail",
+            "courriel",
+            "gmail",
+            "boîte",
+            "inbox",
+            "message",
+            "expéditeur",
+            "sujet",
+        ),
     )
 
 

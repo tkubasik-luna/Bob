@@ -91,7 +91,7 @@ import asyncio
 import contextlib
 import json
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any, TypeGuard
 
@@ -99,6 +99,7 @@ import structlog
 from pydantic import ValidationError
 
 from bob import ws_events
+from bob.config import get_settings
 from bob.context.prompt_fragments import (
     SUB_AGENT_V2_ADDENDUM_TEMPLATE,
     SUB_AGENT_V2_SYSTEM_PROMPT,
@@ -138,11 +139,13 @@ from bob.sub_agent.reasoning_stream import ReasoningStreamReader
 from bob.sub_agent.result_store import StoredResult, ToolResultStore
 from bob.sub_agent.tool_registry import (
     SubAgentToolArgsValidationError,
+    SubAgentToolDefinition,
     SubAgentToolDispatcher,
     SubAgentToolDispatchResult,
     SubAgentToolRegistry,
     build_default_subagent_registry,
 )
+from bob.sub_agent.tool_retrieval import select_tools
 from bob.task_store import Task, TaskStore, TaskStoreError
 from bob.ui_registry import (
     ComponentDescriptor,
@@ -749,7 +752,7 @@ def _normalise_payload(raw: str) -> _NormalisedPayload:
     return _NormalisedPayload(action=parsed)
 
 
-def _render_tool_catalogue(registry: SubAgentToolRegistry) -> str:
+def _render_tool_catalogue(tools: Iterable[SubAgentToolDefinition]) -> str:
     """Render the per-tool argument JSON Schema block for the system prompt.
 
     Issue 0059 (PRD 0008). Replaces the former name+description-only listing
@@ -766,11 +769,17 @@ def _render_tool_catalogue(registry: SubAgentToolRegistry) -> str:
     0057 golden-prompt posture wants byte-stable prompts. Tools are emitted in
     name-sorted order (issue 0063) so the prompt prefix stays byte-stable for
     cache hits regardless of registration order. Returns the empty string for
-    an empty registry so the caller can skip the section header.
+    an empty tool set so the caller can skip the section header.
+
+    PRD 0015 / issue 0092: ``tools`` is now the goal-RETRIEVED SUBSET
+    (:func:`bob.sub_agent.tool_retrieval.select_tools`), not the full registry —
+    the model is advertised only the relevant tools. Dispatch is unchanged: the
+    runner still resolves any registered tool by name (advertised ⊂ dispatchable).
+    Accepts any iterable of definitions so the retrieval list drops straight in.
     """
 
     blocks: list[str] = []
-    for definition in sorted(registry, key=lambda d: d.name):
+    for definition in sorted(tools, key=lambda d: d.name):
         spec = definition.to_spec()
         schema_json = json.dumps(spec.parameters, ensure_ascii=False, sort_keys=True, indent=2)
         blocks.append(
@@ -1603,7 +1612,20 @@ class SubAgentRunner:
     ) -> list[dict[str, Any]]:
         """Build the LLM message list including history + drained addenda."""
 
-        tool_catalogue = _render_tool_catalogue(self._tool_registry)
+        # PRD 0015 / issue 0092 — advertise only the goal-RETRIEVED subset of
+        # tools, not the whole registry, so a weak local model is not drowned in
+        # irrelevant schemas as the registry scales. Dispatch is unaffected:
+        # ``_validate_tool_args`` / ``_handle_tool_call`` still resolve any
+        # REGISTERED tool by name (advertised ⊂ dispatchable), so a tool the
+        # model calls without it being advertised still runs.
+        settings = get_settings()
+        advertised_tools = select_tools(
+            self._tool_registry,
+            task.goal,
+            k=settings.TOOL_RETRIEVAL_K,
+            min_score=settings.TOOL_RETRIEVAL_MIN_SCORE,
+        )
+        tool_catalogue = _render_tool_catalogue(advertised_tools)
         system_prompt = SUB_AGENT_V2_SYSTEM_PROMPT.render(goal=task.goal)
         # Inject the current date so date-typed tool args (e.g. gmail_search
         # ``after`` / ``before``) get the right year — local models otherwise
@@ -1809,9 +1831,7 @@ class SubAgentRunner:
                 return stored.projection.deliverable, (result_summary or stored.projection.summary)
         return None, result_summary
 
-    async def _handle_progress(
-        self, task_id: str, thought: str, *, degraded: bool = False
-    ) -> None:
+    async def _handle_progress(self, task_id: str, thought: str, *, degraded: bool = False) -> None:
         """Persist a v2 ``progress`` thought, leave state ``running``.
 
         PRD 0011 / issue 0070 — narrated-steps fallback. When ``degraded`` is

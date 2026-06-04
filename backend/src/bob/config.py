@@ -170,6 +170,19 @@ class Settings(BaseSettings):
     TAVILY_TIMEOUT_SECONDS: float = 15.0
     WEB_SEARCH_MAX_RESULTS: int = 5
 
+    # Tool retrieval gating (PRD 0015 / issue 0092). The sub-agent runner
+    # advertises only the most goal-relevant tools to the model instead of the
+    # whole registry, via :func:`bob.sub_agent.tool_retrieval.select_tools`.
+    # ``TOOL_RETRIEVAL_K`` caps the number of *relevance-retrieved* tools shown
+    # (``always_on`` core tools are always shown on top of this and do not count
+    # against the cap); ``TOOL_RETRIEVAL_MIN_SCORE`` is the minimum lexical
+    # relevance score a tool must reach to be advertised. Dispatch is unaffected:
+    # a registered-but-not-advertised tool still resolves when the model calls it
+    # by name. Defaults are generous enough that today's 3-tool registry is fully
+    # advertised for a matching goal; they only bite once an MCP fleet lands.
+    TOOL_RETRIEVAL_K: int = 8
+    TOOL_RETRIEVAL_MIN_SCORE: int = 1
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
