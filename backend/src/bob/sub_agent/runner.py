@@ -145,7 +145,11 @@ from bob.sub_agent.tool_registry import (
     SubAgentToolRegistry,
     build_default_subagent_registry,
 )
-from bob.sub_agent.tool_retrieval import select_tools
+from bob.sub_agent.tool_retrieval import (
+    ToolDeferralPlan,
+    build_tool_deferral_plan,
+    select_tools,
+)
 from bob.task_store import Task, TaskStore, TaskStoreError
 from bob.ui_registry import (
     ComponentDescriptor,
@@ -848,6 +852,17 @@ class SubAgentRunner:
         self._on_validation_exhausted: OnValidationExhausted = (
             on_validation_exhausted or SubAgentOnValidationExhausted(runner=self)
         )
+        # PRD 0015 / issue 0096 — native-Anthropic tool deferral. Decided ONCE
+        # from the resolved provider via the client capability query (mirrors the
+        # ``_envelope_schema`` guided-JSON gate above): on a deferral-capable
+        # provider the runner skips the server-side ``select_tools`` retrieval
+        # and hands the platform a deferral plan instead. ``False`` on every
+        # OpenAI-compatible provider (LM Studio) so that path is byte-for-byte
+        # the issue-0092 server-side retrieval — this layer is never on the local
+        # critical path. ``_last_deferral_plan`` records the most recent plan the
+        # native path built (``None`` on the LM Studio path) for observability.
+        self._native_tool_deferral: bool = subagent_client.supports_native_tool_deferral()
+        self._last_deferral_plan: ToolDeferralPlan | None = None
 
     @property
     def addendum_queue(self) -> AddendumQueue:
@@ -858,6 +873,19 @@ class SubAgentRunner:
     @property
     def policy(self) -> SubAgentPolicy:
         return self._policy
+
+    @property
+    def last_deferral_plan(self) -> ToolDeferralPlan | None:
+        """The deferral plan built on the most recent native-Anthropic prompt.
+
+        PRD 0015 / issue 0096. ``None`` until the first prompt is built and
+        ``None`` forever on an OpenAI-compatible (LM Studio) provider — that path
+        runs server-side retrieval and never builds a plan. The native path sets
+        it on every :meth:`_build_messages` so callers / tests can inspect the
+        kept-loaded vs deferred split and the request-shaped deferral params.
+        """
+
+        return self._last_deferral_plan
 
     def request_cancel(self) -> None:
         """Set the cooperative cancellation flag.
@@ -1605,6 +1633,49 @@ class SubAgentRunner:
 
     # --- Message + prompt building -------------------------------------------
 
+    def _advertise_tools(self, task: Task) -> list[SubAgentToolDefinition]:
+        """Pick the tools whose schemas go into the prompt for this ``task``.
+
+        Provider-keyed gate (PRD 0015 / issues 0092 + 0096):
+
+        - **OpenAI-compatible (LM Studio)** — the default. Runs the server-side
+          lexical retrieval gate :func:`bob.sub_agent.tool_retrieval.select_tools`
+          and advertises only the goal-RETRIEVED subset so a weak local model is
+          not drowned in irrelevant schemas as the registry scales. This branch
+          is BYTE-FOR-BYTE the issue-0092 behaviour: same call, same args, same
+          knobs — no deferral params anywhere.
+        - **native Anthropic (claude_cli)** — issue 0096. The platform supports
+          native tool deferral, so server-side retrieval is SKIPPED entirely:
+          :func:`build_tool_deferral_plan` splits the WHOLE fleet into a
+          kept-loaded core (``always_on``) + a deferred remainder and the request
+          builder is handed the ``defer_loading`` / ``mcp_toolset`` params. The
+          model still SEES every tool (deferred schemas load lazily), so this
+          branch advertises the kept-loaded core in the prompt catalogue and
+          stashes the plan on the runner for the request seam + tests.
+
+        Dispatch is unaffected on BOTH branches: ``_validate_tool_args`` /
+        ``_handle_tool_call`` resolve any REGISTERED tool by name (advertised ⊂
+        dispatchable), so a tool the model calls without its schema being in the
+        catalogue still runs.
+        """
+
+        if not self._native_tool_deferral:
+            settings = get_settings()
+            self._last_deferral_plan = None
+            return select_tools(
+                self._tool_registry,
+                task.goal,
+                k=settings.TOOL_RETRIEVAL_K,
+                min_score=settings.TOOL_RETRIEVAL_MIN_SCORE,
+            )
+
+        # Native Anthropic: delegate discovery to the platform's deferral. The
+        # kept-loaded core is the ``always_on`` set; everything else is deferred.
+        plan = build_tool_deferral_plan(self._tool_registry)
+        self._last_deferral_plan = plan
+        loaded_names = set(plan.loaded)
+        return [d for d in self._tool_registry if d.name in loaded_names]
+
     def _build_messages(
         self,
         task: Task,
@@ -1612,19 +1683,7 @@ class SubAgentRunner:
     ) -> list[dict[str, Any]]:
         """Build the LLM message list including history + drained addenda."""
 
-        # PRD 0015 / issue 0092 — advertise only the goal-RETRIEVED subset of
-        # tools, not the whole registry, so a weak local model is not drowned in
-        # irrelevant schemas as the registry scales. Dispatch is unaffected:
-        # ``_validate_tool_args`` / ``_handle_tool_call`` still resolve any
-        # REGISTERED tool by name (advertised ⊂ dispatchable), so a tool the
-        # model calls without it being advertised still runs.
-        settings = get_settings()
-        advertised_tools = select_tools(
-            self._tool_registry,
-            task.goal,
-            k=settings.TOOL_RETRIEVAL_K,
-            min_score=settings.TOOL_RETRIEVAL_MIN_SCORE,
-        )
+        advertised_tools = self._advertise_tools(task)
         tool_catalogue = _render_tool_catalogue(advertised_tools)
         system_prompt = SUB_AGENT_V2_SYSTEM_PROMPT.render(goal=task.goal)
         # Inject the current date so date-typed tool args (e.g. gmail_search
