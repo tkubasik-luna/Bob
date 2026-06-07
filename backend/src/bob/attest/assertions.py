@@ -525,6 +525,40 @@ def check_fsm_reached(spec: dict[str, Any], ctx: AssertionContext) -> AssertionR
     )
 
 
+def check_fsm_not_reached(spec: dict[str, Any], ctx: AssertionContext) -> AssertionResult:
+    """PASS iff NO ``turn_state`` transition reached ``spec['state']`` (issue 0103).
+
+    Spec: ``{kind: fsm_not_reached, state: bob_speaking}``. The negative of
+    :func:`check_fsm_reached` — used by the semantic-endpoint *hesitation*
+    scenario to prove Bob did NOT respond before the user's clause was complete
+    (the FSM never reached ``bob_speaking``, so no say-path ran). An optional
+    ``turn_id`` narrows the check to one turn. Echoes the states actually reached
+    so a red assertion explains itself.
+    """
+
+    state = spec.get("state")
+    if not isinstance(state, str) or not state:
+        return AssertionResult(
+            kind="fsm_not_reached",
+            ok=False,
+            detail={"error": "fsm_not_reached requires a 'state' string"},
+        )
+    want_turn = spec.get("turn_id")
+    transitions = _turn_state_events(ctx.events)
+    states_reached = sorted(
+        {
+            str(t.get("to"))
+            for t in transitions
+            if not (isinstance(want_turn, str) and want_turn) or t.get("turn_id") == want_turn
+        }
+    )
+    return AssertionResult(
+        kind="fsm_not_reached",
+        ok=state not in states_reached,
+        detail={"state": state, "states_reached": states_reached},
+    )
+
+
 def check_audio_chunks_gte(spec: dict[str, Any], ctx: AssertionContext) -> AssertionResult:
     """PASS iff at least ``spec['min']`` outbound ``audio_chunk`` events were seen.
 
@@ -562,6 +596,7 @@ register_assertion("role_used_model", check_role_used_model)
 register_assertion("budget_refused", check_budget_refused)
 register_assertion("stt_final_matches", check_stt_final_matches)
 register_assertion("fsm_reached", check_fsm_reached)
+register_assertion("fsm_not_reached", check_fsm_not_reached)
 register_assertion("audio_chunks_gte", check_audio_chunks_gte)
 
 

@@ -169,6 +169,93 @@ async def test_timeline_inject_text_calls_drive(monkeypatch: pytest.MonkeyPatch)
     assert errors == []
 
 
+async def test_inject_audio_voiced_forwards_0103_knobs(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Issue 0103: a voiced inject_audio step forwards silence_count / frame_gap_ms
+    # / await_reply / settle_ms to the drive layer (the semantic-endpoint dials).
+    captured: dict[str, Any] = {}
+
+    async def _fake_audio(ws_base: str, frames: list[bytes], **kw: Any) -> None:
+        captured["ws_base"] = ws_base
+        captured["n_frames"] = len(frames)
+        captured.update(kw)
+
+    monkeypatch.setattr("bob.attest.runner.inject_audio_ws", _fake_audio)
+
+    scenario = Scenario.from_dict(
+        {
+            "name": "x",
+            "timeline": [
+                {
+                    "do": "inject_audio",
+                    "transcript": "quel temps fait il",
+                    "voiced": True,
+                    "thinker": True,
+                    "silence_count": 12,
+                    "frame_gap_ms": 15,
+                    "await_reply": False,
+                    "settle_ms": 800,
+                }
+            ],
+        }
+    )
+    runner = ScenarioRunner(scenario)
+    errors: list[str] = []
+    await runner._execute_timeline("ws://h", _StubCapture(), errors)  # type: ignore[arg-type]
+
+    assert errors == []
+    assert captured["frame_gap_ms"] == 15
+    assert captured["await_reply"] is False
+    assert captured["settle_ms"] == 800
+
+
+async def test_inject_audio_voiced_defaults_preserve_prior_behaviour(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Without the 0103 knobs a voiced step still awaits the reply with no pacing —
+    # exactly the 0100/0110 behaviour (zero regression).
+    captured: dict[str, Any] = {}
+
+    async def _fake_audio(ws_base: str, frames: list[bytes], **kw: Any) -> None:
+        captured.update(kw)
+
+    monkeypatch.setattr("bob.attest.runner.inject_audio_ws", _fake_audio)
+    scenario = Scenario.from_dict(
+        {
+            "name": "x",
+            "timeline": [{"do": "inject_audio", "transcript": "hi", "voiced": True}],
+        }
+    )
+    runner = ScenarioRunner(scenario)
+    errors: list[str] = []
+    await runner._execute_timeline("ws://h", _StubCapture(), errors)  # type: ignore[arg-type]
+    assert errors == []
+    assert captured["await_reply"] is True
+    assert captured["frame_gap_ms"] == 0
+
+
+def test_extra_env_pins_thinker_debounce_for_inject_audio() -> None:
+    # Issue 0102/0103: a voiced inject_audio carrying ``thinker: true`` pins
+    # THINKER_DEBOUNCE_MS=0 so the background Thinker fires on the first partial.
+    step = {"do": "inject_audio", "transcript": "hi", "voiced": True, "thinker": True}
+    scenario = Scenario.from_dict({"name": "x", "timeline": [step]})
+    env = ScenarioRunner(scenario)._extra_env()
+    assert env["THINKER_DEBOUNCE_MS"] == "0"
+
+
+def test_extra_env_scenario_env_merges() -> None:
+    # Issue 0103: a scenario-level ``env`` (e.g. a large ENDPOINT_SILENCE_MS to
+    # make the silence floor unreachable) is merged into the backend env.
+    scenario = Scenario.from_dict(
+        {
+            "name": "x",
+            "env": {"ENDPOINT_SILENCE_MS": "4000"},
+            "timeline": [{"do": "inject_audio", "transcript": "hi", "voiced": True}],
+        }
+    )
+    env = ScenarioRunner(scenario)._extra_env()
+    assert env["ENDPOINT_SILENCE_MS"] == "4000"
+
+
 async def test_timeline_wait_event_records_timeout_as_error() -> None:
     scenario = Scenario.from_dict(
         {"name": "x", "timeline": [{"do": "wait_event", "type": "say", "timeout_ms": 5}]}

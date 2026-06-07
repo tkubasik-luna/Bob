@@ -410,6 +410,21 @@ class ScenarioRunner:
         through ``user_speaking`` → ``thinking`` → ``bob_speaking`` → ``idle``
         and the say-path. The fake STT still converges to the scripted
         transcript regardless of content.
+
+        Issue 0103 (the SEMANTIC endpoint) adds three additive knobs on a
+        ``voiced`` step:
+
+        - ``silence_count`` — how many trailing silent frames to stream
+          (default 30, the 0100 sizing that crosses the default floor). A
+          scenario that pins a LARGE ``ENDPOINT_SILENCE_MS`` via ``env`` and a
+          SMALL ``silence_count`` proves the endpoint that fired was SEMANTIC:
+          the silence floor was never reachable in so few frames.
+        - ``frame_gap_ms`` — pace the inbound frames over wall-clock so the
+          background Thinker lands its ``user_turn_complete`` snapshot mid-stream
+          and the loop polls it across the following frames (Annexe B + H).
+        - ``await_reply`` — defaults true (read Bob's reply before closing). A
+          hesitation scenario sets it false: NO endpoint is expected, so there is
+          no reply to await — we just settle and let ``voice_stop`` finalize.
         """
 
         transcript = step.get("transcript", "")
@@ -417,13 +432,24 @@ class ScenarioRunner:
         # Fake engine reveals one word per ~1600 samples; 480 samples/frame.
         voiced_count = max(8, (words * 1600) // 480 + 4)
         if step.get("voiced"):
-            frames = synth_voiced_frames(voiced_count=voiced_count)
+            silence_count = int(step.get("silence_count", 30))
+            frame_gap_ms = int(step.get("frame_gap_ms", 0))
+            await_reply = bool(step.get("await_reply", True))
+            settle_ms = int(step.get("settle_ms", 300))
+            frames = synth_voiced_frames(voiced_count=voiced_count, silence_count=silence_count)
             # ``--deep`` (issue 0110): collect Bob's outbound TTS PCM off this
             # socket so the round-trip can re-transcribe exactly what he played.
             collect = self._deep_reply_pcm if self._deep else None
             # Keep the chat socket open until the say-path finishes so the
             # in-flight reply is not cancelled by the socket close (issue 0100).
-            await inject_audio_ws(ws_base, frames, await_reply=True, collect_reply_pcm=collect)
+            await inject_audio_ws(
+                ws_base,
+                frames,
+                await_reply=await_reply,
+                collect_reply_pcm=collect,
+                frame_gap_ms=frame_gap_ms,
+                settle_ms=settle_ms,
+            )
         else:
             frames = synth_mic_frames(frame_count=voiced_count)
             await inject_audio_ws(ws_base, frames)

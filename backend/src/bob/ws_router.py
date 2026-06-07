@@ -632,6 +632,11 @@ async def _handle_voice_start(
         on_thinker_start=(thinker.loop.start if thinker is not None else None),
         on_thinker_feed=(thinker.loop.feed_partial if thinker is not None else None),
         on_thinker_stop=(thinker.loop.stop if thinker is not None else None),
+        # Semantic endpoint (issue 0103): a pure read of the Thinker's latest
+        # ``user_turn_complete`` from the SAME live-transcript store the loop
+        # writes. The Endpointer fires the endpoint early only once a stable
+        # partial confirms it (Annexe H); ``None`` keeps the silence-floor net.
+        thinker_complete=(thinker.user_turn_complete if thinker is not None else None),
     )
     session["thinker_loop"] = thinker.loop if thinker is not None else None
     started = await loop.start()
@@ -886,6 +891,18 @@ class _ThinkerHandle:
 
         await self.loop.stop()
         self.loop.start(turn_id)
+
+    def user_turn_complete(self) -> bool:
+        """Latest ``user_turn_complete`` from the Thinker's snapshot (issue 0103).
+
+        Pure, cheap read of the shared :class:`LiveTranscriptState` the loop
+        polls each frame to drive the SEMANTIC endpoint (Annexe B + H). ``False``
+        when no snapshot has landed yet (the silence floor stays the net) — so a
+        turn the Thinker never flags simply ends on silence as before.
+        """
+
+        snapshot = self.live_state.latest()
+        return bool(snapshot.user_turn_complete) if snapshot is not None else False
 
 
 def _make_thinker_loop(session_id: str, settings: Settings) -> _ThinkerHandle | None:

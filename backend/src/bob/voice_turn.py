@@ -136,6 +136,11 @@ class VoiceTurn:
         # the ``feed_thinker`` action without re-plumbing the emit path. Additive
         # — the 0099 surface is unchanged; empty until the first partial.
         self._latest_partial_text = ""
+        # Latest ``stt_partial`` ``stable_prefix_len`` this turn. The full-duplex
+        # loop (PRD 0016 / issue 0103) reads it to confirm the semantic endpoint:
+        # a ``user_turn_complete`` signal fires the endpoint only once the stable
+        # prefix has advanced (Annexe H). Additive — 0 until the first partial.
+        self._latest_partial_stable_prefix_len = 0
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -288,9 +293,21 @@ class VoiceTurn:
 
         return self._latest_partial_text
 
+    @property
+    def latest_partial_stable_prefix_len(self) -> int:
+        """The most recent partial's ``stable_prefix_len`` (PRD 0016 / issue 0103).
+
+        ``0`` until the first partial. The full-duplex loop reads it to confirm
+        the semantic endpoint — a ``user_turn_complete`` signal fires the
+        endpoint only once this advances (Annexe H anti-false-positive rule).
+        """
+
+        return self._latest_partial_stable_prefix_len
+
     async def _emit_partial(self, partial: SttPartial) -> None:
         self._partial_count += 1
         self._latest_partial_text = partial.text
+        self._latest_partial_stable_prefix_len = partial.stable_prefix_len
         ts = self._now()
         payload = {
             "type": "stt_partial",

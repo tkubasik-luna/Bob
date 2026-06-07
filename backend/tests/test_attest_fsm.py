@@ -55,6 +55,7 @@ def _ctx(*events: dict[str, Any]) -> AssertionContext:
 
 def test_kinds_and_matchers_registered() -> None:
     assert "fsm_reached" in known_kinds()
+    assert "fsm_not_reached" in known_kinds()  # issue 0103
     assert "audio_chunks_gte" in known_kinds()
     assert "turn_state" in LOGICAL_EVENT_MATCHERS
     assert "audio_chunk" in LOGICAL_EVENT_MATCHERS
@@ -97,6 +98,47 @@ def test_fsm_reached_narrows_by_turn_id() -> None:
     )
     assert (
         run_assertion({"kind": "fsm_reached", "state": "bob_speaking", "turn_id": "B"}, ctx).ok
+        is False
+    )
+
+
+# --- fsm_not_reached (issue 0103) --------------------------------------------
+
+
+def test_fsm_not_reached_pass_when_state_absent() -> None:
+    # The hesitation case: the turn opened but never reached bob_speaking.
+    ctx = _ctx(_turn_state("user_speaking"))
+    assert run_assertion({"kind": "fsm_not_reached", "state": "bob_speaking"}, ctx).ok is True
+
+
+def test_fsm_not_reached_fail_when_state_present() -> None:
+    ctx = _ctx(
+        _turn_state("user_speaking"),
+        _turn_state("bob_speaking", frm="thinking"),
+    )
+    result = run_assertion({"kind": "fsm_not_reached", "state": "bob_speaking"}, ctx)
+    assert result.ok is False
+    assert "bob_speaking" in result.detail["states_reached"]
+
+
+def test_fsm_not_reached_requires_state() -> None:
+    result = run_assertion({"kind": "fsm_not_reached"}, _ctx(_turn_state("idle")))
+    assert result.ok is False
+    assert "error" in result.detail
+
+
+def test_fsm_not_reached_narrows_by_turn_id() -> None:
+    ctx = _ctx(
+        _turn_state("bob_speaking", turn_id="A"),
+        _turn_state("user_speaking", turn_id="B"),
+    )
+    # Turn B never reached bob_speaking → not_reached holds for B, fails for A.
+    assert (
+        run_assertion({"kind": "fsm_not_reached", "state": "bob_speaking", "turn_id": "B"}, ctx).ok
+        is True
+    )
+    assert (
+        run_assertion({"kind": "fsm_not_reached", "state": "bob_speaking", "turn_id": "A"}, ctx).ok
         is False
     )
 

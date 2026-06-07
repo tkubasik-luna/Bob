@@ -1,0 +1,79 @@
+# Semantic endpoint — HOLD on a mid-sentence hesitation (PRD 0016 / issue 0103,
+# Annexe B + H).
+#
+# The anti-premature-cut half of the semantic endpoint: when the user's clause is
+# NOT semantically complete (a mid-sentence pause), Bob must WAIT — he does not
+# respond before completeness. Proven end-to-end against an ephemeral backend with
+# the deterministic fake LLM + fake STT + fake TTS (no native models):
+#
+#   1. inject_audio (voiced, thinker: true) — a loud burst + PACED trailing
+#      silence opens the turn and feeds the background ThinkerLoop. Here the
+#      `thinker` fake returns `user_turn_complete: FALSE` (the clause is not done),
+#      so the Endpointer NEVER arms a semantic endpoint.
+#   2. The silence floor is the only net left — and it is pinned LARGE
+#      (ENDPOINT_SILENCE_MS = 4000 ms / ~133 frames) while only ~30 trailing silent
+#      frames are streamed, so the floor is UNREACHABLE too. With neither source
+#      firing, the endpoint NEVER fires: the FSM stays in user_speaking and the
+#      say-path never runs.
+#
+# `await_reply: false` because there is NO reply to await (no endpoint -> no
+# say-path). We settle, then voice_stop finalizes the (unanswered) turn.
+#
+# Assertions: the turn OPENED (user_speaking reached) but Bob did NOT respond —
+# the FSM never reached bob_speaking and no audio_chunk was emitted. This is the
+# "Bob waits on an incomplete clause" acceptance criterion.
+#
+# Run:  uv run bob attest scenarios/semantic-endpoint-hesitation.attest.yaml  (exit 0)
+name: semantic-endpoint-holds-on-hesitation
+description: >-
+  A mid-sentence hesitation (user_turn_complete=false) does NOT trigger the
+  endpoint — Bob waits, the FSM never reaches bob_speaking.
+backend: ephemeral
+llm: fake
+env:
+  # Large floor so the silence net cannot fire in the few silent frames streamed —
+  # isolating the SEMANTIC decision: with user_turn_complete=false, nothing ends
+  # the turn early, and the floor is out of reach.
+  ENDPOINT_SILENCE_MS: "4000"
+fake_llm:
+  # The mini Thinker role returns a snapshot flagging the clause INCOMPLETE.
+  - role: thinker
+    on_input_contains: ""
+    reply: >-
+      {"corrected_text": "je voudrais", "variables": {}, "next_step_plan":
+      "attendre la suite", "user_turn_complete": false, "backchannel": null}
+  # A Speaker reply exists but must never be reached (no endpoint -> no say-path).
+  - role: jarvis
+    on_input_contains: ""
+    reply: "D'accord."
+timeline:
+  - do: inject_audio
+    transcript: "je voudrais"
+    voiced: true
+    thinker: true
+    silence_count: 30
+    frame_gap_ms: 15
+    await_reply: false
+    settle_ms: 800
+  # The turn OPENED (the VAD heard speech).
+  - do: wait_state
+    state: user_speaking
+    timeout_ms: 8000
+  # The Thinker ran (and decided the clause was NOT complete).
+  - do: wait_event
+    type: thinker_snapshot
+    timeout_ms: 8000
+assertions:
+  # The turn opened — the user was heard.
+  - kind: fsm_reached
+    state: user_speaking
+  # The Thinker ran on the partial transcript.
+  - kind: thinker_snapshot_emitted
+    min: 1
+  # Bob did NOT respond before completeness: the endpoint never fired, so the FSM
+  # never reached thinking / bob_speaking and the say-path never produced audio.
+  - kind: fsm_not_reached
+    state: thinking
+  - kind: fsm_not_reached
+    state: bob_speaking
+  - kind: no_error_events

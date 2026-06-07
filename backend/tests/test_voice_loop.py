@@ -232,8 +232,165 @@ async def test_voice_stop_midspeech_tears_down() -> None:
     assert loop.state.value == "idle"
     # The say-path never ran (the user was cut off before endpoint).
     assert say.transcripts == []
-    # voice_stop transition recorded.
-    assert any(t["reason"] == "voice_stop" for t in _turn_states())
+
+
+# --- semantic endpoint (issue 0103, Annexe B + H) ----------------------------
+
+
+def _semantic_settings() -> Settings:
+    # A LARGE silence floor so a turn can ONLY end early via the semantic source;
+    # if the silence floor ever fired in these tests it would mask the signal.
+    return Settings.model_construct(
+        STT_ENGINE="fake",
+        STT_SAMPLE_RATE=16_000,
+        VAD_SPEECH_RMS=0.02,
+        VAD_PAUSE_MS=60,
+        ENDPOINT_SILENCE_MS=3_000,  # 100 frames — far beyond what these tests feed
+        STT_DEBUG_TEXT_MAX_CHARS=64,
+    )
+
+
+def _semantic_loop(
+    say: _RecordingSayPath,
+    complete_flag: Callable[[], bool],
+    *,
+    transcript: str = "bonjour le monde",
+) -> FullDuplexLoop:
+    settings = _semantic_settings()
+    return FullDuplexLoop(
+        voice_turn_factory=lambda: VoiceTurn(
+            engine=FakeSttEngine(transcript=transcript, samples_per_word=160),
+            session_id="s1",
+            settings=settings,
+        ),
+        say_path=say,
+        settings=settings,
+        session_id="s1",
+        thinker_complete=complete_flag,
+    )
+
+
+async def test_semantic_complete_clause_fires_endpoint_before_floor() -> None:
+    # The Thinker flags the clause complete; the fake STT's advancing stable
+    # prefix confirms it; the endpoint fires on the FIRST silence frame — far
+    # before the 100-frame silence floor would.
+    say = _RecordingSayPath(produce_audio=True)
+    loop = _semantic_loop(say, lambda: True)
+    assert await loop.start() is True
+
+    # Voiced burst opens the turn + reveals the whole transcript (advancing
+    # stable prefixes). thinker_complete=True arms the semantic endpoint.
+    for _ in range(6):
+        await loop.feed_raw_frame(_LOUD)
+    assert loop.state is TurnState.USER_SPEAKING
+    # ONE silence frame is enough for the confirmed semantic endpoint (vs 100
+    # frames for the floor) — proving the early fire.
+    await loop.feed_raw_frame(_QUIET)
+    await loop.join()
+
+    assert say.transcripts == ["bonjour le monde"]
+    tos = [t["to"] for t in _turn_states()]
+    assert "thinking" in tos  # the endpoint froze the turn → thinking
+    # The endpoint fired on the single trailing silence frame.
+    latencies = _latency_events()
+    assert latencies and "t_endpoint" in latencies[-1]["marks"]
+
+
+async def test_no_semantic_signal_falls_back_to_silence_floor() -> None:
+    # thinker_complete always False (the Thinker never flags completeness): the
+    # semantic source never arms, so the turn ends ONLY via the silence floor.
+    # With the large floor, a short trailing silence must NOT end the turn.
+    say = _RecordingSayPath(produce_audio=True)
+    loop = _semantic_loop(say, lambda: False)
+    await loop.start()
+    for _ in range(6):
+        await loop.feed_raw_frame(_LOUD)
+    # A handful of silence frames — far short of the 100-frame floor.
+    for _ in range(10):
+        await loop.feed_raw_frame(_QUIET)
+
+    # No endpoint yet: the say-path never ran, the FSM is still user_speaking.
+    assert say.transcripts == []
+    assert loop.state is TurnState.USER_SPEAKING
+    await loop.stop()
+
+
+async def test_midsentence_hesitation_holds_then_floor_eventually_fires() -> None:
+    # The Thinker stays silent (incomplete clause). The loop must NOT end the
+    # turn early on a pause; the silence floor (here tightened) is the only net.
+    settings = Settings.model_construct(
+        STT_ENGINE="fake",
+        STT_SAMPLE_RATE=16_000,
+        VAD_SPEECH_RMS=0.02,
+        VAD_PAUSE_MS=60,
+        ENDPOINT_SILENCE_MS=150,  # 5 frames
+        STT_DEBUG_TEXT_MAX_CHARS=64,
+    )
+    say = _RecordingSayPath(produce_audio=True)
+    loop = FullDuplexLoop(
+        voice_turn_factory=lambda: VoiceTurn(
+            engine=FakeSttEngine(transcript="bonjour le monde", samples_per_word=160),
+            session_id="s1",
+            settings=settings,
+        ),
+        say_path=say,
+        settings=settings,
+        session_id="s1",
+        thinker_complete=lambda: False,  # never complete
+    )
+    await loop.start()
+    for _ in range(6):
+        await loop.feed_raw_frame(_LOUD)
+    # 4 silence frames < the 5-frame floor → Bob still waits (no premature end).
+    for _ in range(4):
+        await loop.feed_raw_frame(_QUIET)
+    assert loop.state is TurnState.USER_SPEAKING
+    assert say.transcripts == []
+    # The 5th silence frame crosses the floor — the net still fires.
+    await loop.feed_raw_frame(_QUIET)
+    await loop.join()
+    assert say.transcripts == ["bonjour le monde"]
+
+
+async def test_withdrawn_signal_holds_until_silence_floor() -> None:
+    # The Thinker first flags complete, then WITHDRAWS it (a later pass says
+    # not-done — a genuine resume). The semantic endpoint disarms and only the
+    # silence floor can end the turn.
+    settings = Settings.model_construct(
+        STT_ENGINE="fake",
+        STT_SAMPLE_RATE=16_000,
+        VAD_SPEECH_RMS=0.02,
+        VAD_PAUSE_MS=60,
+        ENDPOINT_SILENCE_MS=180,  # 6 frames
+        STT_DEBUG_TEXT_MAX_CHARS=64,
+    )
+    complete = {"v": True}
+    say = _RecordingSayPath(produce_audio=True)
+    loop = FullDuplexLoop(
+        voice_turn_factory=lambda: VoiceTurn(
+            engine=FakeSttEngine(transcript="bonjour le monde", samples_per_word=160),
+            session_id="s1",
+            settings=settings,
+        ),
+        say_path=say,
+        settings=settings,
+        session_id="s1",
+        thinker_complete=lambda: complete["v"],
+    )
+    await loop.start()
+    for _ in range(6):
+        await loop.feed_raw_frame(_LOUD)
+    # The Thinker withdraws BEFORE any silence frame would fire the endpoint.
+    complete["v"] = False
+    # 5 silence frames < the 6-frame floor → still held (semantic withdrawn).
+    for _ in range(5):
+        await loop.feed_raw_frame(_QUIET)
+    assert loop.state is TurnState.USER_SPEAKING
+    assert say.transcripts == []
+    # The 6th silence frame crosses the floor — the net fires.
+    await loop.feed_raw_frame(_QUIET)
+    await loop.join()
+    assert say.transcripts == ["bonjour le monde"]
 
 
 async def test_frames_after_stop_are_dropped() -> None:

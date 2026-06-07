@@ -301,6 +301,7 @@ async def inject_audio_ws(
     await_reply: bool = False,
     reply_timeout_ms: int = 30000,
     collect_reply_pcm: bytearray | None = None,
+    frame_gap_ms: int = 0,
 ) -> None:
     """Drive one voice turn through the real binary ``/ws/chat`` path.
 
@@ -310,6 +311,14 @@ async def inject_audio_ws(
     and emits ``stt_final`` on ``/ws/debug``. The ``/ws/debug`` capture (a
     separate socket) records the emitted voice events; the caller's
     ``wait_event`` / ``wait_state`` / assertions read them there.
+
+    ``frame_gap_ms`` (issue 0103): sleep this long between inbound frame sends so
+    the frames arrive PACED over wall-clock instead of back-to-back. The semantic
+    endpoint depends on the background Thinker landing a ``user_turn_complete``
+    snapshot *during* the stream and the loop polling it across subsequent frames
+    (Annexe B + H); a microsecond burst would consume every frame before the
+    async Thinker pass even completes. Default ``0`` keeps the prior back-to-back
+    behaviour (zero change for the 0099/0100/0101/0110 scenarios).
 
     ``await_reply`` (issue 0100): when the frames drive the full-duplex loop to
     an ``endpoint`` (voiced burst + trailing silence), the say-path runs as a
@@ -341,6 +350,8 @@ async def inject_audio_ws(
         await conn.send(json.dumps({"type": "voice_start", "window": "new"}))
         for frame in frames:
             await conn.send(frame)
+            if frame_gap_ms > 0:
+                await asyncio.sleep(frame_gap_ms / 1000.0)
 
         if await_reply:
             # Let the server-side say-path finish: read until ``audio_end`` (or

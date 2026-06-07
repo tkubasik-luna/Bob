@@ -8,7 +8,11 @@ real-time turn FSM (:class:`bob.turn_fsm.TurnFsm`). Issue 0100 built the bare
 audio→brain→audio skeleton + FSM lifecycle; issue 0101 adds **barge-in** (the
 ``bob_speaking`` interrupt). Issue 0102 wires the real **ThinkerLoop** behind the
 0100 symbolic ``start_thinker`` / ``feed_thinker`` actions (the ``on_thinker_*``
-hooks below). NO Draft yet (that is 0104).
+hooks below). Issue 0103 makes the endpoint **semantic**: the loop routes the
+Thinker's ``user_turn_complete`` (+ the STT stable-prefix confirmation) into the
+:class:`bob.endpointer.Endpointer`, so a confirmed complete clause fires
+``t_endpoint`` EARLIER than the silence floor (Annexe B + H). NO Draft yet (that
+is 0104).
 
 Barge-in (issue 0101, Annexe B + F)
 -----------------------------------
@@ -191,6 +195,15 @@ class FullDuplexLoop:
     on_thinker_start: Callable[[str], None] | None = None
     on_thinker_feed: Callable[[str], Awaitable[None]] | None = None
     on_thinker_stop: Callable[[], Awaitable[None]] | None = None
+    #: Semantic-endpoint signal source (PRD 0016 / issue 0103, Annexe B + H). A
+    #: pure read of the Thinker's LATEST ``user_turn_complete`` from the shared
+    #: :class:`bob.live_transcript_state.LiveTranscriptState` (wired by ws_router
+    #: as ``lambda: <latest snapshot>.user_turn_complete``). The loop polls it on
+    #: every advancing partial while the user holds the floor and routes the
+    #: value into the :class:`bob.endpointer.Endpointer`, which fires the endpoint
+    #: EARLY only once a stable partial confirms the clause (anti-false-positive).
+    #: ``None`` keeps the silence-floor-only behaviour (bare loop / no Thinker).
+    thinker_complete: Callable[[], bool] | None = None
     #: Commit-to-history hook for the barge-in ``commit_spoken_partial`` action
     #: (issue 0101): persist what Bob actually played before the cut. Defaults to
     #: the Jarvis store append (wired by ws_router); ``None`` = skip (tests).
@@ -351,8 +364,27 @@ class FullDuplexLoop:
                 with contextlib.suppress(Exception):
                     await self.on_thinker_feed(turn.latest_partial_text)
 
-        # 4) Endpointer — the silence floor. Only meaningful while the user has
-        #    the floor; firing closes the turn and launches the say-path.
+        # 3b) Semantic-endpoint signals (issue 0103, Annexe B + H). The order is
+        #     normative: route the Thinker's LATEST ``user_turn_complete`` FIRST
+        #     (it reflects a *prior* background pass — the snapshot lands
+        #     asynchronously, so we poll it every frame the user holds the floor),
+        #     so it ARMS the pending endpoint against the stable-prefix watermark
+        #     as it stood BEFORE this frame's partial. THEN route this partial's
+        #     ``stable_prefix_len`` — a prefix that grew past that watermark is the
+        #     "next stable partial" that CONFIRMS the clause settled (Annexe H
+        #     anti-false-positive). The Endpointer never fires on the raw signal.
+        if self._fsm.state is TurnState.USER_SPEAKING:
+            if self.thinker_complete is not None:
+                complete = False
+                with contextlib.suppress(Exception):
+                    complete = bool(self.thinker_complete())
+                self._endpointer.note_user_turn_complete(complete)
+            if advanced and turn is not None:
+                self._endpointer.note_stable_prefix(turn.latest_partial_stable_prefix_len)
+
+        # 4) Endpointer — the merged net (issue 0103): the silence floor OR a
+        #    CONFIRMED semantic ``user_turn_complete``. Only meaningful while the
+        #    user has the floor; firing closes the turn and launches the say-path.
         if self._fsm.state is TurnState.USER_SPEAKING and self._endpointer.observe(
             is_speech=is_speech
         ):
@@ -476,7 +508,12 @@ class FullDuplexLoop:
                 await self._open_stt_turn()
 
     async def _on_endpoint(self) -> None:
-        """Handle the silence-floor ``endpoint``: freeze + drive the say-path."""
+        """Handle the ``endpoint`` (silence floor OR semantic): freeze + say-path.
+
+        Issue 0103: ``t_endpoint`` is stamped here whichever source crossed — the
+        silence-floor net or a confirmed semantic ``user_turn_complete`` — so a
+        complete clause's earlier endpoint is measurable in the latency marks.
+        """
 
         self._latency.t_endpoint = self._now()
         transition = self._fsm.on_event(TurnEvent.ENDPOINT, turn_id=self._fsm.turn_id)

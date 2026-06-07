@@ -1,0 +1,90 @@
+# Semantic endpoint — EARLY fire on a complete clause (PRD 0016 / issue 0103,
+# Annexe B + H).
+#
+# Proves the SEMANTIC endpoint end-to-end against an ephemeral backend with the
+# deterministic fake LLM + fake STT + fake TTS (no native models):
+#
+#   1. inject_audio (voiced, thinker: true) — a loud burst + PACED trailing
+#      silence drives the energy VAD -> vad_speech_start; the fake STT converges
+#      to the transcript, emitting stt_partials whose stable prefix advances over
+#      the paced frames. Each partial feeds the background ThinkerLoop (debounce
+#      pinned to 0 by `thinker: true`), whose `thinker` fake returns a JSON
+#      snapshot with `user_turn_complete: true`. The loop routes that signal into
+#      the Endpointer, which fires the endpoint EARLY once the NEXT stable partial
+#      confirms it (Annexe H anti-false-positive) — driving the FSM to thinking ->
+#      bob_speaking and the say-path.
+#
+# The PROOF that the endpoint was SEMANTIC, not the silence floor: ENDPOINT_SILENCE_MS
+# is pinned to 4000 ms (~133 frames at 30 ms) but only ~40 trailing silent frames
+# are streamed. The silence floor is therefore UNREACHABLE in this run — the only
+# thing that can end the turn early is the confirmed `user_turn_complete`. So
+# fsm_reached: bob_speaking + audio_chunks_gte prove the early endpoint fired.
+#
+# `frame_gap_ms` paces the inbound frames over wall-clock so the (async) Thinker
+# pass lands its snapshot mid-stream and the loop polls it across the following
+# frames; a back-to-back microsecond burst would consume every frame before the
+# pass completed.
+#
+# Run:  uv run bob attest scenarios/semantic-endpoint-early.attest.yaml   (exit 0)
+name: semantic-endpoint-early-on-complete-clause
+description: >-
+  A complete clause's user_turn_complete (confirmed by a stable partial) fires
+  the endpoint EARLY — before the (large, unreachable) silence floor.
+backend: ephemeral
+llm: fake
+env:
+  # A LARGE silence floor: ~133 frames at the 30 ms mic frame. We stream only ~40
+  # trailing silent frames, so the floor CANNOT fire — any endpoint here is the
+  # semantic one. (The unit tests cover the floor-as-net path directly.)
+  ENDPOINT_SILENCE_MS: "4000"
+fake_llm:
+  # The mini Thinker role returns a STRICT JSON snapshot flagging the clause
+  # complete (Annexe A.2); chat() returns it verbatim and the loop parses it.
+  - role: thinker
+    on_input_contains: ""
+    reply: >-
+      {"corrected_text": "quel temps fait il a paris", "variables": {"city":
+      "Paris", "intent": "weather"}, "next_step_plan": "donner la meteo de
+      Paris", "user_turn_complete": true, "backchannel": null}
+  # The Speaker (jarvis role) answers the frozen transcript normally.
+  - role: jarvis
+    on_input_contains: "temps"
+    reply: "Il fait beau aujourd'hui à Paris."
+timeline:
+  - do: inject_audio
+    transcript: "quel temps fait il a paris"
+    voiced: true
+    thinker: true
+    silence_count: 40
+    frame_gap_ms: 15
+  # The Thinker produced its (complete) understanding during user_speaking.
+  - do: wait_event
+    type: thinker_snapshot
+    timeout_ms: 8000
+  # The endpoint fired (semantic) — the FSM froze the turn and ran the say-path.
+  - do: wait_state
+    state: bob_speaking
+    timeout_ms: 8000
+  - do: wait_event
+    type: turn_latency
+    timeout_ms: 8000
+assertions:
+  # The background Thinker ran and flagged the clause complete.
+  - kind: thinker_snapshot_emitted
+    min: 1
+  # The endpoint fired EARLY: the FSM reached bob_speaking even though the silence
+  # floor (4000 ms / ~133 frames) was unreachable in the ~40 silent frames streamed.
+  - kind: fsm_reached
+    state: thinking
+  - kind: fsm_reached
+    state: bob_speaking
+  - kind: audio_chunks_gte
+    min: 1
+  - kind: deliverable_nonempty
+  # The endpoint mark exists and is reasonably tight after the first partial — a
+  # sanity bound on the semantic endpoint timing (well under the floor).
+  - kind: latency_lt_ms
+    from_mark: t_first_partial
+    to_mark: t_endpoint
+    max: 4000
+  - kind: no_error_events
