@@ -20,3 +20,4 @@ Personal AI assistant. Tauri + React frontend, FastAPI backend, LM Studio (or an
 - [0014 Refonte HUD « Piste 3D · Nacre »](docs/features/0014-hud-piste-3d-nacre.md) — In-place `new` HUD reskin: conscience orb + left thread-deck + right data dock + typed overlay + settings modal.
 - [0015 Web Search Tool (Tavily)](docs/features/0015-web-search.md) — Tavily-backed `web_search` + `web_fetch` sub-agent tools (search → fetch → synthesise), dedicated `WebResults` HUD card, gated on `TAVILY_API_KEY`.
 - [0016 MCP Tool Scaling](docs/features/0015-mcp-tool-scaling.md) — MCP-client connectors via config manifest + goal-driven `select_tools` gating; weather end-to-end, generic Markdown card, full LM Studio.
+- [0017 Jarvis Temps Réel Full-Duplex](docs/features/0016-jarvis-realtime-fullduplex.md) — Full-duplex voice: streaming STT, parallel Thinker+Draft anticipation, barge-in, backchannels, per-role LLM picker + headless `bob attest` harness.
