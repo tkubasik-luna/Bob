@@ -1,0 +1,94 @@
+# Backchannel — Bob acknowledges in a user pause (PRD 0016 / issue 0105,
+# Annexe A.2 + B + F).
+#
+# Proves the BACKCHANNEL end-to-end against an ephemeral backend with the
+# deterministic fake LLM + fake STT + fake TTS (no native models):
+#
+#   1. inject_audio (voiced, thinker: true) streams a voiced burst with a
+#      MID-UTTERANCE silence beat (`pause_count`) in the middle: voiced / short
+#      silence / voiced, then trailing silence. The early partials feed the
+#      background ThinkerLoop (debounce pinned to 0 by `thinker: true`); its
+#      `thinker` fake returns a snapshot carrying a non-null `backchannel`
+#      ("mm") AND `user_turn_complete: false` (so the SEMANTIC endpoint never
+#      fires early — only the silence floor ends the turn).
+#   2. The mid beat trips the energy VAD's `vad_pause` WHILE the user holds the
+#      floor (`user_speaking`). The FSM's `maybe_backchannel` action runs: the
+#      proactivity gate sees the Thinker's relevant trigger + a fresh refractory
+#      budget and EMITS — Bob synthesises the short token via the fake TTS and
+#      emits a `backchannel` voice event, WITHOUT taking the floor (no
+#      bob_speaking transition for the backchannel; the turn stays user_speaking).
+#   3. After the beat the user resumes; the trailing silence then crosses the
+#      (real) silence floor → endpoint → the normal say-path runs and Bob speaks.
+#
+# The PROOF the backchannel landed DURING the pause (not over active speech): the
+# `backchannel` event fires while the FSM is in `user_speaking` (the pause beat),
+# strictly before the endpoint moves the turn to `thinking` → `bob_speaking`.
+# `VAD_PAUSE_MS` is pinned small (the beat trips it) and `ENDPOINT_SILENCE_MS`
+# large enough that only the trailing silence — not the mid beat — ends the turn.
+#
+# Run:  uv run bob attest scenarios/backchannel.attest.yaml   (exit 0, ok: true)
+name: backchannel-in-user-pause
+description: >-
+  A voiced turn with a mid-utterance pause; the Thinker flags a backchannel and
+  Bob places a brief acknowledgement IN the pause without taking the floor.
+backend: ephemeral
+llm: fake
+env:
+  # The mid beat (pause_count frames) trips vad_pause at this short window...
+  VAD_PAUSE_MS: "150"
+  # ...while the silence floor stays large enough that the mid beat never ends
+  # the turn — only the trailing silence does (the backchannel is in a PAUSE,
+  # not at the endpoint).
+  ENDPOINT_SILENCE_MS: "900"
+  # Allow a backchannel on the very first qualifying pause (no refractory wait).
+  BACKCHANNEL_MIN_INTERVAL_MS: "0"
+fake_llm:
+  # The mini Thinker flags a backchannel ("mm") but NOT turn-complete, so the
+  # semantic endpoint never fires early and the only thing in the mid beat is the
+  # backchannel opportunity. chat() returns the JSON verbatim; the loop parses it.
+  - role: thinker
+    on_input_contains: ""
+    reply: >-
+      {"corrected_text": "quel temps fait il a paris", "variables": {},
+      "next_step_plan": "donner la meteo", "user_turn_complete": false,
+      "backchannel": "mm"}
+  # The Speaker answers the frozen transcript normally at the endpoint.
+  - role: jarvis
+    on_input_contains: "temps"
+    reply: "Il fait beau aujourd'hui à Paris."
+timeline:
+  - do: inject_audio
+    transcript: "quel temps fait il a paris"
+    voiced: true
+    thinker: true
+    pause_count: 12
+    silence_count: 35
+    frame_gap_ms: 15
+  # The Thinker produced its understanding (carrying the backchannel trigger).
+  - do: wait_event
+    type: thinker_snapshot
+    timeout_ms: 8000
+  # Bob placed the acknowledgement IN the pause (user_speaking, no floor change).
+  - do: wait_event
+    type: backchannel
+    timeout_ms: 8000
+  # The turn still ended normally on the silence floor and Bob spoke.
+  - do: wait_state
+    state: bob_speaking
+    timeout_ms: 8000
+  - do: wait_state
+    state: idle
+    timeout_ms: 8000
+assertions:
+  # The background Thinker ran and carried the backchannel trigger.
+  - kind: thinker_snapshot_emitted
+    min: 1
+  # A backchannel was emitted (the acceptance criterion: ack in the pause).
+  - kind: backchannel_emitted
+    min: 1
+  # The turn converged on the normal say-path afterwards (the backchannel did
+  # NOT replace the turn — Bob still answered at the endpoint).
+  - kind: fsm_reached
+    state: bob_speaking
+  - kind: deliverable_nonempty
+  - kind: no_error_events

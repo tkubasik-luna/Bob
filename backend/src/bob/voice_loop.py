@@ -81,6 +81,7 @@ from typing import Protocol
 
 import structlog
 
+from bob.backchannel import BackchannelDecider
 from bob.bargein import BargeInConfirmation, BargeInController
 from bob.config import Settings
 from bob.endpointer import Endpointer
@@ -204,6 +205,22 @@ class FullDuplexLoop:
     #: EARLY only once a stable partial confirms the clause (anti-false-positive).
     #: ``None`` keeps the silence-floor-only behaviour (bare loop / no Thinker).
     thinker_complete: Callable[[], bool] | None = None
+    #: Backchannel trigger source (PRD 0016 / issue 0105, Annexe B + A.2). A pure
+    #: read of the Thinker's LATEST ``backchannel`` token from the shared
+    #: :class:`bob.live_transcript_state.LiveTranscriptState` (wired by ws_router
+    #: as ``lambda: <latest snapshot>.backchannel``). The loop consults it on each
+    #: ``vad_pause`` during ``user_speaking`` (the FSM ``maybe_backchannel`` hook)
+    #: and, gated by the :class:`bob.backchannel.BackchannelDecider`, plays a short
+    #: acknowledgement WITHOUT a floor transition. ``None`` (bare loop / no
+    #: Thinker) means no backchannel ever fires — every pause stays silent.
+    backchannel_trigger: Callable[[], str | None] | None = None
+    #: Short-token synthesis hook for a gated backchannel (PRD 0016 / issue 0105).
+    #: Receives the (interrupted) ``turn_id`` + the brief token; synthesises it via
+    #: Kokoro (fake TTS under attest) and streams it out WITHOUT touching the FSM
+    #: floor. Wired by ws_router; ``None`` skips the audio (the decision + event
+    #: still fire so the gate is attestable in narrow test setups). A failure is
+    #: swallowed — a backchannel hiccup must never perturb the live user turn.
+    backchannel_tts: Callable[[str, str], Awaitable[None]] | None = None
     #: Commit-to-history hook for the barge-in ``commit_spoken_partial`` action
     #: (issue 0101): persist what Bob actually played before the cut. Defaults to
     #: the Jarvis store append (wired by ws_router); ``None`` = skip (tests).
@@ -219,6 +236,10 @@ class FullDuplexLoop:
     _vad: EnergyVad = field(init=False)
     _endpointer: Endpointer = field(init=False)
     _bargein: BargeInController = field(init=False)
+    #: Proactivity gate for pause backchannels (issue 0105). Pure decision
+    #: (relevance = Thinker trigger present; silence-decay = refractory window);
+    #: the loop performs the synthesis only when it says emit. Reset per turn.
+    _backchannel: BackchannelDecider = field(init=False)
     _turn: VoiceTurn | None = None
     #: Annexe F latency accumulator for the turn in flight (issue 0110). Slices
     #: stamp their marks into it; the loop emits the full ``turn_latency`` body
@@ -261,6 +282,9 @@ class FullDuplexLoop:
             speech_rms=self.settings.VAD_SPEECH_RMS,
         )
         self._bargein = BargeInController(confirm_ms=self.settings.BARGEIN_CONFIRM_MS)
+        self._backchannel = BackchannelDecider(
+            min_interval_s=max(0.0, self.settings.BACKCHANNEL_MIN_INTERVAL_MS / 1000.0)
+        )
 
     # -- public API ----------------------------------------------------------
 
@@ -346,7 +370,16 @@ class FullDuplexLoop:
         if vad_event is VadEvent.SPEECH_START:
             await self._on_speech_start()
         elif vad_event is VadEvent.PAUSE and self._fsm.state is TurnState.USER_SPEAKING:
-            await self._dispatch(TurnEvent.VAD_PAUSE, turn_id=self._fsm.turn_id)
+            # The ``user_speaking --vad_pause--> user_speaking`` self-loop whose
+            # Annexe B action is ``maybe_backchannel`` (issue 0105): the turn does
+            # NOT change floor — we just *maybe* drop a brief acknowledgement in
+            # the pause. The decision/synthesis are gated below; the FSM move
+            # itself is a no-op transition that only emits ``turn_state``.
+            transition = self._fsm.on_event(TurnEvent.VAD_PAUSE, turn_id=self._fsm.turn_id)
+            if transition is not None:
+                await self._emit_turn_state(transition)
+                if "maybe_backchannel" in transition.actions:
+                    await self._maybe_backchannel(transition.turn_id)
 
         # 3) An STT partial nudges the FSM's stt_partial self-loop, but only
         #    while the user holds the floor (a partial flushed during finalize
@@ -487,6 +520,9 @@ class FullDuplexLoop:
             # this same call, minus the pre-speech silence we drop here.
             self._begin_capture()
             self._endpointer.reset()
+            # Fresh backchannel proactivity budget for this turn (issue 0105) —
+            # no carry-over of the previous turn's last-emission watermark.
+            self._backchannel.reset()
             # Annexe B ``start_thinker`` — arm the background ThinkerLoop for this
             # turn (PRD 0016 / issue 0102). Synchronous + cheap (resets cadence +
             # clears the live-transcript store); no-op when unwired (bare loop).
@@ -721,6 +757,69 @@ class FullDuplexLoop:
         if not self._stopped and self._turn is None:
             await self._open_stt_turn()
 
+    async def _maybe_backchannel(self, turn_id: str) -> None:
+        """Maybe place a brief acknowledgement in this ``vad_pause`` (issue 0105).
+
+        The Annexe B ``maybe_backchannel`` action, fired on the
+        ``user_speaking --vad_pause--> user_speaking`` self-loop. It is an ACTION,
+        not a floor transition: the FSM stays in ``user_speaking`` (we already
+        emitted the no-op ``turn_state``) and Bob does NOT take the floor — a
+        backchannel rides *over* the pause, never interrupting the user (we are
+        in a pause by construction) and never becoming a ``bob_speaking`` turn.
+
+        Gating (mirrors the inner-thoughts "when-to-speak" proactivity, not
+        systematic): the :class:`bob.backchannel.BackchannelDecider` requires the
+        Thinker's latest ``backchannel`` trigger to be present (relevance) AND the
+        silence-decay refractory window to have elapsed since the last
+        acknowledgement. A pause the Thinker did not flag, or one inside the
+        refractory window, is silently skipped (logged with the reason). When the
+        gate says emit: stamp the pause→ack latency window, synthesise the short
+        token (Kokoro / fake TTS) WITHOUT a floor change, emit the ``backchannel``
+        voice event (Annexe A.2), and arm the refractory window. A trigger source
+        / TTS that is unwired (bare loop) makes this a no-op.
+        """
+
+        if self.backchannel_trigger is None:
+            return
+        trigger: str | None = None
+        with contextlib.suppress(Exception):
+            trigger = self.backchannel_trigger()
+
+        now = self._now()
+        decision = self._backchannel.decide(trigger=trigger, now=now)
+        if not decision.emit:
+            if decision.reason != "no_trigger":
+                _logger.debug(
+                    "voice_loop.backchannel_suppressed",
+                    session_id=self.session_id,
+                    turn_id=turn_id,
+                    reason=decision.reason,
+                )
+            return
+
+        # Annexe F ``backchannel_ms`` window — the pause that opened the
+        # opportunity → the moment the token is produced. Record only the FIRST
+        # backchannel of the turn (the representative pause→ack latency); a later
+        # backchannel does not overwrite the marks.
+        if self._latency.t_backchannel_pause is None:
+            self._latency.t_backchannel_pause = now
+
+        # Synthesise + play the short token WITHOUT touching the FSM floor. A
+        # failure is swallowed: a backchannel hiccup must never perturb the live
+        # user turn (the user keeps the floor regardless).
+        if self.backchannel_tts is not None:
+            with contextlib.suppress(Exception):
+                await self.backchannel_tts(turn_id, decision.token)
+
+        # The token has been produced (end of the ``backchannel_ms`` window).
+        if self._latency.t_backchannel is None:
+            self._latency.t_backchannel = self._now()
+
+        # Arm the refractory window (the proactivity budget is now spent) + emit
+        # the Annexe A.2 ``backchannel`` event so the HUD / harness observe it.
+        self._backchannel.note_emitted(now)
+        await self._emit_backchannel(turn_id, decision.token)
+
     # -- helpers -------------------------------------------------------------
 
     async def _dispatch(self, event: TurnEvent, *, turn_id: str | None = None) -> None:
@@ -890,6 +989,32 @@ class FullDuplexLoop:
             severity="info",
             source="bob.voice_loop.bargein",
             summary=f"bargein (turn={turn_id})",
+            debug_payload=debug_payload,
+        )
+
+    async def _emit_backchannel(self, turn_id: str, token: str) -> None:
+        """Emit the Annexe A.2 ``backchannel`` voice event for a placed token.
+
+        Payload (Annexe A.2): ``{turn_id, token, ts}`` (category ``voice``). The
+        ``ts`` is the emit instant. The ``token`` is the short acknowledgement Bob
+        placed in the pause; it is brief by construction (capped by the decider),
+        but for symmetry with the other voice events that carry user-derived text
+        the ``/ws/debug`` ring-buffer copy is scrubbed to the leading window (a
+        short token survives whole, so the attest harness reads it intact).
+        """
+
+        ts = self._now()
+        payload = {"type": "backchannel", "turn_id": turn_id, "token": token, "ts": ts}
+        debug_payload = {
+            **payload,
+            "token": _scrub_text(token, max_chars=self.settings.STT_DEBUG_TEXT_MAX_CHARS),
+        }
+        await emit_event(
+            payload,
+            category="voice",
+            severity="info",
+            source="bob.voice_loop.backchannel",
+            summary=f"backchannel '{token}' (turn={turn_id})",
             debug_payload=debug_payload,
         )
 

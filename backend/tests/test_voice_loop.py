@@ -49,6 +49,7 @@ def _settings() -> Settings:
         VAD_PAUSE_MS=60,  # 2 frames
         ENDPOINT_SILENCE_MS=120,  # 4 frames
         STT_DEBUG_TEXT_MAX_CHARS=64,
+        BACKCHANNEL_MIN_INTERVAL_MS=0,  # no refractory in unit tests (issue 0105)
     )
 
 
@@ -115,6 +116,8 @@ def _loop(
     transcript: str = "bonjour",
     *,
     persist_turn: Callable[[Any], Awaitable[None]] | None = None,
+    backchannel_trigger: Callable[[], str | None] | None = None,
+    backchannel_tts: Callable[[str, str], Awaitable[None]] | None = None,
 ) -> FullDuplexLoop:
     settings = _settings()
     return FullDuplexLoop(
@@ -127,7 +130,20 @@ def _loop(
         settings=settings,
         session_id="s1",
         persist_turn=persist_turn,
+        backchannel_trigger=backchannel_trigger,
+        backchannel_tts=backchannel_tts,
     )
+
+
+def _backchannel_events() -> list[dict[str, Any]]:
+    """The ``backchannel`` ws_event bodies currently in the debug ring buffer."""
+
+    out: list[dict[str, Any]] = []
+    for event in debug_log.snapshot():
+        ws_event = (event.payload or {}).get("ws_event") or {}
+        if ws_event.get("type") == "backchannel":
+            out.append(ws_event)
+    return out
 
 
 @pytest.fixture(autouse=True)
@@ -853,3 +869,143 @@ async def test_bargein_persists_with_committed_spoken_text() -> None:
     assert bargein_turns[0].spoken_text == "Bonjour le monde"
     # The trailing stop did NOT add a second persist for the same turn id.
     assert len(persist.turns) == 1
+
+
+# --- backchannels (PRD 0016 / issue 0105, Annexe B + A.2 + F) ----------------
+
+
+class _RecordingBackchannelTts:
+    """A fake backchannel TTS hook: records (turn_id, token) it was asked to play."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+
+    async def __call__(self, turn_id: str, token: str) -> None:
+        self.calls.append((turn_id, token))
+
+
+async def _open_turn(loop: FullDuplexLoop, *, loud_frames: int = 6) -> None:
+    """Drive the loop into ``user_speaking`` with a voiced burst (feeds STT)."""
+
+    await loop.start()
+    for _ in range(loud_frames):
+        await loop.feed_raw_frame(_LOUD)
+    assert loop.state is TurnState.USER_SPEAKING
+
+
+async def test_pause_with_trigger_emits_backchannel_without_floor_change() -> None:
+    say = _RecordingSayPath(produce_audio=True)
+    tts = _RecordingBackchannelTts()
+    loop = _loop(
+        say,
+        transcript="bonjour le monde",
+        backchannel_trigger=lambda: "mm",
+        backchannel_tts=tts,
+    )
+    await _open_turn(loop)
+
+    # A short mid-utterance pause (2 quiet frames = VAD_PAUSE_MS) trips vad_pause
+    # but NOT the endpoint (4 frames). The backchannel fires in that pause.
+    for _ in range(2):
+        await loop.feed_raw_frame(_QUIET)
+
+    # The acknowledgement was synthesised + the event emitted...
+    assert tts.calls and tts.calls[0][1] == "mm"
+    backchannels = _backchannel_events()
+    assert len(backchannels) == 1
+    assert backchannels[0]["token"] == "mm"
+    # ...WITHOUT a floor transition: the FSM is still in user_speaking (Bob never
+    # took the floor for the backchannel — no bob_speaking from it).
+    assert loop.state is TurnState.USER_SPEAKING
+    tos = [t["to"] for t in _turn_states(loop._fsm.turn_id)]
+    assert "bob_speaking" not in tos
+
+    await loop.stop()
+
+
+async def test_pause_without_trigger_emits_no_backchannel() -> None:
+    say = _RecordingSayPath()
+    tts = _RecordingBackchannelTts()
+    # The Thinker has nothing to interject (no trigger).
+    loop = _loop(say, backchannel_trigger=lambda: None, backchannel_tts=tts)
+    await _open_turn(loop)
+    for _ in range(2):
+        await loop.feed_raw_frame(_QUIET)
+
+    # A pause the Thinker did not flag stays silent (the gate is not systematic).
+    assert tts.calls == []
+    assert _backchannel_events() == []
+    await loop.stop()
+
+
+async def test_continuous_speech_emits_no_backchannel_over_active_speech() -> None:
+    say = _RecordingSayPath()
+    tts = _RecordingBackchannelTts()
+    loop = _loop(say, backchannel_trigger=lambda: "mm", backchannel_tts=tts)
+    await loop.start()
+    # Continuous voiced frames: no pause → no vad_pause → no backchannel over the
+    # user's active speech, even though the Thinker carries a trigger.
+    for _ in range(10):
+        await loop.feed_raw_frame(_LOUD)
+    assert loop.state is TurnState.USER_SPEAKING
+    assert tts.calls == []
+    assert _backchannel_events() == []
+    await loop.stop()
+
+
+async def test_backchannel_stamps_backchannel_ms_in_turn_latency() -> None:
+    say = _RecordingSayPath(produce_audio=True)
+    loop = _loop(
+        say,
+        transcript="bonjour le monde",
+        backchannel_trigger=lambda: "ok",
+        backchannel_tts=_RecordingBackchannelTts(),
+    )
+    await _open_turn(loop)
+    # Mid pause → backchannel, then resume + trailing silence → endpoint → reply.
+    for _ in range(2):
+        await loop.feed_raw_frame(_QUIET)
+    for _ in range(4):
+        await loop.feed_raw_frame(_LOUD)
+    for _ in range(6):
+        await loop.feed_raw_frame(_QUIET)
+    await loop.join()
+
+    # The turn_latency carries the backchannel marks + a real backchannel_ms.
+    latencies = _latency_events()
+    assert latencies, "expected a turn_latency event"
+    marks = latencies[-1]["marks"]
+    assert "t_backchannel_pause" in marks
+    assert "t_backchannel" in marks
+    derived = latencies[-1]["derived"]
+    assert derived["backchannel_ms"] is not None
+    assert derived["backchannel_ms"] >= 0
+
+
+async def test_no_backchannel_hooks_is_inert() -> None:
+    # The bare loop (no Thinker / no backchannel hooks) never fires a backchannel
+    # even across pauses — zero regression for the 0100/0101 behaviour.
+    say = _RecordingSayPath(produce_audio=True)
+    loop = _loop(say, transcript="bonjour le monde")
+    await _open_turn(loop)
+    for _ in range(2):
+        await loop.feed_raw_frame(_QUIET)
+    assert _backchannel_events() == []
+    await loop.stop()
+
+
+async def test_backchannel_tts_failure_does_not_break_turn() -> None:
+    say = _RecordingSayPath(produce_audio=True)
+
+    async def _boom(turn_id: str, token: str) -> None:
+        raise RuntimeError("tts down")
+
+    loop = _loop(say, backchannel_trigger=lambda: "mm", backchannel_tts=_boom)
+    await _open_turn(loop)
+    for _ in range(2):
+        await loop.feed_raw_frame(_QUIET)
+    # The synthesis raised but was swallowed — the turn is intact (still
+    # user_speaking) and the event still fired (the gate decided to emit).
+    assert loop.state is TurnState.USER_SPEAKING
+    assert len(_backchannel_events()) == 1
+    await loop.stop()

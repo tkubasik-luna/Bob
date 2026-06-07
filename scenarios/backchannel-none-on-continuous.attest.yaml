@@ -1,0 +1,73 @@
+# Backchannel — NONE over continuous speech (PRD 0016 / issue 0105, Annexe B).
+#
+# The negative of `backchannel.attest.yaml`: proves a backchannel is NEVER placed
+# over the user's active speech and is gated (not systematic) when the Thinker
+# has nothing to interject.
+#
+#   1. inject_audio (voiced, thinker: true) streams a CONTINUOUS voiced burst
+#      (no mid-utterance pause beat — `pause_count` defaults to 0) followed by the
+#      trailing silence that ends the turn.
+#   2. The `thinker` fake returns a snapshot with `backchannel: null` — the mini
+#      reasoning pass decided no acknowledgement is warranted. So even though the
+#      trailing silence eventually trips a `vad_pause` (the FSM's
+#      `maybe_backchannel` self-loop runs at the tail of every turn), the
+#      proactivity gate has NO relevant trigger and stays silent.
+#
+# Assertion: ZERO `backchannel` events were emitted — Bob did not interject over
+# the continuous speech, and an un-flagged pause yields nothing (the gate is not
+# systematic). The turn still walks to `bob_speaking` so we know it actually ran.
+#
+# Run:  uv run bob attest scenarios/backchannel-none-on-continuous.attest.yaml
+name: backchannel-none-over-continuous-speech
+description: >-
+  Continuous speech with no Thinker backchannel trigger emits NO backchannel —
+  Bob never interjects over active speech and the gate is not systematic.
+backend: ephemeral
+llm: fake
+env:
+  # A small VAD pause window so the trailing silence DOES trip vad_pause at the
+  # tail — making the "even on a pause, no trigger ⇒ no backchannel" gate the
+  # thing under test (not merely the absence of any pause).
+  VAD_PAUSE_MS: "150"
+  BACKCHANNEL_MIN_INTERVAL_MS: "0"
+fake_llm:
+  # The Thinker has nothing to interject: backchannel is null. (user_turn_complete
+  # false so the turn ends on the silence floor, exercising the say-path.)
+  - role: thinker
+    on_input_contains: ""
+    reply: >-
+      {"corrected_text": "quel temps fait il a paris", "variables": {},
+      "next_step_plan": "donner la meteo", "user_turn_complete": false,
+      "backchannel": null}
+  - role: jarvis
+    on_input_contains: "temps"
+    reply: "Il fait beau aujourd'hui à Paris."
+timeline:
+  - do: inject_audio
+    transcript: "quel temps fait il a paris"
+    voiced: true
+    thinker: true
+    silence_count: 35
+    frame_gap_ms: 15
+  # The Thinker ran (so its null backchannel is a real decision, not a no-show).
+  - do: wait_event
+    type: thinker_snapshot
+    timeout_ms: 8000
+  # The turn ran to completion on the silence floor.
+  - do: wait_state
+    state: bob_speaking
+    timeout_ms: 8000
+  - do: wait_state
+    state: idle
+    timeout_ms: 8000
+assertions:
+  - kind: thinker_snapshot_emitted
+    min: 1
+  # No backchannel over the continuous speech (the negative acceptance criterion).
+  - kind: backchannel_emitted
+    min: 0
+    max: 0
+  - kind: fsm_reached
+    state: bob_speaking
+  - kind: deliverable_nonempty
+  - kind: no_error_events

@@ -271,6 +271,7 @@ def synth_voiced_frames(
     silence_count: int = 30,
     samples_per_frame: int = 480,
     amplitude: int = 8000,
+    pause_count: int = 0,
 ) -> list[bytes]:
     """Synthesise a voiced burst followed by trailing silence (issue 0100).
 
@@ -281,14 +282,33 @@ def synth_voiced_frames(
     say-path. ``silence_count`` must comfortably exceed the configured
     ``ENDPOINT_SILENCE_MS`` floor in frames (default 600 ms / 30 ms ≈ 20 frames),
     so the default 30 silent frames (~900 ms) reliably crosses it.
+
+    ``pause_count`` (issue 0105 — backchannels): when > 0, a MID-UTTERANCE silence
+    gap of ``pause_count`` frames is inserted in the middle of the voiced burst
+    (voiced / silence / voiced), then the trailing silence. That gap is a
+    within-utterance beat: long enough to trip ``vad_pause`` (≥ ``VAD_PAUSE_MS``
+    in frames) but SHORTER than the ``ENDPOINT_SILENCE_MS`` floor, so the turn
+    does NOT end there — it is the backchannel opportunity the loop's
+    ``maybe_backchannel`` action acts on. The :class:`bob.endpointer.Endpointer`
+    resets its silence run on the resumed speech, so the gap never accumulates
+    toward the floor. ``0`` (default) keeps the prior single-burst behaviour (zero
+    change for the 0100/0101/0103/0110 scenarios).
     """
 
-    voiced = [
-        _voiced_frame(samples_per_frame, amplitude=amplitude) for _ in range(max(1, voiced_count))
-    ]
+    voiced_n = max(1, voiced_count)
     silent = synth_mic_frames(
         frame_count=max(1, silence_count), samples_per_frame=samples_per_frame
     )
+    if pause_count > 0:
+        first_half = max(1, voiced_n // 2)
+        second_half = max(1, voiced_n - first_half)
+        burst_a = [_voiced_frame(samples_per_frame, amplitude=amplitude) for _ in range(first_half)]
+        gap = synth_mic_frames(frame_count=pause_count, samples_per_frame=samples_per_frame)
+        burst_b = [
+            _voiced_frame(samples_per_frame, amplitude=amplitude) for _ in range(second_half)
+        ]
+        return burst_a + gap + burst_b + silent
+    voiced = [_voiced_frame(samples_per_frame, amplitude=amplitude) for _ in range(voiced_n)]
     return voiced + silent
 
 

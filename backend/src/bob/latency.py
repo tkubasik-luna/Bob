@@ -6,8 +6,9 @@ event ``{turn_id, marks, derived}`` at turn end (the completed AND the barge-in
 paths). The marks are produced by several upstream slices — the 0100/0101 loop
 already stamps ``t_first_mic_frame`` / ``t_endpoint`` / ``t_first_audio_chunk``
 and the barge-in ``t_bargein_detected`` / ``t_cut``; the Draft slice (0104) will
-add ``t_draft_ready`` / ``t_commit_decision``; backchannels (0105) feed
-``backchannel_ms``. Rather than scatter the mark bookkeeping + the derived-metric
+add ``t_draft_ready`` / ``t_commit_decision``; backchannels (0105) stamp
+``t_backchannel_pause`` / ``t_backchannel`` (deriving ``backchannel_ms``).
+Rather than scatter the mark bookkeeping + the derived-metric
 arithmetic across :mod:`bob.voice_loop`, this module is the ONE place that owns:
 
 - the canonical mark set (one slot per Annexe F mark, ``None`` until stamped);
@@ -80,6 +81,15 @@ class TurnLatency:
     t_bargein_detected: float | None = None
     #: Barge-in: when the loop actually cancelled Bob's in-flight reply.
     t_cut: float | None = None
+    #: Backchannel (issue 0105): the ``vad_pause`` that opened the (first)
+    #: backchannel opportunity this turn — the start of the ``backchannel_ms``
+    #: window. ``None`` until a pause is observed during ``user_speaking``.
+    t_backchannel_pause: float | None = None
+    #: Backchannel (issue 0105): when Bob's (first) acknowledgement token was
+    #: produced (synthesised + played) in that pause — the end of the window.
+    #: ``None`` until a backchannel actually fired (a turn with no backchannel
+    #: leaves both marks unset, so ``backchannel_ms`` stays ``None``).
+    t_backchannel: float | None = None
 
     #: Did Bob speak a committed speculative Draft (vs a cold generation)?
     #: Issue 0104 flips this; ``False`` until then.
@@ -104,6 +114,8 @@ class TurnLatency:
             "t_tts_end": self.t_tts_end,
             "t_bargein_detected": self.t_bargein_detected,
             "t_cut": self.t_cut,
+            "t_backchannel_pause": self.t_backchannel_pause,
+            "t_backchannel": self.t_backchannel,
         }
         return {name: value for name, value in candidates.items() if value is not None}
 
@@ -115,13 +127,17 @@ class TurnLatency:
           marks exist.
         - ``bargein_cut_ms`` = ``t_cut - t_bargein_detected`` (target <300 ms) —
           present only on a barged-in turn.
-        - ``backchannel_ms`` — ``None`` until issue 0105 wires the backchannel
-          mark (the key is always present so the schema is stable).
+        - ``backchannel_ms`` = ``t_backchannel - t_backchannel_pause`` (issue
+          0105, target <500 ms): how fast Bob placed his acknowledgement in the
+          pause. The key is ALWAYS present (``None`` on a turn with no
+          backchannel) so the persisted ``latency_json`` + the harness see a
+          stable schema, but it carries a real ms delta once a backchannel fired.
         - ``draft_hit`` — the bool from the Draft slice (``False`` until 0104).
 
-        A mark→mark metric whose inputs are missing is OMITTED (the
-        feature-gated ``backchannel_ms`` / ``draft_hit`` keys are always present
-        so consumers can rely on them).
+        A mark→mark metric whose inputs are missing is OMITTED, EXCEPT the
+        feature-gated ``backchannel_ms`` / ``draft_hit`` keys which are always
+        present (``backchannel_ms`` as ``None`` when its marks are unset) so
+        consumers can rely on them.
         """
 
         out: dict[str, DerivedValue] = {}
@@ -133,7 +149,9 @@ class TurnLatency:
             out["bargein_cut_ms"] = bargein_cut
         # Feature-gated derived: always present, carrying their not-wired default
         # so the persisted latency_json + the harness see a stable schema.
-        out["backchannel_ms"] = None  # issue 0105
+        # ``backchannel_ms`` (issue 0105) is the pause→ack delta when a
+        # backchannel fired, else ``None``.
+        out["backchannel_ms"] = _delta_ms(self.t_backchannel_pause, self.t_backchannel)
         out["draft_hit"] = self.draft_hit  # issue 0104
         return out
 

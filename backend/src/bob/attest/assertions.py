@@ -133,6 +133,10 @@ LOGICAL_EVENT_MATCHERS: dict[str, EventMatcher] = {
     # PRD 0016 / issue 0101 (Annexe A.2 + B): the confirmed barge-in cut.
     # ``wait_event type: bargein`` blocks until Bob was interrupted.
     "bargein": _voice_subtype_matcher("bargein"),
+    # PRD 0016 / issue 0105 (Annexe A.2 + B): a brief acknowledgement Bob placed
+    # in a user pause (``maybe_backchannel`` action — NOT a floor transition).
+    # ``wait_event type: backchannel`` blocks until one fired.
+    "backchannel": _voice_subtype_matcher("backchannel"),
     # PRD 0016 / issue 0110 (Annexe A.2 + F): the per-turn latency summary the
     # loop emits at turn end. ``wait_event type: turn_latency`` blocks until the
     # turn finished + its marks/derived landed; ``latency_lt_ms`` reads them.
@@ -1056,6 +1060,59 @@ def check_speaker_consulted_thinker(spec: dict[str, Any], ctx: AssertionContext)
 
 register_assertion("thinker_snapshot_emitted", check_thinker_snapshot_emitted)
 register_assertion("speaker_consulted_thinker", check_speaker_consulted_thinker)
+
+
+# --- backchannel assertions (PRD 0016 / issue 0105) --------------------------
+
+
+def check_backchannel_emitted(spec: dict[str, Any], ctx: AssertionContext) -> AssertionResult:
+    """Assert how many ``backchannel`` events fired (Annexe A.2 + B, issue 0105).
+
+    Spec: ``{kind: backchannel_emitted, min: 1}`` (a turn WITH a pause that
+    should be acknowledged) or ``{kind: backchannel_emitted, max: 0}`` (a turn of
+    continuous speech / no qualifying pause → Bob must NOT backchannel over the
+    user's active speech). ``min`` (default 1) is the floor, ``max`` (optional)
+    the ceiling — both are inclusive. Counts the ``backchannel`` voice events on
+    ``/ws/debug`` (Bob placed a brief acknowledgement in a pause). The two bounds
+    let one assertion express both the positive ("at least one") and the
+    negative ("none over active speech") acceptance criteria, each failing loudly
+    when violated (a missing backchannel where one was due, or a spurious one
+    over continuous speech).
+    """
+
+    raw_min = spec.get("min", 1)
+    raw_max = spec.get("max")
+    try:
+        minimum = int(raw_min)
+    except (TypeError, ValueError):
+        return AssertionResult(
+            kind="backchannel_emitted",
+            ok=False,
+            detail={"error": "backchannel_emitted 'min' must be an integer", "min": raw_min},
+        )
+    maximum: int | None = None
+    if raw_max is not None:
+        try:
+            maximum = int(raw_max)
+        except (TypeError, ValueError):
+            return AssertionResult(
+                kind="backchannel_emitted",
+                ok=False,
+                detail={"error": "backchannel_emitted 'max' must be an integer", "max": raw_max},
+            )
+
+    events = _voice_ws_events(ctx.events, "backchannel")
+    count = len(events)
+    ok = count >= minimum and (maximum is None or count <= maximum)
+    tokens = [e.get("token") for e in events][:5]
+    return AssertionResult(
+        kind="backchannel_emitted",
+        ok=ok,
+        detail={"min": minimum, "max": maximum, "count": count, "tokens": tokens},
+    )
+
+
+register_assertion("backchannel_emitted", check_backchannel_emitted)
 
 
 # --- voice persistence + retention assertions (PRD 0016 / issue 0109) --------

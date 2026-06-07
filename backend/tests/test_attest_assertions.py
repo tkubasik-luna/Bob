@@ -62,11 +62,11 @@ def test_event_emitted_fails_when_say_absent() -> None:
 
 
 def test_event_emitted_unknown_logical_type_fails_loudly() -> None:
-    # ``backchannel`` is a documented Annexe A.2 logical type whose matcher has
-    # NOT been wired yet (its slice is 0105) — referencing it must FAIL loudly.
-    # (``bargein`` landed in issue 0101 and is exercised in test_attest_bargein.)
+    # A logical type whose matcher has NOT been wired must FAIL loudly rather than
+    # silently pass. (``backchannel`` was the placeholder here until issue 0105
+    # wired it; use a clearly-unwired name now.)
     ctx = _ctx([_say_event("hi")])
-    result = run_assertion({"kind": "event_emitted", "type": "backchannel"}, ctx)
+    result = run_assertion({"kind": "event_emitted", "type": "not_a_real_event"}, ctx)
     assert result.ok is False
     assert "unknown logical event type" in result.detail["error"]
 

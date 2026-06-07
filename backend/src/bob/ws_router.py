@@ -637,6 +637,15 @@ async def _handle_voice_start(
         # writes. The Endpointer fires the endpoint early only once a stable
         # partial confirms it (Annexe H); ``None`` keeps the silence-floor net.
         thinker_complete=(thinker.user_turn_complete if thinker is not None else None),
+        # Backchannels (issue 0105): on a ``vad_pause`` the loop reads the
+        # Thinker's latest ``backchannel`` trigger (relevance) and, gated by the
+        # proactivity refractory, plays a SHORT token via Kokoro WITHOUT a floor
+        # transition. Both ``None`` when the Thinker is unavailable (bare loop) so
+        # no backchannel ever fires.
+        backchannel_trigger=(thinker.backchannel if thinker is not None else None),
+        backchannel_tts=(
+            _make_backchannel_tts(websocket, session_id) if thinker is not None else None
+        ),
     )
     session["thinker_loop"] = thinker.loop if thinker is not None else None
     started = await loop.start()
@@ -707,6 +716,72 @@ def _make_say_path_driver(
         )
 
     return _drive
+
+
+def _make_backchannel_tts(
+    websocket: WebSocket, session_id: str
+) -> Callable[[str, str], Awaitable[None]]:
+    """Build the backchannel short-token synthesis hook (PRD 0016 / issue 0105).
+
+    On a gated ``vad_pause`` the full-duplex loop hands us the (live) ``turn_id``
+    + a brief token ("mm", "ok je vois"); we synthesise it via the SAME Kokoro
+    engine (fake TTS under attest) and stream the PCM out on ``websocket`` — but
+    deliberately NOT through the say-path machinery: a backchannel is an action in
+    the user's pause, NOT a floor turn, so it carries its OWN synthetic
+    ``msg_id`` (``backchannel:<turn>:<n>``), never flips the FSM, and never runs
+    the orchestrator. The audio rides as ``audio_start`` → raw PCM bytes →
+    ``audio_end`` (the same wire contract the say-path uses, so the client plays
+    it identically) and surfaces one ``audio_chunk`` voice event per block for the
+    debug stream / harness. The loop already wraps this in ``contextlib.suppress``
+    so any synthesis error is swallowed — a backchannel hiccup must never perturb
+    the user's live turn (they keep the floor).
+    """
+
+    counter = 0
+
+    async def _backchannel(turn_id: str, token: str) -> None:
+        nonlocal counter
+        cleaned = clean_for_speech(token).strip()
+        if not cleaned:
+            return
+        counter += 1
+        msg_id = f"backchannel:{turn_id}:{counter}"
+        tts = _tts_service_provider()
+        started_audio = False
+        audio_chunks = 0
+        try:
+            async for chunk in tts.synthesize_stream(cleaned):
+                if not started_audio:
+                    await websocket.send_json(
+                        {"type": "audio_start", "msg_id": msg_id, "sample_rate": chunk.sample_rate}
+                    )
+                    started_audio = True
+                await websocket.send_bytes(chunk.pcm16)
+                # One ``audio_chunk`` voice event per block (same observable proxy
+                # for "Bob made a sound" the say-path emits) so the harness can
+                # count the backchannel audio off ``/ws/debug``.
+                await emit_event(
+                    {
+                        "type": "audio_chunk",
+                        "msg_id": msg_id,
+                        "chunk_index": audio_chunks,
+                        "bytes": len(chunk.pcm16),
+                        "sample_rate": chunk.sample_rate,
+                        "backchannel": True,
+                    },
+                    category="voice",
+                    severity="debug",
+                    source="bob.ws_router.audio_chunk",
+                    summary=f"audio_chunk #{audio_chunks} (backchannel msg={msg_id})",
+                )
+                audio_chunks += 1
+        finally:
+            # Always terminate the synthetic stream so the client's audio queue
+            # for this ``msg_id`` is closed even if synthesis yielded nothing.
+            if started_audio:
+                await websocket.send_json({"type": "audio_end", "msg_id": msg_id})
+
+    return _backchannel
 
 
 def _make_commit_spoken(session_id: str) -> Callable[[str, str], Awaitable[None]]:
@@ -903,6 +978,19 @@ class _ThinkerHandle:
 
         snapshot = self.live_state.latest()
         return bool(snapshot.user_turn_complete) if snapshot is not None else False
+
+    def backchannel(self) -> str | None:
+        """Latest ``backchannel`` trigger from the Thinker's snapshot (issue 0105).
+
+        Pure, cheap read of the shared :class:`LiveTranscriptState` the loop
+        consults on each ``vad_pause`` to decide whether to drop a brief
+        acknowledgement (Annexe B ``maybe_backchannel``). ``None`` when no snapshot
+        has landed yet or the Thinker had nothing to interject — so a pause the
+        Thinker never flagged stays silent (the proactivity gate, not systematic).
+        """
+
+        snapshot = self.live_state.latest()
+        return snapshot.backchannel if snapshot is not None else None
 
 
 def _make_thinker_loop(session_id: str, settings: Settings) -> _ThinkerHandle | None:

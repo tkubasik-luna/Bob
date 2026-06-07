@@ -425,6 +425,14 @@ class ScenarioRunner:
         - ``await_reply`` — defaults true (read Bob's reply before closing). A
           hesitation scenario sets it false: NO endpoint is expected, so there is
           no reply to await — we just settle and let ``voice_stop`` finalize.
+
+        Issue 0105 (backchannels) adds one more knob on a ``voiced`` step:
+
+        - ``pause_count`` — insert a MID-UTTERANCE silence beat of this many
+          frames (voiced / silence / voiced) that trips ``vad_pause`` (the
+          backchannel opportunity) WITHOUT ending the turn (it is shorter than the
+          ``ENDPOINT_SILENCE_MS`` floor and the Endpointer resets on the resumed
+          speech). ``0`` (default) keeps the single-burst behaviour.
         """
 
         transcript = step.get("transcript", "")
@@ -436,7 +444,14 @@ class ScenarioRunner:
             frame_gap_ms = int(step.get("frame_gap_ms", 0))
             await_reply = bool(step.get("await_reply", True))
             settle_ms = int(step.get("settle_ms", 300))
-            frames = synth_voiced_frames(voiced_count=voiced_count, silence_count=silence_count)
+            # ``pause_count`` (issue 0105): a mid-utterance silence beat that trips
+            # ``vad_pause`` (the backchannel opportunity) without ending the turn.
+            pause_count = int(step.get("pause_count", 0))
+            frames = synth_voiced_frames(
+                voiced_count=voiced_count,
+                silence_count=silence_count,
+                pause_count=pause_count,
+            )
             # ``--deep`` (issue 0110): collect Bob's outbound TTS PCM off this
             # socket so the round-trip can re-transcribe exactly what he played.
             collect = self._deep_reply_pcm if self._deep else None

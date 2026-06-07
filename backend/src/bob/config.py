@@ -351,6 +351,18 @@ class Settings(BaseSettings):
     THINKER_DEBOUNCE_MS: int = 250
     THINKER_CANCEL_GRACE_MS: int = 2000
 
+    # Backchannels (PRD 0016 / issue 0105, Annexe B + A.2 + F). On a ``vad_pause``
+    # during ``user_speaking`` Bob may place a brief acknowledgement ("mm", "ok je
+    # vois") — gated by the background Thinker's ``backchannel`` trigger AND a
+    # proactivity refractory window (:class:`bob.backchannel.BackchannelDecider`).
+    # ``BACKCHANNEL_MIN_INTERVAL_MS`` is that silence-decay window: the minimum gap
+    # between two backchannels on one turn, so pauses in a burst yield at most one
+    # acknowledgement (not systematic). 0 disables the refractory (every relevant
+    # pause is allowed). The backchannel is an ACTION in the pause — it never
+    # transitions the floor (no ``bob_speaking``); the derived ``backchannel_ms``
+    # (pause→ack) targets <500 ms.
+    BACKCHANNEL_MIN_INTERVAL_MS: int = 1500
+
     # Voice persistence + retention (PRD 0016 / issue 0109, Annexe E). A
     # finalized full-duplex voice turn is persisted to ``voice_turns`` +
     # ``voice_audio_blobs`` (:mod:`bob.voice_store`): the transcript / spoken

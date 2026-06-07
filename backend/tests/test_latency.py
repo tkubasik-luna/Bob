@@ -77,12 +77,26 @@ def test_derived_bargein_cut_omitted_on_non_bargein_turn() -> None:
 # --- feature-gated derived (always-present keys) -----------------------------
 
 
-def test_derived_backchannel_ms_present_but_none_until_0105() -> None:
+def test_derived_backchannel_ms_present_but_none_without_backchannel() -> None:
     derived = _full().derived()
-    # The key is ALWAYS present (stable schema) but None until issue 0105 wires
-    # the backchannel mark.
+    # The key is ALWAYS present (stable schema); None on a turn with NO
+    # backchannel (its two marks are unset).
     assert "backchannel_ms" in derived
     assert derived["backchannel_ms"] is None
+
+
+def test_derived_backchannel_ms_computed_when_marks_stamped() -> None:
+    # issue 0105: pause→ack delta when a backchannel fired in the pause.
+    lat = TurnLatency(t_backchannel_pause=50.0, t_backchannel=50.3)
+    # (50.3 - 50.0) * 1000 = 300.0 ms.
+    assert lat.derived()["backchannel_ms"] == 300.0
+
+
+def test_backchannel_marks_surface_in_payload() -> None:
+    lat = TurnLatency(t_backchannel_pause=50.0, t_backchannel=50.3)
+    payload = lat.marks_payload()
+    assert payload["t_backchannel_pause"] == 50.0
+    assert payload["t_backchannel"] == 50.3
 
 
 def test_derived_draft_hit_defaults_false_until_0104() -> None:
