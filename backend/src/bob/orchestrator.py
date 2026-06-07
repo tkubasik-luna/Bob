@@ -106,6 +106,10 @@ from bob.context.providers.recent_turns import RecentTurnsProvider
 from bob.context.providers.rolling_summary import RollingSummaryProvider
 from bob.context.providers.state_block import StateBlockProvider
 from bob.context.providers.system_block import SystemBlockProvider
+from bob.context.providers.thinker_state import (
+    THINKER_STATE_PROVIDER_ID,
+    ThinkerStateProvider,
+)
 from bob.context.providers.user_message import UserMessageProvider
 from bob.context.summariser import LLMSummariser, Summariser
 from bob.context.summary_pipeline import maybe_regenerate_rolling_summary
@@ -117,6 +121,7 @@ from bob.epoch import (
     RetrievalAPI,
 )
 from bob.jarvis_store import JarvisStore
+from bob.live_transcript_state import LiveTranscriptState
 from bob.llm.types import LLMResponse, StreamChunk, ToolCall
 from bob.llm_client import LLMClient
 from bob.rolling_summary_store import RollingSummaryStore
@@ -302,6 +307,7 @@ class Orchestrator:
         eviction_strategy: EvictionStrategy | None = None,
         addendum_queue_factory: Callable[[str], AddendumQueue | None] | None = None,
         completion_debounce_seconds: float = DEFAULT_DEBOUNCE_SECONDS,
+        live_transcript_state: LiveTranscriptState | None = None,
     ) -> None:
         self._jarvis_client = jarvis_client
         self._jarvis_store = jarvis_store
@@ -354,6 +360,14 @@ class Orchestrator:
         self._state_policy = state_policy
         self._recency_policy = recency_policy
         self._eviction_strategy = eviction_strategy
+
+        # PRD 0016 / issue 0102 — the Speaker consults the live Thinker snapshot
+        # at assembly. The orchestrator holds the SAME
+        # :class:`LiveTranscriptState` the full-duplex loop's ThinkerLoop writes
+        # (wired at boot by :mod:`bob.ws_router`); a default empty store keeps
+        # every text-only call site (and tests that never speak) a no-op, since
+        # :class:`ThinkerStateProvider` emits nothing for an empty store.
+        self._live_transcript_state = live_transcript_state or LiveTranscriptState()
 
         self._tool_registry = tool_registry or build_default_registry()
         self._tool_dispatcher = ToolDispatcher(
@@ -1068,6 +1082,22 @@ class Orchestrator:
             base=self._context_policy,
         )
 
+    def set_live_transcript_state(self, live_state: LiveTranscriptState) -> None:
+        """Install the active voice session's :class:`LiveTranscriptState` (issue 0102).
+
+        The orchestrator is a session-spanning singleton; the Thinker's
+        live-transcript store is per-voice-session. The WS layer
+        (:mod:`bob.ws_router`) calls this on ``voice_start`` so the Speaker
+        consult (:meth:`_assemble_chat_messages`) reads the SAME store the
+        full-duplex loop's ThinkerLoop writes, and resets it to a fresh empty
+        store on ``voice_stop``. Non-interruptive like :meth:`set_jarvis_client`:
+        the assembler reads ``self._live_transcript_state`` per turn, so an
+        in-flight turn finishes on the previous store and the next picks up the
+        installed one.
+        """
+
+        self._live_transcript_state = live_state
+
     def set_addendum_queue_factory(
         self,
         factory: Callable[[str], AddendumQueue | None] | None,
@@ -1518,6 +1548,12 @@ class Orchestrator:
             store=self._ensure_summary_store(),
             current_epoch_id=current_epoch_id,
         )
+        # PRD 0016 / issue 0102 — the Speaker consult. The pure provider reads
+        # the latest Thinker snapshot from the shared :class:`LiveTranscriptState`
+        # at THIS assembly (endpoint-triggered, per-turn). It is a no-op for a
+        # text turn (empty store), so wiring it unconditionally keeps the bounded
+        # text path byte-for-byte unchanged.
+        thinker_provider = ThinkerStateProvider(live_state=self._live_transcript_state)
         recent_provider = RecentTurnsProvider(jarvis_store=self._jarvis_store)
         user_provider = UserMessageProvider()
         assembler = ContextAssembler(
@@ -1526,12 +1562,56 @@ class Orchestrator:
                 state_provider,
                 digest_provider,
                 rolling_provider,
+                thinker_provider,
                 recent_provider,
                 user_provider,
             ],
             policy=self._context_policy,
         )
-        return assembler.assemble(user_message=user_message)
+        messages = assembler.assemble(user_message=user_message)
+        self._emit_thinker_consult_if_present(messages)
+        return messages
+
+    def _emit_thinker_consult_if_present(self, messages: list[dict[str, Any]]) -> None:
+        """Emit a ``thinker_consult`` voice marker when the snapshot reached the prompt.
+
+        PRD 0016 / issue 0102 acceptance: the attest scenario must prove the
+        Speaker's assembled context *contained* the Thinker snapshot, not merely
+        that a ``thinker_snapshot`` event was emitted. The assembled ``messages``
+        are the ground truth — if the policy includes ``thinker_state`` AND the
+        store held a snapshot, the provider emitted a ``role=system`` THINKER
+        block, which lands here as a message whose content starts with the
+        block's stable header. We surface a dedicated ``thinker_consult`` voice
+        event carrying the consulted ``turn_id`` / ``seq`` so the harness has a
+        single, unambiguous marker to assert on (a pure-assembly path with no
+        snapshot emits nothing).
+        """
+
+        if THINKER_STATE_PROVIDER_ID not in self._context_policy.provider_ids:
+            return
+        snapshot = self._live_transcript_state.latest()
+        if snapshot is None:
+            return
+        consulted = any(
+            isinstance(msg.get("content"), str)
+            and msg["content"].startswith("THINKER (compréhension en cours")
+            for msg in messages
+        )
+        if not consulted:
+            return
+        emit_debug(
+            category="voice",
+            severity="debug",
+            source="bob.orchestrator.thinker_consult",
+            summary=f"speaker consulted thinker snapshot (turn={snapshot.turn_id})",
+            payload={
+                "ws_event": {
+                    "type": "thinker_consult",
+                    "turn_id": snapshot.turn_id,
+                    "seq": snapshot.seq,
+                }
+            },
+        )
 
     def _ensure_summary_store(self) -> RollingSummaryStore:
         """Lazy-init the rolling-summary store on first use.
@@ -1719,10 +1799,7 @@ class Orchestrator:
                 continue
             any_ok = True
             self._collect_dispatch_result(result, spawned, forwarded, cancelled)
-            if (
-                result.tool_name in ("say", "show_task_result")
-                and say_speech is None
-            ):
+            if result.tool_name in ("say", "show_task_result") and say_speech is None:
                 # ``show_task_result`` is reply-class like ``say`` — it
                 # produces speech + ui that the WS router lifts into the
                 # final ``assistant_msg`` frame. The only difference is
@@ -1834,17 +1911,11 @@ class Orchestrator:
         """
 
         for task_id in spawned:
-            await self._emit_jarvis_activity(
-                self._jarvis_orchestration_chip("délègue", task_id)
-            )
+            await self._emit_jarvis_activity(self._jarvis_orchestration_chip("délègue", task_id))
         for task_id in forwarded:
-            await self._emit_jarvis_activity(
-                self._jarvis_orchestration_chip("transmet", task_id)
-            )
+            await self._emit_jarvis_activity(self._jarvis_orchestration_chip("transmet", task_id))
         for task_id in cancelled:
-            await self._emit_jarvis_activity(
-                self._jarvis_orchestration_chip("annule", task_id)
-            )
+            await self._emit_jarvis_activity(self._jarvis_orchestration_chip("annule", task_id))
 
     def _jarvis_orchestration_chip(self, verb: str, task_id: str) -> AgentActivity:
         """Build a curated ``tool_call`` chip for one orchestration act (issue 0072)."""

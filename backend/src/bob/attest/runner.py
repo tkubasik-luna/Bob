@@ -296,31 +296,37 @@ class ScenarioRunner:
         return ""
 
     def _extra_env(self) -> dict[str, str]:
-        """Harness-only env dials a scenario's ops need (issue 0101).
+        """Harness-only env dials a scenario's ops need (issue 0101 + 0102).
 
         A scenario with an ``inject_bargein`` step needs Bob to hold the floor
         long enough to be interrupted, so the fake TTS is paced
         (``BOB_FAKE_TTS_CHUNK_MS``) and the barge-in confirmation window
-        (``BARGEIN_CONFIRM_MS``) is pinned to a deterministic value. Derived from
-        the op's params (with sane defaults) so the YAML stays declarative; empty
-        for scenarios that don't barge in (zero behaviour change for 0100/0099
-        scenarios).
+        (``BARGEIN_CONFIRM_MS``) is pinned to a deterministic value.
+
+        Issue 0102: an ``inject_audio`` / ``inject_bargein`` step carrying
+        ``thinker: true`` pins ``THINKER_DEBOUNCE_MS=0`` so the background Thinker
+        fires on the first ``stt_partial`` (no debounce coalescing to race the
+        short synthetic turn) — making "≥1 snapshot before the endpoint"
+        deterministic. Derived from the op's params so the YAML stays declarative;
+        empty for scenarios that set none of these (zero behaviour change for the
+        0099/0100/0101 scenarios).
         """
 
+        env: dict[str, str] = {}
         for step in self._scenario.timeline:
-            if step.get("do") != "inject_bargein":
-                continue
-            confirm_ms = int(step.get("confirm_ms", 200))
-            chunk_ms = int(step.get("tts_chunk_ms", 60))
-            return {
-                "BARGEIN_CONFIRM_MS": str(max(1, confirm_ms)),
-                "BOB_FAKE_TTS_CHUNK_MS": str(max(0, chunk_ms)),
+            op = step.get("do")
+            if op == "inject_bargein":
+                confirm_ms = int(step.get("confirm_ms", 200))
+                chunk_ms = int(step.get("tts_chunk_ms", 60))
+                env["BARGEIN_CONFIRM_MS"] = str(max(1, confirm_ms))
+                env["BOB_FAKE_TTS_CHUNK_MS"] = str(max(0, chunk_ms))
                 # A handful of chunks at chunk_ms each = the speaking window the
                 # barge-in lands in; the fake yields BOB_FAKE_TTS_CHUNKS per
                 # sentence, so a multi-chunk reply spans well past the window.
-                "BOB_FAKE_TTS_CHUNKS": str(max(1, int(step.get("tts_chunks", 4)))),
-            }
-        return {}
+                env["BOB_FAKE_TTS_CHUNKS"] = str(max(1, int(step.get("tts_chunks", 4))))
+            if op in ("inject_audio", "inject_bargein") and step.get("thinker"):
+                env["THINKER_DEBOUNCE_MS"] = "0"
+        return env
 
     async def _do_inject_audio(self, ws_base: str, step: dict[str, Any]) -> None:
         """Stream synthetic mic frames for one voice turn over the binary WS.

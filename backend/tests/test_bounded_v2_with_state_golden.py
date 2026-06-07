@@ -22,11 +22,13 @@ from bob.context.providers.recent_turns import RecentTurnsProvider
 from bob.context.providers.rolling_summary import RollingSummaryProvider
 from bob.context.providers.state_block import StateBlockProvider
 from bob.context.providers.system_block import SystemBlockProvider
+from bob.context.providers.thinker_state import ThinkerStateProvider
 from bob.context.providers.user_message import UserMessageProvider
 from bob.context.summariser import SUMMARISER_VERSION, RollingSummary
 from bob.db.migrations_runner import apply_migrations, default_migrations_dir
 from bob.epoch.digest import CrossEpochDigestStore
 from bob.jarvis_store import JarvisStore
+from bob.live_transcript_state import LiveTranscriptState
 from bob.rolling_summary_store import RollingSummaryStore
 from bob.task_store import TaskStore
 
@@ -86,6 +88,9 @@ def test_golden_snapshot_bounded_v2_with_state() -> None:
         ),
         CrossEpochDigestProvider(store=digest_store),
         RollingSummaryProvider(store=summary_store),
+        # Empty store → no-op; registered to satisfy the v2 ``thinker_state``
+        # slot (PRD 0016 / issue 0102) without perturbing the golden snapshot.
+        ThinkerStateProvider(live_state=LiveTranscriptState()),
         RecentTurnsProvider(jarvis_store=jarvis_store),
         UserMessageProvider(),
     ]

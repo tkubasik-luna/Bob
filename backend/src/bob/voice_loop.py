@@ -6,8 +6,9 @@ already-built « Listen » STT spine (:class:`bob.voice_turn.VoiceTurn`, issue
 ``process_user_message`` → ``speech_delta`` / ``audio_chunk`` path) via the
 real-time turn FSM (:class:`bob.turn_fsm.TurnFsm`). Issue 0100 built the bare
 audio→brain→audio skeleton + FSM lifecycle; issue 0101 adds **barge-in** (the
-``bob_speaking`` interrupt). NO Thinker, NO Draft (those are 0102/0104 — the
-``start_thinker`` restart on barge-in is a documented no-op hook here).
+``bob_speaking`` interrupt). Issue 0102 wires the real **ThinkerLoop** behind the
+0100 symbolic ``start_thinker`` / ``feed_thinker`` actions (the ``on_thinker_*``
+hooks below). NO Draft yet (that is 0104).
 
 Barge-in (issue 0101, Annexe B + F)
 -----------------------------------
@@ -180,9 +181,19 @@ class FullDuplexLoop:
     settings: Settings
     session_id: str
     #: Restart-the-Thinker hook fired on the barge-in ``start_thinker`` action
-    #: (issue 0101). A no-op by default — issue 0102 wires the real ThinkerLoop.
-    #: Receives the (interrupted) ``turn_id``.
+    #: (issue 0101). Receives the (interrupted) ``turn_id``. Issue 0102 wires the
+    #: real ThinkerLoop (re)start here; ``None`` keeps the 0101 no-op.
     on_thinker_restart: Callable[[str], Awaitable[None]] | None = None
+    #: ThinkerLoop hooks (PRD 0016 / issue 0102 — the real wiring behind the
+    #: 0100 symbolic ``start_thinker`` / ``feed_thinker`` actions). ``on_thinker_start``
+    #: arms the loop for a turn (``idle -> user_speaking``); ``on_thinker_feed``
+    #: hands it each ``stt_partial`` (debounced inside the loop, Annexe H);
+    #: ``on_thinker_stop`` cooperatively cancels it on ``endpoint`` / ``voice_stop``
+    #: (cancel + grace + hard-kill). All ``None`` by default so the bare-loop tests
+    #: (no Thinker) keep their exact behaviour.
+    on_thinker_start: Callable[[str], None] | None = None
+    on_thinker_feed: Callable[[str], Awaitable[None]] | None = None
+    on_thinker_stop: Callable[[], Awaitable[None]] | None = None
     #: Commit-to-history hook for the barge-in ``commit_spoken_partial`` action
     #: (issue 0101): persist what Bob actually played before the cut. Defaults to
     #: the Jarvis store append (wired by ws_router); ``None`` = skip (tests).
@@ -296,9 +307,14 @@ class FullDuplexLoop:
 
         # 3) An STT partial nudges the FSM's stt_partial self-loop, but only
         #    while the user holds the floor (a partial flushed during finalize
-        #    after endpoint must not move the FSM).
+        #    after endpoint must not move the FSM). The FSM's ``stt_partial``
+        #    action is ``feed_thinker`` (Annexe B): hand the latest partial text
+        #    to the background ThinkerLoop (debounced inside the loop, Annexe H).
         if advanced and self._fsm.state is TurnState.USER_SPEAKING:
             await self._dispatch(TurnEvent.STT_PARTIAL, turn_id=self._fsm.turn_id)
+            if self.on_thinker_feed is not None and turn is not None:
+                with contextlib.suppress(Exception):
+                    await self.on_thinker_feed(turn.latest_partial_text)
 
         # 4) Endpointer — the silence floor. Only meaningful while the user has
         #    the floor; firing closes the turn and launches the say-path.
@@ -334,6 +350,11 @@ class FullDuplexLoop:
             return
         self._stopped = True
         await self._cancel_say_task()
+        # Annexe H — ``voice_stop`` tears the loop down: cooperatively cancel any
+        # in-flight Thinker pass too (no-op when unwired / already stopped).
+        if self.on_thinker_stop is not None:
+            with contextlib.suppress(Exception):
+                await self.on_thinker_stop()
         turn = self._turn
         self._turn = None
         if turn is not None:
@@ -375,6 +396,11 @@ class FullDuplexLoop:
             # Fresh latency marks for this turn (keep the first-mic-frame stamp).
             self._marks = _Marks(t_first_mic_frame=self._marks.t_first_mic_frame)
             self._endpointer.reset()
+            # Annexe B ``start_thinker`` — arm the background ThinkerLoop for this
+            # turn (PRD 0016 / issue 0102). Synchronous + cheap (resets cadence +
+            # clears the live-transcript store); no-op when unwired (bare loop).
+            if self.on_thinker_start is not None:
+                self.on_thinker_start(transition.turn_id)
             await self._emit_turn_state(transition)
             return
         # ``thinking`` -> ``user_speaking`` (user resumes before Bob spoke). This
@@ -398,6 +424,16 @@ class FullDuplexLoop:
         if transition is None:
             return
         await self._emit_turn_state(transition)
+
+        # Annexe H — the endpoint FREEZES the turn: cooperatively cancel the
+        # in-flight Thinker pass (cancel + grace + hard-kill, inside the hook)
+        # BEFORE the say-path assembles, so the Speaker consults the snapshot the
+        # loop already produced rather than racing a late pass. The snapshot
+        # survives the cancel (the loop does not clear on stop) so the
+        # ThinkerStateProvider still reads it at assembly. No-op when unwired.
+        if self.on_thinker_stop is not None:
+            with contextlib.suppress(Exception):
+                await self.on_thinker_stop()
 
         # Freeze the transcript (0099 finalize → stt_final) and detach the turn.
         turn = self._turn
@@ -535,7 +571,8 @@ class FullDuplexLoop:
             with contextlib.suppress(Exception):
                 await self.commit_spoken(turn_id, committed_spoken_text)
 
-        # start_thinker — no-op hook today (issue 0102 wires the ThinkerLoop).
+        # start_thinker — restart the ThinkerLoop on the resumed turn (issue 0102
+        # wires this; ``None`` keeps the 0101 no-op).
         if self.on_thinker_restart is not None:
             with contextlib.suppress(Exception):
                 await self.on_thinker_restart(turn_id)

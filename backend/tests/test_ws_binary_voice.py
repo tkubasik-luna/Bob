@@ -38,6 +38,13 @@ class _NoopOrchestrator:
     def set_user_typing(self, typing: bool) -> None:
         return None
 
+    def set_live_transcript_state(self, live_state: Any) -> None:
+        # PRD 0016 / issue 0102 — the voice path installs the Thinker's live
+        # store on voice_start and resets it on voice_stop. The double accepts
+        # it (the consult only matters when ``process_user_message`` runs, which
+        # this path never does).
+        return None
+
 
 @pytest.fixture()
 def voice_client() -> Iterator[TestClient]:

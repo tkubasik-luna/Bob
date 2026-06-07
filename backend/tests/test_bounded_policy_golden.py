@@ -33,12 +33,14 @@ from bob.context.providers.recent_turns import RecentTurnsProvider
 from bob.context.providers.rolling_summary import RollingSummaryProvider
 from bob.context.providers.state_block import StateBlockProvider
 from bob.context.providers.system_block import SystemBlockProvider
+from bob.context.providers.thinker_state import ThinkerStateProvider
 from bob.context.providers.user_message import UserMessageProvider
 from bob.context.summariser import SUMMARISER_VERSION, RollingSummary
 from bob.context.summary_pipeline import maybe_regenerate_rolling_summary
 from bob.db.migrations_runner import apply_migrations, default_migrations_dir
 from bob.epoch.digest import CrossEpochDigestStore
 from bob.jarvis_store import JarvisStore
+from bob.live_transcript_state import LiveTranscriptState
 from bob.rolling_summary_store import RollingSummaryStore
 from bob.task_store import TaskStore
 
@@ -82,6 +84,10 @@ def _bounded_messages(
     providers: list[ContextProvider] = [
         SystemBlockProvider(system_content=system_content),
         RollingSummaryProvider(store=summary_store),
+        # Empty live-transcript store → ThinkerStateProvider is a no-op, so the
+        # golden snapshot is byte-identical; it must be registered because the
+        # bounded policy now lists ``thinker_state`` (PRD 0016 / issue 0102).
+        ThinkerStateProvider(live_state=LiveTranscriptState()),
         RecentTurnsProvider(jarvis_store=jarvis_store),
         UserMessageProvider(),
     ]
@@ -154,6 +160,9 @@ def _bounded_v2_messages(
         StateBlockProvider(task_store=task_store),
         CrossEpochDigestProvider(store=digest_store),
         RollingSummaryProvider(store=summary_store),
+        # No-op empty store (see ``_bounded_messages``) — keeps the snapshot
+        # byte-identical while satisfying the v2 policy's ``thinker_state`` slot.
+        ThinkerStateProvider(live_state=LiveTranscriptState()),
         RecentTurnsProvider(jarvis_store=jarvis_store),
         UserMessageProvider(),
     ]

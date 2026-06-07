@@ -126,6 +126,11 @@ class VoiceTurn:
         # ``stt_partial`` self-loop only on *real* progress, without
         # re-plumbing the emit path. Additive — the 0099 surface is unchanged.
         self._partial_count = 0
+        # Latest ``stt_partial`` text seen this turn. The full-duplex loop
+        # (PRD 0016 / issue 0102) reads it to feed the background ThinkerLoop on
+        # the ``feed_thinker`` action without re-plumbing the emit path. Additive
+        # — the 0099 surface is unchanged; empty until the first partial.
+        self._latest_partial_text = ""
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -256,8 +261,19 @@ class VoiceTurn:
 
         return self._partial_count
 
+    @property
+    def latest_partial_text(self) -> str:
+        """The most recent ``stt_partial`` text this turn (PRD 0016 / issue 0102).
+
+        Empty until the first partial. The full-duplex loop reads it to feed the
+        background ThinkerLoop on the ``feed_thinker`` action.
+        """
+
+        return self._latest_partial_text
+
     async def _emit_partial(self, partial: SttPartial) -> None:
         self._partial_count += 1
+        self._latest_partial_text = partial.text
         ts = self._now()
         payload = {
             "type": "stt_partial",

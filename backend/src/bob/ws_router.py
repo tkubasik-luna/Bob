@@ -72,7 +72,8 @@ import json
 import time
 import traceback
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Coroutine
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -84,12 +85,15 @@ from bob import jarvis_store as jarvis_store_module
 from bob import task_scheduler as task_scheduler_module
 from bob import task_store as task_store_module
 from bob import text_segmenter, ws_events
+from bob.config import Settings
 from bob.debug_log import emit_debug
 from bob.event_bus_v2 import emit_event, get_snapshot_for_task, subscribe_for_task
+from bob.live_transcript_state import LiveTranscriptState
 from bob.orchestrator import Orchestrator, get_default_orchestrator
 from bob.spoken_text_cleaner import clean_for_speech
 from bob.stt_engine import SttEngine, get_default_stt_engine
 from bob.task_store import TaskStoreError
+from bob.thinker_loop import ThinkerLoop
 from bob.tts_service import KokoroTtsService, get_default_tts_service
 from bob.voice_loop import FullDuplexLoop, SayPathDriver
 from bob.voice_turn import VoiceTurn
@@ -588,6 +592,17 @@ async def _handle_voice_start(
         await existing.stop()
         session["voice_loop"] = None
 
+    # PRD 0016 / issue 0102 — the « Penser en parallèle » étage. Build the
+    # per-session live-transcript store + ThinkerLoop (mini ``thinker`` role
+    # client), install the store on the orchestrator so the Speaker consults the
+    # SAME snapshot the loop writes, and wire the loop's hooks behind the FSM's
+    # symbolic start/feed/stop Thinker actions. Degrades cleanly: if the thinker
+    # client cannot be built the loop is omitted and the bare full-duplex loop
+    # runs exactly as in 0101.
+    thinker = _make_thinker_loop(session_id, settings)
+    if thinker is not None:
+        orchestrator.set_live_transcript_state(thinker.live_state)
+
     loop = FullDuplexLoop(
         voice_turn_factory=lambda: VoiceTurn(
             engine=_stt_engine_provider(), session_id=session_id, settings=settings
@@ -596,11 +611,15 @@ async def _handle_voice_start(
         settings=settings,
         session_id=session_id,
         # Barge-in (issue 0101): persist what Bob actually played before the cut
-        # into the Jarvis history, and restart the Thinker (no-op hook until
-        # 0102) so the resumed turn re-plans from the partial.
+        # into the Jarvis history, and restart the Thinker (issue 0102) so the
+        # resumed turn re-plans from the partial.
         commit_spoken=_make_commit_spoken(session_id),
-        on_thinker_restart=_make_thinker_restart(session_id),
+        on_thinker_restart=(thinker.restart if thinker is not None else None),
+        on_thinker_start=(thinker.loop.start if thinker is not None else None),
+        on_thinker_feed=(thinker.loop.feed_partial if thinker is not None else None),
+        on_thinker_stop=(thinker.loop.stop if thinker is not None else None),
     )
+    session["thinker_loop"] = thinker.loop if thinker is not None else None
     started = await loop.start()
     if not started:
         # The first STT session failed to open; the VoiceTurn already emitted
@@ -700,30 +719,110 @@ def _make_commit_spoken(session_id: str) -> Callable[[str, str], Awaitable[None]
     return _commit
 
 
-def _make_thinker_restart(session_id: str) -> Callable[[str], Awaitable[None]]:
-    """Build the barge-in ``start_thinker`` hook (PRD 0016 / issue 0101).
+@dataclass
+class _ThinkerHandle:
+    """Bundle the per-session ThinkerLoop + its store + the barge-in restart hook.
 
-    A documented NO-OP until issue 0102 wires the real ``ThinkerLoop``: on a
-    confirmed barge-in the resumed turn should re-arm the live-transcript thinker
-    so it plans from the user's new utterance. Today we only emit a breadcrumb so
-    the Debug View shows the restart intent; 0102 replaces the body with the
-    actual ThinkerLoop (re)start.
+    PRD 0016 / issue 0102. Returned by :func:`_make_thinker_loop` so
+    :func:`_handle_voice_start` can wire the loop's hooks onto the
+    :class:`bob.voice_loop.FullDuplexLoop` and install the shared store on the
+    orchestrator.
     """
 
-    async def _restart(turn_id: str) -> None:
-        emit_debug(
-            category="voice",
-            severity="debug",
-            source="bob.ws_router._thinker_restart",
-            summary=f"thinker restart hook (turn={turn_id}) — no-op until 0102",
-            payload={"session_id": session_id, "turn_id": turn_id},
-        )
+    loop: ThinkerLoop
+    live_state: LiveTranscriptState
 
-    return _restart
+    async def restart(self, turn_id: str) -> None:
+        """Barge-in ``start_thinker`` — cancel the in-flight pass then re-arm.
+
+        On a confirmed barge-in the resumed turn re-plans from the user's new
+        utterance: stop the current pass cooperatively (cancel + grace +
+        hard-kill) then arm the loop for the same ``turn_id`` so the next partial
+        triggers a fresh pass. The full-duplex loop already cancelled the
+        in-flight pass via ``on_thinker_stop`` is NOT guaranteed on the barge-in
+        edge (that edge fires ``start_thinker``, not ``endpoint``), so we stop
+        here defensively before re-arming.
+        """
+
+        await self.loop.stop()
+        self.loop.start(turn_id)
+
+
+def _make_thinker_loop(session_id: str, settings: Settings) -> _ThinkerHandle | None:
+    """Build the per-session :class:`ThinkerLoop` on the ``thinker`` role client.
+
+    PRD 0016 / issue 0102 (Annexe D + the « Penser en parallèle » étage). Reads
+    the per-role selection (:class:`bob.llm_selection_store.RoleSelectionStore`,
+    default a mini local model) and builds the ``thinker`` role client via
+    :func:`bob.llm.factory.build_thinker_role_client`, then constructs the loop
+    over a fresh per-session :class:`LiveTranscriptState`. The inference is
+    spawned through the scheduler's shared :class:`asyncio.TaskGroup` so a passing
+    pass cannot leak past an orchestrator crash (structured concurrency); when
+    the scheduler has not been started we fall back to a bare task.
+
+    Returns ``None`` (the bare full-duplex loop runs, no Thinker — Annexe G
+    "Draft model indispo" style degrade) when the role store is not primed or the
+    client cannot be built, so a misconfigured thinker role never wedges voice.
+    """
+
+    from bob import llm_selection_store
+    from bob.llm.factory import build_thinker_role_client
+
+    try:
+        role_selection = llm_selection_store.get_default_role_store().read()
+    except RuntimeError:
+        role_selection = None
+    if role_selection is None:
+        role_selection = llm_selection_store.RoleSelection(
+            roles={
+                role: llm_selection_store.LLMSelection(
+                    provider=settings.LLM_PROVIDER,
+                    lm_model=settings.LLM_MODEL,
+                    base_url=settings.LLM_BASE_URL or None,
+                )
+                for role in llm_selection_store.ROLES
+            }
+        )
+    try:
+        client = build_thinker_role_client(role_selection, settings)
+    except Exception:
+        _logger.warning("ws_router.thinker_client_build_failed", session_id=session_id)
+        return None
+
+    live_state = LiveTranscriptState()
+    loop = ThinkerLoop(
+        client=client,
+        live_state=live_state,
+        settings=settings,
+        session_id=session_id,
+        spawn=_thinker_spawn,
+    )
+    return _ThinkerHandle(loop=loop, live_state=live_state)
+
+
+def _thinker_spawn(coro: Coroutine[Any, Any, None]) -> asyncio.Task[None]:
+    """Spawn the ThinkerLoop's inference onto the scheduler's TaskGroup if live.
+
+    Routes through :meth:`bob.task_scheduler.TaskScheduler` shared
+    :class:`asyncio.TaskGroup` (structured concurrency) when the scheduler has
+    been started; otherwise a bare :func:`asyncio.create_task`. The scheduler
+    exposes the group via its private ``_task_group`` — the same handle its own
+    sub-agent runners use; reading it here keeps the Thinker under the one
+    cancellation umbrella the lifespan owns.
+    """
+
+    try:
+        scheduler = task_scheduler_module.get_default_scheduler()
+        group = scheduler._task_group  # shared TaskGroup handle (structured concurrency).
+    except RuntimeError:
+        group = None
+    if group is not None:
+        return group.create_task(coro)
+    return asyncio.create_task(coro)
 
 
 async def _handle_voice_stop(
-    websocket: WebSocket, payload: dict[str, Any], session_id: str
+    websocket: WebSocket, payload: dict[str, Any], session_id: str, orchestrator: Orchestrator
 ) -> None:
     """Client → ``voice_stop`` disarms the mic and tears the loop down (0100).
 
@@ -731,6 +830,11 @@ async def _handle_voice_stop(
     Stops the active loop (finalizing its open STT turn → ``stt_final`` and
     driving the FSM to idle) and clears the slot. A ``voice_stop`` with no armed
     loop is a silent no-op (idempotent).
+
+    Issue 0102: stopping the full-duplex loop already cooperatively cancels the
+    in-flight ThinkerLoop (via ``on_thinker_stop``); we additionally reset the
+    orchestrator's live-transcript store to a fresh empty one so a later text
+    turn never consults a stale snapshot from the closed voice session.
     """
 
     session = _sessions.get(session_id)
@@ -739,7 +843,14 @@ async def _handle_voice_stop(
     loop = session.get("voice_loop")
     if isinstance(loop, FullDuplexLoop):
         await loop.stop()
+        # The loop teardown already cooperatively cancelled the ThinkerLoop;
+        # reset the orchestrator's live-transcript store to a fresh empty one so
+        # a later text turn never consults a stale snapshot. Only when a loop was
+        # actually armed (a bare ``voice_stop`` with no prior ``voice_start`` has
+        # nothing to reset).
+        orchestrator.set_live_transcript_state(LiveTranscriptState())
     session["voice_loop"] = None
+    session["thinker_loop"] = None
 
 
 async def _handle_voice_aec_degraded(
@@ -918,7 +1029,7 @@ async def _handle_client_message(
         return
 
     if msg_type == "voice_stop":
-        await _handle_voice_stop(websocket, payload, session_id)
+        await _handle_voice_stop(websocket, payload, session_id, orchestrator)
         return
 
     if msg_type == "voice_aec_degraded":

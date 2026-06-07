@@ -1,0 +1,6 @@
+[
+  {
+    "role": "system",
+    "content": "THINKER (compréhension en cours du tour, PRD 0016). État maintenu en parallèle de la parole de l'utilisateur :\n- texte_corrigé: \"réserve une table pour deux à vingt heures\"\n- variables: {\"action\": \"reservation\", \"covers\": 2, \"time\": \"20:00\"}\n- plan_prochaine_étape: \"confirmer la réservation\"\nAppuie-toi sur cette compréhension pour répondre directement et à propos."
+  }
+]

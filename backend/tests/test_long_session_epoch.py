@@ -102,17 +102,21 @@ def _assemble(
 
     from bob.context.provider import ContextProvider
     from bob.context.providers.state_block import StateBlockProvider
+    from bob.context.providers.thinker_state import ThinkerStateProvider
+    from bob.live_transcript_state import LiveTranscriptState
     from bob.task_store import TaskStore
 
-    # The long-session test never spawns tasks; we still register the
-    # ``state_block`` provider so the v2 policy provider list resolves
-    # (PRD 0006 / issue 0050).
+    # The long-session test never spawns tasks nor speaks; we still register the
+    # ``state_block`` + ``thinker_state`` providers so the v2 policy provider
+    # list resolves. Both read empty stores → no-op, so the prompt-bound series
+    # is unchanged (PRD 0006 / issue 0050; PRD 0016 / issue 0102).
     task_store = TaskStore(jarvis_store._conn)
     providers: list[ContextProvider] = [
         SystemBlockProvider(system_content=_SYSTEM_PROMPT),
         StateBlockProvider(task_store=task_store),
         CrossEpochDigestProvider(store=digest_store),
         RollingSummaryProvider(store=summary_store),
+        ThinkerStateProvider(live_state=LiveTranscriptState()),
         RecentTurnsProvider(jarvis_store=jarvis_store),
         UserMessageProvider(),
     ]

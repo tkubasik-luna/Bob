@@ -140,6 +140,16 @@ def _build_role_client(role_selection: RoleSelection, role: str, settings: Setti
         # the same LM Studio host still route each request to their own model.
         # base_url is already per-role via the folded ``LLM_BASE_URL``.
         return LMStudioClient(effective, model=selection.lm_model)
+    if selection.provider == "fake":
+        # PRD 0016 / issue 0098 — the attestation harness provider, at the
+        # per-role granularity (the seeded role map inherits ``LLM_PROVIDER=fake``
+        # under the ephemeral backend). ``role`` is threaded so role-scoped
+        # scripted rules target the right client (e.g. a ``role: thinker`` rule
+        # for the Thinker loop's JSON snapshot reply). Built lazily so production
+        # paths never import the attest package — mirrors ``_build_for_backend``.
+        from bob.attest.fake_backend import build_fake_client_from_settings
+
+        return build_fake_client_from_settings(role)
     raise ValueError(f"Unknown LLM backend: {selection.provider!r}")
 
 

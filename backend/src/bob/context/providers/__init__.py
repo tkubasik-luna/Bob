@@ -24,6 +24,7 @@ from bob.context.providers.recent_turns import RecentTurnsProvider
 from bob.context.providers.rolling_summary import RollingSummaryProvider
 from bob.context.providers.state_block import StateBlockProvider
 from bob.context.providers.system_block import SystemBlockProvider
+from bob.context.providers.thinker_state import ThinkerStateProvider
 from bob.context.providers.user_message import UserMessageProvider
 
 __all__ = [
@@ -33,5 +34,6 @@ __all__ = [
     "RollingSummaryProvider",
     "StateBlockProvider",
     "SystemBlockProvider",
+    "ThinkerStateProvider",
     "UserMessageProvider",
 ]

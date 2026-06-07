@@ -121,8 +121,11 @@ def bounded_v1_policy() -> ContextPolicy:
        waiting-input addendum.
     2. ``rolling_summary`` — system-role block carrying the latest
        persisted summary of older turns (skipped when the store is empty).
-    3. ``recent_turns`` — verbatim window of the last K user↔Jarvis pairs.
-    4. ``user_message`` — the live in-progress user turn passed via
+    3. ``thinker_state`` — the live Thinker snapshot for a voice turn
+       (PRD 0016 / issue 0102), skipped when no snapshot exists (every
+       text turn, every voice turn that endpointed before a Thinker pass).
+    4. ``recent_turns`` — verbatim window of the last K user↔Jarvis pairs.
+    5. ``user_message`` — the live in-progress user turn passed via
        :class:`AssemblyContext`.
 
     PRD 0006 STATE block (issue 0050) will slot in between
@@ -132,7 +135,13 @@ def bounded_v1_policy() -> ContextPolicy:
 
     return ContextPolicy(
         policy_id=BOUNDED_V1_POLICY_ID,
-        provider_ids=("system_block", "rolling_summary", "recent_turns", "user_message"),
+        provider_ids=(
+            "system_block",
+            "rolling_summary",
+            "thinker_state",
+            "recent_turns",
+            "user_message",
+        ),
         token_budget=DEFAULT_TOKEN_BUDGET,
         recent_turns_window=DEFAULT_RECENT_TURNS_WINDOW,
     )
@@ -154,13 +163,18 @@ def bounded_v2_policy() -> ContextPolicy:
        epoch has sealed yet.
     4. ``rolling_summary`` — current-epoch rolling summary of older
        turns (skipped when empty).
-    5. ``recent_turns`` — verbatim window of the last K user↔Jarvis pairs.
-    6. ``user_message`` — the live in-progress user turn.
+    5. ``thinker_state`` — the live Thinker snapshot for a voice turn
+       (PRD 0016 / issue 0102); skipped when no snapshot exists (every
+       text turn, every voice turn that endpointed before a Thinker pass),
+       so the bounded text path is byte-for-byte unchanged.
+    6. ``recent_turns`` — verbatim window of the last K user↔Jarvis pairs.
+    7. ``user_message`` — the live in-progress user turn.
 
     The ordering is deliberate: STATE > sealed epochs > current epoch >
-    recent turns > live user. STATE leads so the LLM sees the active
-    task ids before any free-text context that might mention them
-    ambiguously.
+    Thinker snapshot > recent turns > live user. STATE leads so the LLM
+    sees the active task ids before any free-text context that might
+    mention them ambiguously; the Thinker snapshot sits just before the
+    live turn so the freshest understanding is closest to it.
     """
 
     return ContextPolicy(
@@ -170,6 +184,7 @@ def bounded_v2_policy() -> ContextPolicy:
             "state_block",
             "cross_epoch_digest",
             "rolling_summary",
+            "thinker_state",
             "recent_turns",
             "user_message",
         ),

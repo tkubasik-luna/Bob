@@ -133,6 +133,10 @@ LOGICAL_EVENT_MATCHERS: dict[str, EventMatcher] = {
     # PRD 0016 / issue 0101 (Annexe A.2 + B): the confirmed barge-in cut.
     # ``wait_event type: bargein`` blocks until Bob was interrupted.
     "bargein": _voice_subtype_matcher("bargein"),
+    # PRD 0016 / issue 0102 (Annexe A.2 + H): the background Thinker's snapshot
+    # of the turn, and the marker proving the Speaker consulted it at assembly.
+    "thinker_snapshot": _voice_subtype_matcher("thinker_snapshot"),
+    "thinker_consult": _voice_subtype_matcher("thinker_consult"),
 }
 
 
@@ -699,3 +703,71 @@ def _strip_scrub_elision(text: str) -> str:
 
 register_assertion("bargein_within_ms", check_bargein_within_ms)
 register_assertion("committed_equals_spoken", check_committed_equals_spoken)
+
+
+# --- Thinker assertions (PRD 0016 / issue 0102) ------------------------------
+
+
+def _voice_ws_events(events: list[CapturedEvent], subtype: str) -> list[dict[str, Any]]:
+    """Return the ``ws_event`` body of every captured voice event of ``subtype``."""
+
+    matcher = _voice_subtype_matcher(subtype)
+    out: list[dict[str, Any]] = []
+    for event in events:
+        if not matcher(event):
+            continue
+        ws_event = (event.get("payload") or {}).get("ws_event") or {}
+        if isinstance(ws_event, dict):
+            out.append(ws_event)
+    return out
+
+
+def check_thinker_snapshot_emitted(spec: dict[str, Any], ctx: AssertionContext) -> AssertionResult:
+    """PASS iff at least ``spec['min']`` (default 1) ``thinker_snapshot`` events fired.
+
+    Spec: ``{kind: thinker_snapshot_emitted}`` or ``{kind: thinker_snapshot_emitted,
+    min: 2}`` (Annexe A.2 + H). Counts the background Thinker's snapshots on the
+    ``/ws/debug`` stream — the proof the « Penser en parallèle » loop ran on the
+    partial transcript during the turn. FAILs loudly when none was captured (the
+    loop never produced an understanding) so a green run truly exercised it.
+    """
+
+    raw_min = spec.get("min", 1)
+    try:
+        minimum = int(raw_min)
+    except (TypeError, ValueError):
+        return AssertionResult(
+            kind="thinker_snapshot_emitted",
+            ok=False,
+            detail={"error": "thinker_snapshot_emitted 'min' must be an integer", "min": raw_min},
+        )
+    snapshots = _voice_ws_events(ctx.events, "thinker_snapshot")
+    return AssertionResult(
+        kind="thinker_snapshot_emitted",
+        ok=len(snapshots) >= minimum,
+        detail={"min": minimum, "count": len(snapshots)},
+    )
+
+
+def check_speaker_consulted_thinker(spec: dict[str, Any], ctx: AssertionContext) -> AssertionResult:
+    """PASS iff the Speaker consulted a Thinker snapshot at assembly (issue 0102).
+
+    Spec: ``{kind: speaker_consulted_thinker}`` (acceptance: "the Speaker's
+    assembled context contained the snapshot"). The orchestrator emits a
+    dedicated ``thinker_consult`` voice marker (carrying the consulted
+    ``turn_id`` / ``seq``) ONLY when the ``thinker_state`` provider actually
+    folded a snapshot into the assembled prompt — so this assertion proves the
+    snapshot reached the say-path's context, not merely that a snapshot event
+    fired. FAILs when no consult marker was captured.
+    """
+
+    consults = _voice_ws_events(ctx.events, "thinker_consult")
+    return AssertionResult(
+        kind="speaker_consulted_thinker",
+        ok=bool(consults),
+        detail={"consults": len(consults), "seqs": [c.get("seq") for c in consults][:5]},
+    )
+
+
+register_assertion("thinker_snapshot_emitted", check_thinker_snapshot_emitted)
+register_assertion("speaker_consulted_thinker", check_speaker_consulted_thinker)

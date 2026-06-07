@@ -335,6 +335,21 @@ class Settings(BaseSettings):
     # no window to barge into). Ignored unless ``TTS_ENGINE=fake``.
     BOB_FAKE_TTS_CHUNK_MS: int = 0
 
+    # Thinker loop (PRD 0016 / issue 0102, Annexe H). The background
+    # :class:`bob.thinker_loop.ThinkerLoop` re-runs its mini reasoning pass on a
+    # new ``stt_partial`` but DEBOUNCED: a fresh partial within
+    # ``THINKER_DEBOUNCE_MS`` of the last accepted trigger is coalesced, and at
+    # most ONE Thinker inference is ever in flight per turn (a partial that
+    # arrives while a pass is running is dropped, not queued). 250 ms is the PRD
+    # default — long enough to coalesce a burst of partials, short enough that
+    # the understanding stays fresh. ``THINKER_CANCEL_GRACE_MS`` is the
+    # cooperative-cancel grace (mirrors the sub-agent ``cancel_grace_seconds``):
+    # on ``endpoint`` / ``bargein`` / ``voice_stop`` the loop is asked to stop,
+    # given this long to unwind a parked inference, then hard-killed via
+    # :meth:`asyncio.Task.cancel`.
+    THINKER_DEBOUNCE_MS: int = 250
+    THINKER_CANCEL_GRACE_MS: int = 2000
+
     def mcp_server_configs(self) -> tuple[MCPServerConfig, ...]:
         """Parse :attr:`MCP_SERVERS` into typed :class:`MCPServerConfig` records.
 

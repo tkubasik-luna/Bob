@@ -1,0 +1,75 @@
+# Thinker / « Penser en parallèle » attest scenario (PRD 0016 / issue 0102,
+# Annexe A.2 + H).
+#
+# Proves the background Thinker end-to-end against an ephemeral backend with the
+# deterministic fake LLM + fake STT + fake TTS (no native models):
+#
+#   1. inject_audio (voiced, thinker: true) — the loud burst + trailing silence
+#      drives the energy VAD → vad_speech_start; the fake STT converges to the
+#      transcript, emitting stt_partials. Each partial is fed to the background
+#      ThinkerLoop (debounce pinned to 0 via the `thinker: true` flag so a
+#      snapshot reliably lands during the short synthetic turn). The `thinker`
+#      role's fake client returns the scripted JSON snapshot, which the loop
+#      stores + emits as a `thinker_snapshot` voice event.
+#   2. At the silence-floor endpoint the FSM freezes the turn and runs the SAME
+#      Jarvis say-path. At assembly the Speaker consults the latest Thinker
+#      snapshot via the pure ThinkerStateProvider — the orchestrator emits a
+#      `thinker_consult` marker proving the snapshot reached the assembled prompt.
+#
+# Assertions: ≥1 `thinker_snapshot` emitted AND the Speaker consulted it
+# (the acceptance criterion), plus the FSM walked to bob_speaking and Bob spoke.
+#
+# Run:  uv run bob attest scenarios/thinker.attest.yaml   (exit 0, ok: true)
+name: thinker-snapshot-consulted
+description: >-
+  A voiced turn drives the background Thinker; it emits a thinker_snapshot and
+  the Speaker consults it at assembly (thinker_consult marker).
+backend: ephemeral
+llm: fake
+fake_llm:
+  # The mini Thinker role replies with a STRICT JSON snapshot (Annexe A.2);
+  # ``chat()`` returns it verbatim and the loop parses it. An empty
+  # ``on_input_contains`` matches any partial transcript.
+  - role: thinker
+    on_input_contains: ""
+    reply: >-
+      {"corrected_text": "quel temps fait il a paris", "variables": {"city":
+      "Paris", "intent": "weather"}, "next_step_plan": "donner la meteo de
+      Paris", "user_turn_complete": true, "backchannel": null}
+  # The Speaker (jarvis role) answers the frozen transcript normally.
+  - role: jarvis
+    on_input_contains: "temps"
+    reply: "Il fait beau aujourd'hui à Paris."
+timeline:
+  - do: inject_audio
+    transcript: "quel temps fait il a paris"
+    voiced: true
+    thinker: true
+  # The Thinker produced its understanding during user_speaking.
+  - do: wait_event
+    type: thinker_snapshot
+    timeout_ms: 8000
+  # The FSM got the floor (the endpoint ran the say-path).
+  - do: wait_state
+    state: bob_speaking
+    timeout_ms: 8000
+  # The Speaker consulted the snapshot at assembly.
+  - do: wait_event
+    type: thinker_consult
+    timeout_ms: 8000
+  - do: wait_state
+    state: idle
+    timeout_ms: 8000
+assertions:
+  # The background Thinker ran on the partial transcript.
+  - kind: thinker_snapshot_emitted
+    min: 1
+  # The Speaker's assembled context contained the snapshot (acceptance criterion).
+  - kind: speaker_consulted_thinker
+  # The turn converged on the say-path and Bob spoke.
+  - kind: fsm_reached
+    state: bob_speaking
+  - kind: audio_chunks_gte
+    min: 1
+  - kind: deliverable_nonempty
+  - kind: no_error_events
