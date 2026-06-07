@@ -25,6 +25,7 @@
 // state is owned here. Co-located styles live in `SettingsControl.css`.
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useVoiceMode } from "../../hooks/useVoiceMode";
 import {
   type LlmModel,
   LlmModelSwapError,
@@ -32,6 +33,8 @@ import {
   type LlmSelection,
   fetchLlmModels,
   fetchLlmSelection,
+  pingLm,
+  putLlmBaseUrl,
   putLlmModel,
   putLlmProvider,
 } from "../../lib/llmApi";
@@ -46,15 +49,27 @@ const PROVIDER_LM = "lm_studio";
 // `claude_model` field is authoritative once `GET /selection` resolves).
 const CLAUDE_MODEL_FALLBACK = "claude-sonnet-4.5";
 
-// Server-URL presets (ported from the mockup). The active preset highlights
-// when it matches the current URL; clicking one swaps the field. Local-only —
-// there is no URL REST endpoint at this stage.
+// Server-URL presets. Clicking one COMMITS it (PUT { base_url }) after a real
+// reachability probe. URLs carry the OpenAI-compatible `/v1` suffix the
+// inference client needs (the management SDK host strips it server-side).
 const LM_PRESETS = [
-  { label: "localhost", url: "http://localhost:1234" },
-  { label: "studio.local", url: "http://studio.local:1234" },
-  { label: "192.168.1.20", url: "http://192.168.1.20:1234" },
+  { label: "localhost", url: "http://localhost:1234/v1" },
+  { label: "studio.local", url: "http://studio.local:1234/v1" },
+  { label: "192.168.1.20", url: "http://192.168.1.20:1234/v1" },
 ];
 const LM_URL_DEFAULT = LM_PRESETS[0].url;
+
+/** Normalise a raw URL-field value into a committable LM Studio base URL:
+ * force the `http://` scheme, strip trailing slashes, and append the
+ * OpenAI-compatible `/v1` suffix when absent (LM Studio + most OpenAI servers
+ * 404/return non-OpenAI bodies without it). */
+function normalizeLmUrl(raw: string): string {
+  let s = raw.trim();
+  if (!/^https?:\/\//i.test(s)) s = `http://${s}`;
+  s = s.replace(/\/+$/, "");
+  if (!/\/v\d+$/i.test(s)) s = `${s}/v1`;
+  return s;
+}
 
 /** Compact "architecture · quant" spec line — both come straight off the
  * backend `LLMModel`; falls back gracefully when a field is null. (The mockup's
@@ -65,14 +80,21 @@ function modelSpec(m: LlmModel): string {
   return parts.join(" · ");
 }
 
-/** Cheap reachability heuristic for the URL field, ported from the mockup: the
- * URL is "joignable" iff it has a plausible host[:port][/path] shape. This is a
- * display affordance only (no probe request) — the authoritative reachability
- * check happens server-side when switching to LM Studio. */
-function lmUrlReachable(raw: string): boolean {
-  const s = raw.trim().replace(/^https?:\/\//i, "");
-  return /^[\w.-]+(:\d{2,5})?(\/.*)?$/.test(s) && s.length > 3;
-}
+// Real reachability of the current URL field, from a live backend probe
+// (GET /api/llm/ping) — no longer a regex heuristic. `checking` is shown while
+// the ping is in flight so the chip reflects a true online/offline state.
+type PingState =
+  | { status: "idle" }
+  | { status: "checking" }
+  | { status: "online" }
+  | { status: "offline" };
+
+// Base-URL commit (PUT { base_url }) lifecycle. The backend probes the target
+// FIRST; on failure the previous URL is kept and `detail` is surfaced.
+type UrlApplyState =
+  | { status: "idle" }
+  | { status: "loading" }
+  | { status: "error"; detail: string };
 
 type ListState =
   | { status: "idle" }
@@ -129,9 +151,12 @@ export function SettingsControl() {
   const [list, setList] = useState<ListState>({ status: "idle" });
   const [swap, setSwap] = useState<SwapState>({ status: "idle" });
   const [providerSwap, setProviderSwap] = useState<ProviderSwapState>({ status: "idle" });
-  // LM Studio server URL — local-edit only (the mockup behaviour); drives the
-  // reachability chip + preset highlight. No REST endpoint backs it.
+  // LM Studio server URL — seeded from the persisted selection. The URL field +
+  // presets COMMIT via PUT { base_url } (validate-then-swap); `ping` reflects a
+  // real reachability probe of whatever is in the field.
   const [lmUrl, setLmUrl] = useState<string>(LM_URL_DEFAULT);
+  const [ping, setPing] = useState<PingState>({ status: "idle" });
+  const [urlApply, setUrlApply] = useState<UrlApplyState>({ status: "idle" });
   // Ctx slider is LOCAL state (feature 0013): dragging mutates only this; the
   // explicit Apply button fires the blocking reload-with-ctx PUT. `null` until
   // a model + its bound are known.
@@ -143,6 +168,22 @@ export function SettingsControl() {
 
   const isLM = provider === PROVIDER_LM;
 
+  // Voice/TTS toggle — moved here from the old bottom-right glyph (MuteToggle).
+  // The control sits in the VOIX section of the panel; the global `M` shortcut
+  // lives at this always-mounted root so muting stays hands-on-keyboard whether
+  // or not the panel is open.
+  const { voiceEnabled, toggle: toggleVoice } = useVoiceMode();
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "m" && e.key !== "M") return;
+      const active = document.activeElement;
+      if (active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement) return;
+      toggleVoice();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [toggleVoice]);
+
   // Load the current selection once on mount to highlight it and seed the
   // provider toggle. Failure is non-fatal: the modal still renders.
   useEffect(() => {
@@ -151,6 +192,7 @@ export function SettingsControl() {
       .then((sel) => {
         setSelection(sel);
         if (sel.provider) setProvider(sel.provider);
+        if (sel.base_url) setLmUrl(sel.base_url);
       })
       .catch(() => {
         // selection unavailable — leave defaults; do not crash the HUD
@@ -172,6 +214,13 @@ export function SettingsControl() {
       });
   }, []);
 
+  // Probe a URL's reachability (defaults to the current field value). A real
+  // backend ping — sets `checking` while in flight, then online/offline.
+  const runPing = useCallback((url?: string) => {
+    setPing({ status: "checking" });
+    pingLm(url).then((r) => setPing({ status: r.reachable ? "online" : "offline" }));
+  }, []);
+
   // When the panel opens under LM Studio, fetch the live list once. Reseting
   // `fetchedRef` on close means a reopen refetches (the server's loaded set may
   // have changed). Toggling to Claude closes nothing here — the list section is
@@ -185,6 +234,25 @@ export function SettingsControl() {
       fetchedRef.current = false;
     }
   }, [open, isLM, loadModels]);
+
+  // Live reachability: ping the configured/typed LM URL. Runs whenever LM Studio
+  // is the provider — panel OPEN or CLOSED — so both the in-panel chip AND the
+  // status badge beside the gear reflect a REAL online/offline state. Debounced
+  // on the URL (typing) and refreshed on an interval. Switching to Claude clears
+  // it (the CLI bridge is always "on").
+  useEffect(() => {
+    if (!isLM) {
+      setPing({ status: "idle" });
+      return;
+    }
+    const probe = () => runPing(normalizeLmUrl(lmUrl));
+    const handle = setTimeout(probe, 400);
+    const interval = setInterval(probe, 20000);
+    return () => {
+      clearTimeout(handle);
+      clearInterval(interval);
+    };
+  }, [isLM, lmUrl, runPing]);
 
   // Fire the BLOCKING swap PUT for the clicked model. No-op when it is already
   // the current selection or a swap is already in flight. On success we update
@@ -226,6 +294,13 @@ export function SettingsControl() {
           setSelection(next);
           setProvider(next.provider);
           setProviderSwap({ status: "idle" });
+          // Landing on LM Studio: refetch the live list + reprobe — the server's
+          // loaded set may differ from a stale pre-switch fetch.
+          if (next.provider === PROVIDER_LM) {
+            fetchedRef.current = true;
+            loadModels();
+            runPing(normalizeLmUrl(next.base_url ?? lmUrl));
+          }
         })
         .catch((err: unknown) => {
           const detail =
@@ -234,7 +309,7 @@ export function SettingsControl() {
           setProviderSwap({ status: "error", target: p, detail });
         });
     },
-    [provider, providerSwap.status],
+    [provider, providerSwap.status, loadModels, runPing, lmUrl],
   );
 
   const currentModelId = selection?.lm_model ?? null;
@@ -277,12 +352,62 @@ export function SettingsControl() {
 
   // URL field — the protocol is fixed to http:// by the `.set-field-proto`
   // prefix; the input edits the host[:port][/path] body only.
-  const reachable = lmUrlReachable(lmUrl);
+  const reachable = ping.status === "online";
+  const pingChecking = ping.status === "checking";
   const urlBody = lmUrl.replace(/^https?:\/\//i, "");
   const onUrlChange = (v: string) => setLmUrl(`http://${v.replace(/^https?:\/\//i, "")}`);
+  const urlApplying = urlApply.status === "loading";
+  const activeBaseUrl = selection?.base_url ?? null;
+  const urlDirty = normalizeLmUrl(lmUrl) !== (activeBaseUrl ?? "");
+
+  // Commit a base URL — the BLOCKING PUT { base_url } (validate-then-swap). The
+  // backend probes the target first; on success the new server drives both the
+  // inference client + management SDK, then we refetch the (now different)
+  // model list and reprobe. No-op while another URL commit is in flight.
+  const applyUrl = useCallback(
+    (raw: string) => {
+      if (urlApply.status === "loading") return;
+      const url = normalizeLmUrl(raw);
+      setLmUrl(url);
+      setUrlApply({ status: "loading" });
+      putLlmBaseUrl(url)
+        .then((next) => {
+          setSelection(next);
+          if (next.base_url) setLmUrl(next.base_url);
+          setUrlApply({ status: "idle" });
+          fetchedRef.current = true;
+          loadModels();
+          runPing(next.base_url ?? url);
+        })
+        .catch((err: unknown) => {
+          const detail =
+            err instanceof LlmModelSwapError ? err.message : "Échec du changement de serveur";
+          setUrlApply({ status: "error", detail });
+          runPing(url); // refresh the chip so the user sees it's unreachable
+        });
+    },
+    [urlApply.status, loadModels, runPing],
+  );
+
+  // Status badge beside the gear (shown when the panel is closed — the open
+  // panel already carries the full detail). Reports the active model + a real
+  // online/offline dot: under Claude the CLI bridge is always "on"; under LM
+  // Studio it tracks the live reachability probe.
+  const badgeChecking = isLM && ping.status === "checking";
+  const badgeOnline = isLM ? ping.status === "online" : true;
+  const badgeClass = badgeChecking ? "is-loading" : badgeOnline ? "is-ok" : "is-off";
+  const badgeModel = isLM ? (currentModelId ?? "aucun modèle") : claudeModel;
+  const badgeState = badgeChecking ? "ping" : badgeOnline ? "online" : "offline";
 
   return (
     <div className="settings-zone">
+      {!open && (
+        <div className={`settings-status ${badgeClass}`} data-testid="settings-status">
+          <span className={`set-dot ${badgeClass}`} />
+          <span className="settings-status-model">{badgeModel}</span>
+          <span className="settings-status-state">{badgeState}</span>
+        </div>
+      )}
       <button
         type="button"
         className={`settings-btn ${open ? "is-open" : ""}`}
@@ -350,6 +475,22 @@ export function SettingsControl() {
                 </button>
               </div>
 
+              {/* Provider-switch in flight — a clear global loading row so the
+                blocking swap (model load / CLI probe) is visibly pending. */}
+              {providerSwapping && (
+                <output className="set-status is-loading" aria-busy="true">
+                  <span className="set-dot is-loading" />
+                  <span className="eng-name">
+                    Bascule vers{" "}
+                    {providerSwap.status === "loading" && providerSwap.target === PROVIDER_LM
+                      ? "LM Studio"
+                      : "Claude CLI"}
+                    …
+                  </span>
+                  <span className="set-status-state">chargement…</span>
+                </output>
+              )}
+
               {/* Provider-switch error — the toggle reverted to the previous
                 provider; surface why so the user can retry / start LM Studio. */}
               {providerSwap.status === "error" && (
@@ -388,32 +529,62 @@ export function SettingsControl() {
                         inputMode="url"
                         spellCheck="false"
                         value={urlBody}
-                        placeholder="localhost:1234"
+                        placeholder="localhost:1234/v1"
+                        disabled={urlApplying}
                         onChange={(e) => onUrlChange(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") applyUrl(lmUrl);
+                        }}
                         aria-label="URL du serveur LM Studio"
                       />
+                      <button
+                        type="button"
+                        className="set-url-apply"
+                        data-testid="set-url-apply"
+                        disabled={urlApplying || !urlDirty}
+                        aria-busy={urlApplying}
+                        onClick={() => applyUrl(lmUrl)}
+                      >
+                        {urlApplying ? "…" : "OK"}
+                      </button>
                     </div>
+                    {/* Presets only PREFILL the field for quick entry — they do
+                      NOT commit. The URL changes server-side only on « OK ». */}
                     <div className="set-presets">
                       {LM_PRESETS.map((p) => (
                         <button
                           key={p.url}
                           type="button"
                           className={`set-preset ${lmUrl === p.url ? "on" : ""}`}
+                          disabled={urlApplying}
                           onClick={() => setLmUrl(p.url)}
                         >
                           {p.label}
                         </button>
                       ))}
                     </div>
+                    {urlApply.status === "error" && (
+                      <div className="set-ctx-error" role="alert">
+                        {urlApply.detail}
+                      </div>
+                    )}
                   </div>
 
-                  <div className={`set-status ${reachable ? "is-ok" : "is-off"}`}>
-                    <span className={`set-dot ${reachable ? "is-ok" : "is-off"}`} />
+                  <div
+                    className={`set-status ${pingChecking ? "is-loading" : reachable ? "is-ok" : "is-off"}`}
+                  >
+                    <span
+                      className={`set-dot ${pingChecking ? "is-loading" : reachable ? "is-ok" : "is-off"}`}
+                    />
                     <span className="eng-name">
-                      {reachable ? "serveur joignable" : "serveur introuvable"}
+                      {pingChecking
+                        ? "vérification…"
+                        : reachable
+                          ? "serveur joignable"
+                          : "serveur introuvable"}
                     </span>
                     <span className="set-status-state">
-                      {reachable ? "connecté" : "hors ligne"}
+                      {pingChecking ? "ping" : reachable ? "connecté" : "hors ligne"}
                     </span>
                   </div>
 
@@ -532,9 +703,77 @@ export function SettingsControl() {
                 </div>
               )}
             </div>
+
+            <div className="settings-section">
+              <div className="settings-label">VOIX</div>
+              {/* TTS toggle (formerly the bottom-right MuteToggle glyph). One
+                button flips `useVoiceMode().voiceEnabled`; the global `M`
+                shortcut (bound at the component root) mirrors it. */}
+              <button
+                type="button"
+                className={`set-voice ${voiceEnabled ? "on" : ""}`}
+                data-testid="set-voice-toggle"
+                aria-pressed={voiceEnabled}
+                onClick={toggleVoice}
+              >
+                <span className="set-voice-glyph" aria-hidden="true">
+                  {voiceEnabled ? <SpeakerIcon /> : <SpeakerMutedIcon />}
+                </span>
+                <span className="set-voice-name">
+                  {voiceEnabled ? "Voix activée" : "Voix coupée"}
+                </span>
+                <span className="set-voice-hint">M</span>
+              </button>
+            </div>
           </div>
         </>
       )}
     </div>
+  );
+}
+
+/** Regular speaker glyph — voice is on, TTS will play. */
+function SpeakerIcon() {
+  return (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      width="18"
+      height="18"
+      aria-hidden="true"
+      data-testid="speaker-on-icon"
+    >
+      <path d="M11 5 6 9H2v6h4l5 4z" />
+      <path d="M15.54 8.46a5 5 0 0 1 0 7.07" />
+      <path d="M19.07 4.93a10 10 0 0 1 0 14.14" />
+    </svg>
+  );
+}
+
+/** Barred speaker glyph — voice is off / muted, TTS will be skipped. */
+function SpeakerMutedIcon() {
+  return (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      width="18"
+      height="18"
+      aria-hidden="true"
+      data-testid="speaker-off-icon"
+    >
+      <path d="M11 5 6 9H2v6h4l5 4z" />
+      <line x1="22" y1="9" x2="16" y2="15" />
+      <line x1="16" y1="9" x2="22" y2="15" />
+    </svg>
   );
 }

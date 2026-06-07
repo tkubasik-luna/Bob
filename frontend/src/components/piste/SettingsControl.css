@@ -20,6 +20,48 @@
   top: 24px;
   right: 26px;
   z-index: 60;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+/* ── status badge — model + online state, beside the gear ─────────────────── */
+.settings-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 230px;
+  padding: 7px 12px;
+  border-radius: 999px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--dim);
+  background: color-mix(in oklab, var(--bg2) 70%, transparent);
+  border: 1px solid var(--line);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+.settings-status-model {
+  color: var(--ink);
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.settings-status-state {
+  font-size: 8.5px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+.settings-status.is-ok .settings-status-state {
+  color: #7fcba0;
+}
+.settings-status.is-off .settings-status-state {
+  color: #d9a0a0;
+}
+.settings-status.is-loading .settings-status-state {
+  color: #e0c07a;
 }
 .settings-btn {
   display: inline-flex;
@@ -248,6 +290,49 @@
 }
 .set-status.is-off .set-status-state {
   color: #d9a0a0;
+}
+/* In-flight states — provider switch + reachability probe. A pulsing amber dot
+   communicates "working / checking" distinct from the steady ok/off states. */
+.set-dot.is-loading {
+  background: #e0c07a;
+  box-shadow: 0 0 8px rgba(224, 192, 122, 0.6);
+  animation: set-dot-pulse 1s ease-in-out infinite;
+}
+.set-status.is-loading .set-status-state {
+  color: #e0c07a;
+}
+@keyframes set-dot-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+/* URL commit button — sits inside .set-field-row after the input. Mirrors the
+   ctx Apply pill, sized to the row. */
+.set-url-apply {
+  align-self: stretch;
+  padding: 0 13px;
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink);
+  background: color-mix(in oklab, var(--accent) 16%, transparent);
+  border: 0;
+  border-left: 1px solid var(--line);
+  transition: background 0.2s ease;
+}
+.set-url-apply:hover {
+  background: color-mix(in oklab, var(--accent) 26%, transparent);
+}
+.set-url-apply:disabled {
+  cursor: default;
+  opacity: 0.5;
 }
 
 /* ── URL field — LM Studio server endpoint ───────────────────────────────── */
@@ -540,4 +625,46 @@
   font-size: 9px;
   letter-spacing: 0.02em;
   color: #d9a0a0;
+}
+
+/* ── VOIX section — the TTS toggle (moved here from the bottom-right glyph) ── */
+.set-voice {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: color-mix(in oklab, var(--bg2) 70%, transparent);
+  color: var(--dim);
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  transition: background 0.28s ease, color 0.28s ease, box-shadow 0.28s ease;
+}
+.set-voice:hover {
+  color: var(--ink);
+}
+.set-voice.on {
+  color: var(--ink);
+  background: color-mix(in oklab, var(--accent) 18%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--accent) 40%, transparent);
+}
+.set-voice-glyph {
+  display: inline-flex;
+  align-items: center;
+}
+.set-voice-name {
+  flex: 1;
+  text-align: left;
+}
+/* keyboard-shortcut chip, right-aligned */
+.set-voice-hint {
+  padding: 2px 6px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  color: var(--faint);
+  font-size: 10px;
 }

@@ -2,8 +2,8 @@
    BottomBar.css — Piste 3D · Nacre bottom zone (PRD 0014 / issue 0090).
 
    Co-located styling for `BottomBar.tsx`: the bottom-centre voice caption +
-   always-visible composer, and the bottom-right mute glyph, in the « Nacre »
-   visual language. Ported from `Design Mockup/p3d.css` (the frosted-pill
+   always-visible composer, in the « Nacre » visual language. (The voice/mute
+   toggle moved into the « RÉGLAGES » panel — see SettingsControl.) Ported from `Design Mockup/p3d.css` (the frosted-pill
    treatment of `.settings-btn` / `.set-input` / `.set-field-row`) and reusing
    the nacre tokens already declared on the `.piste` scope by the foundation
    sheet (`styles/p3d.css`): `--bg2`, `--ink`, `--dim`, `--faint`, `--accent`,
@@ -11,9 +11,9 @@
 
    SCOPING / COLLISION NOTE — this file is loaded AFTER both `hud.css` and the
    foundation `p3d.css` (Vite module-graph order: it's imported by BottomBar,
-   which mounts under SphereUI). The three leaves (`InputField`,
-   `TranscriptLine`, `MuteToggle`) keep their original `hud.css` class names
-   (`.hud-input*`, `.hud-transcript*`, `.hud-mute`) so their markup + tests are
+   which mounts under SphereUI). The two leaves (`InputField`,
+   `TranscriptLine`) keep their original `hud.css` class names
+   (`.hud-input*`, `.hud-transcript*`) so their markup + tests are
    untouched; we re-skin them here by RAISING SPECIFICITY: every override is
    anchored under `.piste .p3d-bottom …`, which outranks the bare `.hud-*`
    rules in `hud.css`. Nothing here leaks outside the piste subtree.
@@ -22,8 +22,8 @@
 /* ───────────────────────────── FOOTER CONTAINER ────────────────────────
    A full-width strip pinned to the bottom of the piste. It is a passthrough
    for pointer events (`none`) so the inert margins never steal clicks from
-   the 3D stage; only the interactive children (`.p3d-bottom-center`,
-   `.p3d-bottom-mute`) opt back in. z-index sits above the receded stage so
+   the 3D stage; only the interactive child (`.p3d-bottom-center`)
+   opts back in. z-index sits above the receded stage so
    the composer stays reachable while a surface overlay dims the scene. */
 .piste .p3d-bottom {
   position: fixed;
@@ -151,55 +151,12 @@
     color-mix(in oklab, var(--accent) 18%, transparent);
 }
 
-/* ───────────────────────────── MUTE (bottom-right) ─────────────────────
-   Self-positioned column pinned bottom-right, decoupled from the centred
-   composer so toggling never shifts it. The glyph button is re-skinned to a
-   minimal nacre circle echoing `.settings-btn`: faint glyph that lifts to ink
-   with a hairline accent ring on hover. */
-.piste .p3d-bottom-mute {
-  position: absolute;
-  right: 28px;
-  bottom: 26px;
-  pointer-events: auto;
-}
-.piste .p3d-bottom-mute .hud-mute {
-  position: static;
-  inset: auto;
-  appearance: none;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 40px;
-  height: 40px;
-  padding: 0;
-  border-radius: 50%;
-  border: 1px solid var(--line);
-  background: color-mix(in oklab, var(--bg2) 60%, transparent);
-  color: var(--faint);
-  cursor: pointer;
-  backdrop-filter: blur(10px);
-  -webkit-backdrop-filter: blur(10px);
-  transition: color 0.25s ease, border-color 0.25s ease, background 0.25s ease;
-}
-.piste .p3d-bottom-mute .hud-mute:hover {
-  color: var(--ink);
-  border-color: color-mix(in oklab, var(--accent) 40%, transparent);
-}
-/* voice ON: a soft accent tint so the live state reads at a glance, mirroring
-   the mockup's `aria-pressed`/"on" affordances. The leaf sets
-   `aria-pressed={voiceEnabled}`, so we hang the lit state off that attribute. */
-.piste .p3d-bottom-mute .hud-mute[aria-pressed="true"] {
-  color: var(--accent);
-  border-color: color-mix(in oklab, var(--accent) 45%, transparent);
-}
-
 /* ───────────────────────────── OVERLAY-OPEN ────────────────────────────
    When a surface is open the shell adds `.has-surface` and recedes the stage
    (foundation p3d.css). The transcript already unmounts (`hidden=overlayOpen`)
-   so the caption is gone; soften the composer + mute too so the surface owns
+   so the caption is gone; soften the composer too so the surface owns
    the focus, while keeping the input reachable. */
-.piste.has-surface .p3d-bottom-center .hud-input,
-.piste.has-surface .p3d-bottom-mute {
+.piste.has-surface .p3d-bottom-center .hud-input {
   opacity: 0.55;
   transition: opacity 0.5s ease;
 }

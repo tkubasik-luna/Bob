@@ -6,22 +6,22 @@
 //   - InputField   → minimal, always-visible composer pinned bottom-CENTRE.
 //   - TranscriptLine → the live voice caption, sitting just above the input
 //                      (bottom-CENTRE); hides while a surface overlay is open.
-//   - MuteToggle   → glyph button pinned bottom-RIGHT.
+// The voice/mute toggle no longer lives here — it moved into the « RÉGLAGES »
+// panel (SettingsControl, top-right).
 //
-// The three leaves keep their behaviour, props and `hud-*` class names intact —
+// The two leaves keep their behaviour, props and `hud-*` class names intact —
 // the nacre look comes entirely from the co-located `BottomBar.css`, which
 // scopes overrides under `.piste .p3d-bottom …` so they win over the legacy
 // `hud.css` rules without touching the leaves (and so their tests stay green).
 //
 // Layout contract: the centre column is width-clamped and horizontally centred
 // so it never reaches the side slots (task left, data right, both ~40px from
-// the edge and vertically centred). The mute is its own bottom-right column.
+// the edge and vertically centred).
 // The window's top drag strip (`.drag-region`, owned by SphereUI/p3d.css) is
 // untouched — this bar lives at the bottom and never covers it.
 
 import type { SphereDerivedState } from "../../sphere/useSphereState";
 import { InputField } from "../sphere/InputField";
-import { MuteToggle } from "../sphere/MuteToggle";
 import { TranscriptLine } from "../sphere/TranscriptLine";
 import "./BottomBar.css";
 
@@ -45,11 +45,8 @@ export function BottomBar({ transcriptState, overlayOpen }: BottomBarProps) {
         <TranscriptLine state={transcriptState} hidden={overlayOpen} />
         <InputField />
       </div>
-      {/* Bottom-right glyph: mute toggle. Self-contained column so it never
-       * shifts the centred composer. */}
-      <div className="p3d-bottom-mute">
-        <MuteToggle />
-      </div>
+      {/* The voice/mute control now lives in the « RÉGLAGES » panel
+       * (SettingsControl, top-right) — no bottom-right glyph here. */}
     </div>
   );
 }

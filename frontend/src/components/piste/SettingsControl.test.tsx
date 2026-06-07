@@ -15,6 +15,8 @@ const apiMock = vi.hoisted(() => ({
   fetchLlmSelection: vi.fn(),
   putLlmModel: vi.fn(),
   putLlmProvider: vi.fn(),
+  putLlmBaseUrl: vi.fn(),
+  pingLm: vi.fn(),
 }));
 
 vi.mock("../../lib/llmApi", async () => {
@@ -25,6 +27,8 @@ vi.mock("../../lib/llmApi", async () => {
     fetchLlmSelection: apiMock.fetchLlmSelection,
     putLlmModel: apiMock.putLlmModel,
     putLlmProvider: apiMock.putLlmProvider,
+    putLlmBaseUrl: apiMock.putLlmBaseUrl,
+    pingLm: apiMock.pingLm,
   };
 });
 
@@ -59,13 +63,27 @@ describe("SettingsControl — « RÉGLAGES » modal", () => {
     apiMock.fetchLlmSelection.mockReset();
     apiMock.putLlmModel.mockReset();
     apiMock.putLlmProvider.mockReset();
+    apiMock.putLlmBaseUrl.mockReset();
+    apiMock.pingLm.mockReset();
     apiMock.fetchLlmModels.mockResolvedValue(MODELS);
     apiMock.fetchLlmSelection.mockResolvedValue({
       provider: "lm_studio",
       lm_model: "qwen2.5-7b-instruct",
       context_length: { "qwen2.5-7b-instruct": 32768 },
       claude_model: "claude-opus-4",
+      base_url: "http://localhost:1234/v1",
     });
+    // Default: server reachable. The commit echoes the new base_url back.
+    apiMock.pingLm.mockResolvedValue({ reachable: true, host: "localhost:1234" });
+    apiMock.putLlmBaseUrl.mockImplementation((url: string) =>
+      Promise.resolve({
+        provider: "lm_studio",
+        lm_model: "qwen2.5-7b-instruct",
+        context_length: { "qwen2.5-7b-instruct": 32768 },
+        claude_model: "claude-opus-4",
+        base_url: url,
+      }),
+    );
   });
 
   afterEach(() => {
@@ -232,20 +250,45 @@ describe("SettingsControl — « RÉGLAGES » modal", () => {
 
   // --- server URL field + presets --------------------------------------------
 
-  test("a preset swaps the URL and flips reachability to connected", async () => {
+  test("a preset only PREFILLS the field — it does NOT commit", async () => {
     await openAndGetRows();
-    // localhost preset is a plausible host:port → "connecté".
-    fireEvent.click(screen.getByRole("button", { name: "localhost" }));
+    fireEvent.click(screen.getByRole("button", { name: "studio.local" }));
     const input = screen.getByLabelText(/url du serveur lm studio/i) as HTMLInputElement;
-    expect(input.value).toBe("localhost:1234");
-    expect(screen.getByText(/serveur joignable/i)).toBeInTheDocument();
+    expect(input.value).toBe("studio.local:1234/v1");
+    // No PUT fired — the chip is just a quick-fill affordance.
+    expect(apiMock.putLlmBaseUrl).not.toHaveBeenCalled();
   });
 
-  test("an implausible URL shows the offline state", async () => {
+  test("« OK » commits the field URL via PUT { base_url }", async () => {
+    await openAndGetRows();
+    fireEvent.click(screen.getByRole("button", { name: "192.168.1.20" }));
+    fireEvent.click(screen.getByTestId("set-url-apply"));
+    await waitFor(() =>
+      expect(apiMock.putLlmBaseUrl).toHaveBeenCalledWith("http://192.168.1.20:1234/v1"),
+    );
+    await waitFor(() => expect(screen.getByText(/serveur joignable/i)).toBeInTheDocument());
+  });
+
+  test("the initial URL reflects the server actually loaded (GET selection)", async () => {
+    apiMock.fetchLlmSelection.mockResolvedValue({
+      provider: "lm_studio",
+      lm_model: "qwen2.5-7b-instruct",
+      context_length: { "qwen2.5-7b-instruct": 32768 },
+      claude_model: "claude-opus-4",
+      base_url: "http://192.168.4.94:1234/v1",
+    });
+    await openAndGetRows();
+    const input = screen.getByLabelText(/url du serveur lm studio/i) as HTMLInputElement;
+    await waitFor(() => expect(input.value).toBe("192.168.4.94:1234/v1"));
+  });
+
+  test("an unreachable server shows the offline state from a real ping", async () => {
+    apiMock.pingLm.mockResolvedValue({ reachable: false, host: "" });
     await openAndGetRows();
     const input = screen.getByLabelText(/url du serveur lm studio/i);
-    fireEvent.change(input, { target: { value: "x" } });
-    expect(screen.getByText(/serveur introuvable/i)).toBeInTheDocument();
+    fireEvent.change(input, { target: { value: "192.168.9.9:9999" } });
+    // The debounced ping resolves offline → "serveur introuvable".
+    await waitFor(() => expect(screen.getByText(/serveur introuvable/i)).toBeInTheDocument());
   });
 
   // --- ctx-length slider + Apply (feature 0013) ------------------------------
@@ -308,5 +351,42 @@ describe("SettingsControl — « RÉGLAGES » modal", () => {
 
     await waitFor(() => expect(screen.getByTestId("set-ctx")).toHaveTextContent(/out of memory/i));
     expect(screen.getByTestId("set-ctx-apply")).not.toBeDisabled();
+  });
+
+  // VOIX section — the TTS toggle moved here from the old bottom-right glyph.
+  // The store is session-global zustand, so assertions are relative to the
+  // toggle's own prior state rather than an absolute default.
+  test("clicking the VOIX toggle flips voice state + glyph", async () => {
+    render(<SettingsControl />);
+    await waitFor(() => expect(apiMock.fetchLlmSelection).toHaveBeenCalled());
+    openModal();
+
+    const toggle = screen.getByTestId("set-voice-toggle");
+    const before = toggle.getAttribute("aria-pressed");
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute("aria-pressed")).not.toBe(before);
+    // glyph tracks the state: on → speaker, off → barred speaker
+    const onNow = toggle.getAttribute("aria-pressed") === "true";
+    expect(
+      screen.queryByTestId(onNow ? "speaker-on-icon" : "speaker-off-icon"),
+    ).not.toBeNull();
+  });
+
+  test("global `M` toggles voice, but not while typing in an input", async () => {
+    render(<SettingsControl />);
+    await waitFor(() => expect(apiMock.fetchLlmSelection).toHaveBeenCalled());
+    openModal();
+
+    const toggle = screen.getByTestId("set-voice-toggle");
+    const before = toggle.getAttribute("aria-pressed");
+    fireEvent.keyDown(window, { key: "m" });
+    const afterM = toggle.getAttribute("aria-pressed");
+    expect(afterM).not.toBe(before);
+
+    // typing "m" in the URL field must NOT toggle (input focused)
+    const input = screen.getByLabelText(/URL du serveur LM Studio/i);
+    input.focus();
+    fireEvent.keyDown(input, { key: "m" });
+    expect(toggle.getAttribute("aria-pressed")).toBe(afterM);
   });
 });

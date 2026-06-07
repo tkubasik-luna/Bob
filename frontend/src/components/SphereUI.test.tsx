@@ -218,17 +218,17 @@ describe("SphereUI — piste shell structure", () => {
     expect(container.querySelector(".slot-core .core-label")).toBeNull();
   });
 
-  test("renders the nacre bottom bar (transcript + field bottom-centre, mute bottom-right)", () => {
+  test("renders the nacre bottom bar (transcript + field bottom-centre, no mute glyph)", () => {
     const { container } = render(<SphereUI />);
     // Issue 0090 — the provisional `.hud-zone.b` placement is replaced by the
     // nacre `BottomBar`: the live voice caption + always-visible composer sit
-    // in the bottom-centre column; the mute glyph sits in its own bottom-right
-    // column. The leaves keep their `.hud-*` class names (styling only).
+    // in the bottom-centre column. The voice/mute control moved into the
+    // « RÉGLAGES » panel (SettingsControl), so the bottom-right glyph is gone.
     expect(
       container.querySelector(".p3d-bottom .p3d-bottom-center .hud-transcript"),
     ).not.toBeNull();
     expect(container.querySelector(".p3d-bottom .p3d-bottom-center .hud-input")).not.toBeNull();
-    expect(container.querySelector(".p3d-bottom .p3d-bottom-mute .hud-mute")).not.toBeNull();
+    expect(container.querySelector(".p3d-bottom .p3d-bottom-mute")).toBeNull();
   });
 
   test("does NOT auto-open the overlay (click-only per PRD 0014)", () => {
