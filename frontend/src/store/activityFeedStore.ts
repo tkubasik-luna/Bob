@@ -267,6 +267,18 @@ const pendingReasoning = new Map<string, string>();
 /** Handle for the scheduled flush, so we coalesce many deltas into one tick. */
 let flushHandle: number | null = null;
 
+/**
+ * PRD 0014 — agent_refs whose NEXT flushed reasoning delta must start a FRESH
+ * timeline item instead of coalescing into the trailing one. Armed by
+ * `markJarvisTurnStart` so a new turn's reasoning never string-concats into the
+ * PREVIOUS turn's last reasoning item — otherwise the per-turn slice boundary
+ * (an index = timeline length at turn start) would point at item `k` while the
+ * new text grew inside item `k-1`, folding the whole next turn back into the
+ * previous turn's block. Consumed (deleted) the first time a delta for that
+ * agent is flushed.
+ */
+const forceNewReasoningSegment = new Set<string>();
+
 /** rAF if available (browser), else a ~16ms timer (jsdom / Node test env). */
 const scheduleFlush =
   typeof requestAnimationFrame === "function"
@@ -295,6 +307,10 @@ export const useActivityFeedStore = create<ActivityFeedState>((set) => ({
     // last reasoning item, not before it (a delta arriving across the turn gap
     // would otherwise be attributed to the new turn).
     useActivityFeedStore.getState().flushReasoning();
+    // Arm the next jarvis reasoning delta to OPEN a new timeline item at the
+    // boundary index below, so the slice [start, …) holds exactly this turn's
+    // reasoning instead of coalescing into the previous turn's trailing item.
+    forceNewReasoningSegment.add(JARVIS_LANE);
     set((state) => ({ jarvisTurnPending: state.timelineByAgent[JARVIS_LANE]?.length ?? 0 }));
   },
   commitJarvisTurn: (msgId) =>
@@ -351,7 +367,14 @@ export const useActivityFeedStore = create<ActivityFeedState>((set) => ({
       for (const [agentRef, suffix] of drained) {
         if (suffix.length === 0) continue;
         const existing = timelineByAgent[agentRef] ?? [];
-        timelineByAgent[agentRef] = appendReasoningToTimeline(existing, suffix);
+        // A turn just opened on this lane → start a fresh reasoning item so the
+        // per-turn slice boundary lands on a real item boundary (see
+        // `forceNewReasoningSegment`). Otherwise coalesce as usual.
+        if (forceNewReasoningSegment.delete(agentRef)) {
+          timelineByAgent[agentRef] = [...existing, { kind: "reasoning", text: suffix }];
+        } else {
+          timelineByAgent[agentRef] = appendReasoningToTimeline(existing, suffix);
+        }
         if (!agentOrder.includes(agentRef)) agentOrder.push(agentRef);
       }
       return { timelineByAgent, agentOrder };
@@ -410,6 +433,7 @@ export const useActivityFeedStore = create<ActivityFeedState>((set) => ({
   clearAgent: (agentRef) =>
     set((state) => {
       pendingReasoning.delete(agentRef);
+      forceNewReasoningSegment.delete(agentRef);
       // Dropping the Jarvis lane also drops its per-turn segmentation.
       const jarvisClear =
         agentRef === JARVIS_LANE ? { jarvisSegments: [], jarvisTurnPending: null } : {};
@@ -441,6 +465,7 @@ export const useActivityFeedStore = create<ActivityFeedState>((set) => ({
     }),
   reset: () => {
     pendingReasoning.clear();
+    forceNewReasoningSegment.clear();
     if (flushHandle !== null) {
       cancelFlush(flushHandle);
       flushHandle = null;

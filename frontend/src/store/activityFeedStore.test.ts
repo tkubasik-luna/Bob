@@ -363,6 +363,45 @@ describe("jarvis turn segmentation (PRD 0014)", () => {
     ]);
   });
 
+  it("opens a NEW reasoning item at a turn boundary (no cross-turn coalescing)", () => {
+    const store = useActivityFeedStore.getState();
+    // Turn 1: reasoning streams, turn settles.
+    store.markJarvisTurnStart();
+    store.appendReasoningDelta(delta("jarvis", "turn one"));
+    store.flushReasoning();
+    store.commitJarvisTurn("A1");
+    // Turn 2: reasoning streams again. It must NOT concat into turn 1's item —
+    // otherwise the per-turn slice boundary can't separate the turns and the
+    // first turn's block keeps growing.
+    store.markJarvisTurnStart();
+    store.appendReasoningDelta(delta("jarvis", "turn two"));
+    store.flushReasoning();
+    store.commitJarvisTurn("A2");
+
+    const s = useActivityFeedStore.getState();
+    expect(s.timelineByAgent.jarvis).toEqual([
+      { kind: "reasoning", text: "turn one" },
+      { kind: "reasoning", text: "turn two" },
+    ]);
+    // The second segment starts at index 1 — exactly where turn 2's item begins,
+    // so slicing [0,1) → turn one and [1,n) → turn two.
+    expect(s.jarvisSegments).toEqual([
+      { msgId: "A1", start: 0 },
+      { msgId: "A2", start: 1 },
+    ]);
+  });
+
+  it("still coalesces deltas WITHIN a single turn", () => {
+    const store = useActivityFeedStore.getState();
+    store.markJarvisTurnStart();
+    store.appendReasoningDelta(delta("jarvis", "Hello "));
+    store.appendReasoningDelta(delta("jarvis", "world"));
+    store.flushReasoning();
+    expect(useActivityFeedStore.getState().timelineByAgent.jarvis).toEqual([
+      { kind: "reasoning", text: "Hello world" },
+    ]);
+  });
+
   it("reset() clears segments + pending", () => {
     const store = useActivityFeedStore.getState();
     store.markJarvisTurnStart();
