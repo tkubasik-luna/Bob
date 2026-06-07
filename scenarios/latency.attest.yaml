@@ -1,0 +1,55 @@
+# Latency attest scenario (PRD 0016 / issue 0110, Annexe A.2 + C + F).
+#
+# Proves the LATENCY instrumentation end-to-end against an ephemeral backend with
+# the deterministic fake LLM + fake STT + fake TTS (no native models):
+#
+#   1. inject_audio (voiced) — a loud burst + trailing silence drives the energy
+#      VAD -> vad_speech_start, the silence-floor Endpointer -> endpoint, which
+#      freezes the transcript and runs the say-path -> outbound TTS. As the turn
+#      runs, the loop stamps the Annexe F marks on its monotone server clock
+#      (t_first_mic_frame, t_first_partial, t_endpoint, t_first_audio_chunk,
+#      t_tts_end) and emits ONE turn_latency event {turn_id, marks, derived} at
+#      turn end.
+#
+# The wait_event turn_latency step blocks until that summary lands; the
+# latency_lt_ms assertion then reads turn_latency.marks and checks the Annexe F
+# committed target endpoint -> first audio < 800 ms (the deterministic fake path
+# is well under it). no_error_events guards the turn ran clean.
+#
+# A barge-in's cut latency (bargein_within_ms < 300) is covered by the dedicated
+# bargein.attest.yaml scenario (issue 0101) which reads the same Annexe F marks
+# off the bargein event — not duplicated here.
+#
+# Run:  uv run bob attest scenarios/latency.attest.yaml   (exit 0, ok: true)
+name: latency-endpoint-to-first-audio-under-800ms
+description: >-
+  A committed voice turn stamps the Annexe F marks; endpoint -> first audio
+  lands under the 800 ms committed target.
+backend: ephemeral
+llm: fake
+fake_llm:
+  - role: jarvis
+    on_input_contains: "temps"
+    reply: "Il fait beau aujourd'hui."
+timeline:
+  # Voiced audio turn -> full FSM cycle + audio out + the latency marks.
+  - do: inject_audio
+    transcript: "quel temps fait il"
+    voiced: true
+  # Bob got the floor (so t_first_audio_chunk was stamped) and the turn ended.
+  - do: wait_state
+    state: bob_speaking
+    timeout_ms: 8000
+  - do: wait_event
+    type: turn_latency
+    timeout_ms: 8000
+assertions:
+  # The turn produced a reply.
+  - kind: deliverable_nonempty
+  # Annexe F committed target: endpoint -> first audio < 800 ms. Reads
+  # turn_latency.marks (monotone server clock).
+  - kind: latency_lt_ms
+    from_mark: t_endpoint
+    to_mark: t_first_audio_chunk
+    max: 800
+  - kind: no_error_events

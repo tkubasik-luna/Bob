@@ -135,14 +135,16 @@ def test_project_deliverable_empty_when_no_say() -> None:
 
 
 def test_unknown_kind_is_loud_fail_not_silent_pass() -> None:
-    # ``latency_lt_ms`` is a documented Annexe C kind that has NOT been
-    # implemented yet — referencing it must FAIL loudly, naming the kind, never
-    # silently pass. (``bargein_within_ms`` / ``committed_equals_spoken`` landed
-    # in issue 0101 and are exercised in test_attest_bargein.)
-    result = run_assertion({"kind": "latency_lt_ms", "max": 300}, _ctx([]))
+    # ``draft_hit`` is a documented Annexe F derived whose assertion kind has NOT
+    # been implemented yet (its slice is the speculative Draft, 0104) —
+    # referencing it must FAIL loudly, naming the kind, never silently pass.
+    # (``latency_lt_ms`` / ``transcript_roundtrip_similarity_gte`` landed in
+    # issue 0110 and are exercised below; ``bargein_within_ms`` /
+    # ``committed_equals_spoken`` landed in 0101, see test_attest_bargein.)
+    result = run_assertion({"kind": "draft_hit", "expected": True}, _ctx([]))
     assert result.ok is False
     assert "not implemented yet" in result.detail["error"]
-    assert "latency_lt_ms" in result.detail["error"]
+    assert "draft_hit" in result.detail["error"]
 
 
 def test_missing_kind_fails() -> None:
@@ -169,3 +171,205 @@ def test_register_assertion_extends_the_engine() -> None:
         from bob.attest import assertions as _assertions
 
         _assertions._REGISTRY.pop("always_true_probe", None)
+
+
+# --- latency_lt_ms (issue 0110, Annexe C + F) --------------------------------
+
+
+def _turn_latency_event(
+    marks: dict[str, float], derived: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """A captured ``turn_latency`` voice frame (nested under payload.ws_event)."""
+
+    return {
+        "category": "voice",
+        "severity": "debug",
+        "source": "bob.voice_loop.turn_latency",
+        "summary": "turn_latency",
+        "payload": {
+            "ws_event": {
+                "type": "turn_latency",
+                "turn_id": "t1",
+                "marks": marks,
+                "derived": derived or {},
+            }
+        },
+    }
+
+
+def test_latency_lt_ms_passes_under_target() -> None:
+    # endpoint -> first audio = 500 ms, under the 800 ms committed target.
+    ev = _turn_latency_event({"t_endpoint": 10.0, "t_first_audio_chunk": 10.5})
+    result = run_assertion(
+        {
+            "kind": "latency_lt_ms",
+            "from_mark": "t_endpoint",
+            "to_mark": "t_first_audio_chunk",
+            "max": 800,
+        },
+        _ctx([ev]),
+    )
+    assert result.ok is True
+    assert result.detail["actual"] == 500.0
+
+
+def test_latency_lt_ms_fails_over_target() -> None:
+    ev = _turn_latency_event({"t_endpoint": 10.0, "t_first_audio_chunk": 11.0})
+    result = run_assertion(
+        {
+            "kind": "latency_lt_ms",
+            "from_mark": "t_endpoint",
+            "to_mark": "t_first_audio_chunk",
+            "max": 800,
+        },
+        _ctx([ev]),
+    )
+    assert result.ok is False
+    assert result.detail["actual"] == 1000.0
+
+
+def test_latency_lt_ms_takes_best_across_turns() -> None:
+    # Two turns; one slow (1000 ms), one fast (300 ms). The best meets max:800.
+    slow = _turn_latency_event({"t_endpoint": 10.0, "t_first_audio_chunk": 11.0})
+    fast = _turn_latency_event({"t_endpoint": 20.0, "t_first_audio_chunk": 20.3})
+    result = run_assertion(
+        {
+            "kind": "latency_lt_ms",
+            "from_mark": "t_endpoint",
+            "to_mark": "t_first_audio_chunk",
+            "max": 800,
+        },
+        _ctx([slow, fast]),
+    )
+    assert result.ok is True
+    assert result.detail["actual"] == 300.0
+
+
+def test_latency_lt_ms_fails_loudly_when_no_turn_latency_event() -> None:
+    result = run_assertion(
+        {
+            "kind": "latency_lt_ms",
+            "from_mark": "t_endpoint",
+            "to_mark": "t_first_audio_chunk",
+            "max": 800,
+        },
+        _ctx([_say_event("hi")]),
+    )
+    assert result.ok is False
+    assert "no turn_latency event captured" in result.detail["error"]
+
+
+def test_latency_lt_ms_fails_loudly_when_marks_absent() -> None:
+    # The turn finished but never produced t_first_audio_chunk (no audio): the
+    # measured span never occurred → loud fail, not a silent pass.
+    ev = _turn_latency_event({"t_first_mic_frame": 9.0, "t_endpoint": 10.0})
+    result = run_assertion(
+        {
+            "kind": "latency_lt_ms",
+            "from_mark": "t_endpoint",
+            "to_mark": "t_first_audio_chunk",
+            "max": 800,
+        },
+        _ctx([ev]),
+    )
+    assert result.ok is False
+    assert "no turn carried both marks" in result.detail["error"]
+    assert result.detail["marks_seen"]
+
+
+def test_latency_lt_ms_requires_marks_and_max() -> None:
+    ev = _turn_latency_event({"t_endpoint": 10.0, "t_first_audio_chunk": 10.5})
+    missing_from = run_assertion(
+        {"kind": "latency_lt_ms", "to_mark": "t_first_audio_chunk", "max": 800}, _ctx([ev])
+    )
+    assert missing_from.ok is False
+    assert "from_mark" in missing_from.detail["error"]
+    missing_max = run_assertion(
+        {"kind": "latency_lt_ms", "from_mark": "t_endpoint", "to_mark": "t_first_audio_chunk"},
+        _ctx([ev]),
+    )
+    assert missing_max.ok is False
+    assert "max" in missing_max.detail["error"]
+
+
+# --- bargein_within_ms on the bargein event (issue 0101, re-verified) --------
+
+
+def _bargein_event(detected_ts: float, cut_ts: float, committed: str = "Bonjour") -> dict[str, Any]:
+    return {
+        "category": "voice",
+        "severity": "info",
+        "source": "bob.voice_loop.bargein",
+        "summary": "bargein",
+        "payload": {
+            "ws_event": {
+                "type": "bargein",
+                "turn_id": "t1",
+                "detected_ts": detected_ts,
+                "cut_ts": cut_ts,
+                "committed_spoken_text": committed,
+            }
+        },
+    }
+
+
+def test_bargein_within_ms_passes_under_target() -> None:
+    # cut - detected = 250 ms, equals the Annexe F bargein_cut_ms derived.
+    ev = _bargein_event(detected_ts=5.0, cut_ts=5.25)
+    result = run_assertion({"kind": "bargein_within_ms", "max": 300}, _ctx([ev]))
+    assert result.ok is True
+    assert result.detail["actual"] == 250.0
+
+
+def test_bargein_within_ms_fails_when_no_bargein_event() -> None:
+    result = run_assertion({"kind": "bargein_within_ms", "max": 300}, _ctx([_say_event("hi")]))
+    assert result.ok is False
+    assert "no bargein event captured" in result.detail["error"]
+
+
+# --- transcript_roundtrip_similarity_gte (issue 0110, --deep) ----------------
+
+
+def _roundtrip_event(said: str, heard: str, similarity: float | None = None) -> dict[str, Any]:
+    ws_event: dict[str, Any] = {"type": "roundtrip_transcript", "said": said, "heard": heard}
+    if similarity is not None:
+        ws_event["similarity"] = similarity
+    return {
+        "category": "voice",
+        "severity": "debug",
+        "source": "bob.attest.roundtrip",
+        "summary": "roundtrip_transcript",
+        "payload": {"ws_event": ws_event},
+    }
+
+
+def test_roundtrip_similarity_passes_on_exact_match() -> None:
+    ev = _roundtrip_event(said="Bonjour je suis Bob", heard="Bonjour je suis Bob")
+    result = run_assertion({"kind": "transcript_roundtrip_similarity_gte", "min": 0.95}, _ctx([ev]))
+    assert result.ok is True
+    assert result.detail["similarity"] == 1.0
+
+
+def test_roundtrip_similarity_prefers_precomputed_value() -> None:
+    # A carried similarity is trusted (the harness computed it); here a perfect
+    # carried value passes even though the strings differ.
+    ev = _roundtrip_event(said="Bonjour", heard="totally different", similarity=1.0)
+    result = run_assertion({"kind": "transcript_roundtrip_similarity_gte", "min": 0.9}, _ctx([ev]))
+    assert result.ok is True
+
+
+def test_roundtrip_similarity_fails_below_min() -> None:
+    ev = _roundtrip_event(said="Bonjour je suis Bob", heard="xyz")
+    result = run_assertion({"kind": "transcript_roundtrip_similarity_gte", "min": 0.6}, _ctx([ev]))
+    assert result.ok is False
+    assert result.detail["similarity"] < 0.6
+
+
+def test_roundtrip_similarity_fails_loudly_without_deep_event() -> None:
+    # No roundtrip_transcript captured (i.e. --deep not enabled) → loud fail,
+    # never a silent green on a deep assertion.
+    result = run_assertion(
+        {"kind": "transcript_roundtrip_similarity_gte", "min": 0.6}, _ctx([_say_event("hi")])
+    )
+    assert result.ok is False
+    assert "no roundtrip_transcript event captured" in result.detail["error"]

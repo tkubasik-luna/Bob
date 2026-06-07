@@ -81,6 +81,7 @@ from bob.bargein import BargeInConfirmation, BargeInController
 from bob.config import Settings
 from bob.endpointer import Endpointer
 from bob.event_bus_v2 import emit_event
+from bob.latency import DerivedValue, TurnLatency
 from bob.stt_engine import SttFrameError, decode_pcm_frame
 from bob.turn_fsm import Transition, TurnEvent, TurnFsm, TurnState
 from bob.vad import EnergyVad, VadEvent, rms_normalised
@@ -140,7 +141,9 @@ class PersistedTurn:
     - ``final_transcript`` — the frozen ``stt_final`` text (may be empty).
     - ``spoken_text`` — what Bob ACTUALLY played (the committed prefix on a
       barge-in cut; the full reply otherwise; empty when Bob never spoke).
-    - ``marks`` / ``derived`` — the Annexe F latency body for ``latency_json``.
+    - ``marks`` / ``derived`` — the Annexe F latency body for ``latency_json``
+      (centralized in :class:`bob.latency.TurnLatency`; ``derived`` carries the
+      ms deltas plus the feature-gated ``backchannel_ms`` / ``draft_hit``).
     - ``mic_pcm`` — concatenated s16le mic frames captured this turn.
     - ``mic_sample_rate`` — the mic contract rate (``STT_SAMPLE_RATE``).
     - ``tts_pcm`` — concatenated s16le TTS blocks Bob played (empty if none).
@@ -152,57 +155,11 @@ class PersistedTurn:
     final_transcript: str
     spoken_text: str
     marks: dict[str, float]
-    derived: dict[str, float]
+    derived: dict[str, DerivedValue]
     mic_pcm: bytes
     mic_sample_rate: int
     tts_pcm: bytes
     tts_sample_rate: int
-
-
-@dataclass
-class _Marks:
-    """Annexe F latency marks for one turn (monotonic seconds; ``None`` = unset)."""
-
-    t_first_mic_frame: float | None = None
-    t_endpoint: float | None = None
-    t_first_audio_chunk: float | None = None
-    # Barge-in marks (issue 0101): ``t_bargein_detected`` is when the user's
-    # continuous speech that confirmed the cut began; ``t_cut`` is when the loop
-    # actually cancelled Bob's reply. Only set on a barged-in turn.
-    t_bargein_detected: float | None = None
-    t_cut: float | None = None
-
-    def as_payload(self) -> dict[str, float]:
-        """The non-null marks as a plain dict (the ``turn_latency.marks`` body)."""
-
-        out: dict[str, float] = {}
-        if self.t_first_mic_frame is not None:
-            out["t_first_mic_frame"] = self.t_first_mic_frame
-        if self.t_endpoint is not None:
-            out["t_endpoint"] = self.t_endpoint
-        if self.t_first_audio_chunk is not None:
-            out["t_first_audio_chunk"] = self.t_first_audio_chunk
-        if self.t_bargein_detected is not None:
-            out["t_bargein_detected"] = self.t_bargein_detected
-        if self.t_cut is not None:
-            out["t_cut"] = self.t_cut
-        return out
-
-    def derived(self) -> dict[str, float]:
-        """Derived metrics (Annexe F).
-
-        ``endpoint_to_first_audio_ms`` when both marks exist; ``bargein_cut_ms =
-        t_cut - t_bargein_detected`` (target <300 ms) on a barged-in turn.
-        """
-
-        out: dict[str, float] = {}
-        if self.t_endpoint is not None and self.t_first_audio_chunk is not None:
-            out["endpoint_to_first_audio_ms"] = round(
-                (self.t_first_audio_chunk - self.t_endpoint) * 1000.0, 3
-            )
-        if self.t_bargein_detected is not None and self.t_cut is not None:
-            out["bargein_cut_ms"] = round((self.t_cut - self.t_bargein_detected) * 1000.0, 3)
-        return out
 
 
 @dataclass
@@ -250,7 +207,12 @@ class FullDuplexLoop:
     _endpointer: Endpointer = field(init=False)
     _bargein: BargeInController = field(init=False)
     _turn: VoiceTurn | None = None
-    _marks: _Marks = field(default_factory=_Marks)
+    #: Annexe F latency accumulator for the turn in flight (issue 0110). Slices
+    #: stamp their marks into it; the loop emits the full ``turn_latency`` body
+    #: once at finalize (completed + barge-in paths) and hands the same
+    #: marks/derived to ``persist_turn``. Centralizes what the 0100 ``_Marks``
+    #: did inline + adds ``t_first_partial`` / ``t_tts_end``.
+    _latency: TurnLatency = field(default_factory=TurnLatency)
     _say_task: asyncio.Task[None] | None = None
     #: Cumulative cleaned text Bob has actually played in the active say-path
     #: (updated by the say-path's ``on_spoken_progress``); the basis for
@@ -330,8 +292,8 @@ class FullDuplexLoop:
             _logger.debug("voice_loop.bad_frame", session_id=self.session_id, nbytes=len(data))
             return
 
-        if self._marks.t_first_mic_frame is None:
-            self._marks.t_first_mic_frame = self._now()
+        if self._latency.t_first_mic_frame is None:
+            self._latency.t_first_mic_frame = self._now()
 
         # Capture the raw mic PCM for this turn's ``mic_in`` recording (PRD 0016
         # / issue 0109). Only when persistence is wired (the bare-loop tests skip
@@ -379,6 +341,11 @@ class FullDuplexLoop:
         #    action is ``feed_thinker`` (Annexe B): hand the latest partial text
         #    to the background ThinkerLoop (debounced inside the loop, Annexe H).
         if advanced and self._fsm.state is TurnState.USER_SPEAKING:
+            # Annexe F ``t_first_partial`` — the first moment this turn had ANY
+            # hypothesis (the latency from speech-start to "the machine heard
+            # something"). Stamp once per turn; reset at the next turn open.
+            if self._latency.t_first_partial is None:
+                self._latency.t_first_partial = self._now()
             await self._dispatch(TurnEvent.STT_PARTIAL, turn_id=self._fsm.turn_id)
             if self.on_thinker_feed is not None and turn is not None:
                 with contextlib.suppress(Exception):
@@ -479,8 +446,9 @@ class FullDuplexLoop:
             transition = self._fsm.on_event(TurnEvent.VAD_SPEECH_START, turn_id=turn.turn_id)
             if transition is None:
                 return
-            # Fresh latency marks for this turn (keep the first-mic-frame stamp).
-            self._marks = _Marks(t_first_mic_frame=self._marks.t_first_mic_frame)
+            # Fresh latency accumulator for this turn (keep the first-mic-frame
+            # stamp — it measures from when Bob started listening).
+            self._latency = TurnLatency(t_first_mic_frame=self._latency.t_first_mic_frame)
             # Fresh per-turn capture buffers (PRD 0016 / issue 0109). Reset HERE
             # at the open so the persisted ``mic_in`` is this utterance only; the
             # frame that just tripped speech-start is already in ``_mic_pcm`` from
@@ -510,7 +478,7 @@ class FullDuplexLoop:
     async def _on_endpoint(self) -> None:
         """Handle the silence-floor ``endpoint``: freeze + drive the say-path."""
 
-        self._marks.t_endpoint = self._now()
+        self._latency.t_endpoint = self._now()
         transition = self._fsm.on_event(TurnEvent.ENDPOINT, turn_id=self._fsm.turn_id)
         if transition is None:
             return
@@ -565,7 +533,7 @@ class FullDuplexLoop:
             if first_audio_seen:
                 return
             first_audio_seen = True
-            self._marks.t_first_audio_chunk = self._now()
+            self._latency.t_first_audio_chunk = self._now()
             moved = self._fsm.on_event(TurnEvent.SPEAK_START, turn_id=turn_id)
             if moved is not None:
                 await self._emit_turn_state(moved)
@@ -619,6 +587,14 @@ class FullDuplexLoop:
         """
 
         owns_turn = self._fsm.turn_id == turn_id
+        # Annexe F ``t_tts_end`` — the say-path returned (synthesis done) and this
+        # task still owns the turn, so Bob just finished speaking. Stamp it only
+        # when Bob actually got the floor (``t_first_audio_chunk`` set) so a
+        # no-audio degraded turn carries no spurious tts-end mark; a barge-in cut
+        # re-points the FSM off this turn, so we don't stamp a tts-end there (that
+        # turn ended at ``t_cut``, not a clean synthesis end).
+        if owns_turn and self._latency.t_first_audio_chunk is not None:
+            self._latency.t_tts_end = self._now()
         completed_normally = owns_turn and self._fsm.state in (
             TurnState.BOB_SPEAKING,
             TurnState.THINKING,
@@ -668,8 +644,8 @@ class FullDuplexLoop:
         """
 
         committed_spoken_text = self._spoken_text
-        self._marks.t_bargein_detected = confirmation.detected_ts
-        self._marks.t_cut = self._now()
+        self._latency.t_bargein_detected = confirmation.detected_ts
+        self._latency.t_cut = self._now()
 
         transition = self._fsm.on_event(TurnEvent.BARGEIN_CONFIRMED, turn_id=self._fsm.turn_id)
         if transition is None:
@@ -755,8 +731,8 @@ class FullDuplexLoop:
             end_reason=end_reason,
             final_transcript=self._final_transcript,
             spoken_text=spoken_text if spoken_text is not None else self._spoken_text,
-            marks=self._marks.as_payload(),
-            derived=self._marks.derived(),
+            marks=self._latency.marks_payload(),
+            derived=self._latency.derived(),
             mic_pcm=bytes(self._mic_pcm),
             mic_sample_rate=self.settings.STT_SAMPLE_RATE or 16_000,
             tts_pcm=bytes(self._tts_pcm),
@@ -817,14 +793,24 @@ class FullDuplexLoop:
         )
 
     async def _emit_turn_latency(self, turn_id: str) -> None:
-        """Emit the Annexe F ``turn_latency`` summary for a finished turn."""
+        """Emit the Annexe F ``turn_latency`` summary for a finished turn.
+
+        The body (``{turn_id, marks, derived}``) comes from
+        :meth:`bob.latency.TurnLatency.as_event_body`, the SAME projection the
+        persistence hook serialises into ``voice_turns.latency_json`` — so the
+        wire event the attest harness reads and the stored blob can never drift.
+        ``ts`` is the emit instant (the rest of the marks are the turn's own
+        monotone stamps). ``marks`` carries every mark a slice stamped this turn
+        (``t_first_mic_frame`` / ``t_first_partial`` / ``t_endpoint`` /
+        ``t_first_audio_chunk`` / ``t_tts_end`` from the loop, the barge-in pair
+        on a cut; ``t_draft_ready`` / ``t_commit_decision`` remain absent until
+        the Draft slice 0104 stamps them).
+        """
 
         await emit_event(
             {
                 "type": "turn_latency",
-                "turn_id": turn_id,
-                "marks": self._marks.as_payload(),
-                "derived": self._marks.derived(),
+                **self._latency.as_event_body(turn_id),
                 "ts": self._now(),
             },
             category="voice",
@@ -847,7 +833,7 @@ class FullDuplexLoop:
         whole).
         """
 
-        cut_ts = self._marks.t_cut if self._marks.t_cut is not None else self._now()
+        cut_ts = self._latency.t_cut if self._latency.t_cut is not None else self._now()
         payload = {
             "type": "bargein",
             "turn_id": turn_id,

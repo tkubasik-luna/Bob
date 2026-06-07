@@ -46,6 +46,7 @@ from bob.attest.drive import (
     inject_audio_ws,
     inject_bargein_ws,
     inject_text,
+    roundtrip_transcribe,
     synth_mic_frames,
     synth_voiced_frames,
 )
@@ -155,8 +156,16 @@ class ScenarioRunner:
     :meth:`run` directly.
     """
 
-    def __init__(self, scenario: Scenario) -> None:
+    def __init__(self, scenario: Scenario, *, deep: bool = False) -> None:
         self._scenario = scenario
+        #: ``--deep`` (issue 0110): when set, a voiced audio turn captures Bob's
+        #: outbound TTS PCM and the runner synthesises a ``roundtrip_transcript``
+        #: observation (TTS→STT→compare) the ``transcript_roundtrip_similarity_gte``
+        #: assertion reads. Off by default (the fast, deterministic path).
+        self._deep = deep
+        #: Bob's captured outbound PCM per deep audio turn (accumulated by
+        #: ``_do_inject_audio`` when deep). Re-transcribed at settle.
+        self._deep_reply_pcm = bytearray()
         self._validate_supported()
 
     def _validate_supported(self) -> None:
@@ -209,6 +218,14 @@ class ScenarioRunner:
             backend.stop()
 
         deliverable = project_deliverable(events)
+        # ``--deep`` (issue 0110): re-transcribe Bob's captured spoken reply and
+        # append the round-trip observation so a
+        # ``transcript_roundtrip_similarity_gte`` assertion can read it. Appended
+        # to the captured-event list (the harness owns the verdict, so a
+        # harness-computed observation rides the same ``ctx.events`` the
+        # assertions inspect). No-op when not deep / Bob never spoke.
+        if self._deep:
+            events.append(self._roundtrip_event(deliverable))
         ctx = AssertionContext(events=events, deliverable=deliverable)
 
         results: list[dict[str, Any]] = []
@@ -306,6 +323,41 @@ class ScenarioRunner:
                 return transcript if isinstance(transcript, str) else ""
         return ""
 
+    def _roundtrip_event(self, deliverable: str) -> CapturedEvent:
+        """Build the ``--deep`` ``roundtrip_transcript`` observation (issue 0110).
+
+        ``said`` is Bob's reply (the projected deliverable); ``heard`` is the
+        re-transcription of the PCM he actually played
+        (:func:`bob.attest.drive.roundtrip_transcribe` — a deterministic fake
+        stand-in keyed to ``said`` under fake TTS/STT, the real whisper under
+        ``--real``). The similarity is left to the assertion to compute from
+        ``said`` / ``heard`` (it owns the ratio), so the metric lives in exactly
+        one place.
+
+        The frame is shaped exactly like a captured ``/ws/debug`` voice event
+        (``payload.ws_event.type == "roundtrip_transcript"``) so the assertion's
+        matcher reads it identically to a wire event. A turn where Bob never
+        spoke yields empty PCM → empty ``heard`` → similarity 0.0, so the deep
+        assertion fails loudly rather than passing on silence.
+        """
+
+        heard = roundtrip_transcribe(
+            bytes(self._deep_reply_pcm), said=deliverable, real=self._scenario.llm == "real"
+        )
+        return {
+            "category": "voice",
+            "severity": "debug",
+            "source": "bob.attest.roundtrip",
+            "summary": "roundtrip_transcript",
+            "payload": {
+                "ws_event": {
+                    "type": "roundtrip_transcript",
+                    "said": deliverable,
+                    "heard": heard,
+                }
+            },
+        }
+
     def _extra_env(self) -> dict[str, str]:
         """Harness-only env dials a scenario's ops need (issue 0101 + 0102).
 
@@ -366,9 +418,12 @@ class ScenarioRunner:
         voiced_count = max(8, (words * 1600) // 480 + 4)
         if step.get("voiced"):
             frames = synth_voiced_frames(voiced_count=voiced_count)
+            # ``--deep`` (issue 0110): collect Bob's outbound TTS PCM off this
+            # socket so the round-trip can re-transcribe exactly what he played.
+            collect = self._deep_reply_pcm if self._deep else None
             # Keep the chat socket open until the say-path finishes so the
             # in-flight reply is not cancelled by the socket close (issue 0100).
-            await inject_audio_ws(ws_base, frames, await_reply=True)
+            await inject_audio_ws(ws_base, frames, await_reply=True, collect_reply_pcm=collect)
         else:
             frames = synth_mic_frames(frame_count=voiced_count)
             await inject_audio_ws(ws_base, frames)

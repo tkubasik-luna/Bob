@@ -568,8 +568,18 @@ async def test_completed_turn_persists_with_audio_and_transcript() -> None:
     # …and Bob's outbound chunk as tts_out PCM at the TTS rate.
     assert snap.tts_pcm == b"\x00" * 64
     assert snap.tts_sample_rate == 24_000
-    # Latency marks rode along (Annexe F basics).
+    # The FULL Annexe F latency struct rode along into the persistence snapshot
+    # (issue 0110): the 0100 basics + the formalised t_first_partial / t_tts_end,
+    # and the derived endpoint_to_first_audio_ms computed from the marks.
+    assert "t_first_mic_frame" in snap.marks
+    assert "t_first_partial" in snap.marks
     assert "t_endpoint" in snap.marks
+    assert "t_first_audio_chunk" in snap.marks
+    assert "t_tts_end" in snap.marks
+    assert "endpoint_to_first_audio_ms" in snap.derived
+    # The feature-gated derived carry their not-wired defaults (stable schema).
+    assert snap.derived["backchannel_ms"] is None
+    assert snap.derived["draft_hit"] is False
 
 
 async def test_voice_stop_midturn_persists_voice_stop() -> None:

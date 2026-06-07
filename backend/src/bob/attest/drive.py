@@ -300,6 +300,7 @@ async def inject_audio_ws(
     open_timeout_ms: int = 10000,
     await_reply: bool = False,
     reply_timeout_ms: int = 30000,
+    collect_reply_pcm: bytearray | None = None,
 ) -> None:
     """Drive one voice turn through the real binary ``/ws/chat`` path.
 
@@ -319,6 +320,15 @@ async def inject_audio_ws(
     the terminal ``audio_end`` (bounded by ``reply_timeout_ms``) BEFORE sending
     ``voice_stop`` + closing. Without it (the 0099 STT-only path) we send
     ``voice_stop`` immediately and settle briefly.
+
+    ``collect_reply_pcm`` (issue 0110 ``--deep``): when provided, the bytes of
+    every outbound audio binary frame Bob plays are appended into this buffer.
+    The say-path sends Bob's reply as RAW s16le PCM (``websocket.send_bytes``,
+    no tag byte — unlike the tagged inbound mic frames), so the whole frame is
+    the PCM. The deep round-trip then re-transcribes exactly the bytes Bob spoke
+    (TTS→STT→compare). Only meaningful with ``await_reply`` (we must read the
+    outbound frames to see the audio). ``None`` keeps the prior zero-capture
+    behaviour.
     """
 
     async with websockets.connect(
@@ -334,7 +344,8 @@ async def inject_audio_ws(
 
         if await_reply:
             # Let the server-side say-path finish: read until ``audio_end`` (or
-            # timeout). The PCM rides as binary frames we simply ignore; the JSON
+            # timeout). Bob's PCM rides as binary frames; we normally ignore them
+            # but capture them for the deep round-trip when asked. The JSON
             # ``audio_end`` is the terminator. The FSM has returned to idle by
             # then, so the trailing ``voice_stop`` is a clean no-op teardown.
             deadline = asyncio.get_event_loop().time() + (reply_timeout_ms / 1000.0)
@@ -346,7 +357,11 @@ async def inject_audio_ws(
                     raw = await asyncio.wait_for(conn.recv(), timeout=remaining)
                 except (TimeoutError, websockets.ConnectionClosed):
                     break
-                if isinstance(raw, bytes):
+                if isinstance(raw, (bytes, bytearray)):
+                    if collect_reply_pcm is not None and raw:
+                        # Outbound audio is raw s16le PCM (no tag byte) — append
+                        # the whole frame for the deep round-trip re-transcription.
+                        collect_reply_pcm.extend(bytes(raw))
                     continue
                 try:
                     frame = json.loads(raw)
@@ -450,3 +465,47 @@ async def inject_bargein_ws(
         await asyncio.sleep(max(settle_ms, 0) / 1000.0)
         await conn.send(json.dumps({"type": "voice_stop"}))
         await asyncio.sleep(0.1)
+
+
+def roundtrip_transcribe(pcm16: bytes, *, said: str, real: bool) -> str:
+    """Re-transcribe Bob's captured TTS PCM for the ``--deep`` round-trip.
+
+    PRD 0016 / issue 0110 (Annexe C ``--deep`` = "round-trip TTS→whisper→
+    compare"). Given the raw s16le PCM Bob actually played (collected off the
+    chat socket) and the text he was *meant* to say, return what whisper hears:
+
+    - ``real=False`` (the harness default, fake TTS/STT): the fake TTS emits
+      silent placeholder PCM that carries no words, so a content-based whisper
+      pass would hear nothing. The deterministic stand-in feeds the captured PCM
+      through a :class:`bob.stt_engine.FakeSttEngine` TARGETED to ``said`` — it
+      reveals ``said`` word-by-word as the (silent) samples accumulate, so a turn
+      that genuinely produced audio re-transcribes to ``said`` (similarity 1.0)
+      while a turn that produced NO audio (empty ``pcm16``) re-transcribes to ``""``
+      (similarity 0.0 → the assertion fails, as it should). This keeps the deep
+      path exact + offline in CI without a native model.
+    - ``real=True`` (``--real``): run the genuine
+      :meth:`bob.stt_engine.WhisperCppSttEngine.transcribe_pcm` over the captured
+      PCM — the true end-to-end intelligibility check against real synthesis.
+
+    Empty PCM short-circuits to ``""`` regardless (nothing was played, so nothing
+    can be heard).
+    """
+
+    if not pcm16:
+        return ""
+    if real:
+        from bob.config import get_settings
+        from bob.stt_engine import WhisperCppSttEngine
+
+        whisper = WhisperCppSttEngine(get_settings())
+        return whisper.transcribe_pcm(pcm16)
+
+    # Deterministic fake stand-in: a FakeSttEngine keyed to ``said`` reveals it
+    # as the captured (silent) samples accumulate. ``samples_per_word`` small so
+    # even a short reply surfaces whole from the available PCM.
+    from bob.stt_engine import FakeSttEngine
+
+    fake = FakeSttEngine(transcript=said, samples_per_word=160)
+    session = fake.open_session("roundtrip")
+    session.accept_frame(pcm16)
+    return session.finalize().text

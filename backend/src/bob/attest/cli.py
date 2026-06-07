@@ -41,7 +41,7 @@ def _cmd_attest(args: argparse.Namespace) -> int:
 
     try:
         scenario = Scenario.from_yaml_file(args.scenario)
-        runner = ScenarioRunner(scenario)
+        runner = ScenarioRunner(scenario, deep=bool(getattr(args, "deep", False)))
     except (ScenarioError, OSError) as exc:
         _print_verdict(
             {
@@ -72,6 +72,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run a declarative attestation scenario (YAML) and print a verdict.",
     )
     attest.add_argument("scenario", help="Path to the scenario YAML file.")
+    attest.add_argument(
+        "--deep",
+        action="store_true",
+        help=(
+            "Enable the TTS->STT round-trip check (issue 0110): re-transcribe "
+            "Bob's spoken reply and emit a 'roundtrip_transcript' observation so "
+            "a 'transcript_roundtrip_similarity_gte' assertion can verify "
+            "intelligibility. Off by default (deterministic + fast)."
+        ),
+    )
     attest.set_defaults(func=_cmd_attest)
 
     return parser

@@ -1,0 +1,44 @@
+# Deep round-trip attest scenario (PRD 0016 / issue 0110, Annexe C --deep).
+#
+# Proves the TTS -> STT round-trip intelligibility check. MUST be run with
+# --deep: the harness captures Bob's outbound TTS PCM off the chat socket,
+# re-transcribes it (a deterministic fake stand-in keyed to Bob's reply under
+# the fake TTS/STT, a real whisper under --real), and emits a
+# roundtrip_transcript {said, heard} observation the assertion reads.
+#
+#   1. inject_audio (voiced) — drives the say-path so Bob actually speaks; the
+#      --deep harness collects every outbound PCM frame.
+#   2. After the run, the harness re-transcribes the captured audio. Under the
+#      fake engine the round-trip is exact (heard == said), so the similarity is
+#      1.0 and transcript_roundtrip_similarity_gte min:0.6 passes deterministically.
+#
+# WITHOUT --deep there is no roundtrip_transcript event, so the deep assertion
+# FAILS loudly (a non-deep run never silently passes a deep scenario).
+#
+# Run:  uv run bob attest scenarios/latency-deep.attest.yaml --deep   (exit 0)
+name: latency-deep-roundtrip-intelligible
+description: >-
+  Bob's spoken reply, fed back through STT (--deep), re-transcribes faithfully:
+  TTS -> whisper -> compare similarity >= 0.6.
+backend: ephemeral
+llm: fake
+fake_llm:
+  - role: jarvis
+    on_input_contains: "temps"
+    reply: "Il fait beau aujourd'hui."
+timeline:
+  - do: inject_audio
+    transcript: "quel temps fait il"
+    voiced: true
+  - do: wait_state
+    state: bob_speaking
+    timeout_ms: 8000
+  - do: wait_event
+    type: audio_chunk
+    timeout_ms: 8000
+assertions:
+  - kind: deliverable_nonempty
+  # The round-trip preserved Bob's reply (intelligible synthesis). Requires --deep.
+  - kind: transcript_roundtrip_similarity_gte
+    min: 0.6
+  - kind: no_error_events

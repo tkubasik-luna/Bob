@@ -133,6 +133,14 @@ LOGICAL_EVENT_MATCHERS: dict[str, EventMatcher] = {
     # PRD 0016 / issue 0101 (Annexe A.2 + B): the confirmed barge-in cut.
     # ``wait_event type: bargein`` blocks until Bob was interrupted.
     "bargein": _voice_subtype_matcher("bargein"),
+    # PRD 0016 / issue 0110 (Annexe A.2 + F): the per-turn latency summary the
+    # loop emits at turn end. ``wait_event type: turn_latency`` blocks until the
+    # turn finished + its marks/derived landed; ``latency_lt_ms`` reads them.
+    "turn_latency": _voice_subtype_matcher("turn_latency"),
+    # PRD 0016 / issue 0110 (Annexe C ``--deep``): the harness-synthesised
+    # TTS->STT round-trip observation; ``transcript_roundtrip_similarity_gte``
+    # reads it. Present in the matcher table so the kind is a known logical type.
+    "roundtrip_transcript": _voice_subtype_matcher("roundtrip_transcript"),
     # PRD 0016 / issue 0102 (Annexe A.2 + H): the background Thinker's snapshot
     # of the turn, and the marker proving the Speaker consulted it at assembly.
     "thinker_snapshot": _voice_subtype_matcher("thinker_snapshot"),
@@ -707,6 +715,244 @@ def _strip_scrub_elision(text: str) -> str:
 
 register_assertion("bargein_within_ms", check_bargein_within_ms)
 register_assertion("committed_equals_spoken", check_committed_equals_spoken)
+
+
+# --- latency assertions (PRD 0016 / issue 0110, Annexe C + F) ----------------
+
+
+def _turn_latency_events(events: list[CapturedEvent]) -> list[dict[str, Any]]:
+    """Return the ``ws_event`` body of every captured ``turn_latency`` voice event.
+
+    Each body is the Annexe A.2 / F summary the loop emits at turn end:
+    ``{type, turn_id, marks, derived, ts}`` (nested under ``payload.ws_event``).
+    ``marks`` is a ``{name: monotone_seconds}`` map of only the marks a slice
+    stamped this turn; ``derived`` is the ms-delta / bool projection. This is the
+    single source ``latency_lt_ms`` reads — the same marks the persisted
+    ``voice_turns.latency_json`` carries (both come from
+    :meth:`bob.latency.TurnLatency.as_event_body`).
+    """
+
+    matcher = _voice_subtype_matcher("turn_latency")
+    out: list[dict[str, Any]] = []
+    for event in events:
+        if not matcher(event):
+            continue
+        ws_event = (event.get("payload") or {}).get("ws_event") or {}
+        if isinstance(ws_event, dict):
+            out.append(ws_event)
+    return out
+
+
+def check_latency_lt_ms(spec: dict[str, Any], ctx: AssertionContext) -> AssertionResult:
+    """PASS iff some turn's ``to_mark - from_mark`` is ``<= spec['max']`` ms.
+
+    Spec: ``{kind: latency_lt_ms, from_mark: t_endpoint, to_mark: t_first_audio_chunk,
+    max: 800}`` (Annexe C + F). Reads the ``marks`` of the captured
+    ``turn_latency`` voice events (monotone seconds) and computes the delta in
+    milliseconds — exactly the Annexe F derived (e.g. ``endpoint_to_first_audio_ms
+    < 800`` committed / ``< 1500`` cold). The BEST (smallest) delta across every
+    turn that carried BOTH marks is checked, so a multi-turn run passes when at
+    least one turn met the target.
+
+    FAILs loudly — never a silent green — when: ``from_mark`` / ``to_mark`` are
+    missing from the spec; no ``turn_latency`` event was captured (no turn
+    finished); or no captured turn carried BOTH marks (the measured span never
+    occurred — e.g. asserting ``t_first_audio_chunk`` on a turn where Bob never
+    spoke). The detail echoes the marks each turn DID carry so a red assertion is
+    self-explanatory.
+    """
+
+    from_mark = spec.get("from_mark")
+    to_mark = spec.get("to_mark")
+    if not isinstance(from_mark, str) or not from_mark:
+        return AssertionResult(
+            kind="latency_lt_ms",
+            ok=False,
+            detail={"error": "latency_lt_ms requires a 'from_mark' string"},
+        )
+    if not isinstance(to_mark, str) or not to_mark:
+        return AssertionResult(
+            kind="latency_lt_ms",
+            ok=False,
+            detail={"error": "latency_lt_ms requires a 'to_mark' string"},
+        )
+    raw_max = spec.get("max")
+    try:
+        maximum = float(raw_max)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return AssertionResult(
+            kind="latency_lt_ms",
+            ok=False,
+            detail={"error": "latency_lt_ms requires a numeric 'max'", "max": raw_max},
+        )
+
+    summaries = _turn_latency_events(ctx.events)
+    if not summaries:
+        return AssertionResult(
+            kind="latency_lt_ms",
+            ok=False,
+            detail={
+                "error": "no turn_latency event captured",
+                "from_mark": from_mark,
+                "to_mark": to_mark,
+                "expected_max": maximum,
+            },
+        )
+    measured: list[float] = []
+    marks_seen: list[list[str]] = []
+    for body in summaries:
+        marks = body.get("marks") or {}
+        if not isinstance(marks, dict):
+            continue
+        marks_seen.append(sorted(str(k) for k in marks))
+        start = marks.get(from_mark)
+        end = marks.get(to_mark)
+        if isinstance(start, (int, float)) and isinstance(end, (int, float)):
+            measured.append(round((float(end) - float(start)) * 1000.0, 3))
+    if not measured:
+        return AssertionResult(
+            kind="latency_lt_ms",
+            ok=False,
+            detail={
+                "error": f"no turn carried both marks {from_mark!r} and {to_mark!r}",
+                "from_mark": from_mark,
+                "to_mark": to_mark,
+                "expected_max": maximum,
+                "marks_seen": marks_seen[:5],
+            },
+        )
+    actual = min(measured)
+    return AssertionResult(
+        kind="latency_lt_ms",
+        ok=actual <= maximum,
+        detail={
+            "from_mark": from_mark,
+            "to_mark": to_mark,
+            "expected_max": maximum,
+            "actual": actual,
+            "all_ms": measured[:5],
+        },
+    )
+
+
+register_assertion("latency_lt_ms", check_latency_lt_ms)
+
+
+# --- deep (round-trip) assertions (PRD 0016 / issue 0110, Annexe C --deep) ----
+
+
+def _norm_for_similarity(text: str) -> str:
+    """Normalise text for the round-trip similarity ratio (issue 0110).
+
+    Collapses whitespace, casefolds, and strips trailing punctuation noise so the
+    comparison reflects *what was said*, not formatting. The same normalisation
+    is applied to both the said text and the re-transcribed text so the ratio is
+    a fair word-level overlap.
+    """
+
+    lowered = " ".join(text.split()).casefold()
+    return "".join(ch for ch in lowered if ch.isalnum() or ch.isspace()).strip()
+
+
+def _similarity_ratio(said: str, heard: str) -> float:
+    """Return a 0..1 similarity between the said and the re-transcribed text.
+
+    Uses :class:`difflib.SequenceMatcher` over the normalised strings — a
+    decode-fidelity-tolerant ratio (1.0 == identical after normalisation). Two
+    empty strings are treated as a perfect match (1.0); one empty and one not is
+    0.0. This is the metric ``transcript_roundtrip_similarity_gte`` thresholds.
+    """
+
+    import difflib
+
+    a = _norm_for_similarity(said)
+    b = _norm_for_similarity(heard)
+    if not a and not b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+
+def check_transcript_roundtrip_similarity_gte(
+    spec: dict[str, Any], ctx: AssertionContext
+) -> AssertionResult:
+    """PASS iff a TTS→STT round-trip preserved the reply (``--deep`` only).
+
+    Spec: ``{kind: transcript_roundtrip_similarity_gte, min: 0.6}`` (Annexe C
+    ``--deep``). The DEEP scenario re-records Bob's spoken reply: the say-path's
+    TTS audio is fed back through whisper, and the re-transcription is emitted as
+    a ``roundtrip_transcript`` voice event ``{said, heard, similarity}``. This
+    assertion reads that event and checks the similarity ``>= min`` — proving the
+    end-to-end audio path (synthesise → play → hear) is faithful, not merely that
+    bytes flowed. Under the deterministic fake TTS/STT the round-trip is exact
+    (the fake STT converges to the said text), so the assertion is stable in CI;
+    against real models it tolerates decode fuzz via the ratio.
+
+    The harness computes the ratio at emit time and also carries the raw ``said``
+    / ``heard`` so the assertion can recompute defensively (a malformed
+    pre-computed ``similarity`` falls back to recomputation). FAILs loudly when
+    the run carried no ``roundtrip_transcript`` event — i.e. ``--deep`` was not
+    enabled, or no reply was spoken — so a non-deep run never silently passes a
+    deep assertion.
+    """
+
+    raw_min = spec.get("min", 0.6)
+    try:
+        minimum = float(raw_min)
+    except (TypeError, ValueError):
+        return AssertionResult(
+            kind="transcript_roundtrip_similarity_gte",
+            ok=False,
+            detail={"error": "transcript_roundtrip_similarity_gte 'min' must be a number"},
+        )
+    roundtrips = _voice_ws_events(ctx.events, "roundtrip_transcript")
+    if not roundtrips:
+        return AssertionResult(
+            kind="transcript_roundtrip_similarity_gte",
+            ok=False,
+            detail={
+                "error": "no roundtrip_transcript event captured (run with --deep?)",
+                "expected_min": minimum,
+            },
+        )
+    # Best similarity across captured round-trips. Prefer the harness-computed
+    # value; recompute from said/heard when it is absent or non-numeric.
+    best = -1.0
+    best_detail: dict[str, Any] = {}
+    for ev in roundtrips:
+        said = ev.get("said")
+        heard = ev.get("heard")
+        precomputed = ev.get("similarity")
+        if isinstance(precomputed, (int, float)):
+            ratio = float(precomputed)
+        elif isinstance(said, str) and isinstance(heard, str):
+            ratio = _similarity_ratio(said, heard)
+        else:
+            continue
+        if ratio > best:
+            best = ratio
+            best_detail = {
+                "said": said if isinstance(said, str) else None,
+                "heard": heard if isinstance(heard, str) else None,
+            }
+    if best < 0.0:
+        return AssertionResult(
+            kind="transcript_roundtrip_similarity_gte",
+            ok=False,
+            detail={
+                "error": "roundtrip_transcript event missing said/heard/similarity",
+                "expected_min": minimum,
+            },
+        )
+    return AssertionResult(
+        kind="transcript_roundtrip_similarity_gte",
+        ok=best >= minimum,
+        detail={"expected_min": minimum, "similarity": round(best, 4), **best_detail},
+    )
+
+
+register_assertion("transcript_roundtrip_similarity_gte", check_transcript_roundtrip_similarity_gte)
 
 
 # --- Thinker assertions (PRD 0016 / issue 0102) ------------------------------
