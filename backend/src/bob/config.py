@@ -286,6 +286,37 @@ class Settings(BaseSettings):
     # native whisper model. Ignored unless ``STT_ENGINE=fake``.
     BOB_FAKE_STT_TRANSCRIPT: str = ""
 
+    # Full-duplex loop — VAD + Endpointer + TurnFsm (PRD 0016 / issue 0100,
+    # Annexe B). These drive the real-time turn-taking state machine over the
+    # inbound mic frames (the same 16 kHz s16le frames the STT engine sees).
+    #
+    # ``VAD_*`` configure the energy-threshold :class:`bob.vad.EnergyVad`:
+    # ``VAD_SPEECH_RMS`` is the normalised ([0,1]) RMS at/above which a frame
+    # counts as speech (fast attack); ``VAD_PAUSE_MS`` is the short trailing
+    # silence (within-utterance beat) that emits ``vad_pause`` (a backchannel
+    # opportunity in later slices). ``ENDPOINT_SILENCE_MS`` is the *longer*
+    # silence floor (~500-700 ms - issue 0100 scope) after which
+    # :class:`bob.endpointer.Endpointer` declares ``endpoint`` (end of the
+    # user's turn → freeze transcript → Jarvis say-path). The semantic
+    # ``user_turn_complete`` endpoint is issue 0103; only the silence floor is
+    # wired here. All three are derived against the ~30 ms mic frame size, so
+    # they are expressed in ms / normalised units and stay engine-relative.
+    VAD_SPEECH_RMS: float = 0.02
+    VAD_PAUSE_MS: int = 300
+    ENDPOINT_SILENCE_MS: int = 600
+
+    # TTS engine selection (PRD 0016 / issue 0100). ``kokoro`` (default) is the
+    # real local engine (:class:`bob.tts_service.KokoroTtsService`). ``fake`` is
+    # the attestation-harness engine (:class:`bob.tts_service.FakeTtsService`):
+    # a deterministic, offline, native-free generator of a fixed number of
+    # silent PCM chunks per call — it lets the ``bob attest --audio`` full-duplex
+    # scenario assert the audio-out path (``audio_chunks_gte``, FSM
+    # ``bob_speaking``) without Kokoro / espeak-ng, exactly as the ``fake`` LLM /
+    # STT engines do for their layers. NEVER the production default. The number
+    # of chunks the fake yields per non-empty call is ``BOB_FAKE_TTS_CHUNKS``.
+    TTS_ENGINE: Literal["kokoro", "fake"] = "kokoro"
+    BOB_FAKE_TTS_CHUNKS: int = 2
+
     def mcp_server_configs(self) -> tuple[MCPServerConfig, ...]:
         """Parse :attr:`MCP_SERVERS` into typed :class:`MCPServerConfig` records.
 

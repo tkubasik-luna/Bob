@@ -72,7 +72,7 @@ import json
 import time
 import traceback
 import uuid
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import httpx
@@ -85,12 +85,13 @@ from bob import task_scheduler as task_scheduler_module
 from bob import task_store as task_store_module
 from bob import text_segmenter, ws_events
 from bob.debug_log import emit_debug
-from bob.event_bus_v2 import get_snapshot_for_task, subscribe_for_task
+from bob.event_bus_v2 import emit_event, get_snapshot_for_task, subscribe_for_task
 from bob.orchestrator import Orchestrator, get_default_orchestrator
 from bob.spoken_text_cleaner import clean_for_speech
 from bob.stt_engine import SttEngine, get_default_stt_engine
 from bob.task_store import TaskStoreError
 from bob.tts_service import KokoroTtsService, get_default_tts_service
+from bob.voice_loop import FullDuplexLoop, SayPathDriver
 from bob.voice_turn import VoiceTurn
 
 router = APIRouter()
@@ -153,10 +154,12 @@ async def chat_ws(websocket: WebSocket) -> None:
     # `voice_mode` frame on every toggle (and on connect/reconnect for
     # re-sync). When true, proactive pushes are also voiced via TTS, not
     # only direct replies to `user_msg` carrying their own `voice: true`.
-    # ``voice_turn`` holds the active :class:`bob.voice_turn.VoiceTurn` for the
-    # « Listen » STT pipeline (issue 0099): set on ``voice_start``, cleared on
-    # ``voice_stop`` / final / abort. ``None`` when no mic turn is in flight.
-    _sessions[session_id] = {"active_tts": [], "voice_mode": False, "voice_turn": None}
+    # ``voice_loop`` holds the active :class:`bob.voice_loop.FullDuplexLoop` for
+    # the « Listen » → say-path full-duplex loop (issue 0100, building on the
+    # 0099 STT spine): created on ``voice_start``, torn down on ``voice_stop`` /
+    # socket close. ``None`` when the mic is not armed. The loop owns the
+    # per-utterance :class:`bob.voice_turn.VoiceTurn` STT sessions internally.
+    _sessions[session_id] = {"active_tts": [], "voice_mode": False, "voice_loop": None}
     orchestrator = _orchestrator_provider()
 
     # Slice 0039: connect-time debug event. Lives outside any user turn so
@@ -536,25 +539,30 @@ async def _handle_voice_mode(
 
 
 async def _handle_voice_start(
-    websocket: WebSocket, payload: dict[str, Any], session_id: str
+    websocket: WebSocket,
+    payload: dict[str, Any],
+    session_id: str,
+    orchestrator: Orchestrator,
 ) -> None:
-    """Client → ``voice_start`` arms the mic for a new « Listen » turn (0099).
+    """Client → ``voice_start`` arms the mic for the full-duplex loop (0100).
 
-    Annexe A.1: ``{type, window, ts_client}``. The HUD ``new`` window sends
-    this when the voice toggle is ON and the user starts speaking; the
-    binary mic frames that follow (tag ``0x01``) feed the STT engine until a
-    matching ``voice_stop`` (or socket close) freezes the turn.
+    Annexe A.1: ``{type, window, ts_client}``. The HUD ``new`` window sends this
+    when the voice toggle is ON; the binary mic frames that follow (tag
+    ``0x01``) drive the :class:`bob.voice_loop.FullDuplexLoop` — VAD detects
+    speech, the silence-floor endpoint freezes the transcript and runs the
+    EXISTING Jarvis say-path, and the FSM emits ``turn_state`` throughout —
+    until a matching ``voice_stop`` (or socket close) tears the loop down.
 
     Gating: when ``STT_ENABLED`` is false we refuse with ``stt_disabled`` and
-    open no turn (the server stays up). A ``voice_start`` while a turn is
-    already active finalizes the previous one first (defensive — the client
-    should pair start/stop, but a dropped ``voice_stop`` must not wedge the
-    session).
+    arm nothing (the server stays up). A ``voice_start`` while a loop is already
+    armed tears the previous one down first (defensive — the client should pair
+    start/stop, but a dropped ``voice_stop`` must not wedge the session).
     """
 
     from bob.config import get_settings
 
-    if not get_settings().STT_ENABLED:
+    settings = get_settings()
+    if not settings.STT_ENABLED:
         await websocket.send_json(
             {"type": "error", "code": "stt_disabled", "message": "STT is disabled (STT_ENABLED)"}
         )
@@ -564,79 +572,135 @@ async def _handle_voice_start(
     if session is None:
         return
 
-    # Defensive: a lingering turn (missed voice_stop) is finalized before the
-    # new one opens so we never run two STT sessions for one socket.
-    existing = session.get("voice_turn")
-    if isinstance(existing, VoiceTurn):
-        await existing.finalize()
-        session["voice_turn"] = None
+    # Defensive: a lingering loop (missed voice_stop) is torn down before the
+    # new one arms so we never run two loops for one socket.
+    existing = session.get("voice_loop")
+    if isinstance(existing, FullDuplexLoop):
+        await existing.stop()
+        session["voice_loop"] = None
 
-    turn = VoiceTurn(engine=_stt_engine_provider(), session_id=session_id)
-    started = await turn.start()
+    loop = FullDuplexLoop(
+        voice_turn_factory=lambda: VoiceTurn(
+            engine=_stt_engine_provider(), session_id=session_id, settings=settings
+        ),
+        say_path=_make_say_path_driver(websocket, session_id, orchestrator),
+        settings=settings,
+        session_id=session_id,
+    )
+    started = await loop.start()
     if not started:
-        # ``start`` already emitted the abort event (Annexe G). Leave the slot
-        # empty so subsequent binary frames are dropped until the next start.
-        session["voice_turn"] = None
+        # The first STT session failed to open; the VoiceTurn already emitted
+        # its abort event (Annexe G). Leave the slot empty so binary frames are
+        # dropped until the next voice_start.
+        session["voice_loop"] = None
         return
-    session["voice_turn"] = turn
+    session["voice_loop"] = loop
     emit_debug(
         category="voice",
         severity="info",
         source="bob.ws_router._handle_voice_start",
-        summary=f"voice_start (turn={turn.turn_id})",
-        payload={"session_id": session_id, "turn_id": turn.turn_id},
-        turn_id=turn.turn_id,
+        summary=f"voice_start (session={session_id})",
+        payload={"session_id": session_id},
     )
+
+
+def _make_say_path_driver(
+    websocket: WebSocket, session_id: str, orchestrator: Orchestrator
+) -> SayPathDriver:
+    """Build the :class:`bob.voice_loop.SayPathDriver` bound to this session.
+
+    At ``endpoint`` the loop hands us the frozen transcript; we run the EXISTING
+    Jarvis say-path (``process_user_message`` → ``assistant_msg``) and stream the
+    reply's TTS audio out on ``websocket`` — the SAME path a ``user_msg`` /
+    ``client_text`` turn takes (the two converge here). ``on_first_audio`` fires
+    just before the first outbound chunk so the loop marks
+    ``t_first_audio_chunk`` + flips the FSM into ``bob_speaking``. An empty
+    transcript (no speech captured) is skipped so we never run a turn on
+    nothing.
+    """
+
+    async def _drive(
+        transcript: str,
+        *,
+        turn_id: str,
+        on_first_audio: Callable[[], Awaitable[None]],
+    ) -> None:
+        if not transcript.strip():
+            return
+        response = await orchestrator.process_user_message(session_id, transcript)
+        msg_id = response.msg_id or uuid.uuid4().hex
+        await websocket.send_json(
+            {
+                "type": "assistant_msg",
+                "msg_id": msg_id,
+                "speech": response.speech,
+                "ui": [component.model_dump() for component in response.ui],
+                "proactive": False,
+            }
+        )
+        if not response.speech.strip():
+            return
+        await _synthesize_and_stream(
+            websocket,
+            session_id,
+            msg_id,
+            response.speech,
+            on_first_audio=on_first_audio,
+        )
+
+    return _drive
 
 
 async def _handle_voice_stop(
     websocket: WebSocket, payload: dict[str, Any], session_id: str
 ) -> None:
-    """Client → ``voice_stop`` closes the mic and freezes the turn (0099).
+    """Client → ``voice_stop`` disarms the mic and tears the loop down (0100).
 
     Annexe A.1 ``{type, ts_client}`` / Annexe B ``* + voice_stop -> idle``.
-    Finalizes the active turn (emitting ``stt_final``) and clears the slot.
-    A ``voice_stop`` with no active turn is a silent no-op (idempotent).
+    Stops the active loop (finalizing its open STT turn → ``stt_final`` and
+    driving the FSM to idle) and clears the slot. A ``voice_stop`` with no armed
+    loop is a silent no-op (idempotent).
     """
 
     session = _sessions.get(session_id)
     if session is None:
         return
-    turn = session.get("voice_turn")
-    if isinstance(turn, VoiceTurn):
-        await turn.finalize()
-    session["voice_turn"] = None
+    loop = session.get("voice_loop")
+    if isinstance(loop, FullDuplexLoop):
+        await loop.stop()
+    session["voice_loop"] = None
 
 
 async def _handle_binary_frame(data: bytes, session_id: str) -> None:
-    """Route a binary mic frame (tag ``0x01``) to the active voice turn.
+    """Route a binary mic frame (tag ``0x01``) to the armed full-duplex loop.
 
-    A frame that arrives with no active turn (race: frames in flight after a
+    A frame that arrives with no armed loop (race: frames in flight after a
     ``voice_stop``, or before ``voice_start`` landed) is silently dropped.
-    Decoding + STT failures are owned by :class:`bob.voice_turn.VoiceTurn`
-    (bad frame → drop; transcription failure → clean turn abort).
+    Decoding + STT failures are owned downstream by the loop /
+    :class:`bob.voice_turn.VoiceTurn` (bad frame → drop; transcription failure →
+    clean turn abort).
     """
 
     session = _sessions.get(session_id)
     if session is None:
         return
-    turn = session.get("voice_turn")
-    if not isinstance(turn, VoiceTurn):
+    loop = session.get("voice_loop")
+    if not isinstance(loop, FullDuplexLoop):
         return
-    await turn.feed_raw_frame(data)
+    await loop.feed_raw_frame(data)
 
 
 async def _finalize_active_voice_turn(session_id: str) -> None:
-    """Finalize any in-flight voice turn on socket close (Annexe G)."""
+    """Tear down any armed full-duplex loop on socket close (Annexe G)."""
 
     session = _sessions.get(session_id)
     if session is None:
         return
-    turn = session.get("voice_turn")
-    if isinstance(turn, VoiceTurn):
+    loop = session.get("voice_loop")
+    if isinstance(loop, FullDuplexLoop):
         with contextlib.suppress(Exception):
-            await turn.finalize()
-    session["voice_turn"] = None
+            await loop.stop()
+    session["voice_loop"] = None
 
 
 async def _handle_request_task_messages(websocket: WebSocket, payload: dict[str, Any]) -> None:
@@ -733,7 +797,7 @@ async def _handle_client_message(
         return
 
     if msg_type == "voice_start":
-        await _handle_voice_start(websocket, payload, session_id)
+        await _handle_voice_start(websocket, payload, session_id, orchestrator)
         return
 
     if msg_type == "voice_stop":
@@ -887,6 +951,8 @@ async def _synthesize_and_stream(
     session_id: str,
     msg_id: str,
     text: str,
+    *,
+    on_first_audio: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
     """Segment ``text``, stream PCM chunks straight from KPipeline to the WS.
 
@@ -959,6 +1025,7 @@ async def _synthesize_and_stream(
     started_at = time.perf_counter()
     started_audio = False
     error_emitted = False
+    audio_chunks = 0
 
     try:
         for idx, sentence in enumerate(sentences):
@@ -992,7 +1059,34 @@ async def _synthesize_and_stream(
                             },
                         )
                         started_audio = True
+                        # Full-duplex loop hook (issue 0100): mark
+                        # ``t_first_audio_chunk`` + flip the turn FSM into
+                        # ``bob_speaking`` exactly once, just before the very
+                        # first outbound chunk. ``None`` on the text path.
+                        if on_first_audio is not None:
+                            await on_first_audio()
+                            on_first_audio = None
                     await websocket.send_bytes(chunk.pcm16)
+                    # PRD 0016 / Annexe A.2 — surface each outbound PCM block as
+                    # an ``audio_chunk`` voice event so the attestation harness
+                    # can count audio-out on ``/ws/debug`` (the raw PCM rides the
+                    # chat socket and never lands in the ring buffer). The full
+                    # text/transcript stays off this event (just the index +
+                    # size) so no scrubbing is needed.
+                    audio_chunks += 1
+                    await emit_event(
+                        {
+                            "type": "audio_chunk",
+                            "msg_id": msg_id,
+                            "chunk_index": audio_chunks - 1,
+                            "bytes": len(chunk.pcm16),
+                            "sample_rate": chunk.sample_rate,
+                        },
+                        category="voice",
+                        severity="debug",
+                        source="bob.ws_router.audio_chunk",
+                        summary=f"audio_chunk #{audio_chunks - 1} (msg={msg_id})",
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

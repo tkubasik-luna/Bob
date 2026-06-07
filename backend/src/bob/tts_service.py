@@ -250,17 +250,68 @@ class KokoroTtsService:
         return SynthesisResult(pcm16=b"".join(parts), sample_rate=self.sample_rate)
 
 
+class FakeTtsService(KokoroTtsService):
+    """Deterministic, offline, native-free TTS for the attestation harness.
+
+    PRD 0016 / issue 0100. Subclasses :class:`KokoroTtsService` so it slots into
+    the same provider type but overrides every Kokoro / KPipeline touch-point:
+    it loads nothing and :meth:`synthesize_stream` yields a fixed number of
+    short *silent* PCM16 chunks for any non-empty text (empty text yields
+    nothing, matching the real engine). This lets the ``bob attest --audio``
+    full-duplex scenario drive audio-out → ``audio_chunk`` events → the FSM
+    ``bob_speaking`` transition with zero dependency on espeak-ng / torch, the
+    same way :class:`bob.attest.fake_backend.FakeLlmClient` /
+    :class:`bob.stt_engine.FakeSttEngine` fake their layers.
+    """
+
+    #: ~50 ms of s16le silence at the model sample rate — small but non-empty.
+    _CHUNK_SAMPLES = 1200
+
+    def __init__(self, settings: Settings | None = None, *, chunks: int | None = None) -> None:
+        super().__init__(settings)
+        resolved = chunks if chunks is not None else self._settings.BOB_FAKE_TTS_CHUNKS
+        self._chunks = max(1, resolved)
+
+    def is_model_cached(self) -> bool:
+        return True
+
+    def preload(self) -> None:
+        return None
+
+    def warmup(self) -> None:
+        return None
+
+    async def synthesize_stream(
+        self,
+        text: str,
+        *,
+        voice: str | None = None,
+        speed: float | None = None,
+    ) -> AsyncIterator[SynthesisChunk]:
+        if not text.strip():
+            return
+        pcm = b"\x00\x00" * self._CHUNK_SAMPLES
+        for _ in range(self._chunks):
+            yield SynthesisChunk(pcm16=pcm, sample_rate=self.sample_rate)
+
+
 _default_service: KokoroTtsService | None = None
 _default_lock = Lock()
 
 
+def _build_tts_service(settings: Settings) -> KokoroTtsService:
+    if settings.TTS_ENGINE == "fake":
+        return FakeTtsService(settings)
+    return KokoroTtsService(settings)
+
+
 def get_default_tts_service() -> KokoroTtsService:
-    """Return the process-wide :class:`KokoroTtsService` (created on demand)."""
+    """Return the process-wide TTS service (created on demand from settings)."""
 
     global _default_service
     if _default_service is not None:
         return _default_service
     with _default_lock:
         if _default_service is None:
-            _default_service = KokoroTtsService()
+            _default_service = _build_tts_service(get_settings())
         return _default_service

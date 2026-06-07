@@ -241,6 +241,13 @@ class EphemeralBackend:
                 # Text-only harness: skip the Kokoro download + espeak-ng warmup
                 # so boot is offline + fast and cannot native-abort in CI.
                 "BOB_SKIP_TTS_PRELOAD": "true",
+                # Deterministic, native-free TTS for the harness (PRD 0016 /
+                # issue 0100): the ``fake`` engine yields fixed silent PCM
+                # chunks so an ``--audio`` full-duplex scenario can attest the
+                # audio-out path (``audio_chunk`` events → FSM ``bob_speaking``)
+                # with zero dependency on espeak-ng / torch. Harmless for
+                # text-only scenarios (no synthesis is requested).
+                "TTS_ENGINE": "fake",
                 # Keep Gmail / Tavily / MCP dormant — point their on-disk paths
                 # into the throwaway dir and leave keys unset so nothing reaches
                 # out and nothing touches the real ``~/.bob``.

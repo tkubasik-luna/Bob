@@ -250,22 +250,75 @@ def synth_mic_frames(*, frame_count: int = 8, samples_per_frame: int = 480) -> l
     return [_MIC_FRAME_TAG + pcm for _ in range(max(1, frame_count))]
 
 
+def _voiced_frame(samples_per_frame: int, *, amplitude: int = 8000) -> bytes:
+    """One mic frame of a loud-ish square-ish tone (energy well above VAD floor).
+
+    The bare full-duplex loop (issue 0100) gates the turn on an energy VAD, so
+    the ``--audio`` scenario that drives the FSM needs frames with real RMS
+    energy (silent frames would never trip ``vad_speech_start``). A constant
+    ``amplitude`` per sample gives a normalised RMS of ``amplitude/32768`` ≈ 0.24
+    — comfortably above the default ``VAD_SPEECH_RMS`` (0.02). Content is
+    irrelevant: the fake STT engine still converges to its scripted transcript.
+    """
+
+    sample = int(amplitude).to_bytes(2, "little", signed=True)
+    return _MIC_FRAME_TAG + sample * samples_per_frame
+
+
+def synth_voiced_frames(
+    *,
+    voiced_count: int = 12,
+    silence_count: int = 30,
+    samples_per_frame: int = 480,
+    amplitude: int = 8000,
+) -> list[bytes]:
+    """Synthesise a voiced burst followed by trailing silence (issue 0100).
+
+    Drives the full-duplex loop's VAD + Endpointer for real: ``voiced_count``
+    loud frames trip ``vad_speech_start`` (and feed the fake STT), then
+    ``silence_count`` silent frames let the silence-floor :class:`Endpointer`
+    fire ``endpoint`` — which freezes the transcript and runs the Jarvis
+    say-path. ``silence_count`` must comfortably exceed the configured
+    ``ENDPOINT_SILENCE_MS`` floor in frames (default 600 ms / 30 ms ≈ 20 frames),
+    so the default 30 silent frames (~900 ms) reliably crosses it.
+    """
+
+    voiced = [
+        _voiced_frame(samples_per_frame, amplitude=amplitude) for _ in range(max(1, voiced_count))
+    ]
+    silent = synth_mic_frames(
+        frame_count=max(1, silence_count), samples_per_frame=samples_per_frame
+    )
+    return voiced + silent
+
+
 async def inject_audio_ws(
     ws_base: str,
     frames: list[bytes],
     *,
     settle_ms: int = 300,
     open_timeout_ms: int = 10000,
+    await_reply: bool = False,
+    reply_timeout_ms: int = 30000,
 ) -> None:
-    """Drive one voice turn through the real binary ``/ws/chat`` path (0099).
+    """Drive one voice turn through the real binary ``/ws/chat`` path.
 
     Opens a chat socket, drains the connect-time ``session`` frame, sends
     ``voice_start`` (JSON), streams the binary mic ``frames`` (each tag ``0x01``
     + s16le PCM), then ``voice_stop`` (JSON) which freezes the turn server-side
-    and emits ``stt_final`` on ``/ws/debug``. Returns after a short settle so the
-    server finalises before the socket closes. The ``/ws/debug`` capture (a
-    separate socket) records the emitted ``stt_partial`` / ``stt_final`` frames;
-    the caller's ``wait_event`` / assertions read them there.
+    and emits ``stt_final`` on ``/ws/debug``. The ``/ws/debug`` capture (a
+    separate socket) records the emitted voice events; the caller's
+    ``wait_event`` / ``wait_state`` / assertions read them there.
+
+    ``await_reply`` (issue 0100): when the frames drive the full-duplex loop to
+    an ``endpoint`` (voiced burst + trailing silence), the say-path runs as a
+    server-side background task that streams ``audio_chunk`` / ``audio_end``
+    frames on THIS socket. We must keep the socket open until the reply finishes
+    — otherwise closing it cancels the in-flight say-path and the FSM never
+    reaches ``bob_speaking``. So with ``await_reply`` we read chat frames until
+    the terminal ``audio_end`` (bounded by ``reply_timeout_ms``) BEFORE sending
+    ``voice_stop`` + closing. Without it (the 0099 STT-only path) we send
+    ``voice_stop`` immediately and settle briefly.
     """
 
     async with websockets.connect(
@@ -278,6 +331,30 @@ async def inject_audio_ws(
         await conn.send(json.dumps({"type": "voice_start", "window": "new"}))
         for frame in frames:
             await conn.send(frame)
+
+        if await_reply:
+            # Let the server-side say-path finish: read until ``audio_end`` (or
+            # timeout). The PCM rides as binary frames we simply ignore; the JSON
+            # ``audio_end`` is the terminator. The FSM has returned to idle by
+            # then, so the trailing ``voice_stop`` is a clean no-op teardown.
+            deadline = asyncio.get_event_loop().time() + (reply_timeout_ms / 1000.0)
+            while True:
+                remaining = deadline - asyncio.get_event_loop().time()
+                if remaining <= 0:
+                    break
+                try:
+                    raw = await asyncio.wait_for(conn.recv(), timeout=remaining)
+                except (TimeoutError, websockets.ConnectionClosed):
+                    break
+                if isinstance(raw, bytes):
+                    continue
+                try:
+                    frame = json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if isinstance(frame, dict) and frame.get("type") == "audio_end":
+                    break
+
         await conn.send(json.dumps({"type": "voice_stop"}))
         # Let the server process voice_stop → finalize → emit stt_final before
         # the socket closes (close also finalises, but an explicit settle keeps

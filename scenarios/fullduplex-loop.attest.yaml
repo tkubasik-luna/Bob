@@ -1,0 +1,75 @@
+# Full-duplex loop attest scenario (PRD 0016 / issue 0100, Annexe A.2 + B + F).
+#
+# Proves the BARE full-duplex loop end-to-end against an ephemeral backend with
+# the deterministic fake LLM + fake STT + fake TTS (no native models):
+#
+#   1. inject_text — the HYBRID text path still converges on the Jarvis say-path
+#      (zero regression on the existing text entry); it produces a `say`.
+#   2. inject_audio (voiced) — a loud burst + trailing silence drives the energy
+#      VAD → `vad_speech_start`, the silence-floor Endpointer → `endpoint`, which
+#      freezes the transcript and runs the SAME say-path → outbound TTS. The
+#      TurnFsm walks idle → user_speaking → thinking → bob_speaking → idle,
+#      emitting a `turn_state` event on every transition; the say-path emits
+#      `audio_chunk` events as it streams.
+#
+# The wait_state steps assert the ORDERED sequence as the run executes; the
+# fsm_reached / audio_chunks_gte assertions re-check the invariants on the
+# captured stream. A voice turn and a text turn converge on one say-path.
+#
+# Run:  uv run bob attest scenarios/fullduplex-loop.attest.yaml   (exit 0, ok: true)
+name: fullduplex-loop-bare
+description: >-
+  Hybrid text + voiced audio turn; the FSM walks
+  idle->user_speaking->thinking->bob_speaking->idle and Bob speaks (audio_chunk).
+backend: ephemeral
+llm: fake
+fake_llm:
+  - role: jarvis
+    on_input_contains: "bonjour"
+    reply: "Bonjour ! Je suis Bob, ton assistant."
+  - role: jarvis
+    on_input_contains: "temps"
+    reply: "Il fait beau aujourd'hui."
+timeline:
+  # 1) Hybrid text path — converges on the say-path (no FSM, no regression).
+  - do: inject_text
+    text: "bonjour Bob"
+  - do: wait_event
+    type: say
+    timeout_ms: 15000
+  # 2) Voiced audio turn — drives the full FSM cycle + audio out. The voiced
+  #    burst + trailing silence trips the VAD then the silence-floor endpoint.
+  - do: inject_audio
+    transcript: "quel temps fait il"
+    voiced: true
+  # Ordered FSM walk (each waits on the corresponding turn_state.to).
+  - do: wait_state
+    state: user_speaking
+    timeout_ms: 8000
+  - do: wait_state
+    state: thinking
+    timeout_ms: 8000
+  - do: wait_state
+    state: bob_speaking
+    timeout_ms: 8000
+  - do: wait_state
+    state: idle
+    timeout_ms: 8000
+assertions:
+  # The text turn's say (hybrid convergence) + the audio turn's reply.
+  - kind: event_emitted
+    type: say
+  - kind: deliverable_nonempty
+  # The FSM visited every state of the basic Annexe B cycle.
+  - kind: fsm_reached
+    state: user_speaking
+  - kind: fsm_reached
+    state: thinking
+  - kind: fsm_reached
+    state: bob_speaking
+  - kind: fsm_reached
+    state: idle
+  # Bob actually spoke (outbound TTS chunks observed on /ws/debug).
+  - kind: audio_chunks_gte
+    min: 1
+  - kind: no_error_events

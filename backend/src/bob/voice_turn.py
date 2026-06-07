@@ -121,6 +121,11 @@ class VoiceTurn:
         self._session: SttSession | None = None
         self._turn_token: Token[str | None] | None = None
         self._finished = False
+        # Monotonic count of ``stt_partial`` events emitted this turn. The
+        # full-duplex loop (issue 0100) reads it to fire the FSM's
+        # ``stt_partial`` self-loop only on *real* progress, without
+        # re-plumbing the emit path. Additive — the 0099 surface is unchanged.
+        self._partial_count = 0
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -245,7 +250,14 @@ class VoiceTurn:
 
     # -- emit helpers --------------------------------------------------------
 
+    @property
+    def partial_count(self) -> int:
+        """Monotonic count of ``stt_partial`` events emitted this turn (0100)."""
+
+        return self._partial_count
+
     async def _emit_partial(self, partial: SttPartial) -> None:
+        self._partial_count += 1
         ts = self._now()
         payload = {
             "type": "stt_partial",

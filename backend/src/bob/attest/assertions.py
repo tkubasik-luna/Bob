@@ -125,6 +125,11 @@ LOGICAL_EVENT_MATCHERS: dict[str, EventMatcher] = {
     "say": _is_say,
     "stt_partial": _voice_subtype_matcher("stt_partial"),
     "stt_final": _voice_subtype_matcher("stt_final"),
+    # PRD 0016 / issue 0100 (Annexe A.2 + B): the full-duplex loop's FSM
+    # transition event + the outbound TTS chunk marker. ``wait_event`` /
+    # ``wait_state`` synchronise on these.
+    "turn_state": _voice_subtype_matcher("turn_state"),
+    "audio_chunk": _voice_subtype_matcher("audio_chunk"),
 }
 
 
@@ -386,10 +391,95 @@ def run_assertion(spec: dict[str, Any], ctx: AssertionContext) -> AssertionResul
     return fn(spec, ctx)
 
 
-# Register the three kinds this skeleton ships. Later slices append their own
-# via ``register_assertion`` / ``@assertion`` next to the new logic.
+# --- full-duplex loop assertions (PRD 0016 / issue 0100) ---------------------
+
+
+def _turn_state_events(events: list[CapturedEvent]) -> list[dict[str, Any]]:
+    """Return the ``ws_event`` body of every captured ``turn_state`` voice event.
+
+    Each body is the Annexe A.2 ``turn_state`` payload
+    (``{turn_id, from, to, reason, ts, type}``) the loop emits via
+    :func:`bob.event_bus_v2.emit_event` (nested under ``payload.ws_event``).
+    """
+
+    matcher = _voice_subtype_matcher("turn_state")
+    out: list[dict[str, Any]] = []
+    for event in events:
+        if not matcher(event):
+            continue
+        ws_event = (event.get("payload") or {}).get("ws_event") or {}
+        if isinstance(ws_event, dict):
+            out.append(ws_event)
+    return out
+
+
+def check_fsm_reached(spec: dict[str, Any], ctx: AssertionContext) -> AssertionResult:
+    """PASS iff a ``turn_state`` transition reached ``spec['state']`` (Annexe C).
+
+    Spec: ``{kind: fsm_reached, state: bob_speaking}``. Reads the ``to`` field of
+    the captured ``turn_state`` voice events (PRD 0016 / Annexe B). This asserts
+    the FSM *visited* the target state at some point in the run — the invariant a
+    slice cares about ("Bob got the floor", "the user was heard") — not the exact
+    transition path. An optional ``turn_id`` narrows the check to one turn.
+    """
+
+    state = spec.get("state")
+    if not isinstance(state, str) or not state:
+        return AssertionResult(
+            kind="fsm_reached",
+            ok=False,
+            detail={"error": "fsm_reached requires a 'state' string"},
+        )
+    want_turn = spec.get("turn_id")
+    transitions = _turn_state_events(ctx.events)
+    states_reached = sorted(
+        {
+            str(t.get("to"))
+            for t in transitions
+            if not (isinstance(want_turn, str) and want_turn) or t.get("turn_id") == want_turn
+        }
+    )
+    return AssertionResult(
+        kind="fsm_reached",
+        ok=state in states_reached,
+        detail={"state": state, "states_reached": states_reached},
+    )
+
+
+def check_audio_chunks_gte(spec: dict[str, Any], ctx: AssertionContext) -> AssertionResult:
+    """PASS iff at least ``spec['min']`` outbound ``audio_chunk`` events were seen.
+
+    Spec: ``{kind: audio_chunks_gte, min: 1}`` (Annexe C). Counts the
+    ``audio_chunk`` voice events the say-path emits per outbound PCM block (the
+    raw PCM rides the chat socket, so the count is the debug-observable proxy for
+    "Bob actually spoke"). Covers the bare-loop audio-out criterion; a later
+    barge-in slice asserts a *cut* count against the same events.
+    """
+
+    raw_min = spec.get("min", 1)
+    try:
+        minimum = int(raw_min)
+    except (TypeError, ValueError):
+        return AssertionResult(
+            kind="audio_chunks_gte",
+            ok=False,
+            detail={"error": "audio_chunks_gte 'min' must be an integer", "min": raw_min},
+        )
+    matcher = _voice_subtype_matcher("audio_chunk")
+    count = sum(1 for event in ctx.events if matcher(event))
+    return AssertionResult(
+        kind="audio_chunks_gte",
+        ok=count >= minimum,
+        detail={"min": minimum, "count": count},
+    )
+
+
+# Register the kinds this module ships. Later slices append their own via
+# ``register_assertion`` / ``@assertion`` next to the new logic.
 register_assertion("event_emitted", check_event_emitted)
 register_assertion("no_error_events", check_no_error_events)
 register_assertion("deliverable_nonempty", check_deliverable_nonempty)
 register_assertion("role_used_model", check_role_used_model)
 register_assertion("stt_final_matches", check_stt_final_matches)
+register_assertion("fsm_reached", check_fsm_reached)
+register_assertion("audio_chunks_gte", check_audio_chunks_gte)

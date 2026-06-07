@@ -132,10 +132,14 @@ def test_project_deliverable_empty_when_no_say() -> None:
 
 
 def test_unknown_kind_is_loud_fail_not_silent_pass() -> None:
-    result = run_assertion({"kind": "fsm_reached", "state": "bob_speaking"}, _ctx([]))
+    # ``bargein_within_ms`` is a documented Annexe C kind that has NOT been
+    # implemented yet (its slice is 0101) — referencing it must FAIL loudly,
+    # naming the kind, never silently pass. (``fsm_reached`` / ``audio_chunks_gte``
+    # landed in issue 0100 and are exercised in test_attest_fsm.)
+    result = run_assertion({"kind": "bargein_within_ms", "max": 300}, _ctx([]))
     assert result.ok is False
     assert "not implemented yet" in result.detail["error"]
-    assert "fsm_reached" in result.detail["error"]
+    assert "bargein_within_ms" in result.detail["error"]
 
 
 def test_missing_kind_fails() -> None:

@@ -37,10 +37,17 @@ import yaml
 from bob.attest.assertions import (
     LOGICAL_EVENT_MATCHERS,
     AssertionContext,
+    CapturedEvent,
     project_deliverable,
     run_assertion,
 )
-from bob.attest.drive import DebugCapture, inject_audio_ws, inject_text, synth_mic_frames
+from bob.attest.drive import (
+    DebugCapture,
+    inject_audio_ws,
+    inject_text,
+    synth_mic_frames,
+    synth_voiced_frames,
+)
 from bob.attest.ephemeral import EphemeralBackend
 from bob.attest.fake_backend import FakeScript
 
@@ -263,10 +270,7 @@ class ScenarioRunner:
                     ms = step.get("ms", step.get("at_ms", 0))
                     await asyncio.sleep(max(int(ms), 0) / 1000.0)
                 elif op == "wait_state":
-                    errors.append(
-                        f"timeline[{index}] op {op!r} is not implemented in this "
-                        "slice (lands with the FSM slice)"
-                    )
+                    await self._do_wait_state(step, capture, errors)
                 else:
                     errors.append(f"timeline[{index}] unknown op {op!r}")
             except ScenarioError as exc:
@@ -295,13 +299,27 @@ class ScenarioRunner:
         transcript, so silent frames sized to comfortably cover the transcript
         drive the REAL decode → ``VoiceTurn`` → ``stt_final`` path. Content
         fidelity is irrelevant — the assertion checks the contract, not audio.
+
+        ``voiced: true`` (issue 0100) instead streams a loud burst + trailing
+        silence so the full-duplex loop's energy VAD trips ``vad_speech_start``
+        and its silence-floor Endpointer fires ``endpoint`` — driving the FSM
+        through ``user_speaking`` → ``thinking`` → ``bob_speaking`` → ``idle``
+        and the say-path. The fake STT still converges to the scripted
+        transcript regardless of content.
         """
 
         transcript = step.get("transcript", "")
         words = max(1, len(str(transcript).split()))
         # Fake engine reveals one word per ~1600 samples; 480 samples/frame.
-        frame_count = max(8, (words * 1600) // 480 + 4)
-        await inject_audio_ws(ws_base, synth_mic_frames(frame_count=frame_count))
+        voiced_count = max(8, (words * 1600) // 480 + 4)
+        if step.get("voiced"):
+            frames = synth_voiced_frames(voiced_count=voiced_count)
+            # Keep the chat socket open until the say-path finishes so the
+            # in-flight reply is not cancelled by the socket close (issue 0100).
+            await inject_audio_ws(ws_base, frames, await_reply=True)
+        else:
+            frames = synth_mic_frames(frame_count=voiced_count)
+            await inject_audio_ws(ws_base, frames)
 
     async def _do_wait_event(
         self, step: dict[str, Any], capture: DebugCapture, errors: list[str]
@@ -319,3 +337,37 @@ class ScenarioRunner:
         ok = await capture.wait_for(matcher, timeout_ms=timeout_ms)
         if not ok:
             errors.append(f"wait_event: '{logical_type}' not observed within {timeout_ms}ms")
+
+    async def _do_wait_state(
+        self, step: dict[str, Any], capture: DebugCapture, errors: list[str]
+    ) -> None:
+        """Block until a ``turn_state`` voice event reaches ``state`` (Annexe B).
+
+        Op: ``{do: wait_state, state: bob_speaking, timeout_ms: 1500}``. The
+        full-duplex FSM (issue 0100) emits a ``turn_state`` voice event on every
+        transition; this synchronises on the one whose ``to`` field equals the
+        requested state (optionally narrowed by ``turn_id``). A timeout records a
+        loud timeline error so the run is never silently green.
+        """
+
+        state = step.get("state")
+        if not isinstance(state, str) or not state:
+            errors.append("wait_state: requires a 'state' string")
+            return
+        timeout_ms = int(step.get("timeout_ms", 1500))
+        want_turn = step.get("turn_id")
+        turn_state_matcher = LOGICAL_EVENT_MATCHERS["turn_state"]
+
+        def _reached(event: CapturedEvent) -> bool:
+            if not turn_state_matcher(event):
+                return False
+            ws_event = (event.get("payload") or {}).get("ws_event") or {}
+            if ws_event.get("to") != state:
+                return False
+            if isinstance(want_turn, str) and want_turn:
+                return bool(ws_event.get("turn_id") == want_turn)
+            return True
+
+        ok = await capture.wait_for(_reached, timeout_ms=timeout_ms)
+        if not ok:
+            errors.append(f"wait_state: '{state}' not reached within {timeout_ms}ms")

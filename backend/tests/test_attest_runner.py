@@ -193,23 +193,34 @@ async def test_timeline_wait_event_unknown_type_is_loud() -> None:
     assert any("unknown logical event type" in e for e in errors)
 
 
-async def test_timeline_unimplemented_voice_ops_are_loud_not_silent() -> None:
-    # ``inject_audio`` is now implemented (issue 0099 — see test_attest_audio);
-    # ``wait_state`` (FSM) is still pending, so it alone must surface a loud
-    # "not implemented" timeline error rather than passing silently.
+async def test_wait_state_op_is_implemented_and_synchronises() -> None:
+    # ``inject_audio`` (issue 0099) and ``wait_state`` (issue 0100 — the FSM
+    # slice) are both implemented now. ``wait_state`` must synchronise on a
+    # ``turn_state`` voice event whose ``to`` matches and NOT record a "not
+    # implemented" error (the old stub behaviour). A stub capture that reports
+    # the state reached drives the happy path here; the timeout / unknown
+    # branches live in test_attest_fsm.
+    turn_state_event = {
+        "category": "voice",
+        "payload": {"ws_event": {"type": "turn_state", "to": "bob_speaking"}},
+    }
     scenario = Scenario.from_dict(
         {
             "name": "x",
-            "timeline": [
-                {"do": "wait_state", "state": "bob_speaking"},
-            ],
+            "timeline": [{"do": "wait_state", "state": "bob_speaking", "timeout_ms": 50}],
         }
     )
     runner = ScenarioRunner(scenario)
     errors: list[str] = []
-    await runner._execute_timeline("ws://h", _StubCapture(), errors)  # type: ignore[arg-type]
-    assert len(errors) == 1
-    assert all("not implemented in this slice" in e for e in errors)
+    await runner._execute_timeline(
+        "ws://h",
+        _StubCapture(wait_results=[True]),  # type: ignore[arg-type]
+        errors,
+    )
+    # No "not implemented" error — the op ran. (The stub answers the predicate
+    # via its preset True; the real matcher is unit-tested in test_attest_fsm.)
+    assert errors == []
+    _ = turn_state_event  # documents the frame shape wait_state matches on
 
 
 async def test_timeline_unknown_op_is_loud() -> None:
