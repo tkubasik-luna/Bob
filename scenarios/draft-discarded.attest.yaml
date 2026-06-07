@@ -1,0 +1,76 @@
+# Speculative Draft — DIVERGENT end-of-phrase → discarded, then COLD (PRD 0016 /
+# issue 0104, Annexe A.2 + F + G).
+#
+# Proves the anticipation MISS path end-to-end against an ephemeral backend with
+# the deterministic fake LLM + fake STT + fake TTS (no native models):
+#
+#   1. inject_audio (voiced, draft: true) — the fake STT STREAMS the transcript
+#      (`transcript`) word-by-word; each partial feeds the SpeculativeDraft, which
+#      pre-writes a reply to what the user *seemed* to be saying (draft_status
+#      drafting → ready). But this turn carries an end-of-phrase STT REVISION
+#      (`env: BOB_FAKE_STT_REVISE_TO`): at finalize the transcript freezes to a
+#      DIVERGENT clause the draft never saw.
+#   2. At the endpoint the loop runs the PURE commit gate on that divergent FINAL.
+#      It is neither a prefix-extension of the partial the draft fired on nor
+#      above the token-overlap similarity threshold → the gate DISCARDS the draft
+#      (draft_status discarded, reason divergence). The Speaker then regenerates
+#      COLD on the divergent final via the normal say-path (process_user_message →
+#      the orchestrator `say` output event → TTS), so the user still gets a
+#      correct reply to what they ACTUALLY said.
+#
+# Assertions: draft_status reached `discarded` (the gate rejected the stale
+# draft), the COLD reply landed (deliverable_nonempty — proof the say-path
+# regenerated), the FSM got the floor, and no errors.
+#
+# Run:  uv run bob attest scenarios/draft-discarded.attest.yaml   (exit 0, ok: true)
+name: draft-discarded-on-divergent-input
+description: >-
+  A voiced turn whose final transcript DIVERGES (end-of-phrase STT revision) from
+  the partial the draft fired on: the commit gate discards the stale draft and
+  the Speaker regenerates a correct COLD reply.
+backend: ephemeral
+llm: fake
+env:
+  # End-of-phrase revision: the fake STT streams `transcript` as partials (what
+  # the draft sees) but FREEZES to this divergent clause — a token-set that does
+  # not prefix-match and falls below the similarity guard, so the gate discards.
+  BOB_FAKE_STT_REVISE_TO: "annule tout finalement laisse tomber merci"
+fake_llm:
+  # The Draft pre-writes a reply to the STREAMED partial (a restaurant booking).
+  - role: draft
+    on_input_contains: ""
+    reply: "Je réserve une table pour ce soir."
+  # The COLD Speaker answers the DIVERGENT final transcript (the cancel). This is
+  # the reply the user actually gets after the draft is discarded.
+  - role: jarvis
+    on_input_contains: "annule"
+    reply: "D'accord, j'annule tout."
+timeline:
+  - do: inject_audio
+    transcript: "reserve une table pour ce soir"
+    voiced: true
+    draft: true
+  # The drafter reached its terminal verdict (discarded).
+  - do: wait_event
+    type: draft_status
+    timeout_ms: 8000
+  # The FSM got the floor on the COLD regeneration.
+  - do: wait_state
+    state: bob_speaking
+    timeout_ms: 8000
+  - do: wait_state
+    state: idle
+    timeout_ms: 8000
+assertions:
+  # The commit gate DISCARDED the stale draft on divergence.
+  - kind: draft_status
+    state: discarded
+    reason: divergence
+  # The Speaker regenerated COLD: a non-empty reply to what the user actually
+  # said reached the say-path's `say` output event.
+  - kind: deliverable_nonempty
+  - kind: fsm_reached
+    state: bob_speaking
+  - kind: audio_chunks_gte
+    min: 1
+  - kind: no_error_events

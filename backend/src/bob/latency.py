@@ -23,10 +23,11 @@ when its inputs are unset) in a single, audited spot.
 
 Marks are *monotone seconds* (``time.monotonic``); the derived deltas are
 reported in **milliseconds** to match Annexe F's targets (e.g.
-``endpoint_to_first_audio_ms < 800``). ``backchannel_ms`` stays ``None`` until
-0105 and ``draft_hit`` stays ``False`` until 0104 — the fields exist now (a
-stable schema for the persisted ``latency_json`` + the harness) but carry their
-"feature not wired" defaults.
+``endpoint_to_first_audio_ms < 800``). ``backchannel_ms`` is stamped by the
+backchannel slice (0105) and ``t_draft_ready`` / ``t_commit_decision`` /
+``draft_hit`` by the SpeculativeDraft commit gate (0104) — each carries its
+"feature not wired" default (``None`` / ``False``) on a turn where that slice did
+not run, so the persisted ``latency_json`` + the harness see a stable schema.
 """
 
 from __future__ import annotations
@@ -69,9 +70,12 @@ class TurnLatency:
     t_first_partial: float | None = None
     #: Endpoint — the silence floor / ``user_turn_complete`` froze the turn.
     t_endpoint: float | None = None
-    #: Draft ready (issue 0104 — speculative draft generated). Placeholder today.
+    #: Draft ready (issue 0104) — stamped by the commit gate when a speculative
+    #: draft had been pre-written at the endpoint (committed or discarded on
+    #: divergence). Absent on a cold turn (no draft was produced).
     t_draft_ready: float | None = None
-    #: Commit decision (issue 0104 — draft committed vs cold). Placeholder today.
+    #: Commit decision (issue 0104) — stamped when the commit gate ran (committed
+    #: the draft vs fell back to cold). Absent when no drafter is wired.
     t_commit_decision: float | None = None
     #: First outbound TTS chunk left the socket (Bob got the floor / spoke).
     t_first_audio_chunk: float | None = None
@@ -91,8 +95,9 @@ class TurnLatency:
     #: leaves both marks unset, so ``backchannel_ms`` stays ``None``).
     t_backchannel: float | None = None
 
-    #: Did Bob speak a committed speculative Draft (vs a cold generation)?
-    #: Issue 0104 flips this; ``False`` until then.
+    #: Did Bob speak a committed speculative Draft (vs a cold generation)? The
+    #: commit gate (issue 0104) flips this ``True`` when it adopts a pre-written
+    #: draft; ``False`` on the cold path (discarded / no draft / no drafter).
     draft_hit: bool = False
 
     def marks_payload(self) -> dict[str, float]:
@@ -132,7 +137,8 @@ class TurnLatency:
           pause. The key is ALWAYS present (``None`` on a turn with no
           backchannel) so the persisted ``latency_json`` + the harness see a
           stable schema, but it carries a real ms delta once a backchannel fired.
-        - ``draft_hit`` — the bool from the Draft slice (``False`` until 0104).
+        - ``draft_hit`` — the bool from the Draft slice (issue 0104): ``True`` when
+          Bob spoke a committed speculative draft, else ``False`` (cold / no drafter).
 
         A mark→mark metric whose inputs are missing is OMITTED, EXCEPT the
         feature-gated ``backchannel_ms`` / ``draft_hit`` keys which are always

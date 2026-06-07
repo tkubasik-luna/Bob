@@ -92,6 +92,7 @@ from bob.debug_log import emit_debug
 from bob.event_bus_v2 import emit_event, get_snapshot_for_task, subscribe_for_task
 from bob.live_transcript_state import LiveTranscriptState
 from bob.orchestrator import Orchestrator, get_default_orchestrator
+from bob.speculative_draft import SpeculativeDraft
 from bob.spoken_text_cleaner import clean_for_speech
 from bob.stt_engine import SttEngine, get_default_stt_engine
 from bob.task_store import TaskStoreError
@@ -612,6 +613,14 @@ async def _handle_voice_start(
     if thinker is not None:
         orchestrator.set_live_transcript_state(thinker.live_state)
 
+    # PRD 0016 / issue 0104 — the anticipation capstone. Build the per-session
+    # SpeculativeDraft on the mini ``draft`` role client; it pre-writes the
+    # conversational reply on the partial transcript IN PARALLEL with the Thinker
+    # (distinct role clients). Degrades cleanly (Annexe G "Draft model indispo →
+    # désactive l'anticipation, toujours froid"): if the draft client cannot be
+    # built the drafter is omitted and every turn regenerates COLD.
+    drafter = _make_speculative_draft(session_id, settings)
+
     loop = FullDuplexLoop(
         voice_turn_factory=lambda: VoiceTurn(
             engine=_stt_engine_provider(), session_id=session_id, settings=settings
@@ -646,8 +655,18 @@ async def _handle_voice_start(
         backchannel_tts=(
             _make_backchannel_tts(websocket, session_id) if thinker is not None else None
         ),
+        # SpeculativeDraft (issue 0104): arm/feed/stop mirror the Thinker hooks; the
+        # commit gate (PURE) runs at the endpoint on the FINAL transcript and the
+        # decision event is emitted via the drafter. All ``None`` when the draft
+        # model is unavailable (Annexe G) → anticipation off, every turn cold.
+        on_draft_start=(drafter.start if drafter is not None else None),
+        on_draft_feed=(drafter.feed_partial if drafter is not None else None),
+        on_draft_stop=(drafter.stop if drafter is not None else None),
+        draft_commit_gate=(drafter.commit_gate if drafter is not None else None),
+        draft_emit_decision=(drafter.emit_decision if drafter is not None else None),
     )
     session["thinker_loop"] = thinker.loop if thinker is not None else None
+    session["speculative_draft"] = drafter
     started = await loop.start()
     if not started:
         # The first STT session failed to open; the VoiceTurn already emitted
@@ -678,6 +697,15 @@ def _make_say_path_driver(
     ``t_first_audio_chunk`` + flips the FSM into ``bob_speaking``. An empty
     transcript (no speech captured) is skipped so we never run a turn on
     nothing.
+
+    ``prepared_reply`` (PRD 0016 / issue 0104): a COMMITTED speculative draft. The
+    endpoint's commit gate adopted a pre-written reply, so we BYPASS the cold
+    Speaker generation (``process_user_message``) and speak the draft verbatim —
+    the trivial-validation adoption that makes the reply near-instant. We still
+    persist it as the assistant turn in the Jarvis history (so conversational
+    continuity holds) and emit the SAME ``assistant_msg`` + TTS stream the cold
+    path emits, so the client + the latency marks are identical apart from the
+    skipped generation. ``None`` keeps the cold path unchanged.
     """
 
     async def _drive(
@@ -687,27 +715,57 @@ def _make_say_path_driver(
         on_first_audio: Callable[[], Awaitable[None]],
         on_spoken_progress: Callable[[str], Awaitable[None]] | None = None,
         on_audio_chunk: Callable[[bytes, int], Awaitable[None]] | None = None,
+        prepared_reply: str | None = None,
     ) -> None:
         if not transcript.strip():
             return
-        response = await orchestrator.process_user_message(session_id, transcript)
-        msg_id = response.msg_id or uuid.uuid4().hex
+        if prepared_reply is not None and prepared_reply.strip():
+            # Committed speculative draft (issue 0104): adopt the pre-written text
+            # verbatim. Persist it as the assistant turn (the orchestrator's ``say``
+            # handler would have done this on the cold path) so the conversation
+            # history reflects what Bob actually said, then stream it like any reply.
+            speech = prepared_reply.strip()
+            msg_id = uuid.uuid4().hex
+            with contextlib.suppress(RuntimeError):
+                jarvis_store_module.get_default_store().append("assistant", speech)
+            ui: list[Any] = []
+            # Emit the SAME ``category="output"`` reply event the cold say-path
+            # emits from ``process_user_message`` — so a committed draft is
+            # observably a reply (the deliverable projection + the Debug View read
+            # it identically whether Bob spoke a draft or a cold generation).
+            emit_debug(
+                category="output",
+                severity="info",
+                source="bob.ws_router.say_path_committed_draft",
+                summary=f'Bob répond (draft): "{speech[:80]}"',
+                payload={
+                    "speech": speech,
+                    "ui": [],
+                    "proactive": False,
+                    "draft_committed": True,
+                },
+            )
+        else:
+            response = await orchestrator.process_user_message(session_id, transcript)
+            speech = response.speech
+            msg_id = response.msg_id or uuid.uuid4().hex
+            ui = [component.model_dump() for component in response.ui]
         await websocket.send_json(
             {
                 "type": "assistant_msg",
                 "msg_id": msg_id,
-                "speech": response.speech,
-                "ui": [component.model_dump() for component in response.ui],
+                "speech": speech,
+                "ui": ui,
                 "proactive": False,
             }
         )
-        if not response.speech.strip():
+        if not speech.strip():
             return
         await _synthesize_and_stream(
             websocket,
             session_id,
             msg_id,
-            response.speech,
+            speech,
             on_first_audio=on_first_audio,
             # Barge-in needs to know what Bob actually played (issue 0101).
             on_spoken_progress=on_spoken_progress,
@@ -816,6 +874,26 @@ def _make_commit_spoken(session_id: str) -> Callable[[str, str], Awaitable[None]
     return _commit
 
 
+def _draft_outcome_from_latency(marks: dict[str, float], derived: dict[str, Any]) -> str:
+    """Map the Annexe F latency body to the ``voice_turns.draft_outcome`` enum (0104).
+
+    - ``committed`` — ``draft_hit`` is True (Bob spoke a committed speculative
+      draft this turn).
+    - ``discarded`` — a draft was produced at the gate (``t_draft_ready`` stamped)
+      but the commit gate rejected it (divergence) → Bob regenerated COLD.
+    - ``none`` — no draft this turn (the drafter was unwired / suppressed / never
+      fired). The single source is the same latency body the event + the
+      ``latency_json`` carry, so the persisted outcome can never drift from the
+      marks.
+    """
+
+    if bool(derived.get("draft_hit")):
+        return "committed"
+    if "t_draft_ready" in marks:
+        return "discarded"
+    return "none"
+
+
 def _make_persist_turn(session_id: str) -> Callable[[PersistedTurn], Awaitable[None]]:
     """Build the voice-turn persistence hook (PRD 0016 / issue 0109, Annexe E).
 
@@ -823,7 +901,8 @@ def _make_persist_turn(session_id: str) -> Callable[[PersistedTurn], Awaitable[N
     :class:`bob.voice_loop.PersistedTurn` snapshot. We:
 
     1. write the ``voice_turns`` row (transcript, spoken text, end reason,
-       latency JSON; ``draft_outcome`` is ``"none"`` until issue 0104);
+       latency JSON; ``draft_outcome`` derived from the Annexe F ``draft_hit`` —
+       issue 0104 — committed / discarded / none);
     2. write the ``mic_in`` + ``tts_out`` audio as WAV files on disk (paths in
        ``voice_audio_blobs``) — an empty recording is simply skipped;
     3. link the final transcript into the persistent Jarvis history and record
@@ -862,7 +941,12 @@ def _make_persist_turn(session_id: str) -> Callable[[PersistedTurn], Awaitable[N
             except RuntimeError:
                 jarvis_msg_id = None
 
-        # 1) The voice_turns row. draft_outcome stays "none" until issue 0104.
+        # 1) The voice_turns row. ``draft_outcome`` (issue 0104) is derived from
+        #    the Annexe F latency body: ``draft_hit`` True ⇒ Bob spoke a committed
+        #    speculative draft; else if a draft was produced at the gate
+        #    (``t_draft_ready`` stamped) but not adopted ⇒ ``discarded``; else
+        #    ``none`` (no draft this turn — cold path / drafter unwired).
+        draft_outcome = _draft_outcome_from_latency(turn.marks, turn.derived)
         store.write_turn(
             turn_id=turn.turn_id,
             started_at=started_at,
@@ -870,7 +954,7 @@ def _make_persist_turn(session_id: str) -> Callable[[PersistedTurn], Awaitable[N
             final_transcript=turn.final_transcript or None,
             spoken_text=turn.spoken_text or None,
             end_reason=turn.end_reason,
-            draft_outcome="none",
+            draft_outcome=draft_outcome,
             latency_json=latency_json,
             jarvis_msg_id=jarvis_msg_id,
         )
@@ -1066,6 +1150,55 @@ def _thinker_spawn(coro: Coroutine[Any, Any, None]) -> asyncio.Task[None]:
     return asyncio.create_task(coro)
 
 
+def _make_speculative_draft(session_id: str, settings: Settings) -> SpeculativeDraft | None:
+    """Build the per-session :class:`SpeculativeDraft` on the ``draft`` role client.
+
+    PRD 0016 / issue 0104 (Annexe D + G). Reads the per-role selection
+    (:class:`bob.llm_selection_store.RoleSelectionStore`, default a mini fast
+    model) and builds the ``draft`` role client via
+    :func:`bob.llm.factory.build_draft_role_client`, then constructs the drafter.
+    Its inference is spawned through the SAME scheduler TaskGroup the Thinker uses
+    (:func:`_thinker_spawn`) so a passing pass cannot leak past an orchestrator
+    crash (structured concurrency).
+
+    Returns ``None`` (anticipation OFF — every turn COLD, Annexe G "Draft model
+    indispo") when the role store is not primed or the client cannot be built, so
+    a misconfigured ``draft`` role never wedges voice. The full-duplex loop then
+    runs exactly as 0100/0103 (no draft hooks wired).
+    """
+
+    from bob import llm_selection_store
+    from bob.llm.factory import build_draft_role_client
+
+    try:
+        role_selection = llm_selection_store.get_default_role_store().read()
+    except RuntimeError:
+        role_selection = None
+    if role_selection is None:
+        role_selection = llm_selection_store.RoleSelection(
+            roles={
+                role: llm_selection_store.LLMSelection(
+                    provider=settings.LLM_PROVIDER,
+                    lm_model=settings.LLM_MODEL,
+                    base_url=settings.LLM_BASE_URL or None,
+                )
+                for role in llm_selection_store.ROLES
+            }
+        )
+    try:
+        client = build_draft_role_client(role_selection, settings)
+    except Exception:
+        _logger.warning("ws_router.draft_client_build_failed", session_id=session_id)
+        return None
+
+    return SpeculativeDraft(
+        client=client,
+        settings=settings,
+        session_id=session_id,
+        spawn=_thinker_spawn,
+    )
+
+
 async def _handle_voice_stop(
     websocket: WebSocket, payload: dict[str, Any], session_id: str, orchestrator: Orchestrator
 ) -> None:
@@ -1096,6 +1229,7 @@ async def _handle_voice_stop(
         orchestrator.set_live_transcript_state(LiveTranscriptState())
     session["voice_loop"] = None
     session["thinker_loop"] = None
+    session["speculative_draft"] = None
 
 
 async def _handle_voice_aec_degraded(

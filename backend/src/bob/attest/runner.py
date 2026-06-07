@@ -373,6 +373,12 @@ class ScenarioRunner:
         deterministic. Derived from the op's params so the YAML stays declarative;
         empty for scenarios that set none of these (zero behaviour change for the
         0099/0100/0101 scenarios).
+
+        Issue 0104: a step carrying ``draft: true`` ALSO pins
+        ``THINKER_DEBOUNCE_MS=0`` (the SpeculativeDraft reuses the Thinker
+        debounce knob) so the speculative draft fires on the first ``stt_partial``
+        and reliably lands a pre-written reply before the short synthetic turn's
+        endpoint — making "a draft was ready at the commit gate" deterministic.
         """
 
         env: dict[str, str] = {}
@@ -387,7 +393,9 @@ class ScenarioRunner:
                 # barge-in lands in; the fake yields BOB_FAKE_TTS_CHUNKS per
                 # sentence, so a multi-chunk reply spans well past the window.
                 env["BOB_FAKE_TTS_CHUNKS"] = str(max(1, int(step.get("tts_chunks", 4))))
-            if op in ("inject_audio", "inject_bargein") and step.get("thinker"):
+            if op in ("inject_audio", "inject_bargein") and (
+                step.get("thinker") or step.get("draft")
+            ):
                 env["THINKER_DEBOUNCE_MS"] = "0"
         # Scenario-level backend env (issue 0109): merged AFTER the derived
         # per-step dials so an explicit scenario value wins, but still BEFORE the

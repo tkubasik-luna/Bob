@@ -153,6 +153,11 @@ LOGICAL_EVENT_MATCHERS: dict[str, EventMatcher] = {
     # (voice_turns row + audio blobs) and the retention sweep evicted something.
     "voice_turn_persisted": _voice_subtype_matcher("voice_turn_persisted"),
     "voice_retention_purged": _voice_subtype_matcher("voice_retention_purged"),
+    # PRD 0016 / issue 0104 (Annexe A.2 + F): the SpeculativeDraft lifecycle
+    # (drafting / ready / committed / discarded). ``wait_event type: draft_status``
+    # blocks until the anticipation reached a phase; ``draft_status`` (assertion)
+    # checks the gate verdict.
+    "draft_status": _voice_subtype_matcher("draft_status"),
 }
 
 
@@ -1211,3 +1216,49 @@ def check_voice_retention_purged(spec: dict[str, Any], ctx: AssertionContext) ->
 
 register_assertion("voice_turn_persisted", check_voice_turn_persisted)
 register_assertion("voice_retention_purged", check_voice_retention_purged)
+
+
+# --- speculative draft assertions (PRD 0016 / issue 0104) --------------------
+
+
+def check_draft_status(spec: dict[str, Any], ctx: AssertionContext) -> AssertionResult:
+    """PASS iff a ``draft_status`` event reached ``spec['state']`` (Annexe A.2 + F).
+
+    Spec: ``{kind: draft_status, state: committed}`` (the aligned-input scenario)
+    or ``{kind: draft_status, state: discarded}`` (the divergent end-of-phrase
+    scenario), with an optional ``reason`` narrowing (``prefix`` / ``similarity``
+    / ``divergence`` / ``no_draft`` / ``tool_turn``). Reads the ``state`` field of
+    the captured ``draft_status`` voice events the
+    :class:`bob.speculative_draft.SpeculativeDraft` emits across the turn
+    (``drafting`` → ``ready`` → ``committed``/``discarded``). This is the
+    black-box proof the anticipation reached the asserted verdict — the commit
+    gate adopted the pre-written draft (``committed``) or threw it away and
+    regenerated COLD (``discarded``). FAILs loudly (echoing the states actually
+    seen) when no matching ``draft_status`` was captured, so a scenario that
+    expected a verdict and got none is red, not silently green.
+    """
+
+    state = spec.get("state")
+    if not isinstance(state, str) or not state:
+        return AssertionResult(
+            kind="draft_status",
+            ok=False,
+            detail={"error": "draft_status requires a 'state' string"},
+        )
+    want_reason = spec.get("reason")
+    events = _voice_ws_events(ctx.events, "draft_status")
+    states_seen = sorted({str(e.get("state")) for e in events})
+    matched = [
+        e
+        for e in events
+        if e.get("state") == state
+        and (not (isinstance(want_reason, str) and want_reason) or e.get("reason") == want_reason)
+    ]
+    detail: dict[str, Any] = {"state": state, "states_seen": states_seen}
+    if isinstance(want_reason, str) and want_reason:
+        detail["reason"] = want_reason
+        detail["reasons_seen"] = sorted({str(e.get("reason")) for e in events})
+    return AssertionResult(kind="draft_status", ok=bool(matched), detail=detail)
+
+
+register_assertion("draft_status", check_draft_status)

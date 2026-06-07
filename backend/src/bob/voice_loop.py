@@ -11,8 +11,12 @@ audio→brain→audio skeleton + FSM lifecycle; issue 0101 adds **barge-in** (th
 hooks below). Issue 0103 makes the endpoint **semantic**: the loop routes the
 Thinker's ``user_turn_complete`` (+ the STT stable-prefix confirmation) into the
 :class:`bob.endpointer.Endpointer`, so a confirmed complete clause fires
-``t_endpoint`` EARLIER than the silence floor (Annexe B + H). NO Draft yet (that
-is 0104).
+``t_endpoint`` EARLIER than the silence floor (Annexe B + H). Issue 0104 adds the
+**SpeculativeDraft** (the anticipation capstone): a ``draft`` mini model pre-writes
+the conversational reply on the PARTIAL transcript IN PARALLEL with the Thinker, and
+at the endpoint a pure commit gate (prefix fast-path -> similarity guard -> discard)
+decides whether to adopt it verbatim into the say-path (``prepared_reply``) for a
+near-instant reply, or regenerate COLD.
 
 Barge-in (issue 0101, Annexe B + F)
 -----------------------------------
@@ -87,6 +91,7 @@ from bob.config import Settings
 from bob.endpointer import Endpointer
 from bob.event_bus_v2 import emit_event
 from bob.latency import DerivedValue, TurnLatency
+from bob.speculative_draft import DraftDecision
 from bob.stt_engine import SttFrameError, decode_pcm_frame
 from bob.turn_fsm import Transition, TurnEvent, TurnFsm, TurnState
 from bob.vad import EnergyVad, VadEvent, rms_normalised
@@ -129,7 +134,18 @@ class SayPathDriver(Protocol):
         on_first_audio: Callable[[], Awaitable[None]],
         on_spoken_progress: Callable[[str], Awaitable[None]] | None = None,
         on_audio_chunk: Callable[[bytes, int], Awaitable[None]] | None = None,
-    ) -> None: ...
+        prepared_reply: str | None = None,
+    ) -> None:
+        """``prepared_reply`` (PRD 0016 / issue 0104): a COMMITTED speculative draft.
+
+        When the endpoint's commit gate adopts a pre-written draft, the loop hands
+        its text here so the driver skips the cold Speaker generation and speaks
+        the draft verbatim (trivial validation — it is already text) → TTS, while
+        still persisting it as the assistant turn. ``None`` (the cold path) keeps
+        the normal say-path: the driver runs ``process_user_message`` on the
+        transcript exactly as in 0100/0103.
+        """
+        ...
 
 
 @dataclass(frozen=True)
@@ -221,6 +237,31 @@ class FullDuplexLoop:
     #: still fire so the gate is attestable in narrow test setups). A failure is
     #: swallowed — a backchannel hiccup must never perturb the live user turn.
     backchannel_tts: Callable[[str, str], Awaitable[None]] | None = None
+    #: SpeculativeDraft hooks (PRD 0016 / issue 0104 — the anticipation capstone).
+    #: They MIRROR the Thinker hooks: ``on_draft_start`` arms the drafter for a
+    #: turn (``idle -> user_speaking``); ``on_draft_feed`` hands it each
+    #: ``stt_partial`` (debounced inside the loop, so a draft is pre-written while
+    #: the user still speaks); ``on_draft_stop`` cooperatively cancels it on
+    #: ``endpoint`` / ``voice_stop`` (cancel + grace + hard-kill), leaving the
+    #: latest landed draft readable for the commit gate. All ``None`` (the bare
+    #: loop, or the ``draft`` model unavailable — Annexe G) means NO anticipation:
+    #: every turn regenerates COLD, byte-for-byte as 0100/0103.
+    on_draft_start: Callable[[str], None] | None = None
+    on_draft_feed: Callable[[str], Awaitable[None]] | None = None
+    on_draft_stop: Callable[[], Awaitable[None]] | None = None
+    #: Commit gate (PRD 0016 / issue 0104, Annexe F). A PURE read run at the
+    #: endpoint on the FINAL frozen transcript: it returns a
+    #: :class:`bob.speculative_draft.DraftDecision` — ``committed`` (adopt the
+    #: pre-written draft text into the say-path) via the prefix fast-path or the
+    #: similarity guard, else ``discarded`` (regenerate COLD). ``None`` keeps the
+    #: cold path (no drafter). Wired by ws_router to ``drafter.commit_gate``.
+    draft_commit_gate: Callable[[str], DraftDecision] | None = None
+    #: Emit the terminal ``draft_status`` event for the gate verdict (Annexe A.2).
+    #: Receives the ``turn_id`` + the :class:`DraftDecision` the gate returned, so
+    #: the marks (``t_commit_decision`` / ``draft_hit``) and the wire event stay in
+    #: one place. ``None`` skips the event (the marks still flip). Wired to
+    #: ``drafter.emit_decision``.
+    draft_emit_decision: Callable[[str, DraftDecision], Awaitable[None]] | None = None
     #: Commit-to-history hook for the barge-in ``commit_spoken_partial`` action
     #: (issue 0101): persist what Bob actually played before the cut. Defaults to
     #: the Jarvis store append (wired by ws_router); ``None`` = skip (tests).
@@ -393,9 +434,17 @@ class FullDuplexLoop:
             if self._latency.t_first_partial is None:
                 self._latency.t_first_partial = self._now()
             await self._dispatch(TurnEvent.STT_PARTIAL, turn_id=self._fsm.turn_id)
-            if self.on_thinker_feed is not None and turn is not None:
-                with contextlib.suppress(Exception):
-                    await self.on_thinker_feed(turn.latest_partial_text)
+            if turn is not None:
+                if self.on_thinker_feed is not None:
+                    with contextlib.suppress(Exception):
+                        await self.on_thinker_feed(turn.latest_partial_text)
+                # Feed the SAME partial to the SpeculativeDraft (PRD 0016 / issue
+                # 0104). It runs IN PARALLEL with the Thinker on a DISTINCT role
+                # client, pre-writing the conversational reply (debounced, ≤1 in
+                # flight inside the drafter). No-op when unwired (Annexe G).
+                if self.on_draft_feed is not None:
+                    with contextlib.suppress(Exception):
+                        await self.on_draft_feed(turn.latest_partial_text)
 
         # 3b) Semantic-endpoint signals (issue 0103, Annexe B + H). The order is
         #     normative: route the Thinker's LATEST ``user_turn_complete`` FIRST
@@ -455,6 +504,11 @@ class FullDuplexLoop:
         if self.on_thinker_stop is not None:
             with contextlib.suppress(Exception):
                 await self.on_thinker_stop()
+        # Likewise tear down the SpeculativeDraft (PRD 0016 / issue 0104): cancel
+        # an in-flight pass so no background drafting outlives the session.
+        if self.on_draft_stop is not None:
+            with contextlib.suppress(Exception):
+                await self.on_draft_stop()
         turn = self._turn
         self._turn = None
         # Capture the FSM turn id + whether the open turn aborted BEFORE the
@@ -528,6 +582,12 @@ class FullDuplexLoop:
             # clears the live-transcript store); no-op when unwired (bare loop).
             if self.on_thinker_start is not None:
                 self.on_thinker_start(transition.turn_id)
+            # Arm the SpeculativeDraft for this turn (PRD 0016 / issue 0104) — same
+            # synchronous cadence reset as the Thinker; clears the previous turn's
+            # held draft so we never adopt a stale pre-written reply. No-op when
+            # unwired (bare loop / draft model unavailable — Annexe G).
+            if self.on_draft_start is not None:
+                self.on_draft_start(transition.turn_id)
             await self._emit_turn_state(transition)
             return
         # ``thinking`` -> ``user_speaking`` (user resumes before Bob spoke). This
@@ -566,6 +626,14 @@ class FullDuplexLoop:
         if self.on_thinker_stop is not None:
             with contextlib.suppress(Exception):
                 await self.on_thinker_stop()
+        # SpeculativeDraft (PRD 0016 / issue 0104): freeze the drafter the SAME way
+        # — cancel the in-flight pass (cancel + grace + hard-kill) so the commit
+        # gate reads the latest LANDED draft rather than racing a late pass. The
+        # held draft survives the stop (the drafter clears only on the next
+        # ``start``). No-op when unwired (Annexe G — always cold).
+        if self.on_draft_stop is not None:
+            with contextlib.suppress(Exception):
+                await self.on_draft_stop()
 
         # Freeze the transcript (0099 finalize → stt_final) and detach the turn.
         turn = self._turn
@@ -584,12 +652,68 @@ class FullDuplexLoop:
         self._bargein.reset()
         self._spoken_text = ""
 
+        # The COMMIT GATE (PRD 0016 / issue 0104, Annexe F). On the FINAL frozen
+        # transcript, decide whether to adopt the pre-written draft: a committed
+        # draft is re-injected into the say-path verbatim (``prepared_reply``) so
+        # Bob answers near-instantly; a discarded one (divergence / no draft / tool
+        # turn) leaves ``prepared_reply`` None and the say-path regenerates COLD.
+        prepared_reply = await self._run_commit_gate(transcript, transition.turn_id)
+
         # Launch the say-path as a background task so a long generation does not
         # block the frame pump. Frames keep feeding STT while Bob speaks; once a
         # confirmation window of user speech elapses the barge-in path cuts in.
-        self._say_task = asyncio.create_task(self._run_say_path(transcript, transition.turn_id))
+        self._say_task = asyncio.create_task(
+            self._run_say_path(transcript, transition.turn_id, prepared_reply=prepared_reply)
+        )
 
-    async def _run_say_path(self, transcript: str, turn_id: str) -> None:
+    async def _run_commit_gate(self, transcript: str, turn_id: str) -> str | None:
+        """Run the speculative-draft commit gate at the endpoint (issue 0104).
+
+        Returns the COMMITTED draft text to adopt into the say-path, or ``None``
+        when the turn must regenerate COLD (no drafter wired, no draft produced, a
+        tool turn, or the gate discarded on divergence). Stamps the Annexe F
+        marks + flips ``draft_hit`` and emits the terminal ``draft_status`` event
+        (Annexe A.2) — keeping the marks and the wire event in one place. Never
+        raises: a gate hiccup must never take the turn down (it degrades to cold).
+
+        ``t_draft_ready`` is stamped when a draft actually existed at the gate (the
+        anticipation produced something to judge); ``t_commit_decision`` is stamped
+        unconditionally (the gate ran). ``draft_hit`` is the Annexe F bool the
+        latency summary + the persisted row carry: ``True`` only when Bob will
+        speak a committed draft.
+        """
+
+        if self.draft_commit_gate is None:
+            return None
+        decision: DraftDecision | None = None
+        try:
+            decision = self.draft_commit_gate(transcript)
+        except Exception:
+            _logger.exception("voice_loop.commit_gate_failed", session_id=self.session_id)
+            return None
+        if decision is None:
+            return None
+
+        # ``t_draft_ready`` — the anticipation had a pre-written reply to judge
+        # (committed via prefix/similarity, or discarded only on divergence — NOT
+        # on ``no_draft`` / ``tool_turn`` where nothing was drafted).
+        if decision.reason not in ("no_draft", "tool_turn"):
+            self._latency.t_draft_ready = self._now()
+        # ``t_commit_decision`` — the gate ran (whatever the verdict).
+        self._latency.t_commit_decision = self._now()
+        self._latency.draft_hit = decision.committed
+
+        if self.draft_emit_decision is not None:
+            with contextlib.suppress(Exception):
+                await self.draft_emit_decision(turn_id, decision)
+
+        if decision.committed and decision.text.strip():
+            return decision.text
+        return None
+
+    async def _run_say_path(
+        self, transcript: str, turn_id: str, *, prepared_reply: str | None = None
+    ) -> None:
         """Drive the existing Jarvis say-path on the frozen transcript, then idle.
 
         ``on_first_audio`` flips ``thinking`` -> ``bob_speaking`` and stamps
@@ -597,6 +721,12 @@ class FullDuplexLoop:
         driver returns (audio done, or none produced) we flip the FSM back to
         ``idle`` and emit the latency summary. A driver exception degrades to a
         clean idle (never crashes the session).
+
+        ``prepared_reply`` (PRD 0016 / issue 0104): a COMMITTED speculative draft.
+        When the endpoint's commit gate adopted a pre-written reply, the loop
+        threads its text to the driver so it speaks the draft verbatim instead of
+        cold-generating — the anticipation that lets ``endpoint_to_first_audio_ms``
+        land under the committed target (Annexe F). ``None`` keeps the cold path.
         """
 
         first_audio_seen = False
@@ -634,6 +764,7 @@ class FullDuplexLoop:
                 on_first_audio=_on_first_audio,
                 on_spoken_progress=_on_spoken_progress,
                 on_audio_chunk=_on_audio_chunk,
+                prepared_reply=prepared_reply,
             )
         except asyncio.CancelledError:
             raise
@@ -741,6 +872,12 @@ class FullDuplexLoop:
         if self.on_thinker_restart is not None:
             with contextlib.suppress(Exception):
                 await self.on_thinker_restart(turn_id)
+        # Re-arm the SpeculativeDraft on the resumed turn (PRD 0016 / issue 0104):
+        # the drafter's ``start`` clears the now-stale pre-written reply (Bob was
+        # cut off) so the resumed utterance speculates afresh. No-op when unwired.
+        if self.on_draft_start is not None:
+            with contextlib.suppress(Exception):
+                self.on_draft_start(turn_id)
 
         await self._emit_bargein(turn_id, confirmation, committed_spoken_text)
 
@@ -939,8 +1076,9 @@ class FullDuplexLoop:
         monotone stamps). ``marks`` carries every mark a slice stamped this turn
         (``t_first_mic_frame`` / ``t_first_partial`` / ``t_endpoint`` /
         ``t_first_audio_chunk`` / ``t_tts_end`` from the loop, the barge-in pair
-        on a cut; ``t_draft_ready`` / ``t_commit_decision`` remain absent until
-        the Draft slice 0104 stamps them).
+        on a cut; ``t_draft_ready`` / ``t_commit_decision`` from the Draft commit
+        gate — issue 0104 — when a drafter is wired, plus the ``draft_hit``
+        derived bool).
         """
 
         await emit_event(

@@ -187,13 +187,25 @@ class _FakeSession:
     one more word of the scripted transcript per ``_words_per_chunk`` worth
     of accumulated samples, so a fixture WAV streamed in frames produces a
     realistic-looking partial sequence with a stable, asserted final.
+
+    ``revise_to`` (PRD 0016 / issue 0104) models an end-of-phrase STT REVISION:
+    the partials reveal ``transcript`` word-by-word (what the live consumers — the
+    Thinker and the SpeculativeDraft — see DURING speech), but :meth:`finalize`
+    returns ``revise_to`` instead. This is the realistic case a speculative draft
+    must guard against: the pre-written reply was built on the streamed partial,
+    yet the settled clause diverged. ``None`` (the default) keeps the exact prior
+    behaviour (final == the streamed transcript), so every existing fixture is
+    byte-for-byte unchanged.
     """
 
-    def __init__(self, transcript: str, *, samples_per_word: int) -> None:
+    def __init__(
+        self, transcript: str, *, samples_per_word: int, revise_to: str | None = None
+    ) -> None:
         self._words = transcript.split()
         self._samples_per_word = max(1, samples_per_word)
         self._samples = 0
         self._revealed = 0
+        self._revise_to = revise_to
 
     def accept_frame(self, pcm: bytes) -> list[SttPartial]:
         self._samples += pcm16_sample_count(pcm)
@@ -211,6 +223,10 @@ class _FakeSession:
         return out
 
     def finalize(self) -> SttFinal:
+        # An end-of-phrase revision (issue 0104) overrides the streamed transcript
+        # at freeze time; otherwise the final is exactly what the partials built.
+        if self._revise_to is not None:
+            return SttFinal(text=self._revise_to)
         return SttFinal(text=" ".join(self._words))
 
     def close(self) -> None:
@@ -222,25 +238,38 @@ class FakeSttEngine:
 
     Construction:
 
-    - ``transcript`` — the canned final transcript every session converges
-      to. Sessions reveal it word-by-word as PCM accumulates so partials are
-      realistic.
+    - ``transcript`` — the canned transcript every session reveals word-by-word
+      as PCM accumulates (so partials are realistic). Also the FINAL transcript
+      unless ``revise_to`` overrides it.
     - ``samples_per_word`` — how many s16le samples must accumulate before
       the next word is revealed. Defaults small so a short fixture surfaces
       the whole transcript.
+    - ``revise_to`` — when set, the FINAL transcript a session freezes to
+      (modelling an end-of-phrase STT revision, issue 0104). The partials still
+      reveal ``transcript`` during speech; only :meth:`finalize` differs. ``None``
+      (the default) keeps the final equal to the streamed transcript.
 
     Always "cached" (no model, no download) so the lazy-download branch is
     skipped on the fake path and the suite is deterministic.
     """
 
-    def __init__(self, *, transcript: str = "", samples_per_word: int = 1600) -> None:
+    def __init__(
+        self,
+        *,
+        transcript: str = "",
+        samples_per_word: int = 1600,
+        revise_to: str | None = None,
+    ) -> None:
         self.transcript = transcript
         self.samples_per_word = samples_per_word
+        self.revise_to = revise_to
         self.opened_turns: list[str] = []
 
     def open_session(self, turn_id: str) -> SttSession:
         self.opened_turns.append(turn_id)
-        return _FakeSession(self.transcript, samples_per_word=self.samples_per_word)
+        return _FakeSession(
+            self.transcript, samples_per_word=self.samples_per_word, revise_to=self.revise_to
+        )
 
     def is_model_cached(self) -> bool:
         return True
@@ -452,7 +481,13 @@ def _build_engine(settings: Settings) -> SttEngine:
     if settings.STT_ENGINE == "fake":
         # The canned transcript is injected by the attest harness via
         # ``BOB_FAKE_STT_TRANSCRIPT`` (empty in normal dev/test → empty finals).
-        return FakeSttEngine(transcript=settings.BOB_FAKE_STT_TRANSCRIPT)
+        # ``BOB_FAKE_STT_REVISE_TO`` (issue 0104) optionally overrides the FINAL
+        # transcript to model an end-of-phrase revision; empty keeps final ==
+        # streamed transcript.
+        return FakeSttEngine(
+            transcript=settings.BOB_FAKE_STT_TRANSCRIPT,
+            revise_to=settings.BOB_FAKE_STT_REVISE_TO or None,
+        )
     return WhisperCppSttEngine(settings)
 
 

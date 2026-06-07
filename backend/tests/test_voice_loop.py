@@ -25,6 +25,7 @@ import pytest
 
 from bob import debug_log
 from bob.config import Settings
+from bob.speculative_draft import SpeculativeDraft
 from bob.stt_engine import MIC_FRAME_TAG, FakeSttEngine
 from bob.turn_fsm import TurnState
 from bob.voice_loop import FullDuplexLoop, PersistedTurn
@@ -89,6 +90,9 @@ class _RecordingSayPath:
     def __init__(self, *, produce_audio: bool = True, audio_chunk_bytes: int = 0) -> None:
         self.transcripts: list[str] = []
         self.turn_ids: list[str] = []
+        #: The ``prepared_reply`` (committed speculative draft, issue 0104) the loop
+        #: passed for each call — ``None`` on the cold path.
+        self.prepared_replies: list[str | None] = []
         self._produce_audio = produce_audio
         self._audio_chunk_bytes = audio_chunk_bytes
 
@@ -100,9 +104,11 @@ class _RecordingSayPath:
         on_first_audio: Callable[[], Awaitable[None]],
         on_spoken_progress: Callable[[str], Awaitable[None]] | None = None,
         on_audio_chunk: Callable[[bytes, int], Awaitable[None]] | None = None,
+        prepared_reply: str | None = None,
     ) -> None:
         self.transcripts.append(transcript)
         self.turn_ids.append(turn_id)
+        self.prepared_replies.append(prepared_reply)
         if self._produce_audio and transcript.strip():
             await on_first_audio()
             if self._audio_chunk_bytes and on_audio_chunk is not None:
@@ -440,6 +446,7 @@ class _BlockingSayPath:
         on_first_audio: Callable[[], Awaitable[None]],
         on_spoken_progress: Callable[[str], Awaitable[None]] | None = None,
         on_audio_chunk: Callable[[bytes, int], Awaitable[None]] | None = None,
+        prepared_reply: str | None = None,
     ) -> None:
         self.transcripts.append(transcript)
         self.entered.set()
@@ -546,6 +553,7 @@ class _SpeakingSayPath:
         on_first_audio: Callable[[], Awaitable[None]],
         on_spoken_progress: Callable[[str], Awaitable[None]] | None = None,
         on_audio_chunk: Callable[[bytes, int], Awaitable[None]] | None = None,
+        prepared_reply: str | None = None,
     ) -> None:
         await on_first_audio()  # → bob_speaking
         if on_audio_chunk is not None:
@@ -1009,3 +1017,147 @@ async def test_backchannel_tts_failure_does_not_break_turn() -> None:
     assert loop.state is TurnState.USER_SPEAKING
     assert len(_backchannel_events()) == 1
     await loop.stop()
+
+
+# --- speculative draft wiring (PRD 0016 / issue 0104) ------------------------
+
+
+class _FakeDraftClientLoop:
+    """A trivial ``draft`` client: echoes a fixed reply for any partial."""
+
+    def __init__(self, reply: str) -> None:
+        self._reply = reply
+        self.calls: list[str] = []
+
+    def supports_guided_json(self) -> bool:
+        return False
+
+    async def chat(self, messages: list[dict[str, Any]], **kwargs: Any) -> str:
+        self.calls.append(next((m["content"] for m in reversed(messages)), ""))
+        return self._reply
+
+    async def complete(self, *args: Any, **kwargs: Any) -> Any:  # pragma: no cover - unused
+        raise NotImplementedError
+
+
+def _draft_status_events() -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for event in debug_log.snapshot():
+        ws_event = (event.payload or {}).get("ws_event") or {}
+        if ws_event.get("type") == "draft_status":
+            out.append(ws_event)
+    return out
+
+
+def _loop_with_draft(
+    say_path: _RecordingSayPath,
+    *,
+    draft_reply: str,
+    transcript: str = "quel temps fait il",
+    revise_to: str | None = None,
+) -> tuple[FullDuplexLoop, SpeculativeDraft]:
+    """Build a loop with a REAL SpeculativeDraft wired behind the draft hooks.
+
+    ``revise_to`` (issue 0104): when set, the fake STT streams ``transcript`` as
+    partials (what the draft fires on) but freezes to this divergent final — so
+    the commit gate sees a non-prefix, low-overlap final and discards.
+    """
+
+    settings = _settings()
+    # Pin the debounce to 0 so the draft fires on the first partial of the short
+    # synthetic turn (mirrors the attest ``draft: true`` knob).
+    settings = settings.model_copy(
+        update={"THINKER_DEBOUNCE_MS": 0, "DRAFT_COMMIT_SIMILARITY": 0.6}
+    )
+    drafter = SpeculativeDraft(
+        client=_FakeDraftClientLoop(draft_reply),  # type: ignore[arg-type]
+        settings=settings,
+        session_id="s1",
+        spawn=asyncio.create_task,
+    )
+    loop = FullDuplexLoop(
+        voice_turn_factory=lambda: VoiceTurn(
+            engine=FakeSttEngine(transcript=transcript, samples_per_word=160, revise_to=revise_to),
+            session_id="s1",
+            settings=settings,
+        ),
+        say_path=say_path,
+        settings=settings,
+        session_id="s1",
+        on_draft_start=drafter.start,
+        on_draft_feed=drafter.feed_partial,
+        on_draft_stop=drafter.stop,
+        draft_commit_gate=drafter.commit_gate,
+        draft_emit_decision=drafter.emit_decision,
+    )
+    return loop, drafter
+
+
+async def test_committed_draft_is_adopted_into_say_path() -> None:
+    say = _RecordingSayPath(produce_audio=True)
+    loop, _drafter = _loop_with_draft(say, draft_reply="Il fait beau à Paris.")
+    await loop.start()
+    for _ in range(8):
+        await loop.feed_raw_frame(_LOUD)
+    for _ in range(8):
+        await loop.feed_raw_frame(_QUIET)
+    await loop.join()
+
+    # The final transcript == the partial the draft fired on → prefix fast-path
+    # commit. The committed text is re-injected into the say-path verbatim.
+    assert say.prepared_replies == ["Il fait beau à Paris."]
+    # draft_status reached committed; the latency body flips draft_hit + carries
+    # the draft marks.
+    states = [e["state"] for e in _draft_status_events()]
+    assert states[-1] == "committed"
+    latency = _latency_events()[-1]
+    assert latency["derived"]["draft_hit"] is True
+    assert "t_draft_ready" in latency["marks"]
+    assert "t_commit_decision" in latency["marks"]
+
+
+async def test_divergent_final_discards_draft_and_runs_cold() -> None:
+    say = _RecordingSayPath(produce_audio=True)
+    # The draft fires on the streamed "reserve une table..." partials, but the
+    # final REVISES to a divergent clause → the gate discards → cold say-path.
+    loop, _drafter = _loop_with_draft(
+        say,
+        draft_reply="Je réserve une table.",
+        transcript="reserve une table pour ce soir",
+        revise_to="annule tout finalement laisse tomber",
+    )
+    await loop.start()
+    for _ in range(10):
+        await loop.feed_raw_frame(_LOUD)
+    for _ in range(8):
+        await loop.feed_raw_frame(_QUIET)
+    await loop.join()
+
+    # COLD path: no prepared reply, the say-path ran on the (divergent) final
+    # transcript itself.
+    assert say.prepared_replies == [None]
+    assert say.transcripts == ["annule tout finalement laisse tomber"]
+    states = [e["state"] for e in _draft_status_events()]
+    assert states[-1] == "discarded"
+    latency = _latency_events()[-1]
+    assert latency["derived"]["draft_hit"] is False
+
+
+async def test_no_drafter_keeps_cold_path_unchanged() -> None:
+    # The bare loop (no draft hooks) — every turn is COLD, prepared_reply is None,
+    # and draft_hit stays False (Annexe G degradation shape).
+    say = _RecordingSayPath(produce_audio=True)
+    loop = _loop(say, transcript="bonjour")
+    await loop.start()
+    for _ in range(6):
+        await loop.feed_raw_frame(_LOUD)
+    for _ in range(8):
+        await loop.feed_raw_frame(_QUIET)
+    await loop.join()
+
+    assert say.prepared_replies == [None]
+    assert not _draft_status_events()
+    latency = _latency_events()[-1]
+    assert latency["derived"]["draft_hit"] is False
+    assert "t_draft_ready" not in latency["marks"]
+    assert "t_commit_decision" not in latency["marks"]

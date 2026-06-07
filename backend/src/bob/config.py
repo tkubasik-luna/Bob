@@ -287,6 +287,15 @@ class Settings(BaseSettings):
     # native whisper model. Ignored unless ``STT_ENGINE=fake``.
     BOB_FAKE_STT_TRANSCRIPT: str = ""
 
+    # Attestation harness only (PRD 0016 / issue 0104): an end-of-phrase STT
+    # REVISION for the fake engine. When non-empty the fake STT streams
+    # ``BOB_FAKE_STT_TRANSCRIPT`` as partials (what the live Thinker + Draft see)
+    # but freezes to THIS string at finalize — modelling the case a speculative
+    # draft must guard against (the pre-written reply was built on the partial,
+    # yet the settled clause diverged). Empty (the default) keeps the final equal
+    # to the streamed transcript. Ignored unless ``STT_ENGINE=fake``.
+    BOB_FAKE_STT_REVISE_TO: str = ""
+
     # Full-duplex loop — VAD + Endpointer + TurnFsm (PRD 0016 / issue 0100,
     # Annexe B). These drive the real-time turn-taking state machine over the
     # inbound mic frames (the same 16 kHz s16le frames the STT engine sees).
@@ -362,6 +371,23 @@ class Settings(BaseSettings):
     # transitions the floor (no ``bob_speaking``); the derived ``backchannel_ms``
     # (pause→ack) targets <500 ms.
     BACKCHANNEL_MIN_INTERVAL_MS: int = 1500
+
+    # Speculative Draft / anticipation (PRD 0016 / issue 0104, Annexe A.2 + F + G).
+    # While the user speaks, the ``draft`` role (a mini fast model) pre-writes the
+    # conversational reply on the partial transcript
+    # (:class:`bob.speculative_draft.SpeculativeDraft`). At the endpoint a PURE
+    # commit gate decides whether to adopt it: a prefix fast-path (the final
+    # transcript ≈ a prefix-or-extension of the partial the draft fired on) commits
+    # instantly; otherwise a light token-overlap similarity guard commits when the
+    # overlap is at/above ``DRAFT_COMMIT_SIMILARITY``; otherwise the draft is
+    # discarded and the Speaker regenerates COLD. 0.6 is a forgiving default —
+    # high enough to reject a genuinely divergent end-of-phrase, low enough that a
+    # paraphrase-grade STT settle still commits. The cadence reuses the Thinker
+    # debounce/grace knobs (THINKER_DEBOUNCE_MS / THINKER_CANCEL_GRACE_MS). The
+    # derived ``endpoint_to_first_audio_ms`` on a committed draft targets <800 ms
+    # (Annexe F). Degradation (Annexe G): when the ``draft`` model is unavailable
+    # the WS layer omits the loop entirely → anticipation off, every turn cold.
+    DRAFT_COMMIT_SIMILARITY: float = 0.6
 
     # Voice persistence + retention (PRD 0016 / issue 0109, Annexe E). A
     # finalized full-duplex voice turn is persisted to ``voice_turns`` +

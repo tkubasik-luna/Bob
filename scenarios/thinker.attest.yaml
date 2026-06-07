@@ -19,13 +19,28 @@
 # Assertions: ≥1 `thinker_snapshot` emitted AND the Speaker consulted it
 # (the acceptance criterion), plus the FSM walked to bob_speaking and Bob spoke.
 #
+# Anticipation interplay (issue 0104): the SpeculativeDraft is always wired. The
+# Speaker consults the Thinker only on the COLD assembly path — a COMMITTED draft
+# bypasses assembly. So this scenario carries an end-of-phrase STT REVISION
+# (`env: BOB_FAKE_STT_REVISE_TO`): the draft fires on the streamed partial but the
+# final diverges, the commit gate DISCARDS it, and the Speaker regenerates COLD —
+# consulting the Thinker snapshot at assembly. This is the faithful integration:
+# a divergent turn falls to cold, where the Thinker's running understanding feeds
+# the reply.
+#
 # Run:  uv run bob attest scenarios/thinker.attest.yaml   (exit 0, ok: true)
 name: thinker-snapshot-consulted
 description: >-
   A voiced turn drives the background Thinker; it emits a thinker_snapshot and
-  the Speaker consults it at assembly (thinker_consult marker).
+  the Speaker consults it at the COLD assembly (thinker_consult marker).
 backend: ephemeral
 llm: fake
+env:
+  # End-of-phrase divergence so the speculative draft is discarded and the cold
+  # say-path runs (where the Thinker is consulted). Still contains "temps" so the
+  # jarvis rule fires; the token-set diverges from the streamed partial below the
+  # similarity threshold and is not a prefix → discard.
+  BOB_FAKE_STT_REVISE_TO: "quel temps fera t il demain a lyon"
 fake_llm:
   # The mini Thinker role replies with a STRICT JSON snapshot (Annexe A.2);
   # ``chat()`` returns it verbatim and the loop parses it. An empty

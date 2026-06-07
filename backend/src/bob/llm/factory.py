@@ -172,8 +172,10 @@ def build_thinker_role_client(role_selection: RoleSelection, settings: Settings)
 def build_draft_role_client(role_selection: RoleSelection, settings: Settings) -> LLMClient:
     """Return the :class:`LLMClient` for the ``draft`` (speculative) role.
 
-    Wired into the map for completeness; the speculative drafter that consumes
-    it lands in a later slice (S8).
+    Consumed by :class:`bob.speculative_draft.SpeculativeDraft` (PRD 0016 / issue
+    0104): a mini fast model that pre-writes the conversational reply on the
+    partial transcript while the user speaks. The ``fake`` branch routes ``role:
+    draft`` scripted rules so the attest harness can drive the speculative text.
     """
 
     return _build_role_client(role_selection, "draft", settings)

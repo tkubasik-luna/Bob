@@ -22,6 +22,12 @@
 # cut AND survives the debug-scrub window — the committed text the harness reads
 # off /ws/debug is exactly that played prefix.
 #
+# Anticipation (issue 0104): the SpeculativeDraft is always wired, so a voiced
+# conversational turn pre-writes + commits a draft (the aligned final prefixes the
+# partial → committed). Bob therefore speaks the COMMITTED DRAFT here, so the
+# `draft` role scripts the SAME reply as `jarvis` — the barge-in then cuts the
+# committed draft (a stronger test: barge-in over an anticipated reply).
+#
 # Run:  uv run bob attest scenarios/bargein.attest.yaml   (exit 0, ok: true)
 name: bargein-cuts-within-300ms
 description: >-
@@ -30,6 +36,12 @@ description: >-
 backend: ephemeral
 llm: fake
 fake_llm:
+  # The SpeculativeDraft pre-writes the reply (always-on anticipation, issue
+  # 0104); Bob speaks the committed draft, so it carries the same multi-sentence
+  # reply the cold Speaker would have produced.
+  - role: draft
+    on_input_contains: ""
+    reply: "Bonjour. Je suis Bob. Comment puis-je aider."
   - role: jarvis
     on_input_contains: "temps"
     reply: "Bonjour. Je suis Bob. Comment puis-je aider."
@@ -45,6 +57,10 @@ timeline:
     confirm_ms: 200
     tts_chunk_ms: 60
     tts_chunks: 4
+    # Pin the draft debounce to 0 (issue 0104) so the speculative draft fires on
+    # the first partial and reliably commits before turn-1's endpoint — Bob then
+    # speaks the committed draft, which the barge-in cuts.
+    draft: true
   # The FSM got the floor, then the barge-in handed it back to the user.
   - do: wait_state
     state: bob_speaking

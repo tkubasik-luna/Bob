@@ -1,0 +1,87 @@
+# Speculative Draft — ALIGNED input → committed (PRD 0016 / issue 0104,
+# Annexe A.2 + F + G).
+#
+# Proves the anticipation HAPPY path end-to-end against an ephemeral backend with
+# the deterministic fake LLM + fake STT + fake TTS (no native models):
+#
+#   1. inject_audio (voiced, draft: true) — the loud burst + trailing silence
+#      drives the energy VAD → vad_speech_start; the fake STT reveals the
+#      transcript word-by-word, emitting stt_partials. Each partial is fed to the
+#      SpeculativeDraft (debounce pinned to 0 via `draft: true` so a draft
+#      reliably lands during the short synthetic turn). The `draft` role's fake
+#      client returns the pre-written spoken reply; the loop emits draft_status
+#      drafting → ready.
+#   2. At the silence-floor endpoint the loop runs the PURE commit gate on the
+#      FINAL frozen transcript. The fake STT's final IS the streamed transcript
+#      (no revision here), so the partial the draft fired on is a prefix of the
+#      final → the prefix fast-path COMMITS. The committed draft is re-injected
+#      into the say-path verbatim (no cold Speaker generation) → TTS → audio out.
+#      The loop emits draft_status committed, stamps t_draft_ready /
+#      t_commit_decision and flips draft_hit, so endpoint → first audio lands well
+#      under the 800 ms committed target (Annexe F).
+#
+# Assertions: draft_status reached `committed` (the gate adopted the draft), the
+# FSM got the floor + Bob spoke (audio_chunks_gte), and endpoint → first audio
+# < 800 ms (latency_lt_ms reads turn_latency.marks). no_error_events guards a
+# clean turn.
+#
+# (Bob speaks the draft verbatim — the committed path bypasses the orchestrator's
+# `say` output event, so `deliverable_nonempty` is NOT asserted here; the
+# audio-out + draft_status:committed are the load-bearing proof. The divergent
+# sibling scenario asserts the COLD reply's deliverable.)
+#
+# Run:  uv run bob attest scenarios/draft-committed.attest.yaml   (exit 0, ok: true)
+name: draft-committed-on-aligned-input
+description: >-
+  A voiced turn whose final transcript matches the partial the draft fired on:
+  the commit gate adopts the pre-written draft (prefix fast-path) and Bob speaks
+  it near-instantly (endpoint → first audio < 800 ms).
+backend: ephemeral
+llm: fake
+fake_llm:
+  # The mini Draft role pre-writes the spoken reply on the partial transcript.
+  # ``chat()`` returns it verbatim; an empty ``on_input_contains`` matches any
+  # partial. This is the text the commit gate adopts into the say-path.
+  - role: draft
+    on_input_contains: ""
+    reply: "Il fait beau aujourd'hui à Paris."
+  # A jarvis fallback (the COLD path) — never reached on a committed turn, but
+  # present so an unexpected discard still yields a sensible reply.
+  - role: jarvis
+    on_input_contains: "temps"
+    reply: "Il fait beau aujourd'hui à Paris."
+timeline:
+  - do: inject_audio
+    transcript: "quel temps fait il a paris"
+    voiced: true
+    draft: true
+  # The drafter reached its terminal verdict.
+  - do: wait_event
+    type: draft_status
+    timeout_ms: 8000
+  # The FSM got the floor (the committed draft ran the say-path).
+  - do: wait_state
+    state: bob_speaking
+    timeout_ms: 8000
+  - do: wait_event
+    type: turn_latency
+    timeout_ms: 8000
+  - do: wait_state
+    state: idle
+    timeout_ms: 8000
+assertions:
+  # The commit gate ADOPTED the speculative draft (the anticipation hit).
+  - kind: draft_status
+    state: committed
+  # The turn converged on the say-path and Bob spoke the committed draft.
+  - kind: fsm_reached
+    state: bob_speaking
+  - kind: audio_chunks_gte
+    min: 1
+  # Annexe F committed target: endpoint → first audio < 800 ms (reads
+  # turn_latency.marks; the deterministic fake path is well under it).
+  - kind: latency_lt_ms
+    from_mark: t_endpoint
+    to_mark: t_first_audio_chunk
+    max: 800
+  - kind: no_error_events
