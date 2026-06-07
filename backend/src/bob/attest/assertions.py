@@ -137,6 +137,10 @@ LOGICAL_EVENT_MATCHERS: dict[str, EventMatcher] = {
     # of the turn, and the marker proving the Speaker consulted it at assembly.
     "thinker_snapshot": _voice_subtype_matcher("thinker_snapshot"),
     "thinker_consult": _voice_subtype_matcher("thinker_consult"),
+    # PRD 0016 / issue 0109 (Annexe E): the finalized turn was persisted
+    # (voice_turns row + audio blobs) and the retention sweep evicted something.
+    "voice_turn_persisted": _voice_subtype_matcher("voice_turn_persisted"),
+    "voice_retention_purged": _voice_subtype_matcher("voice_retention_purged"),
 }
 
 
@@ -771,3 +775,101 @@ def check_speaker_consulted_thinker(spec: dict[str, Any], ctx: AssertionContext)
 
 register_assertion("thinker_snapshot_emitted", check_thinker_snapshot_emitted)
 register_assertion("speaker_consulted_thinker", check_speaker_consulted_thinker)
+
+
+# --- voice persistence + retention assertions (PRD 0016 / issue 0109) --------
+
+
+def check_voice_turn_persisted(spec: dict[str, Any], ctx: AssertionContext) -> AssertionResult:
+    """PASS iff a finalized voice turn was persisted (Annexe E).
+
+    Spec: ``{kind: voice_turn_persisted}`` or with optional filters
+    ``{min: 1, min_blobs: 1, end_reason: completed}``. Counts the
+    ``voice_turn_persisted`` voice events the WS persist hook emits — the
+    black-box proof the ``voice_turns`` row + audio blobs were written (the row
+    + file themselves are off the wire; the event carries ``blob_count`` /
+    ``end_reason`` / ``has_transcript`` so the harness asserts without reaching
+    into the DB). ``min_blobs`` requires at least one matching event to carry
+    that many blobs; ``end_reason`` filters to a specific finalize kind. FAILs
+    loudly when nothing was persisted (the finalize path never wrote a turn).
+    """
+
+    raw_min = spec.get("min", 1)
+    raw_min_blobs = spec.get("min_blobs")
+    want_end_reason = spec.get("end_reason")
+    try:
+        minimum = int(raw_min)
+    except (TypeError, ValueError):
+        return AssertionResult(
+            kind="voice_turn_persisted",
+            ok=False,
+            detail={"error": "voice_turn_persisted 'min' must be an integer", "min": raw_min},
+        )
+
+    events = _voice_ws_events(ctx.events, "voice_turn_persisted")
+    if isinstance(want_end_reason, str) and want_end_reason:
+        events = [e for e in events if e.get("end_reason") == want_end_reason]
+
+    ok = len(events) >= minimum
+    detail: dict[str, Any] = {
+        "min": minimum,
+        "count": len(events),
+        "blob_counts": [e.get("blob_count") for e in events][:5],
+        "end_reasons": [e.get("end_reason") for e in events][:5],
+    }
+    if want_end_reason is not None:
+        detail["end_reason"] = want_end_reason
+    if raw_min_blobs is not None:
+        try:
+            min_blobs = int(raw_min_blobs)
+        except (TypeError, ValueError):
+            return AssertionResult(
+                kind="voice_turn_persisted",
+                ok=False,
+                detail={"error": "voice_turn_persisted 'min_blobs' must be an integer"},
+            )
+        blobs_ok = any(int(e.get("blob_count") or 0) >= min_blobs for e in events)
+        ok = ok and blobs_ok
+        detail["min_blobs"] = min_blobs
+
+    return AssertionResult(kind="voice_turn_persisted", ok=ok, detail=detail)
+
+
+def check_voice_retention_purged(spec: dict[str, Any], ctx: AssertionContext) -> AssertionResult:
+    """PASS iff the retention sweep evicted at least ``spec['min_blobs']`` blobs.
+
+    Spec: ``{kind: voice_retention_purged}`` or ``{min_blobs: 1}`` (Annexe E.3).
+    Counts the ``voice_retention_purged`` voice events the persist hook emits
+    when :func:`bob.voice_retention_policy.enforce` actually deleted something —
+    the proof a forced-tiny cap evicted the oldest audio (file + row). The
+    summed ``blobs_deleted`` across the captured purge events must meet the
+    threshold (default 1). FAILs when no purge fired (nothing was over the cap,
+    so the scenario didn't exercise eviction).
+    """
+
+    raw_min_blobs = spec.get("min_blobs", 1)
+    try:
+        min_blobs = int(raw_min_blobs)
+    except (TypeError, ValueError):
+        return AssertionResult(
+            kind="voice_retention_purged",
+            ok=False,
+            detail={"error": "voice_retention_purged 'min_blobs' must be an integer"},
+        )
+    purges = _voice_ws_events(ctx.events, "voice_retention_purged")
+    total_blobs = sum(int(p.get("blobs_deleted") or 0) for p in purges)
+    total_turns = sum(int(p.get("turns_deleted") or 0) for p in purges)
+    return AssertionResult(
+        kind="voice_retention_purged",
+        ok=total_blobs >= min_blobs,
+        detail={
+            "min_blobs": min_blobs,
+            "purge_events": len(purges),
+            "blobs_deleted": total_blobs,
+            "turns_deleted": total_turns,
+        },
+    )
+
+
+register_assertion("voice_turn_persisted", check_voice_turn_persisted)
+register_assertion("voice_retention_purged", check_voice_retention_purged)

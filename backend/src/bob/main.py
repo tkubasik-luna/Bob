@@ -30,6 +30,7 @@ from bob import jarvis_store as jarvis_store_module
 from bob import orchestrator as orchestrator_module
 from bob import task_scheduler as task_scheduler_module
 from bob import task_store as task_store_module
+from bob import voice_store as voice_store_module
 from bob.config import get_settings
 from bob.connectors.mcp import MCPRuntime
 from bob.db.migrations_runner import apply_migrations, default_migrations_dir
@@ -74,6 +75,7 @@ from bob.sub_agent import (
 from bob.task_scheduler import build_default_scheduler
 from bob.task_store import TaskStore
 from bob.tts_service import get_default_tts_service
+from bob.voice_retention_policy import set_retention_policy as set_voice_retention_policy
 from bob.ws_debug import router as ws_debug_router
 from bob.ws_router import router as ws_router
 
@@ -122,6 +124,16 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     jarvis_store_module.set_default_store(store)
     task_store = TaskStore(conn)
     task_store_module.set_default_store(task_store)
+
+    # Voice persistence + retention (PRD 0016 / issue 0109, Annexe E). The voice
+    # store shares the Jarvis SQLite connection (the 0010/0011 migrations ran
+    # above) and writes the mic/tts WAV files under ``{data_dir}/voice_audio/``.
+    # The retention policy (separate size/age caps) is built from settings and
+    # installed process-wide; the per-turn persist hook enforces it after each
+    # write. Both cleared on teardown.
+    voice_store = voice_store_module.VoiceStore(conn, data_dir)
+    voice_store_module.set_default_store(voice_store)
+    set_voice_retention_policy(settings.voice_retention_policy())
 
     # LLM selection store (PRD 0012 / issue 0078). JSON file under BOB_DATA_DIR
     # owns the runtime selection: seed from .env on first boot, JSON wins after.
@@ -325,6 +337,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         task_scheduler_module.set_default_scheduler(None)
         task_store_module.set_default_store(None)
         jarvis_store_module.set_default_store(None)
+        voice_store_module.set_default_store(None)
         set_default_llm_selection_store(None)
         conn.close()
         uninstall_file_sink()

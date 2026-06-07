@@ -1,0 +1,67 @@
+# Voice persistence + retention attest scenario (PRD 0016 / issue 0109, Annexe E).
+#
+# Proves the PERSIST + RETENTION path end-to-end against an ephemeral backend
+# with the deterministic fake LLM + fake STT + fake TTS (no native models):
+#
+#   1. inject_audio (voiced) — a voiced burst + trailing silence drives the
+#      full-duplex loop to an endpoint, runs the say-path (fake TTS streams a
+#      couple of silent PCM chunks) and the turn finalizes `completed`. At
+#      finalize the WS persist hook (issue 0109) writes the `voice_turns` row +
+#      the `mic_in` + `tts_out` WAV blobs on disk and emits
+#      `voice_turn_persisted {turn_id, blob_count, end_reason, ...}`.
+#   2. Because the scenario pins `VOICE_RETENTION_MAX_AUDIO_BYTES=1` (a
+#      deliberately tiny cap), the retention sweep that runs right after the
+#      write finds the just-written audio over the cap and evicts the oldest
+#      blobs first (file + row), emitting `voice_retention_purged
+#      {blobs_deleted, ...}`.
+#
+# The assertions read ONLY the captured `/ws/debug` events (black-box): the row
+# + WAV file themselves are off the wire — the events carry the proof. A focused
+# unit/integration test (`tests/test_voice_store.py`,
+# `tests/test_voice_retention.py`) reads the ephemeral DB / disk directly to
+# confirm the row + file shape.
+#
+# Run:  uv run bob attest scenarios/voice-retention.attest.yaml   (exit 0, ok: true)
+name: voice-retention-persist-and-purge
+description: >-
+  A voiced turn is persisted (voice_turns row + mic/tts WAV blobs) and a forced
+  tiny audio cap evicts the oldest blobs (purge event observed on /ws/debug).
+backend: ephemeral
+llm: fake
+# Tiny audio size ceiling so the very first turn's blobs exceed the cap and the
+# retention sweep evicts oldest-first. Merged into the backend env BEFORE the
+# forced isolation keys (a scenario can't break isolation).
+env:
+  VOICE_RETENTION_MAX_AUDIO_BYTES: "1"
+fake_llm:
+  - role: jarvis
+    on_input_contains: "temps"
+    reply: "Il fait beau aujourd'hui."
+timeline:
+  # A voiced audio turn — opens the turn, endpoints, runs the say-path → reply
+  # audio, finalizes `completed` → persist hook writes the row + blobs.
+  - do: inject_audio
+    transcript: "quel temps fait il"
+    voiced: true
+  - do: wait_state
+    state: bob_speaking
+    timeout_ms: 8000
+  - do: wait_state
+    state: idle
+    timeout_ms: 8000
+  # The turn was persisted, then the tiny cap evicted the oldest audio.
+  - do: wait_event
+    type: voice_turn_persisted
+    timeout_ms: 8000
+  - do: wait_event
+    type: voice_retention_purged
+    timeout_ms: 8000
+assertions:
+  # A finalized turn was persisted with at least one audio blob written.
+  - kind: voice_turn_persisted
+    min: 1
+    min_blobs: 1
+  # The retention sweep evicted at least one blob (oldest first, file + row).
+  - kind: voice_retention_purged
+    min_blobs: 1
+  - kind: no_error_events

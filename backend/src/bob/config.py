@@ -19,6 +19,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 if TYPE_CHECKING:
     from bob.connectors.mcp.models import MCPServerConfig
+    from bob.voice_retention_policy import VoiceRetentionPolicy
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 _ENV_FILE = _REPO_ROOT / ".env"
@@ -349,6 +350,44 @@ class Settings(BaseSettings):
     # :meth:`asyncio.Task.cancel`.
     THINKER_DEBOUNCE_MS: int = 250
     THINKER_CANCEL_GRACE_MS: int = 2000
+
+    # Voice persistence + retention (PRD 0016 / issue 0109, Annexe E). A
+    # finalized full-duplex voice turn is persisted to ``voice_turns`` +
+    # ``voice_audio_blobs`` (:mod:`bob.voice_store`): the transcript / spoken
+    # text / latency marks as a DB row, the mic-in + tts-out audio as WAV files
+    # on disk under ``{BOB_DATA_DIR}/voice_audio/`` (only the path lives in the
+    # DB). :class:`bob.voice_retention_policy.VoiceRetentionPolicy` keeps the
+    # disk bounded with TWO SEPARATE caps (Annexe E.3): the audio blobs by total
+    # SIZE (oldest first, file + row deleted) and the transcript rows by AGE.
+    #
+    # ``VOICE_PERSIST_ENABLED`` master-switches the whole persist path off (the
+    # attest harness flips it for the retention scenario / leaves real captures
+    # out of CI). ``VOICE_RETENTION_MAX_AUDIO_BYTES`` is the audio size ceiling
+    # (default 1.5 GiB); ``VOICE_RETENTION_MAX_TURN_AGE_DAYS`` is the transcript
+    # age window (default 30 days). Either set to 0 disables that dimension's
+    # sweep (kept forever) — mirrors the ``None`` no-op of the event policy.
+    VOICE_PERSIST_ENABLED: bool = True
+    VOICE_RETENTION_MAX_AUDIO_BYTES: int = int(1.5 * 1024 * 1024 * 1024)
+    VOICE_RETENTION_MAX_TURN_AGE_DAYS: float = 30.0
+
+    def voice_retention_policy(self) -> VoiceRetentionPolicy:
+        """Build the :class:`VoiceRetentionPolicy` from the settings dials.
+
+        A ``0`` (or negative) cap maps to ``None`` (that dimension is not
+        enforced — kept forever), matching the nullable-field no-op contract of
+        the policy. Imported lazily so the config module never hard-depends on
+        the voice store / policy package at import time (the gmail/tavily/mcp
+        lazy-import pattern).
+        """
+
+        from bob.voice_retention_policy import VoiceRetentionPolicy
+
+        max_bytes = self.VOICE_RETENTION_MAX_AUDIO_BYTES
+        max_age_days = self.VOICE_RETENTION_MAX_TURN_AGE_DAYS
+        return VoiceRetentionPolicy(
+            max_audio_bytes=max_bytes if max_bytes > 0 else None,
+            max_turn_age_seconds=(max_age_days * 24 * 60 * 60) if max_age_days > 0 else None,
+        )
 
     def mcp_server_configs(self) -> tuple[MCPServerConfig, ...]:
         """Parse :attr:`MCP_SERVERS` into typed :class:`MCPServerConfig` records.

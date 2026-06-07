@@ -56,6 +56,23 @@ class JarvisStore:
                 (role, content, action),
             )
 
+    def append_returning_id(self, role: Role, content: str, action: Action | None = None) -> str:
+        """Append a message and return its row id as a string.
+
+        PRD 0016 / issue 0109: the voice persistence path commits the final
+        transcript as a Jarvis turn and records which thread entry it became in
+        ``voice_turns.jarvis_msg_id``. The id is the ``jarvis_messages`` integer
+        PK rendered as text (the column is ``TEXT``). Identical write semantics
+        to :meth:`append`; only the return differs.
+        """
+
+        with self._lock, self._conn:
+            cursor = self._conn.execute(
+                "INSERT INTO jarvis_messages(role, content, action) VALUES (?, ?, ?)",
+                (role, content, action),
+            )
+            return str(cursor.lastrowid or 0)
+
     def history(self) -> list[Message]:
         """Return every persisted message in insertion order.
 

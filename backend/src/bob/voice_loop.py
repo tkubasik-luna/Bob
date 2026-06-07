@@ -107,6 +107,12 @@ class SayPathDriver(Protocol):
     barge-in cut, ``committed_spoken_text`` is exactly what left the speaker
     before the interrupt — never the un-played tail. A driver that streams
     nothing simply never calls it (``committed_spoken_text`` stays empty).
+
+    ``on_audio_chunk`` (PRD 0016 / issue 0109) is invoked with the raw PCM bytes
+    + sample rate of each outbound TTS block, just after it leaves the socket.
+    The loop accumulates these into the turn's ``tts_out`` recording so the
+    persistence hook can write the WAV. ``None`` skips it (tests / the text
+    path that does not persist a voice turn).
     """
 
     async def __call__(
@@ -116,7 +122,41 @@ class SayPathDriver(Protocol):
         turn_id: str,
         on_first_audio: Callable[[], Awaitable[None]],
         on_spoken_progress: Callable[[str], Awaitable[None]] | None = None,
+        on_audio_chunk: Callable[[bytes, int], Awaitable[None]] | None = None,
     ) -> None: ...
+
+
+@dataclass(frozen=True)
+class PersistedTurn:
+    """Everything the persistence hook needs to write one finalized turn.
+
+    PRD 0016 / issue 0109 (Annexe E). Assembled by the loop at every finalize
+    exit path (endpoint→reply done, barge-in cut, ``voice_stop`` / socket close,
+    clean error) and handed to the injected ``persist_turn`` hook, which owns
+    the DB row + WAV files + Jarvis-history link + the persistence event. The
+    loop never touches SQLite/disk itself — it only knows the turn's shape.
+
+    - ``end_reason`` — 'completed' | 'bargein' | 'voice_stop' | 'error'.
+    - ``final_transcript`` — the frozen ``stt_final`` text (may be empty).
+    - ``spoken_text`` — what Bob ACTUALLY played (the committed prefix on a
+      barge-in cut; the full reply otherwise; empty when Bob never spoke).
+    - ``marks`` / ``derived`` — the Annexe F latency body for ``latency_json``.
+    - ``mic_pcm`` — concatenated s16le mic frames captured this turn.
+    - ``mic_sample_rate`` — the mic contract rate (``STT_SAMPLE_RATE``).
+    - ``tts_pcm`` — concatenated s16le TTS blocks Bob played (empty if none).
+    - ``tts_sample_rate`` — the TTS model rate of those blocks (0 when none).
+    """
+
+    turn_id: str
+    end_reason: str
+    final_transcript: str
+    spoken_text: str
+    marks: dict[str, float]
+    derived: dict[str, float]
+    mic_pcm: bytes
+    mic_sample_rate: int
+    tts_pcm: bytes
+    tts_sample_rate: int
 
 
 @dataclass
@@ -198,6 +238,12 @@ class FullDuplexLoop:
     #: (issue 0101): persist what Bob actually played before the cut. Defaults to
     #: the Jarvis store append (wired by ws_router); ``None`` = skip (tests).
     commit_spoken: Callable[[str, str], Awaitable[None]] | None = None
+    #: Persistence hook fired once per turn at every finalize exit path (PRD
+    #: 0016 / issue 0109, Annexe E). Receives a :class:`PersistedTurn` snapshot
+    #: (transcript, spoken text, end reason, latency marks, mic + tts PCM) and
+    #: owns the DB row + WAV files + Jarvis link + the persistence event. Wired
+    #: by ws_router; ``None`` = no persistence (the bare-loop tests / voice OFF).
+    persist_turn: Callable[[PersistedTurn], Awaitable[None]] | None = None
 
     _fsm: TurnFsm = field(default_factory=TurnFsm)
     _vad: EnergyVad = field(init=False)
@@ -212,6 +258,21 @@ class FullDuplexLoop:
     _spoken_text: str = ""
     _stopped: bool = False
     _started: bool = False
+    #: Per-turn audio + transcript capture for persistence (PRD 0016 / issue
+    #: 0109). ``_mic_pcm`` accumulates the decoded s16le mic frames of the turn
+    #: in flight; ``_tts_pcm`` accumulates the outbound TTS blocks Bob played;
+    #: ``_tts_sample_rate`` is the rate of those blocks (0 until the first one);
+    #: ``_final_transcript`` is the frozen ``stt_final`` text. All reset when a
+    #: new turn opens (``_begin_capture``) and drained by ``_persist_turn``. A
+    #: ``bytearray`` keeps the per-frame append O(1).
+    _mic_pcm: bytearray = field(default_factory=bytearray)
+    _tts_pcm: bytearray = field(default_factory=bytearray)
+    _tts_sample_rate: int = 0
+    _final_transcript: str = ""
+    #: Turn ids already handed to ``persist_turn`` — the finalize exits race
+    #: (``voice_stop`` after an endpoint say-path is still finishing), so we
+    #: persist each turn AT MOST ONCE. Bounded implicitly by the session length.
+    _persisted_turn_ids: set[str] = field(default_factory=set)
 
     def __post_init__(self) -> None:
         frame_ms = self._frame_ms()
@@ -271,6 +332,13 @@ class FullDuplexLoop:
 
         if self._marks.t_first_mic_frame is None:
             self._marks.t_first_mic_frame = self._now()
+
+        # Capture the raw mic PCM for this turn's ``mic_in`` recording (PRD 0016
+        # / issue 0109). Only when persistence is wired (the bare-loop tests skip
+        # it). ``_begin_capture`` resets the buffer at every turn open so what we
+        # persist is the utterance from speech-start onward, not stale silence.
+        if self.persist_turn is not None:
+            self._mic_pcm.extend(pcm)
 
         # One RMS pass; the same per-frame speech/silence decision feeds the VAD
         # (speech/pause edges), the Endpointer (silence floor) AND the barge-in
@@ -357,10 +425,28 @@ class FullDuplexLoop:
                 await self.on_thinker_stop()
         turn = self._turn
         self._turn = None
+        # Capture the FSM turn id + whether the open turn aborted BEFORE the
+        # VOICE_STOP dispatch resets the FSM, so a mid-turn teardown persists the
+        # right turn with the right end reason (PRD 0016 / issue 0109).
+        active_turn_id = self._fsm.turn_id
+        mid_turn = self._fsm.state is not TurnState.IDLE and bool(active_turn_id)
         if turn is not None:
+            aborted = turn.aborted
             with contextlib.suppress(Exception):
-                await turn.finalize()
+                final = await turn.finalize()
+                if final is not None:
+                    self._final_transcript = final.text
+        else:
+            aborted = False
         await self._dispatch(TurnEvent.VOICE_STOP)
+        # Persist the interrupted-in-flight turn (Annexe G: WS cut / toggle OFF
+        # mid-turn → finalize + persist the partial). Only when the loop was
+        # genuinely mid-turn — a ``stop`` after a turn already completed (FSM
+        # idle) persists nothing, and a turn that already persisted (barge-in /
+        # completed) is a no-op via the idempotency guard. ``error`` when the STT
+        # turn aborted (Annexe G), else ``voice_stop``.
+        if mid_turn and active_turn_id is not None:
+            await self._persist_turn(active_turn_id, "error" if aborted else "voice_stop")
 
     # -- FSM-driven steps ----------------------------------------------------
 
@@ -395,6 +481,11 @@ class FullDuplexLoop:
                 return
             # Fresh latency marks for this turn (keep the first-mic-frame stamp).
             self._marks = _Marks(t_first_mic_frame=self._marks.t_first_mic_frame)
+            # Fresh per-turn capture buffers (PRD 0016 / issue 0109). Reset HERE
+            # at the open so the persisted ``mic_in`` is this utterance only; the
+            # frame that just tripped speech-start is already in ``_mic_pcm`` from
+            # this same call, minus the pre-speech silence we drop here.
+            self._begin_capture()
             self._endpointer.reset()
             # Annexe B ``start_thinker`` — arm the background ThinkerLoop for this
             # turn (PRD 0016 / issue 0102). Synchronous + cheap (resets cadence +
@@ -443,6 +534,9 @@ class FullDuplexLoop:
             final = await turn.finalize()
             if final is not None:
                 transcript = final.text
+        # Record the frozen transcript for this turn's persisted row (issue 0109);
+        # the say-path's reply (spoken_text) + completion drive the actual write.
+        self._final_transcript = transcript
 
         # Reset the per-reply barge-in state for the turn we are about to speak:
         # a fresh confirmation window + an empty played-text accumulator.
@@ -484,12 +578,21 @@ class FullDuplexLoop:
             if self._fsm.turn_id == turn_id:
                 self._spoken_text = played
 
+        async def _on_audio_chunk(pcm: bytes, sample_rate: int) -> None:
+            # Accumulate Bob's outbound PCM for this turn's ``tts_out`` recording
+            # (PRD 0016 / issue 0109). Guard against a late callback from a
+            # say-path we no longer own (a barge-in re-pointed the FSM).
+            if self._fsm.turn_id == turn_id and self.persist_turn is not None:
+                self._tts_pcm.extend(pcm)
+                self._tts_sample_rate = sample_rate
+
         try:
             await self.say_path(
                 transcript,
                 turn_id=turn_id,
                 on_first_audio=_on_first_audio,
                 on_spoken_progress=_on_spoken_progress,
+                on_audio_chunk=_on_audio_chunk,
             )
         except asyncio.CancelledError:
             raise
@@ -516,6 +619,10 @@ class FullDuplexLoop:
         """
 
         owns_turn = self._fsm.turn_id == turn_id
+        completed_normally = owns_turn and self._fsm.state in (
+            TurnState.BOB_SPEAKING,
+            TurnState.THINKING,
+        )
         if owns_turn and self._fsm.state is TurnState.BOB_SPEAKING:
             transition = self._fsm.on_event(TurnEvent.TTS_END, turn_id=turn_id)
         elif owns_turn and self._fsm.state is TurnState.THINKING:
@@ -525,6 +632,15 @@ class FullDuplexLoop:
         if transition is not None:
             await self._emit_turn_state(transition)
         await self._emit_turn_latency(turn_id)
+        # Persist the finished turn (PRD 0016 / issue 0109). ``completed_normally``
+        # is true only when THIS say-task drove the teardown (the say-path ran to
+        # the end while still owning the floor). A barge-in re-points the FSM to
+        # ``user_speaking`` on the same turn id BEFORE cancelling this task, so it
+        # is NOT ``completed_normally`` here — the barge-in path persists that
+        # turn with ``end_reason="bargein"`` instead. The idempotency guard makes
+        # a double-call harmless regardless.
+        if completed_normally:
+            await self._persist_turn(turn_id, "completed")
         # Re-arm STT for the next utterance unless we have been stopped or a
         # resumed turn already opened one.
         if not self._stopped and self._turn is None:
@@ -579,6 +695,13 @@ class FullDuplexLoop:
 
         await self._emit_bargein(turn_id, confirmation, committed_spoken_text)
 
+        # Persist the interrupted turn (PRD 0016 / issue 0109): ``end_reason``
+        # ``bargein``, ``spoken_text`` = exactly what Bob played before the cut.
+        # The barge-in re-uses this turn id for the RESUMED utterance (0101 FSM
+        # contract we don't change), so this is the turn's terminal persist — the
+        # idempotency guard then makes the resumed turn's later finalize a no-op.
+        await self._persist_turn(turn_id, "bargein", spoken_text=committed_spoken_text)
+
         # Re-arm STT for the resumed utterance (the user is now speaking on the
         # SAME turn id). The cancelled say task's ``_finalize_say`` may already
         # have opened one; only open if still detached.
@@ -593,6 +716,62 @@ class FullDuplexLoop:
         transition = self._fsm.on_event(event, turn_id=turn_id)
         if transition is not None:
             await self._emit_turn_state(transition)
+
+    def _begin_capture(self) -> None:
+        """Reset the per-turn persistence buffers at a turn open (issue 0109)."""
+
+        self._mic_pcm = bytearray()
+        self._tts_pcm = bytearray()
+        self._tts_sample_rate = 0
+        self._final_transcript = ""
+
+    async def _persist_turn(
+        self, turn_id: str, end_reason: str, *, spoken_text: str | None = None
+    ) -> None:
+        """Hand the finished turn's snapshot to the persistence hook (issue 0109).
+
+        Idempotent per ``turn_id`` (the finalize exits race — ``voice_stop`` can
+        fire while an endpoint say-path is still unwinding; a barge-in re-uses
+        the id for the resumed utterance). The FIRST exit to reach a turn wins;
+        later calls are dropped so we never write duplicate audio blobs. The hook
+        owns the DB row + WAV files + Jarvis-history link + the persistence event
+        + the retention sweep; the loop only assembles the snapshot. A hook
+        failure is swallowed so persistence never takes the voice loop down.
+
+        ``spoken_text`` overrides the accumulated played text (the barge-in cut
+        passes the committed prefix explicitly); otherwise the loop's running
+        ``_spoken_text`` is used. After persisting, the buffers are released so a
+        long armed session does not grow unbounded.
+        """
+
+        if self.persist_turn is None:
+            return
+        if turn_id in self._persisted_turn_ids:
+            return
+        self._persisted_turn_ids.add(turn_id)
+
+        snapshot = PersistedTurn(
+            turn_id=turn_id,
+            end_reason=end_reason,
+            final_transcript=self._final_transcript,
+            spoken_text=spoken_text if spoken_text is not None else self._spoken_text,
+            marks=self._marks.as_payload(),
+            derived=self._marks.derived(),
+            mic_pcm=bytes(self._mic_pcm),
+            mic_sample_rate=self.settings.STT_SAMPLE_RATE or 16_000,
+            tts_pcm=bytes(self._tts_pcm),
+            tts_sample_rate=self._tts_sample_rate,
+        )
+        try:
+            await self.persist_turn(snapshot)
+        except Exception:
+            _logger.exception(
+                "voice_loop.persist_failed", session_id=self.session_id, turn_id=turn_id
+            )
+        finally:
+            # Release the (potentially large) PCM buffers for this turn.
+            self._mic_pcm = bytearray()
+            self._tts_pcm = bytearray()
 
     @staticmethod
     async def _feed_stt(turn: VoiceTurn, pcm: bytes) -> bool:

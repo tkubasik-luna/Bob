@@ -27,7 +27,7 @@ from bob import debug_log
 from bob.config import Settings
 from bob.stt_engine import MIC_FRAME_TAG, FakeSttEngine
 from bob.turn_fsm import TurnState
-from bob.voice_loop import FullDuplexLoop
+from bob.voice_loop import FullDuplexLoop, PersistedTurn
 from bob.voice_turn import VoiceTurn
 
 
@@ -77,12 +77,19 @@ def _latency_events() -> list[dict[str, Any]]:
 
 
 class _RecordingSayPath:
-    """A fake say-path: records the transcript, optionally emits 'audio'."""
+    """A fake say-path: records the transcript, optionally emits 'audio'.
 
-    def __init__(self, *, produce_audio: bool = True) -> None:
+    When ``produce_audio`` is set it flips the FSM into ``bob_speaking`` via
+    ``on_first_audio``, optionally streams ``audio_chunk_bytes`` of synthetic
+    PCM through ``on_audio_chunk`` (issue 0109 ``tts_out`` capture), and reports
+    the spoken text via ``on_spoken_progress``.
+    """
+
+    def __init__(self, *, produce_audio: bool = True, audio_chunk_bytes: int = 0) -> None:
         self.transcripts: list[str] = []
         self.turn_ids: list[str] = []
         self._produce_audio = produce_audio
+        self._audio_chunk_bytes = audio_chunk_bytes
 
     async def __call__(
         self,
@@ -91,14 +98,24 @@ class _RecordingSayPath:
         turn_id: str,
         on_first_audio: Callable[[], Awaitable[None]],
         on_spoken_progress: Callable[[str], Awaitable[None]] | None = None,
+        on_audio_chunk: Callable[[bytes, int], Awaitable[None]] | None = None,
     ) -> None:
         self.transcripts.append(transcript)
         self.turn_ids.append(turn_id)
         if self._produce_audio and transcript.strip():
             await on_first_audio()
+            if self._audio_chunk_bytes and on_audio_chunk is not None:
+                await on_audio_chunk(b"\x00" * self._audio_chunk_bytes, 24_000)
+            if on_spoken_progress is not None:
+                await on_spoken_progress(transcript)
 
 
-def _loop(say_path: _RecordingSayPath, transcript: str = "bonjour") -> FullDuplexLoop:
+def _loop(
+    say_path: _RecordingSayPath,
+    transcript: str = "bonjour",
+    *,
+    persist_turn: Callable[[Any], Awaitable[None]] | None = None,
+) -> FullDuplexLoop:
     settings = _settings()
     return FullDuplexLoop(
         voice_turn_factory=lambda: VoiceTurn(
@@ -109,6 +126,7 @@ def _loop(say_path: _RecordingSayPath, transcript: str = "bonjour") -> FullDuple
         say_path=say_path,
         settings=settings,
         session_id="s1",
+        persist_turn=persist_turn,
     )
 
 
@@ -248,6 +266,7 @@ class _BlockingSayPath:
         turn_id: str,
         on_first_audio: Callable[[], Awaitable[None]],
         on_spoken_progress: Callable[[str], Awaitable[None]] | None = None,
+        on_audio_chunk: Callable[[bytes, int], Awaitable[None]] | None = None,
     ) -> None:
         self.transcripts.append(transcript)
         self.entered.set()
@@ -353,8 +372,11 @@ class _SpeakingSayPath:
         turn_id: str,
         on_first_audio: Callable[[], Awaitable[None]],
         on_spoken_progress: Callable[[str], Awaitable[None]] | None = None,
+        on_audio_chunk: Callable[[bytes, int], Awaitable[None]] | None = None,
     ) -> None:
         await on_first_audio()  # → bob_speaking
+        if on_audio_chunk is not None:
+            await on_audio_chunk(b"\x00\x00\x00\x00", 24_000)
         if on_spoken_progress is not None:
             await on_spoken_progress(self.played)
         self.entered.set()
@@ -508,3 +530,159 @@ async def test_short_burst_during_bob_speaking_does_not_cut() -> None:
 
     say.release.set()
     await loop.stop()
+
+
+# --- persistence hook at finalize (PRD 0016 / issue 0109) --------------------
+
+
+class _RecordingPersist:
+    """Captures every :class:`PersistedTurn` the loop hands to ``persist_turn``."""
+
+    def __init__(self) -> None:
+        self.turns: list[PersistedTurn] = []
+
+    async def __call__(self, turn: PersistedTurn) -> None:
+        self.turns.append(turn)
+
+
+async def test_completed_turn_persists_with_audio_and_transcript() -> None:
+    persist = _RecordingPersist()
+    say = _RecordingSayPath(produce_audio=True, audio_chunk_bytes=64)
+    loop = _loop(say, transcript="bonjour le monde", persist_turn=persist)
+    await loop.start()
+
+    for _ in range(8):
+        await loop.feed_raw_frame(_LOUD)
+    for _ in range(8):
+        await loop.feed_raw_frame(_QUIET)
+    await loop.join()
+
+    assert len(persist.turns) == 1
+    snap = persist.turns[0]
+    assert snap.end_reason == "completed"
+    assert snap.turn_id == say.turn_ids[0]
+    assert snap.final_transcript == "bonjour le monde"
+    # The user's voiced frames were captured as mic_in PCM…
+    assert len(snap.mic_pcm) > 0
+    assert snap.mic_sample_rate == 16_000
+    # …and Bob's outbound chunk as tts_out PCM at the TTS rate.
+    assert snap.tts_pcm == b"\x00" * 64
+    assert snap.tts_sample_rate == 24_000
+    # Latency marks rode along (Annexe F basics).
+    assert "t_endpoint" in snap.marks
+
+
+async def test_voice_stop_midturn_persists_voice_stop() -> None:
+    persist = _RecordingPersist()
+    say = _RecordingSayPath()
+    loop = _loop(say, persist_turn=persist)
+    await loop.start()
+    # Only a voiced burst — the user is still speaking (no endpoint yet).
+    for _ in range(5):
+        await loop.feed_raw_frame(_LOUD)
+    assert loop.state is TurnState.USER_SPEAKING
+
+    await loop.stop()
+
+    assert len(persist.turns) == 1
+    assert persist.turns[0].end_reason == "voice_stop"
+    # The in-flight utterance was captured.
+    assert len(persist.turns[0].mic_pcm) > 0
+
+
+async def test_stop_when_idle_persists_nothing() -> None:
+    """A ``voice_stop`` between turns (FSM idle) writes no turn."""
+
+    persist = _RecordingPersist()
+    say = _RecordingSayPath()
+    loop = _loop(say, persist_turn=persist)
+    await loop.start()
+    # No frames → the FSM never left idle.
+    assert loop.state is TurnState.IDLE
+
+    await loop.stop()
+
+    assert persist.turns == []
+
+
+async def test_completed_then_stop_persists_once() -> None:
+    """A completed turn followed by socket-close persists exactly once.
+
+    The completed turn persists on ``_finalize_say``; the trailing ``stop`` finds
+    the FSM idle (turn already done) and the id already persisted, so the
+    idempotency guard makes it a no-op — no duplicate row / blobs.
+    """
+
+    persist = _RecordingPersist()
+    say = _RecordingSayPath(produce_audio=True, audio_chunk_bytes=16)
+    loop = _loop(say, transcript="bonjour", persist_turn=persist)
+    await loop.start()
+    for _ in range(8):
+        await loop.feed_raw_frame(_LOUD)
+    for _ in range(8):
+        await loop.feed_raw_frame(_QUIET)
+    await loop.join()
+    await loop.stop()
+
+    assert len(persist.turns) == 1
+    assert persist.turns[0].end_reason == "completed"
+
+
+async def test_persist_hook_failure_does_not_break_loop() -> None:
+    """A raising ``persist_turn`` is swallowed — the turn still completes."""
+
+    async def _boom(turn: PersistedTurn) -> None:
+        raise RuntimeError("disk full")
+
+    say = _RecordingSayPath(produce_audio=True)
+    loop = _loop(say, transcript="bonjour", persist_turn=_boom)
+    await loop.start()
+    for _ in range(8):
+        await loop.feed_raw_frame(_LOUD)
+    for _ in range(8):
+        await loop.feed_raw_frame(_QUIET)
+    await loop.join()
+
+    # The loop reached idle despite the hook raising.
+    assert loop.state is TurnState.IDLE
+
+
+async def test_bargein_persists_with_committed_spoken_text() -> None:
+    persist = _RecordingPersist()
+    say = _SpeakingSayPath(played="Bonjour le monde")
+    settings = Settings.model_construct(
+        STT_ENGINE="fake",
+        STT_SAMPLE_RATE=16_000,
+        VAD_SPEECH_RMS=0.02,
+        VAD_PAUSE_MS=60,
+        ENDPOINT_SILENCE_MS=120,
+        STT_DEBUG_TEXT_MAX_CHARS=64,
+        BARGEIN_CONFIRM_MS=90,
+    )
+    loop = FullDuplexLoop(
+        voice_turn_factory=lambda: VoiceTurn(
+            engine=FakeSttEngine(transcript="bonjour", samples_per_word=160),
+            session_id="s1",
+            settings=settings,
+        ),
+        say_path=say,
+        settings=settings,
+        session_id="s1",
+        persist_turn=persist,
+    )
+    loop._now = _fake_clock(step_ms=30.0)  # type: ignore[method-assign]
+    await _drive_to_bob_speaking(loop, say)
+
+    # Continuous voiced burst past the 90 ms window → confirmed barge-in.
+    for _ in range(5):
+        await loop.feed_raw_frame(_LOUD)
+
+    say.release.set()
+    await loop.stop()
+
+    # Exactly one persist — the barge-in cut — carrying the played prefix.
+    bargein_turns = [t for t in persist.turns if t.end_reason == "bargein"]
+    assert len(bargein_turns) == 1
+    assert bargein_turns[0].spoken_text == "Bonjour le monde"
+    # The trailing stop did NOT add a second persist for the same turn id.
+    assert len(persist.turns) == 1

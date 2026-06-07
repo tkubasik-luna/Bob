@@ -75,6 +75,13 @@ class Scenario:
     fake_llm: list[dict[str, Any]] = field(default_factory=list)
     timeline: list[dict[str, Any]] = field(default_factory=list)
     assertions: list[dict[str, Any]] = field(default_factory=list)
+    #: Optional backend env overrides (PRD 0016 / issue 0109). A flat
+    #: string→scalar map merged into the ephemeral backend's env BEFORE the
+    #: forced isolation/provider keys (which always win — a scenario can't break
+    #: isolation). Lets a scenario pin a harness-only dial it needs, e.g. a tiny
+    #: ``VOICE_RETENTION_MAX_AUDIO_BYTES`` so the retention sweep evicts. Empty by
+    #: default (zero behaviour change for every prior scenario).
+    env: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, raw: object) -> Scenario:
@@ -92,6 +99,9 @@ class Scenario:
         fake_llm = raw.get("fake_llm", [])
         if not isinstance(fake_llm, list):
             raise ScenarioError("'fake_llm' must be a list of rules")
+        raw_env = raw.get("env", {})
+        if not isinstance(raw_env, dict):
+            raise ScenarioError("'env' must be a mapping of name -> value")
         return cls(
             name=name,
             description=str(raw.get("description", "")),
@@ -100,6 +110,7 @@ class Scenario:
             fake_llm=[s for s in fake_llm if isinstance(s, dict)],
             timeline=[s for s in timeline if isinstance(s, dict)],
             assertions=[a for a in assertions if isinstance(a, dict)],
+            env={str(k): str(v) for k, v in raw_env.items()},
         )
 
     @classmethod
@@ -326,6 +337,10 @@ class ScenarioRunner:
                 env["BOB_FAKE_TTS_CHUNKS"] = str(max(1, int(step.get("tts_chunks", 4))))
             if op in ("inject_audio", "inject_bargein") and step.get("thinker"):
                 env["THINKER_DEBOUNCE_MS"] = "0"
+        # Scenario-level backend env (issue 0109): merged AFTER the derived
+        # per-step dials so an explicit scenario value wins, but still BEFORE the
+        # forced isolation/provider keys in the ephemeral backend.
+        env.update(self._scenario.env)
         return env
 
     async def _do_inject_audio(self, ws_base: str, step: dict[str, Any]) -> None:

@@ -121,6 +121,11 @@ class VoiceTurn:
         self._session: SttSession | None = None
         self._turn_token: Token[str | None] | None = None
         self._finished = False
+        # Set when the turn ended via :meth:`abort` (degraded exit, Annexe G)
+        # rather than a clean :meth:`finalize`. The full-duplex loop (PRD 0016 /
+        # issue 0109) reads :attr:`aborted` to persist the turn with
+        # ``end_reason="error"``. Additive — does not change the 0099 surface.
+        self._aborted = False
         # Monotonic count of ``stt_partial`` events emitted this turn. The
         # full-duplex loop (issue 0100) reads it to fire the FSM's
         # ``stt_partial`` self-loop only on *real* progress, without
@@ -237,6 +242,7 @@ class VoiceTurn:
 
     async def _abort_already_finishing(self, *, reason: str) -> None:
         self._finished = True
+        self._aborted = True
         _logger.warning(
             "voice_turn.aborted",
             session_id=self._session_id,
@@ -260,6 +266,17 @@ class VoiceTurn:
         """Monotonic count of ``stt_partial`` events emitted this turn (0100)."""
 
         return self._partial_count
+
+    @property
+    def aborted(self) -> bool:
+        """True when the turn ended via :meth:`abort` (Annexe G error exit).
+
+        The full-duplex loop (PRD 0016 / issue 0109) reads this to persist the
+        turn with ``end_reason="error"`` rather than ``voice_stop`` when an STT
+        / finalize failure tore it down.
+        """
+
+        return self._aborted
 
     @property
     def latest_partial_text(self) -> str:

@@ -74,6 +74,7 @@ import traceback
 import uuid
 from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -84,7 +85,8 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from bob import jarvis_store as jarvis_store_module
 from bob import task_scheduler as task_scheduler_module
 from bob import task_store as task_store_module
-from bob import text_segmenter, ws_events
+from bob import text_segmenter, voice_retention_policy, ws_events
+from bob import voice_store as voice_store_module
 from bob.config import Settings
 from bob.debug_log import emit_debug
 from bob.event_bus_v2 import emit_event, get_snapshot_for_task, subscribe_for_task
@@ -95,11 +97,18 @@ from bob.stt_engine import SttEngine, get_default_stt_engine
 from bob.task_store import TaskStoreError
 from bob.thinker_loop import ThinkerLoop
 from bob.tts_service import KokoroTtsService, get_default_tts_service
-from bob.voice_loop import FullDuplexLoop, SayPathDriver
+from bob.voice_loop import FullDuplexLoop, PersistedTurn, SayPathDriver
 from bob.voice_turn import VoiceTurn
 
 router = APIRouter()
 _logger = structlog.get_logger(__name__)
+
+
+def _now_iso() -> str:
+    """ISO-8601 UTC timestamp for the voice persistence rows (issue 0109)."""
+
+    return datetime.now(UTC).isoformat()
+
 
 # Per-session shape:
 #   {"active_tts": list[tuple[str, asyncio.Task[None]]]}
@@ -614,6 +623,11 @@ async def _handle_voice_start(
         # into the Jarvis history, and restart the Thinker (issue 0102) so the
         # resumed turn re-plans from the partial.
         commit_spoken=_make_commit_spoken(session_id),
+        # Voice persistence (issue 0109): write the voice_turns row + mic/tts WAV
+        # blobs at every finalize, link the transcript into Jarvis history, emit
+        # the persistence + retention events. ``None`` when persistence is off
+        # (master switch) so capture + writes never happen.
+        persist_turn=(_make_persist_turn(session_id) if settings.VOICE_PERSIST_ENABLED else None),
         on_thinker_restart=(thinker.restart if thinker is not None else None),
         on_thinker_start=(thinker.loop.start if thinker is not None else None),
         on_thinker_feed=(thinker.loop.feed_partial if thinker is not None else None),
@@ -658,6 +672,7 @@ def _make_say_path_driver(
         turn_id: str,
         on_first_audio: Callable[[], Awaitable[None]],
         on_spoken_progress: Callable[[str], Awaitable[None]] | None = None,
+        on_audio_chunk: Callable[[bytes, int], Awaitable[None]] | None = None,
     ) -> None:
         if not transcript.strip():
             return
@@ -682,6 +697,8 @@ def _make_say_path_driver(
             on_first_audio=on_first_audio,
             # Barge-in needs to know what Bob actually played (issue 0101).
             on_spoken_progress=on_spoken_progress,
+            # Voice persistence captures Bob's outbound PCM (issue 0109).
+            on_audio_chunk=on_audio_chunk,
         )
 
     return _drive
@@ -717,6 +734,129 @@ def _make_commit_spoken(session_id: str) -> Callable[[str, str], Awaitable[None]
         )
 
     return _commit
+
+
+def _make_persist_turn(session_id: str) -> Callable[[PersistedTurn], Awaitable[None]]:
+    """Build the voice-turn persistence hook (PRD 0016 / issue 0109, Annexe E).
+
+    On every finalized voice turn the full-duplex loop hands us a
+    :class:`bob.voice_loop.PersistedTurn` snapshot. We:
+
+    1. write the ``voice_turns`` row (transcript, spoken text, end reason,
+       latency JSON; ``draft_outcome`` is ``"none"`` until issue 0104);
+    2. write the ``mic_in`` + ``tts_out`` audio as WAV files on disk (paths in
+       ``voice_audio_blobs``) — an empty recording is simply skipped;
+    3. link the final transcript into the persistent Jarvis history and record
+       the resulting message id in ``voice_turns.jarvis_msg_id`` (skipped on a
+       barge-in turn, where issue 0101 already appended the played prefix, and
+       when there is no transcript);
+    4. emit a ``voice_turn_persisted`` voice event the attest harness asserts on;
+    5. enforce :class:`bob.voice_retention_policy.VoiceRetentionPolicy` and, when
+       it evicted anything, emit ``voice_retention_purged``.
+
+    Silently degrades when the stores are not primed (narrow test setups) and
+    never raises — the loop already wraps the hook, but we keep the boundary
+    clean so a persistence hiccup cannot perturb the live turn.
+    """
+
+    async def _persist(turn: PersistedTurn) -> None:
+        try:
+            store = voice_store_module.get_default_store()
+        except RuntimeError:
+            return
+
+        started_at = _now_iso()
+        latency_json: str | None = None
+        if turn.marks or turn.derived:
+            latency_json = json.dumps({"marks": turn.marks, "derived": turn.derived})
+
+        # 3) Link the final transcript into Jarvis history (Annexe E.1). A
+        #    barge-in turn already had its played prefix appended by issue 0101's
+        #    commit_spoken, so we don't double-append there; a turn with no
+        #    transcript (Bob never heard anything) has nothing to link.
+        jarvis_msg_id: str | None = None
+        if turn.end_reason != "bargein" and turn.final_transcript.strip():
+            try:
+                jarvis_store = jarvis_store_module.get_default_store()
+                jarvis_msg_id = jarvis_store.append_returning_id("user", turn.final_transcript)
+            except RuntimeError:
+                jarvis_msg_id = None
+
+        # 1) The voice_turns row. draft_outcome stays "none" until issue 0104.
+        store.write_turn(
+            turn_id=turn.turn_id,
+            started_at=started_at,
+            ended_at=_now_iso(),
+            final_transcript=turn.final_transcript or None,
+            spoken_text=turn.spoken_text or None,
+            end_reason=turn.end_reason,
+            draft_outcome="none",
+            latency_json=latency_json,
+            jarvis_msg_id=jarvis_msg_id,
+        )
+
+        # 2) The audio blobs (WAV on disk, path in DB). Empty recordings skipped.
+        blob_count = 0
+        mic_blob = store.write_audio_blob(
+            turn_id=turn.turn_id,
+            kind="mic_in",
+            pcm16=turn.mic_pcm,
+            sample_rate=turn.mic_sample_rate,
+        )
+        if mic_blob is not None:
+            blob_count += 1
+        if turn.tts_pcm and turn.tts_sample_rate > 0:
+            tts_blob = store.write_audio_blob(
+                turn_id=turn.turn_id,
+                kind="tts_out",
+                pcm16=turn.tts_pcm,
+                sample_rate=turn.tts_sample_rate,
+            )
+            if tts_blob is not None:
+                blob_count += 1
+
+        # 4) The persistence event the harness asserts on (black-box contract).
+        await emit_event(
+            {
+                "type": "voice_turn_persisted",
+                "turn_id": turn.turn_id,
+                "end_reason": turn.end_reason,
+                "blob_count": blob_count,
+                "has_transcript": bool(turn.final_transcript.strip()),
+                "jarvis_msg_id": jarvis_msg_id,
+            },
+            category="voice",
+            severity="info",
+            source="bob.ws_router.voice_turn_persisted",
+            summary=f"voice_turn_persisted (turn={turn.turn_id}, blobs={blob_count})",
+        )
+
+        # 5) Retention sweep (Annexe E.3) — separate size/age caps. Emit a purge
+        #    event only when something was actually evicted so the harness can
+        #    assert it with a forced-tiny cap. Best-effort: never break persist.
+        try:
+            outcome = voice_retention_policy.enforce(store)
+        except Exception:
+            _logger.exception("ws_router.voice_retention_failed", session_id=session_id)
+            return
+        if outcome.anything:
+            await emit_event(
+                {
+                    "type": "voice_retention_purged",
+                    "blobs_deleted": outcome.blobs_deleted,
+                    "turns_deleted": outcome.turns_deleted,
+                    "audio_bytes_freed": outcome.audio_bytes_freed,
+                },
+                category="voice",
+                severity="info",
+                source="bob.ws_router.voice_retention_purged",
+                summary=(
+                    f"voice_retention_purged (blobs={outcome.blobs_deleted}, "
+                    f"turns={outcome.turns_deleted})"
+                ),
+            )
+
+    return _persist
 
 
 @dataclass
@@ -1186,6 +1326,7 @@ async def _synthesize_and_stream(
     *,
     on_first_audio: Callable[[], Awaitable[None]] | None = None,
     on_spoken_progress: Callable[[str], Awaitable[None]] | None = None,
+    on_audio_chunk: Callable[[bytes, int], Awaitable[None]] | None = None,
 ) -> None:
     """Segment ``text``, stream PCM chunks straight from KPipeline to the WS.
 
@@ -1329,6 +1470,12 @@ async def _synthesize_and_stream(
                         source="bob.ws_router.audio_chunk",
                         summary=f"audio_chunk #{audio_chunks - 1} (msg={msg_id})",
                     )
+                    # PRD 0016 / issue 0109 — hand the raw PCM block to the
+                    # full-duplex loop so it accumulates Bob's ``tts_out``
+                    # recording for persistence. ``None`` on the text path (no
+                    # voice turn is persisted there).
+                    if on_audio_chunk is not None:
+                        await on_audio_chunk(chunk.pcm16, chunk.sample_rate)
                 # This sentence's chunks have all left the socket — report the
                 # cumulative text Bob has actually played (issue 0101). A
                 # barge-in cancel between sentences lands here with the last
