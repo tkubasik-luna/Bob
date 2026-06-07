@@ -27,15 +27,16 @@
  *
  * Default value & the reality constraint
  * ---------------------------------------
- * A headless agent cannot empirically measure ≥25 dB AEC on a real mic, so the
- * spike's criteria C2/C3 land `pending` until a human runs the on-device step.
- * Per the AFK auto-fallback rule (`selectCapturePath`: anything short of an
- * all-pass → `rust`), the deterministic default committed here is therefore
- * **`rust`** — the safe, no-regression fallback. When the on-device run
- * confirms the webview path (≥25 dB + word transcribed), flip
- * `DEFAULT_CAPTURE_DECISION.path` to `"webview"` (and the persisted verdict will
- * agree). This default is itself derived by feeding the scaffolded
- * criteria-results through the real selector — it is NOT a hand-picked guess.
+ * The PRD default capture source is **`webview`** (getUserMedia + AudioWorklet,
+ * AEC by WKWebView); the Rust path is the FALLBACK chosen only when the spike
+ * measures an AEC failure. A headless agent cannot empirically measure ≥25 dB
+ * on a real mic, so C2/C3 stay `pending` until a human runs the on-device step;
+ * pre-spike we run the PRD default (`webview`) with `hardwarePending: true` so
+ * the « Listen » pipeline (issue 0099) is functional, NOT dead-on-arrival. The
+ * AFK auto-fallback rule (`selectCapturePath`: anything short of an all-pass →
+ * `rust`) is what an on-device spike FAILURE would select — exported as
+ * {@link FALLBACK_CAPTURE_PATH}; flip `DEFAULT_CAPTURE_DECISION.path` to it if
+ * the device run fails the AEC criteria.
  */
 
 import { type CapturePath, type CriterionResult, selectCapturePath } from "./aecSpikeSelector";
@@ -86,24 +87,57 @@ export interface CaptureDecision {
 }
 
 /**
- * The committed, deterministic decision. `path` is derived from
- * {@link SCAFFOLDED_SPIKE_RESULTS} via {@link selectCapturePath} so it can never
- * silently disagree with the documented AFK rule.
+ * The committed, deterministic decision.
+ *
+ * `path` is the **PRD 0016 default capture source — `webview`** (getUserMedia +
+ * AudioWorklet, AEC handled by WKWebView). The Rust path is the documented
+ * *fallback the spike selects only on measured AEC failure*
+ * ({@link selectCapturePath} over a non-pass spike → `rust`; see
+ * {@link FALLBACK_CAPTURE_PATH}). Pre-spike (AFK, no hardware) we run the PRD
+ * default optimistically with `hardwarePending: true` so issue 0099's mic
+ * capture is functional; the on-device spike flips this to `rust` IF the ≥25 dB
+ * / word-transcribed criteria fail.
  */
 export const DEFAULT_CAPTURE_DECISION: CaptureDecision = {
   schemaVersion: 1,
-  path: selectCapturePath(SCAFFOLDED_SPIKE_RESULTS),
+  path: "webview",
   hardwarePending: true,
 };
 
 /**
+ * What the AFK auto-fallback rule yields for the current (all-`pending`)
+ * scaffolded spike results: `rust`. Exported so a follow-up that records a real
+ * spike FAILURE can switch {@link DEFAULT_CAPTURE_DECISION} to this without
+ * re-deriving the rule, and so the rule stays asserted in tests.
+ */
+export const FALLBACK_CAPTURE_PATH: CapturePath = selectCapturePath(SCAFFOLDED_SPIKE_RESULTS);
+
+//: Runtime/test override of the capture path (issue 0099). `null` = use the
+//: committed default. The AEC runtime probe (issue 0101) may also flip this.
+let _captureDecisionOverride: CapturePath | null = null;
+
+/**
+ * Override the capture path at runtime (or in tests); `null` clears it.
+ *
+ * Lets the AEC runtime probe / degraded-mode gate (issue 0101) switch the
+ * source without rebuilding, and lets 0099's tests drive both branches.
+ */
+export function setCaptureDecisionOverride(path: CapturePath | null): void {
+  _captureDecisionOverride = path;
+}
+
+/**
  * Canonical read path for downstream consumers (issue 0099).
  *
- * Returns the in-app decision. Kept as a function (not a bare export of the
- * const) so a future iteration can layer a persisted-verdict override on top
- * (read the disk JSON, fall back to the constant) without changing call sites.
+ * Returns the active decision: the {@link setCaptureDecisionOverride} value when
+ * set, else the committed {@link DEFAULT_CAPTURE_DECISION}. Kept as a function
+ * so a future iteration can layer the persisted-verdict JSON on top without
+ * changing call sites.
  */
 export function getCaptureDecision(): CaptureDecision {
+  if (_captureDecisionOverride !== null) {
+    return { ...DEFAULT_CAPTURE_DECISION, path: _captureDecisionOverride };
+  }
   return DEFAULT_CAPTURE_DECISION;
 }
 

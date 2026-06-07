@@ -1,0 +1,20 @@
+# Listen / STT attest scenario (PRD 0016 / issue 0099, Annexe A.2 + C).
+#
+# Drives the REAL binary mic-frame path over /ws/chat against an ephemeral
+# backend whose STT engine is the deterministic fake (converges to the
+# transcript below — no native whisper model needed). Asserts the contract:
+# a stt_final transcript was emitted and contains the expected word.
+name: listen-stt-final
+description: A known fixture transcript surfaces as stt_final over the binary WS path.
+backend: ephemeral
+llm: fake
+timeline:
+  - do: inject_audio
+    transcript: "bonjour paris"
+  - do: wait_event
+    type: stt_final
+    timeout_ms: 8000
+assertions:
+  - kind: stt_final_matches
+    contains: "bonjour"
+  - kind: no_error_events

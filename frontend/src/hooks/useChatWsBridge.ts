@@ -14,6 +14,8 @@ import { useWebSocket } from "./useWebSocket";
 type UseChatWsBridgeResult = {
   status: ConnectionStatus;
   send: (msg: ClientMessage) => void;
+  /** Raw binary sender for the « Listen » mic path (issue 0099). */
+  sendBinary: (data: ArrayBuffer) => void;
 };
 
 /**
@@ -277,7 +279,7 @@ export function useChatWsBridge(): UseChatWsBridgeResult {
     audioEnqueue(data, stream.sampleRate, stream.msgId);
   }, []);
 
-  const { status, send } = useWebSocket({
+  const { status, send, sendBinary } = useWebSocket({
     url: WS_URL,
     onMessage: handleMessage,
     onBinary: handleBinary,
@@ -298,5 +300,5 @@ export function useChatWsBridge(): UseChatWsBridgeResult {
     send({ type: "voice_mode", enabled: voiceEnabled });
   }, [status, voiceEnabled, send]);
 
-  return { status, send };
+  return { status, send, sendBinary };
 }

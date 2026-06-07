@@ -247,6 +247,45 @@ class Settings(BaseSettings):
     MCP_SERVERS: list[dict[str, Any]] = Field(default_factory=list)
     MCP_CALL_TIMEOUT_SECONDS: float = 30.0
 
+    # Speech-to-text (PRD 0016 / issue 0099 — Jarvis real-time « Listen »).
+    # The mic capture path (webview AudioWorklet) downsamples to 16 kHz mono
+    # s16le and ships binary WS frames tagged ``0x01``; the backend decodes
+    # them and feeds :class:`bob.stt_engine.SttEngine`. whisper.cpp
+    # (Metal/CoreML on Apple Silicon) backs the default engine via
+    # ``pywhispercpp`` with the ``large-v3-turbo`` model, downloaded lazily on
+    # first use (mirrors the Kokoro HF-cache pattern — no manual artifacts, a
+    # ``tts_preparing``-style toast is emitted while it downloads).
+    #
+    # OPTIONAL by design (no model_validator requirement): the backend boots
+    # and the suite passes without the native model or ``pywhispercpp``
+    # installed. The real engine is only loaded at first mic frame; tests
+    # drive a deterministic fake engine behind the same interface. Set
+    # ``STT_ENABLED=false`` to refuse mic frames entirely (server stays up).
+    #
+    # ``STT_SAMPLE_RATE`` is the contract sample rate of the inbound PCM
+    # (16 kHz — what the webview worklet resamples to AND what whisper.cpp
+    # expects); it is NOT a free dial, it must match Annexe A.1. ``STT_MODEL``
+    # selects the whisper.cpp model name. ``STT_PARTIAL_MIN_CHARS`` debounces
+    # noisy short partials away from the wire (only emit a partial once the
+    # hypothesis grew past this many chars OR the stable prefix advanced).
+    # ``STT_DEBUG_TEXT_MAX_CHARS`` caps how much user transcript text reaches
+    # the debug ring buffer (the full text always reaches the client; the ring
+    # buffer copy is truncated/masked — Privacy note, Annexe A.2).
+    STT_ENABLED: bool = True
+    STT_ENGINE: Literal["whisper_cpp", "fake"] = "whisper_cpp"
+    STT_MODEL: str = "large-v3-turbo"
+    STT_LANGUAGE: str = "fr"
+    STT_SAMPLE_RATE: int = 16_000
+    STT_PARTIAL_MIN_CHARS: int = 1
+    STT_DEBUG_TEXT_MAX_CHARS: int = 16
+
+    # Attestation harness only (PRD 0016 / issue 0099): the canned transcript
+    # the deterministic ``fake`` STT engine converges to. Injected by the
+    # ``bob attest`` ``inject_audio`` path before booting the ephemeral backend
+    # so an ``--audio`` scenario asserts a known ``stt_final`` without the
+    # native whisper model. Ignored unless ``STT_ENGINE=fake``.
+    BOB_FAKE_STT_TRANSCRIPT: str = ""
+
     def mcp_server_configs(self) -> tuple[MCPServerConfig, ...]:
         """Parse :attr:`MCP_SERVERS` into typed :class:`MCPServerConfig` records.
 

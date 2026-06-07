@@ -123,6 +123,17 @@ def set_ws_emitter(fn: WsEmitter | None) -> None:
         _ws_emitters.add(fn)
 
 
+def snapshot_ws_emitters() -> set[WsEmitter]:
+    """Return a copy of the currently-registered emitter set.
+
+    Lets a harness (issue 0099 attest drive layer) temporarily take over the
+    channel and restore the prior emitters afterwards via
+    :func:`add_ws_emitter`, without poking the module-private set directly.
+    """
+
+    return set(_ws_emitters)
+
+
 async def emit_event(
     payload: WsTaskEvent,
     *,
@@ -309,5 +320,6 @@ __all__ = [
     "get_snapshot_for_task",
     "remove_ws_emitter",
     "set_ws_emitter",
+    "snapshot_ws_emitters",
     "subscribe_for_task",
 ]

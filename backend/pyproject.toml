@@ -39,6 +39,17 @@ dependencies = [
 # Greenfield ``bob`` CLI — the attestation harness front door (issue 0098).
 bob = "bob.attest.cli:main"
 
+# Optional speech-to-text engine (PRD 0016 / issue 0099). whisper.cpp via
+# pywhispercpp backs the real « Listen » STT engine on Apple Silicon
+# (Metal/CoreML). Kept OPTIONAL so the backend boots and the suite passes
+# without the native binding: the default engine lazy-loads it on first mic
+# frame, and tests/attest scenarios drive a deterministic fake engine behind
+# the same interface. Install with ``uv sync --extra stt``.
+[project.optional-dependencies]
+stt = [
+    "pywhispercpp>=1.3.0",
+]
+
 [dependency-groups]
 dev = [
     "pytest>=8.3",
@@ -97,3 +108,6 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "slow: opt-in tests that need native deps / models (e.g. whisper.cpp); skipped in default CI",
+]

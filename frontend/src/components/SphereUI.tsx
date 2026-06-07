@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
+import { useMicCapture } from "../audio/useMicCapture";
 import { useChatWsBridge } from "../hooks/useChatWsBridge";
+import { useVoiceMode } from "../hooks/useVoiceMode";
 import { useAudioLevel } from "../sphere/useAudioLevel";
 import { type SphereDerivedState, useSphereState } from "../sphere/useSphereState";
 import { useDevTweaksStore } from "../state/devTweaksStore";
@@ -75,11 +77,24 @@ export function SphereUI() {
   // branch (assistant snippet or hint). Narrow back here so we don't change
   // the leaf signature.
   const transcriptState = forcedStateForTranscript(effectiveState);
-  const { send } = useChatWsBridge();
+  const { status: wsStatus, send, sendBinary } = useChatWsBridge();
   // Tap the live TTS RMS so the orb pulses with the actual voice. The hook
   // returns a stable ref — passing it down keeps SphereCanvas's rAF loop
   // reading the latest value without triggering a parent re-render.
   const audioLevelRef = useAudioLevel();
+
+  // PRD 0016 / issue 0099 — the « Listen » mic path. The HUD `new` window owns
+  // the mic; it is armed only while the voice toggle is ON *and* the socket is
+  // open (so `voice_start` + binary frames never fire on a dead connection).
+  // `useMicCapture` handles getUserMedia + the AudioWorklet + the
+  // voice_start/voice_stop framing; mounting it here is the whole wiring.
+  const { voiceEnabled } = useVoiceMode();
+  useMicCapture({
+    enabled: voiceEnabled && wsStatus === "open",
+    send,
+    sendBinary,
+    windowName: "new",
+  });
 
   // PRD 0014 / issue 0091 — cold-start ↔ rest orchestration. `hasActivity` is
   // TRUE once any REAL datum exists in the session and FALSE again when it all

@@ -194,19 +194,21 @@ async def test_timeline_wait_event_unknown_type_is_loud() -> None:
 
 
 async def test_timeline_unimplemented_voice_ops_are_loud_not_silent() -> None:
+    # ``inject_audio`` is now implemented (issue 0099 — see test_attest_audio);
+    # ``wait_state`` (FSM) is still pending, so it alone must surface a loud
+    # "not implemented" timeline error rather than passing silently.
     scenario = Scenario.from_dict(
         {
             "name": "x",
             "timeline": [
                 {"do": "wait_state", "state": "bob_speaking"},
-                {"do": "inject_audio", "fixture": "x.wav"},
             ],
         }
     )
     runner = ScenarioRunner(scenario)
     errors: list[str] = []
     await runner._execute_timeline("ws://h", _StubCapture(), errors)  # type: ignore[arg-type]
-    assert len(errors) == 2
+    assert len(errors) == 1
     assert all("not implemented in this slice" in e for e in errors)
 
 

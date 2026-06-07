@@ -68,6 +68,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import time
 import traceback
 import uuid
@@ -87,8 +88,10 @@ from bob.debug_log import emit_debug
 from bob.event_bus_v2 import get_snapshot_for_task, subscribe_for_task
 from bob.orchestrator import Orchestrator, get_default_orchestrator
 from bob.spoken_text_cleaner import clean_for_speech
+from bob.stt_engine import SttEngine, get_default_stt_engine
 from bob.task_store import TaskStoreError
 from bob.tts_service import KokoroTtsService, get_default_tts_service
+from bob.voice_turn import VoiceTurn
 
 router = APIRouter()
 _logger = structlog.get_logger(__name__)
@@ -99,6 +102,7 @@ _sessions: dict[str, dict[str, Any]] = {}
 
 _orchestrator_provider: Callable[[], Orchestrator] = get_default_orchestrator
 _tts_service_provider: Callable[[], KokoroTtsService] = get_default_tts_service
+_stt_engine_provider: Callable[[], SttEngine] = get_default_stt_engine
 
 
 def set_orchestrator_provider(provider: Callable[[], Orchestrator]) -> None:
@@ -121,6 +125,18 @@ def reset_tts_service_provider() -> None:
     _tts_service_provider = get_default_tts_service
 
 
+def set_stt_engine_provider(provider: Callable[[], SttEngine]) -> None:
+    """Override the STT engine factory (tests / attest scenarios)."""
+
+    global _stt_engine_provider
+    _stt_engine_provider = provider
+
+
+def reset_stt_engine_provider() -> None:
+    global _stt_engine_provider
+    _stt_engine_provider = get_default_stt_engine
+
+
 @router.websocket("/ws/chat")
 async def chat_ws(websocket: WebSocket) -> None:
     """Bidirectional chat WebSocket with streaming TTS.
@@ -137,7 +153,10 @@ async def chat_ws(websocket: WebSocket) -> None:
     # `voice_mode` frame on every toggle (and on connect/reconnect for
     # re-sync). When true, proactive pushes are also voiced via TTS, not
     # only direct replies to `user_msg` carrying their own `voice: true`.
-    _sessions[session_id] = {"active_tts": [], "voice_mode": False}
+    # ``voice_turn`` holds the active :class:`bob.voice_turn.VoiceTurn` for the
+    # « Listen » STT pipeline (issue 0099): set on ``voice_start``, cleared on
+    # ``voice_stop`` / final / abort. ``None`` when no mic turn is in flight.
+    _sessions[session_id] = {"active_tts": [], "voice_mode": False, "voice_turn": None}
     orchestrator = _orchestrator_provider()
 
     # Slice 0039: connect-time debug event. Lives outside any user turn so
@@ -213,12 +232,38 @@ async def chat_ws(websocket: WebSocket) -> None:
         await _replay_active_tasks(websocket)
 
         while True:
-            payload = await websocket.receive_json()
+            # ``receive()`` (not ``receive_json()``) so the SAME socket carries
+            # JSON text frames AND binary mic frames (issue 0099 / Annexe A.1).
+            # Binary frames are PCM 16 kHz mono s16le with a 1-byte type tag;
+            # text frames are the existing JSON protocol.
+            message = await websocket.receive()
+            if message.get("type") == "websocket.disconnect":
+                break
+            data_bytes = message.get("bytes")
+            if data_bytes is not None:
+                await _handle_binary_frame(data_bytes, session_id)
+                continue
+            text = message.get("text")
+            if text is None:
+                continue
+            try:
+                payload = json.loads(text)
+            except json.JSONDecodeError:
+                # Malformed text frame — report and keep the socket alive
+                # rather than tearing the connection down.
+                await websocket.send_json(
+                    {"type": "error", "code": "bad_payload", "message": "frame is not valid JSON"}
+                )
+                continue
             await _handle_client_message(websocket, payload, session_id, orchestrator)
     except WebSocketDisconnect:
         pass
     finally:
         ws_events.remove_emitter(_session_emit)
+        # Socket closed mid-turn (Annexe G: WS binaire coupé en plein tour) —
+        # finalize the active voice turn so the partial transcript is frozen
+        # and persisted rather than abandoned.
+        await _finalize_active_voice_turn(session_id)
         await _cancel_active_tts(session_id, emit_audio_end=False, websocket=None)
         _sessions.pop(session_id, None)
         # Slice 0039: disconnect-time debug event. Lives outside any user turn.
@@ -490,6 +535,110 @@ async def _handle_voice_mode(
         session["voice_mode"] = enabled
 
 
+async def _handle_voice_start(
+    websocket: WebSocket, payload: dict[str, Any], session_id: str
+) -> None:
+    """Client → ``voice_start`` arms the mic for a new « Listen » turn (0099).
+
+    Annexe A.1: ``{type, window, ts_client}``. The HUD ``new`` window sends
+    this when the voice toggle is ON and the user starts speaking; the
+    binary mic frames that follow (tag ``0x01``) feed the STT engine until a
+    matching ``voice_stop`` (or socket close) freezes the turn.
+
+    Gating: when ``STT_ENABLED`` is false we refuse with ``stt_disabled`` and
+    open no turn (the server stays up). A ``voice_start`` while a turn is
+    already active finalizes the previous one first (defensive — the client
+    should pair start/stop, but a dropped ``voice_stop`` must not wedge the
+    session).
+    """
+
+    from bob.config import get_settings
+
+    if not get_settings().STT_ENABLED:
+        await websocket.send_json(
+            {"type": "error", "code": "stt_disabled", "message": "STT is disabled (STT_ENABLED)"}
+        )
+        return
+
+    session = _sessions.get(session_id)
+    if session is None:
+        return
+
+    # Defensive: a lingering turn (missed voice_stop) is finalized before the
+    # new one opens so we never run two STT sessions for one socket.
+    existing = session.get("voice_turn")
+    if isinstance(existing, VoiceTurn):
+        await existing.finalize()
+        session["voice_turn"] = None
+
+    turn = VoiceTurn(engine=_stt_engine_provider(), session_id=session_id)
+    started = await turn.start()
+    if not started:
+        # ``start`` already emitted the abort event (Annexe G). Leave the slot
+        # empty so subsequent binary frames are dropped until the next start.
+        session["voice_turn"] = None
+        return
+    session["voice_turn"] = turn
+    emit_debug(
+        category="voice",
+        severity="info",
+        source="bob.ws_router._handle_voice_start",
+        summary=f"voice_start (turn={turn.turn_id})",
+        payload={"session_id": session_id, "turn_id": turn.turn_id},
+        turn_id=turn.turn_id,
+    )
+
+
+async def _handle_voice_stop(
+    websocket: WebSocket, payload: dict[str, Any], session_id: str
+) -> None:
+    """Client → ``voice_stop`` closes the mic and freezes the turn (0099).
+
+    Annexe A.1 ``{type, ts_client}`` / Annexe B ``* + voice_stop -> idle``.
+    Finalizes the active turn (emitting ``stt_final``) and clears the slot.
+    A ``voice_stop`` with no active turn is a silent no-op (idempotent).
+    """
+
+    session = _sessions.get(session_id)
+    if session is None:
+        return
+    turn = session.get("voice_turn")
+    if isinstance(turn, VoiceTurn):
+        await turn.finalize()
+    session["voice_turn"] = None
+
+
+async def _handle_binary_frame(data: bytes, session_id: str) -> None:
+    """Route a binary mic frame (tag ``0x01``) to the active voice turn.
+
+    A frame that arrives with no active turn (race: frames in flight after a
+    ``voice_stop``, or before ``voice_start`` landed) is silently dropped.
+    Decoding + STT failures are owned by :class:`bob.voice_turn.VoiceTurn`
+    (bad frame → drop; transcription failure → clean turn abort).
+    """
+
+    session = _sessions.get(session_id)
+    if session is None:
+        return
+    turn = session.get("voice_turn")
+    if not isinstance(turn, VoiceTurn):
+        return
+    await turn.feed_raw_frame(data)
+
+
+async def _finalize_active_voice_turn(session_id: str) -> None:
+    """Finalize any in-flight voice turn on socket close (Annexe G)."""
+
+    session = _sessions.get(session_id)
+    if session is None:
+        return
+    turn = session.get("voice_turn")
+    if isinstance(turn, VoiceTurn):
+        with contextlib.suppress(Exception):
+            await turn.finalize()
+    session["voice_turn"] = None
+
+
 async def _handle_request_task_messages(websocket: WebSocket, payload: dict[str, Any]) -> None:
     """Client → return the full ``task_messages`` log for a task.
 
@@ -581,6 +730,14 @@ async def _handle_client_message(
 
     if msg_type == "voice_mode":
         await _handle_voice_mode(websocket, payload, session_id)
+        return
+
+    if msg_type == "voice_start":
+        await _handle_voice_start(websocket, payload, session_id)
+        return
+
+    if msg_type == "voice_stop":
+        await _handle_voice_stop(websocket, payload, session_id)
         return
 
     if msg_type != "user_msg":

@@ -40,7 +40,7 @@ from bob.attest.assertions import (
     project_deliverable,
     run_assertion,
 )
-from bob.attest.drive import DebugCapture, inject_text
+from bob.attest.drive import DebugCapture, inject_audio_ws, inject_text, synth_mic_frames
 from bob.attest.ephemeral import EphemeralBackend
 from bob.attest.fake_backend import FakeScript
 
@@ -167,7 +167,10 @@ class ScenarioRunner:
     async def _run_async(self) -> dict[str, Any]:
         started = time.monotonic()
         script = FakeScript.from_rules(self._scenario.fake_llm)
-        backend = EphemeralBackend(fake_llm_script=script.to_json())
+        backend = EphemeralBackend(
+            fake_llm_script=script.to_json(),
+            fake_stt_transcript=self._audio_transcript(),
+        )
         handle = backend.start()
         capture = DebugCapture(handle.ws_base)
         timeline_errors: list[str] = []
@@ -236,9 +239,10 @@ class ScenarioRunner:
     ) -> None:
         """Run each timeline step in order. Unknown ops are loud errors.
 
-        Supported ops (this slice): ``inject_text``, ``wait_event``,
-        ``wait_ms``. ``wait_state`` / ``inject_audio`` (voice) raise a recorded
-        error rather than passing silently — their slices wire them in.
+        Supported ops: ``inject_text``, ``inject_audio`` (issue 0099 — binary
+        mic frames over the real WS), ``wait_event``, ``wait_ms``.
+        ``wait_state`` (FSM) raises a recorded error rather than passing
+        silently — its slice wires it in.
         """
 
         import asyncio
@@ -251,20 +255,53 @@ class ScenarioRunner:
                     if not isinstance(text, str):
                         raise ScenarioError("inject_text 'text' must be a string")
                     await inject_text(ws_base, text)
+                elif op == "inject_audio":
+                    await self._do_inject_audio(ws_base, step)
                 elif op == "wait_event":
                     await self._do_wait_event(step, capture, errors)
                 elif op == "wait_ms":
                     ms = step.get("ms", step.get("at_ms", 0))
                     await asyncio.sleep(max(int(ms), 0) / 1000.0)
-                elif op in ("wait_state", "inject_audio"):
+                elif op == "wait_state":
                     errors.append(
                         f"timeline[{index}] op {op!r} is not implemented in this "
-                        "slice (lands with the voice/FSM slices)"
+                        "slice (lands with the FSM slice)"
                     )
                 else:
                     errors.append(f"timeline[{index}] unknown op {op!r}")
             except ScenarioError as exc:
                 errors.append(f"timeline[{index}] {exc}")
+
+    def _audio_transcript(self) -> str:
+        """The transcript the fake STT engine should converge to for this run.
+
+        Scans the timeline for the first ``inject_audio`` step's ``transcript``
+        (the deterministic fake engine is single-transcript per backend, so the
+        first audio turn defines it). Empty when the scenario injects no audio —
+        a text-only run leaves the fake engine idle.
+        """
+
+        for step in self._scenario.timeline:
+            if step.get("do") == "inject_audio":
+                transcript = step.get("transcript", "")
+                return transcript if isinstance(transcript, str) else ""
+        return ""
+
+    async def _do_inject_audio(self, ws_base: str, step: dict[str, Any]) -> None:
+        """Stream synthetic mic frames for one voice turn over the binary WS.
+
+        The fake STT engine (booted with ``BOB_FAKE_STT_TRANSCRIPT`` =
+        :meth:`_audio_transcript`) ignores PCM content and converges to that
+        transcript, so silent frames sized to comfortably cover the transcript
+        drive the REAL decode → ``VoiceTurn`` → ``stt_final`` path. Content
+        fidelity is irrelevant — the assertion checks the contract, not audio.
+        """
+
+        transcript = step.get("transcript", "")
+        words = max(1, len(str(transcript).split()))
+        # Fake engine reveals one word per ~1600 samples; 480 samples/frame.
+        frame_count = max(8, (words * 1600) // 480 + 4)
+        await inject_audio_ws(ws_base, synth_mic_frames(frame_count=frame_count))
 
     async def _do_wait_event(
         self, step: dict[str, Any], capture: DebugCapture, errors: list[str]

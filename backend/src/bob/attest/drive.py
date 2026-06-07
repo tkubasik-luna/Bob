@@ -19,12 +19,21 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import wave
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
+import numpy as np
 import websockets
 
+from bob.stt_engine import MIC_FRAME_TAG
+
 CapturedEvent = dict[str, Any]
+
+#: Default mic frame duration. 30 ms at 16 kHz = 480 samples = 960 bytes — the
+#: same frame size the webview ``MicCapture`` worklet produces (Annexe A.1).
+DEFAULT_FRAME_MS = 30
 
 
 class DebugCapture:
@@ -155,3 +164,122 @@ async def inject_text(ws_base: str, text: str, *, turn_timeout_ms: int = 30000) 
             frame = await _recv()
             if frame.get("type") == "thinking" and frame.get("state") == "end":
                 saw_thinking_end = True
+
+
+#: First byte of a mic frame (Annexe A.1) — single-sourced from the STT engine.
+_MIC_FRAME_TAG = bytes([MIC_FRAME_TAG])
+
+
+def _resample_linear(samples: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
+    """Linear-interpolate ``samples`` from ``src_rate`` to ``dst_rate``.
+
+    Good enough for a test fixture (we are not chasing audio fidelity, just a
+    16 kHz mono stream the fake engine counts and the decoder validates). A
+    no-op when the rates already match.
+    """
+
+    if src_rate == dst_rate or samples.size == 0:
+        return samples
+    duration = samples.size / float(src_rate)
+    dst_n = max(1, round(duration * dst_rate))
+    src_idx = np.linspace(0.0, samples.size - 1, num=dst_n)
+    resampled = np.interp(src_idx, np.arange(samples.size), samples)
+    return np.asarray(resampled, dtype=np.float32)
+
+
+def wav_to_pcm16_frames(
+    path: str | Path,
+    *,
+    target_rate: int = 16_000,
+    frame_ms: int = DEFAULT_FRAME_MS,
+) -> list[bytes]:
+    """Read a WAV fixture → list of binary mic frames (tag ``0x01``).
+
+    Converts to mono, resamples to ``target_rate``, re-quantises to s16le, and
+    slices into ``frame_ms`` frames each prefixed with the ``0x01`` mic tag —
+    the exact bytes the webview ``MicCapture`` ships (Annexe A.1). Supports
+    8/16/32-bit PCM WAVs. Used by the ``--audio`` real-engine attest path; the
+    deterministic fake path uses :func:`synth_mic_frames` instead.
+    """
+
+    path = Path(path)
+    with wave.open(str(path), "rb") as wf:
+        n_channels = wf.getnchannels()
+        sampwidth = wf.getsampwidth()
+        src_rate = wf.getframerate()
+        raw = wf.readframes(wf.getnframes())
+
+    if sampwidth == 1:
+        # 8-bit WAV is unsigned; center to [-1, 1).
+        arr = (np.frombuffer(raw, dtype=np.uint8).astype(np.float32) - 128.0) / 128.0
+    elif sampwidth == 2:
+        arr = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
+    elif sampwidth == 4:
+        arr = np.frombuffer(raw, dtype="<i4").astype(np.float32) / 2147483648.0
+    else:
+        raise ValueError(f"unsupported WAV sample width: {sampwidth} bytes")
+
+    if n_channels > 1:
+        arr = arr.reshape(-1, n_channels).mean(axis=1)
+
+    arr = _resample_linear(arr, src_rate, target_rate)
+    pcm16 = np.clip(arr, -1.0, 1.0)
+    pcm16 = (pcm16 * 32767.0).astype("<i2")
+
+    samples_per_frame = max(1, int(target_rate * frame_ms / 1000))
+    frames: list[bytes] = []
+    for start in range(0, pcm16.size, samples_per_frame):
+        chunk = pcm16[start : start + samples_per_frame]
+        if chunk.size == 0:
+            continue
+        frames.append(_MIC_FRAME_TAG + chunk.tobytes())
+    return frames
+
+
+def synth_mic_frames(*, frame_count: int = 8, samples_per_frame: int = 480) -> list[bytes]:
+    """Synthesise ``frame_count`` silent mic frames (tag ``0x01`` + s16le zeros).
+
+    The deterministic fake STT engine ignores PCM *content* (it converges to a
+    scripted transcript), so silent frames are enough to exercise the REAL
+    binary-decode → ``VoiceTurn`` → ``stt_final`` path end-to-end over the wire.
+    ``480`` samples = 30 ms at 16 kHz, the same frame size the webview worklet
+    produces.
+    """
+
+    pcm = b"\x00\x00" * samples_per_frame  # s16le silence
+    return [_MIC_FRAME_TAG + pcm for _ in range(max(1, frame_count))]
+
+
+async def inject_audio_ws(
+    ws_base: str,
+    frames: list[bytes],
+    *,
+    settle_ms: int = 300,
+    open_timeout_ms: int = 10000,
+) -> None:
+    """Drive one voice turn through the real binary ``/ws/chat`` path (0099).
+
+    Opens a chat socket, drains the connect-time ``session`` frame, sends
+    ``voice_start`` (JSON), streams the binary mic ``frames`` (each tag ``0x01``
+    + s16le PCM), then ``voice_stop`` (JSON) which freezes the turn server-side
+    and emits ``stt_final`` on ``/ws/debug``. Returns after a short settle so the
+    server finalises before the socket closes. The ``/ws/debug`` capture (a
+    separate socket) records the emitted ``stt_partial`` / ``stt_final`` frames;
+    the caller's ``wait_event`` / assertions read them there.
+    """
+
+    async with websockets.connect(
+        f"{ws_base}/ws/chat", open_timeout=open_timeout_ms / 1000.0
+    ) as conn:
+        # Drain the connect-time ``session`` frame (and any replay) briefly.
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(conn.recv(), timeout=2.0)
+
+        await conn.send(json.dumps({"type": "voice_start", "window": "new"}))
+        for frame in frames:
+            await conn.send(frame)
+        await conn.send(json.dumps({"type": "voice_stop"}))
+        # Let the server process voice_stop → finalize → emit stt_final before
+        # the socket closes (close also finalises, but an explicit settle keeps
+        # the event ordering deterministic for the capture).
+        await asyncio.sleep(max(settle_ms, 0) / 1000.0)

@@ -104,11 +104,13 @@ class EphemeralBackend:
         self,
         *,
         fake_llm_script: str = "",
+        fake_stt_transcript: str = "",
         host: str = "127.0.0.1",
         boot_timeout_seconds: float = 30.0,
         python_executable: str | None = None,
     ) -> None:
         self._fake_llm_script = fake_llm_script
+        self._fake_stt_transcript = fake_stt_transcript
         self._host = host
         self._boot_timeout = boot_timeout_seconds
         self._python = python_executable or sys.executable
@@ -228,6 +230,12 @@ class EphemeralBackend:
                 "ORCHESTRATION_LOG_ENABLED": "false",
                 "LLM_PROVIDER": "fake",
                 "BOB_FAKE_LLM_SCRIPT": self._fake_llm_script,
+                # Deterministic STT for the harness: the fake engine converges
+                # to ``BOB_FAKE_STT_TRANSCRIPT`` so an ``--audio`` scenario needs
+                # no native whisper model. Harmless for text-only scenarios (no
+                # voice turn is opened).
+                "STT_ENGINE": "fake",
+                "BOB_FAKE_STT_TRANSCRIPT": self._fake_stt_transcript,
                 "BACKEND_HOST": self._host,
                 "BACKEND_PORT": str(port),
                 # Text-only harness: skip the Kokoro download + espeak-ng warmup

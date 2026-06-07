@@ -4,6 +4,7 @@ import { describe, expect, test } from "vitest";
 import { buildSpikeVerdict, selectCapturePath } from "./aecSpikeSelector";
 import {
   DEFAULT_CAPTURE_DECISION,
+  FALLBACK_CAPTURE_PATH,
   HALF_DUPLEX_GATE_SPEC,
   SCAFFOLDED_SPIKE_RESULTS,
   VERDICT_ARTEFACT_FILENAME,
@@ -11,14 +12,17 @@ import {
 } from "./captureDecision";
 
 describe("captureDecision artefact (consumed by issue 0099)", () => {
-  test("default decision is derived from the scaffolded results via the real selector", () => {
-    // No hand-picked path: it must equal what the pure selector says.
-    expect(DEFAULT_CAPTURE_DECISION.path).toBe(selectCapturePath(SCAFFOLDED_SPIKE_RESULTS));
+  test("app default is the PRD `webview` capture path, hardware validation pending", () => {
+    // PRD 0016 default capture source; the « Listen » pipeline (0099) is
+    // functional pre-spike rather than dead-on-arrival on the rust stub.
+    expect(DEFAULT_CAPTURE_DECISION.path).toBe("webview");
+    expect(DEFAULT_CAPTURE_DECISION.hardwarePending).toBe(true);
   });
 
-  test("headless (no-hardware) default selects the safe `rust` fallback", () => {
-    expect(DEFAULT_CAPTURE_DECISION.path).toBe("rust");
-    expect(DEFAULT_CAPTURE_DECISION.hardwarePending).toBe(true);
+  test("the AFK fallback path is derived from the real selector → rust (spike-failure)", () => {
+    // What an on-device spike FAILURE would select; flip the default to this.
+    expect(FALLBACK_CAPTURE_PATH).toBe(selectCapturePath(SCAFFOLDED_SPIKE_RESULTS));
+    expect(FALLBACK_CAPTURE_PATH).toBe("rust");
   });
 
   test("getCaptureDecision is the canonical read path and is stable", () => {
@@ -65,8 +69,10 @@ describe("committed spike verdict artefact (aec_spike_verdict.json)", () => {
     );
   });
 
-  test("the persisted verdict agrees with the in-app decision path", () => {
-    expect(loadVerdict().chosen_path).toBe(getCaptureDecision().path);
+  test("the persisted verdict records the spike-fallback path (the AFK selection)", () => {
+    // The on-disk verdict is the spike's own (headless → rust) selection; the
+    // app default is the optimistic PRD webview path. They legitimately differ.
+    expect(loadVerdict().chosen_path).toBe(FALLBACK_CAPTURE_PATH);
   });
 });
 

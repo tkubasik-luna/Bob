@@ -125,13 +125,35 @@ export type VoiceModeMsg = {
   enabled: boolean;
 };
 
+/** PRD 0016 / issue 0099, Annexe A.1 — arms the mic for a « Listen » turn.
+ * Sent by the HUD `new` window when the voice toggle is ON and the user
+ * starts speaking. The binary mic frames (tag `0x01`) that follow feed the
+ * server STT engine until the matching `voice_stop` (or socket close). */
+export type VoiceStartMsg = {
+  type: "voice_start";
+  /** Which window owns the mic (the HUD `new` window today). */
+  window: string;
+  /** Client monotonic timestamp (ms) when the mic armed. */
+  ts_client: number;
+};
+
+/** PRD 0016 / issue 0099, Annexe A.1 — closes the mic and freezes the turn
+ * (kill-switch / toggle OFF). The server finalizes the active STT turn and
+ * emits the `stt_final`. */
+export type VoiceStopMsg = {
+  type: "voice_stop";
+  ts_client: number;
+};
+
 export type ClientMessage =
   | UserMsg
   | DismissTaskMsg
   | RequestTaskMessagesMsg
   | CancelTaskMsg
   | ClientTypingMsg
-  | VoiceModeMsg;
+  | VoiceModeMsg
+  | VoiceStartMsg
+  | VoiceStopMsg;
 
 // Server → client
 export type SessionMsg = {
@@ -231,6 +253,56 @@ export type AudioErrorMsg = {
   type: "audio_error";
   msg_id: string;
   reason: string;
+};
+
+/** PRD 0016 / issue 0099, Annexe A.2 — an incremental whisper hypothesis for
+ * the in-flight voice turn. `text` is the full hypothesis so far (not a
+ * delta); `stable_prefix_len` is the count of leading characters the engine
+ * considers settled (render solidly; the tail is tentative). `ts` is a server
+ * monotonic timestamp (seconds). */
+export type SttPartialMsg = {
+  type: "stt_partial";
+  turn_id: string;
+  text: string;
+  stable_prefix_len: number;
+  ts: number;
+};
+
+/** PRD 0016 / issue 0099, Annexe A.2 — the frozen transcript for a voice turn,
+ * emitted once at endpoint / `voice_stop`. */
+export type SttFinalMsg = {
+  type: "stt_final";
+  turn_id: string;
+  text: string;
+  ts: number;
+};
+
+/** PRD 0016 / issue 0099, Annexe G — the whisper model is being downloaded
+ * lazily on first use. Mirrors `tts_preparing`: the frontend shows a
+ * "Préparation de la transcription…" toast, dismissed on `stt_ready`. */
+export type SttPreparingMsg = {
+  type: "stt_preparing";
+  turn_id: string;
+  ts: number;
+};
+
+/** Paired with `stt_preparing` — the whisper model finished loading and the
+ * turn can transcribe. Frontend dismisses the prep toast. */
+export type SttReadyMsg = {
+  type: "stt_ready";
+  turn_id: string;
+  ts: number;
+};
+
+/** PRD 0016 / issue 0099, Annexe G — the voice turn was aborted cleanly (STT
+ * engine unavailable / failed mid-turn / download failed). `end_reason` is
+ * always `"error"`. The HUD returns to idle and surfaces a toast; no crash. */
+export type VoiceTurnErrorMsg = {
+  type: "voice_turn_error";
+  turn_id: string;
+  reason: string;
+  end_reason: "error";
+  ts: number;
 };
 
 /** Lifecycle state of a sub-task in the sidebar. Mirrors
@@ -458,6 +530,11 @@ export type ServerMessage =
   | TtsPreparingMsg
   | TtsReadyMsg
   | AudioErrorMsg
+  | SttPartialMsg
+  | SttFinalMsg
+  | SttPreparingMsg
+  | SttReadyMsg
+  | VoiceTurnErrorMsg
   | TaskCreatedMsg
   | TaskUpdatedMsg
   | TaskResultMsg

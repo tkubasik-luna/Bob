@@ -11,6 +11,14 @@ type Options = {
 type UseWebSocketResult = {
   status: ConnectionStatus;
   send: (msg: ClientMessage) => void;
+  /**
+   * Send a raw binary frame (ArrayBuffer) on the same socket. Used by the
+   * « Listen » mic path (issue 0099) to ship PCM frames tagged `0x01`
+   * (Annexe A.1). Unlike {@link send}, binary frames are NOT queued on a
+   * closed socket — mic audio is real-time and stale frames are worthless, so
+   * a frame sent while disconnected is dropped.
+   */
+  sendBinary: (data: ArrayBuffer) => void;
 };
 
 const BACKOFF_STEPS_MS = [500, 1000, 2000, 4000, 8000, 10000];
@@ -129,5 +137,13 @@ export function useWebSocket({ url, onMessage, onBinary }: Options): UseWebSocke
     }
   }, []);
 
-  return { status, send };
+  const sendBinary = useCallback((data: ArrayBuffer) => {
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(data);
+    }
+    // Dropped when not open: real-time mic audio is not worth queueing.
+  }, []);
+
+  return { status, send, sendBinary };
 }

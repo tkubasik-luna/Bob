@@ -34,6 +34,7 @@ slices.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -98,11 +99,32 @@ def _is_say(event: CapturedEvent) -> bool:
     return isinstance(speech, str) and bool(speech.strip())
 
 
+def _voice_subtype_matcher(subtype: str) -> EventMatcher:
+    """Build a matcher for a ``category="voice"`` event with ``payload.type``.
+
+    The « Listen » pipeline (issue 0099) emits its events via
+    :func:`bob.event_bus_v2.emit_event`, which nests the wire payload under
+    ``payload.ws_event`` in the captured debug frame; the concrete kind is
+    ``payload.ws_event.type`` (``stt_partial`` / ``stt_final`` — Annexe A.2).
+    This lets ``wait_event`` synchronise on a transcript landing.
+    """
+
+    def _match(event: CapturedEvent) -> bool:
+        if event.get("category") != "voice":
+            return False
+        ws_event = (event.get("payload") or {}).get("ws_event") or {}
+        return ws_event.get("type") == subtype
+
+    return _match
+
+
 #: Logical-event → debug-frame predicate. Extended per slice (``bargein``,
 #: ``endpoint``, ``user_speaking``, ...). Kept module-level so a later slice
 #: registers its matcher next to its assertion kind.
 LOGICAL_EVENT_MATCHERS: dict[str, EventMatcher] = {
     "say": _is_say,
+    "stt_partial": _voice_subtype_matcher("stt_partial"),
+    "stt_final": _voice_subtype_matcher("stt_final"),
 }
 
 
@@ -246,6 +268,68 @@ def check_role_used_model(spec: dict[str, Any], ctx: AssertionContext) -> Assert
     )
 
 
+def _stt_final_texts(events: list[CapturedEvent]) -> list[str]:
+    """Return the ``text`` of every captured ``stt_final`` voice event.
+
+    Note (Privacy, Annexe A.2): the ``/ws/debug`` copy the harness captures
+    carries the **scrubbed** transcript — :func:`bob.voice_turn._scrub_text`
+    keeps the first ``STT_DEBUG_TEXT_MAX_CHARS`` characters verbatim then
+    elides. A scenario therefore asserts a substring within that leading
+    window (the demo fixture keeps the transcript short so it survives whole).
+    """
+
+    matcher = _voice_subtype_matcher("stt_final")
+    texts: list[str] = []
+    for event in events:
+        if not matcher(event):
+            continue
+        ws_event = (event.get("payload") or {}).get("ws_event") or {}
+        text = ws_event.get("text")
+        if isinstance(text, str):
+            texts.append(text)
+    return texts
+
+
+def check_stt_final_matches(spec: dict[str, Any], ctx: AssertionContext) -> AssertionResult:
+    """PASS iff some ``stt_final`` transcript matches ``contains`` / ``regex``.
+
+    Spec: ``{kind: stt_final_matches, contains: "..."}`` or
+    ``{kind: stt_final_matches, regex: "..."}`` (Annexe C — audio mode). Asserts
+    the *contract* (the expected words were transcribed), never an exact string,
+    so a fuzzy real-STT run stays robust. Reads the scrubbed ``/ws/debug`` copy
+    (see :func:`_stt_final_texts`).
+    """
+
+    contains = spec.get("contains")
+    regex = spec.get("regex")
+    if not isinstance(contains, str) and not isinstance(regex, str):
+        return AssertionResult(
+            kind="stt_final_matches",
+            ok=False,
+            detail={"error": "stt_final_matches requires a 'contains' or 'regex' string"},
+        )
+    finals = _stt_final_texts(ctx.events)
+    if not finals:
+        return AssertionResult(
+            kind="stt_final_matches",
+            ok=False,
+            detail={"error": "no stt_final event captured", "finals": []},
+        )
+    if isinstance(contains, str):
+        ok = any(contains in text for text in finals)
+        criterion: dict[str, Any] = {"contains": contains}
+    else:
+        assert isinstance(regex, str)
+        pattern = re.compile(regex)
+        ok = any(pattern.search(text) is not None for text in finals)
+        criterion = {"regex": regex}
+    return AssertionResult(
+        kind="stt_final_matches",
+        ok=ok,
+        detail={**criterion, "finals": finals[:5]},
+    )
+
+
 # --- registry ----------------------------------------------------------------
 
 #: Assertion implementation type — pure function over (spec, context).
@@ -308,3 +392,4 @@ register_assertion("event_emitted", check_event_emitted)
 register_assertion("no_error_events", check_no_error_events)
 register_assertion("deliverable_nonempty", check_deliverable_nonempty)
 register_assertion("role_used_model", check_role_used_model)
+register_assertion("stt_final_matches", check_stt_final_matches)
