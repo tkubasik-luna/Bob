@@ -216,3 +216,130 @@ export async function putLlmBaseUrl(baseUrl: string, signal?: AbortSignal): Prom
   }
   return (await res.json()) as LlmSelection;
 }
+
+// =============================================================================
+// Per-role selection — PRD 0016 / issue 0106 + 0108 (the per-role RolePicker)
+// =============================================================================
+//
+// The v2 surface sits ALONGSIDE the global `/selection` endpoints above:
+//   GET  /api/llm/roles        → the full per-role map (+ stt + budget).
+//   PUT  /api/llm/roles/{role} → swap ONE role's selection; rebuilds only that
+//                                role's client (the other three are untouched).
+// Mirror of `bob.llm_router.RoleMapResponse`. The four role ids are the fixed
+// `bob.llm_selection_store.ROLES` vocabulary.
+
+/** The four orchestrator roles (mirror of the backend `ROLES` tuple). The
+ * RolePicker renders one block per role in this order. */
+export const LLM_ROLES = ["jarvis", "thinker", "draft", "subagent"] as const;
+export type LlmRole = (typeof LLM_ROLES)[number];
+
+/** One role's flat selection — mirror of the backend `RoleSelectionBody`.
+ *
+ * `provider` is `lm_studio` | `claude_cli`; `base_url` / `lm_model` are
+ * per-role (a role may pin its own server + model); `context_length` is the
+ * per-model ctx map round-tripped for budgeting. A Claude-CLI role carries a
+ * null `base_url` / `lm_model` (the model label is the shared `claude_model`). */
+export type RoleSelection = {
+  provider: string;
+  base_url: string | null;
+  lm_model: string | null;
+  context_length: Record<string, number>;
+};
+
+/** The `stt` block — mirror of the backend `SttSelectionBody` (Annexe D). */
+export type SttSelection = {
+  engine: string;
+  model: string;
+};
+
+/** The `budget` block — mirror of the backend `BudgetSelectionBody` (Annexe D).
+ *
+ * This is the model-budget CONFIG, not live usage. `ceiling_gib` is the global
+ * per-host RAM ceiling in GiB (`null` = "detect later" — the local-RAM probe);
+ * `reserve_gib` is the OS head-room margin; `per_host_override` maps a host
+ * (`host:port` or base URL) to an explicit ceiling for remote servers.
+ *
+ * NOTE (seam, issue 0107): the backend exposes no LIVE resident-usage endpoint —
+ * `model_budget.HostBudget.resident_gib()` lives only in-process on the
+ * `LMStudioManager`. The picker renders this config + surfaces an over-budget
+ * REFUSAL via the `PUT` 409 `budget_exceeded` error; it cannot show a live
+ * usage/ceiling gauge until a usage endpoint ships. */
+export type BudgetSelection = {
+  ceiling_gib: number | null;
+  reserve_gib: number;
+  per_host_override: Record<string, number>;
+};
+
+/** The full per-role map — mirror of the backend `RoleMapResponse`.
+ *
+ * `claude_model` is the read-only Claude label (mirrors `GET /selection`) so a
+ * per-role Claude pick renders a model name without a separate fetch. */
+export type RoleMap = {
+  schema_version: number;
+  roles: Record<string, RoleSelection>;
+  stt: SttSelection;
+  budget: BudgetSelection;
+  claude_model: string;
+};
+
+/** Raised by {@link putLlmRole} when a per-role swap fails (the backend returns
+ * 404 / 409 / 422 / 503 with a structured `{error, detail}` body). The picker
+ * keeps the PREVIOUS per-role selection and surfaces `message` as the detail.
+ *
+ * `code === "budget_exceeded"` is the Annexe G over-budget refusal (409): the
+ * role's model would push the host's resident set over its ceiling, so the load
+ * was refused BEFORE touching the SDK — the picker shows the over-budget
+ * warning. Other codes: `unknown_role` (404), `model_not_found` (404),
+ * `load_failed` (409 — real OOM), `unknown_provider` (422),
+ * `lm_studio_unavailable` (503), `swap_unavailable` (503 — lifespan not up). */
+export class LlmRoleSwapError extends Error {
+  readonly code: string;
+  constructor(code: string, detail: string) {
+    super(detail);
+    this.name = "LlmRoleSwapError";
+    this.code = code;
+  }
+}
+
+/** Fetch the full per-role LLM selection map (+ stt + budget). Read-only. */
+export async function fetchLlmRoles(signal?: AbortSignal): Promise<RoleMap> {
+  const res = await fetch(`${API_BASE_URL}/api/llm/roles`, { signal });
+  if (!res.ok) {
+    throw new Error(`GET /api/llm/roles failed: ${res.status}`);
+  }
+  return (await res.json()) as RoleMap;
+}
+
+/** Swap ONE role's selection — synchronous + BLOCKING (issue 0106).
+ *
+ * The backend validates the role id + provider, rebuilds ONLY that role's
+ * client (the per-host multi-load budget check can refuse here), persists the
+ * v2 map, and returns the full updated {@link RoleMap}. On failure it keeps the
+ * previous per-role state and returns a structured `{error, detail}` body; we
+ * throw {@link LlmRoleSwapError} so the caller stays on the previous selection
+ * and surfaces the detail (e.g. the `budget_exceeded` over-budget warning). */
+export async function putLlmRole(
+  role: LlmRole,
+  selection: RoleSelection,
+  signal?: AbortSignal,
+): Promise<RoleMap> {
+  const res = await fetch(`${API_BASE_URL}/api/llm/roles/${role}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(selection),
+    signal,
+  });
+  if (!res.ok) {
+    let code = "swap_failed";
+    let detail = `PUT /api/llm/roles/${role} failed: ${res.status}`;
+    try {
+      const body = (await res.json()) as { error?: string; detail?: string };
+      if (typeof body.error === "string" && body.error) code = body.error;
+      if (typeof body.detail === "string" && body.detail) detail = body.detail;
+    } catch {
+      // keep the defaults
+    }
+    throw new LlmRoleSwapError(code, detail);
+  }
+  return (await res.json()) as RoleMap;
+}

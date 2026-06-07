@@ -1,21 +1,17 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
-// The « RÉGLAGES » modal talks to the backend through `lib/llmApi`. We mock that
-// module so the test is offline + deterministic — no real fetch. The backend
-// already filters embeddings out of `GET /api/llm/models`, so the mocked list
-// is chat-only; the test asserts the modal renders exactly the fetched ids and
-// highlights the current selection.
-//
-// These cases are ported from the deleted `components/sphere/ProviderPicker
-// .test.tsx` (issue 0089 folds the picker into this modal). The flow gains one
-// step: open the top-right gear first, then interact inside the panel.
+// PRD 0016 / issue 0108 — the « RÉGLAGES » modal is now a PER-ROLE picker. It
+// talks to the backend through `lib/llmApi`; we mock that module so the test is
+// offline + deterministic (no real fetch). These cases mirror the pre-0108
+// SettingsControl.test.tsx structure (open the gear, interact inside the panel)
+// but target the per-role surface: `GET /api/llm/roles` + `PUT /api/llm/roles/
+// {role}`, with the model list from `GET /api/llm/models` feeding each LM Studio
+// role's dropdown.
 const apiMock = vi.hoisted(() => ({
+  fetchLlmRoles: vi.fn(),
+  putLlmRole: vi.fn(),
   fetchLlmModels: vi.fn(),
-  fetchLlmSelection: vi.fn(),
-  putLlmModel: vi.fn(),
-  putLlmProvider: vi.fn(),
-  putLlmBaseUrl: vi.fn(),
   pingLm: vi.fn(),
 }));
 
@@ -23,16 +19,14 @@ vi.mock("../../lib/llmApi", async () => {
   const actual = await vi.importActual<typeof import("../../lib/llmApi")>("../../lib/llmApi");
   return {
     ...actual,
+    fetchLlmRoles: apiMock.fetchLlmRoles,
+    putLlmRole: apiMock.putLlmRole,
     fetchLlmModels: apiMock.fetchLlmModels,
-    fetchLlmSelection: apiMock.fetchLlmSelection,
-    putLlmModel: apiMock.putLlmModel,
-    putLlmProvider: apiMock.putLlmProvider,
-    putLlmBaseUrl: apiMock.putLlmBaseUrl,
     pingLm: apiMock.pingLm,
   };
 });
 
-import { LlmModelSwapError } from "../../lib/llmApi";
+import { LlmRoleSwapError, type RoleMap } from "../../lib/llmApi";
 import { SettingsControl } from "./SettingsControl";
 
 const MODELS = [
@@ -44,46 +38,72 @@ const MODELS = [
     loaded: true,
   },
   {
-    id: "llama-3.3-70b",
-    quantisation: "Q3_K_L",
-    architecture: "llama",
-    max_context_length: 8192,
+    id: "qwen2.5-3b-instruct",
+    quantisation: "Q4_K_M",
+    architecture: "qwen2",
+    max_context_length: 16384,
     loaded: false,
   },
 ];
+
+/** A complete per-role map: jarvis/thinker/draft on LM Studio, subagent on
+ * Claude CLI — exercising both provider sides + the budget/stt blocks. */
+function baseRoleMap(): RoleMap {
+  return {
+    schema_version: 2,
+    roles: {
+      jarvis: {
+        provider: "lm_studio",
+        base_url: "http://localhost:1234/v1",
+        lm_model: "qwen2.5-7b-instruct",
+        context_length: { "qwen2.5-7b-instruct": 32768 },
+      },
+      thinker: {
+        provider: "lm_studio",
+        base_url: "http://localhost:1234/v1",
+        lm_model: "qwen2.5-3b-instruct",
+        context_length: {},
+      },
+      draft: {
+        provider: "lm_studio",
+        base_url: "http://localhost:1234/v1",
+        lm_model: "qwen2.5-3b-instruct",
+        context_length: {},
+      },
+      subagent: {
+        provider: "claude_cli",
+        base_url: null,
+        lm_model: null,
+        context_length: {},
+      },
+    },
+    stt: { engine: "whisper_cpp", model: "large-v3-turbo" },
+    budget: { ceiling_gib: null, reserve_gib: 8, per_host_override: {} },
+    claude_model: "claude-opus-4",
+  };
+}
 
 /** Open the gear button → the modal panel. */
 function openModal() {
   fireEvent.click(screen.getByRole("button", { name: /réglages/i }));
 }
 
-describe("SettingsControl — « RÉGLAGES » modal", () => {
+async function openPanel() {
+  render(<SettingsControl />);
+  await waitFor(() => expect(apiMock.fetchLlmRoles).toHaveBeenCalled());
+  openModal();
+  expect(screen.getByRole("dialog")).toBeInTheDocument();
+}
+
+describe("SettingsControl — per-role « RÉGLAGES » modal", () => {
   beforeEach(() => {
+    apiMock.fetchLlmRoles.mockReset();
+    apiMock.putLlmRole.mockReset();
     apiMock.fetchLlmModels.mockReset();
-    apiMock.fetchLlmSelection.mockReset();
-    apiMock.putLlmModel.mockReset();
-    apiMock.putLlmProvider.mockReset();
-    apiMock.putLlmBaseUrl.mockReset();
     apiMock.pingLm.mockReset();
+    apiMock.fetchLlmRoles.mockResolvedValue(baseRoleMap());
     apiMock.fetchLlmModels.mockResolvedValue(MODELS);
-    apiMock.fetchLlmSelection.mockResolvedValue({
-      provider: "lm_studio",
-      lm_model: "qwen2.5-7b-instruct",
-      context_length: { "qwen2.5-7b-instruct": 32768 },
-      claude_model: "claude-opus-4",
-      base_url: "http://localhost:1234/v1",
-    });
-    // Default: server reachable. The commit echoes the new base_url back.
     apiMock.pingLm.mockResolvedValue({ reachable: true, host: "localhost:1234" });
-    apiMock.putLlmBaseUrl.mockImplementation((url: string) =>
-      Promise.resolve({
-        provider: "lm_studio",
-        lm_model: "qwen2.5-7b-instruct",
-        context_length: { "qwen2.5-7b-instruct": 32768 },
-        claude_model: "claude-opus-4",
-        base_url: url,
-      }),
-    );
   });
 
   afterEach(() => {
@@ -92,299 +112,244 @@ describe("SettingsControl — « RÉGLAGES » modal", () => {
 
   test("renders the gear button and no panel until opened", async () => {
     render(<SettingsControl />);
-    // selection loads on mount, but the model list must NOT be fetched yet
-    await waitFor(() => expect(apiMock.fetchLlmSelection).toHaveBeenCalled());
-    expect(apiMock.fetchLlmModels).not.toHaveBeenCalled();
-    // The panel (dialog) is closed.
+    await waitFor(() => expect(apiMock.fetchLlmRoles).toHaveBeenCalled());
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 
-  test("fetches the model list on open and renders the live list", async () => {
-    render(<SettingsControl />);
-    await waitFor(() => expect(apiMock.fetchLlmSelection).toHaveBeenCalled());
+  // --- per-role render -------------------------------------------------------
 
-    openModal();
-    expect(screen.getByRole("dialog")).toBeInTheDocument();
-
-    // Opening under LM Studio (the seeded provider) fetches the list once.
-    await waitFor(() => expect(apiMock.fetchLlmModels).toHaveBeenCalledTimes(1));
-    await waitFor(() => expect(screen.getAllByRole("option")).toHaveLength(2));
-    const options = screen.getAllByRole("option");
-    expect(options[0]).toHaveTextContent("qwen2.5-7b-instruct");
-    expect(options[1]).toHaveTextContent("llama-3.3-70b");
-    // no embedding model leaks in (backend filters them; mocked list is chat-only)
-    expect(screen.queryByText(/embed/i)).not.toBeInTheDocument();
+  test("renders one block per role (jarvis/thinker/draft/subagent)", async () => {
+    await openPanel();
+    for (const role of ["jarvis", "thinker", "draft", "subagent"]) {
+      expect(screen.getByTestId(`set-role-${role}`)).toBeInTheDocument();
+    }
   });
 
-  test("highlights the current selection (aria-selected)", async () => {
-    render(<SettingsControl />);
-    await waitFor(() => expect(apiMock.fetchLlmSelection).toHaveBeenCalled());
-    openModal();
-
-    await waitFor(() => expect(screen.getAllByRole("option")).toHaveLength(2));
-
-    const selected = screen.getByRole("option", { selected: true });
-    expect(selected).toHaveTextContent("qwen2.5-7b-instruct");
-    const others = screen.getAllByRole("option", { selected: false });
-    expect(others).toHaveLength(1);
-    expect(others[0]).toHaveTextContent("llama-3.3-70b");
-  });
-
-  test("re-fetches the model list on a fresh open", async () => {
-    render(<SettingsControl />);
-    await waitFor(() => expect(apiMock.fetchLlmSelection).toHaveBeenCalled());
-    openModal(); // open
-    await waitFor(() => expect(apiMock.fetchLlmModels).toHaveBeenCalledTimes(1));
-
-    // close (✕) then reopen — the loaded set may have changed server-side, so
-    // a fresh open re-fetches.
-    fireEvent.click(screen.getByRole("button", { name: /fermer/i }));
-    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
-    openModal();
-    await waitFor(() => expect(apiMock.fetchLlmModels).toHaveBeenCalledTimes(2));
-  });
-
-  async function openAndGetRows() {
-    render(<SettingsControl />);
-    await waitFor(() => expect(apiMock.fetchLlmSelection).toHaveBeenCalled());
-    openModal();
-    await waitFor(() => expect(screen.getAllByRole("option")).toHaveLength(2));
-  }
-
-  test("clicking a non-current model fires the blocking PUT with a loading state", async () => {
-    let resolvePut: (sel: unknown) => void = () => {};
-    apiMock.putLlmModel.mockReturnValue(
-      new Promise((res) => {
-        resolvePut = res;
-      }),
-    );
-
-    await openAndGetRows();
-    const target = screen.getByTestId("set-model-llama-3.3-70b");
-    fireEvent.click(target);
-
-    expect(apiMock.putLlmModel).toHaveBeenCalledWith("llama-3.3-70b");
-    await waitFor(() => expect(target).toHaveAttribute("aria-busy", "true"));
-    expect(target).toBeDisabled();
-    expect(target).toHaveTextContent(/chargement/i);
-
-    resolvePut({
-      provider: "lm_studio",
-      lm_model: "llama-3.3-70b",
-      context_length: {},
-      claude_model: "claude-opus-4",
-    });
+  test("an LM Studio role shows its model dropdown; the Claude role shows the CLI hint", async () => {
+    await openPanel();
+    // jarvis is LM Studio → dropdown present, seeded to its pinned model.
     await waitFor(() =>
-      expect(screen.getByRole("option", { selected: true })).toHaveTextContent("llama-3.3-70b"),
+      expect((screen.getByTestId("set-role-model-jarvis") as HTMLSelectElement).value).toBe(
+        "qwen2.5-7b-instruct",
+      ),
     );
+    // subagent is Claude CLI → no dropdown, read-only model label in the hint.
+    expect(screen.queryByTestId("set-role-model-subagent")).not.toBeInTheDocument();
+    const sub = screen.getByTestId("set-role-subagent");
+    expect(within(sub).getByText(/claude-opus-4/)).toBeInTheDocument();
   });
 
-  test("a failed swap stays on the previous model and shows the error", async () => {
-    apiMock.putLlmModel.mockRejectedValue(new LlmModelSwapError("load_failed", "out of memory"));
-
-    await openAndGetRows();
-    fireEvent.click(screen.getByTestId("set-model-llama-3.3-70b"));
-
-    await waitFor(() =>
-      expect(screen.getByTestId("set-model-llama-3.3-70b")).toHaveTextContent(/out of memory/i),
-    );
-    expect(screen.getByRole("option", { selected: true })).toHaveTextContent("qwen2.5-7b-instruct");
+  test("the model dropdown is fed by the role's host GET /models", async () => {
+    await openPanel();
+    const select = (await screen.findByTestId("set-role-model-jarvis")) as HTMLSelectElement;
+    const optionValues = Array.from(select.options).map((o) => o.value);
+    expect(optionValues).toContain("qwen2.5-7b-instruct");
+    expect(optionValues).toContain("qwen2.5-3b-instruct");
+    expect(apiMock.fetchLlmModels).toHaveBeenCalled();
   });
 
-  test("clicking the already-current model does not fire a PUT", async () => {
-    await openAndGetRows();
-    fireEvent.click(screen.getByTestId("set-model-qwen2.5-7b-instruct"));
-    expect(apiMock.putLlmModel).not.toHaveBeenCalled();
-  });
+  // --- provider selection (per role) -----------------------------------------
 
-  // --- provider switch -------------------------------------------------------
-
-  test("toggling to Claude CLI fires the provider PUT and shows the read-only label", async () => {
-    apiMock.putLlmProvider.mockResolvedValue({
+  test("switching a role to Claude CLI fires PUT /roles/{role} with the Claude shape", async () => {
+    const next = baseRoleMap();
+    next.roles.jarvis = {
       provider: "claude_cli",
-      lm_model: "qwen2.5-7b-instruct",
+      base_url: null,
+      lm_model: null,
       context_length: {},
-      claude_model: "claude-opus-4",
+    };
+    apiMock.putLlmRole.mockResolvedValue(next);
+
+    await openPanel();
+    const jarvis = screen.getByTestId("set-role-jarvis");
+    fireEvent.click(within(jarvis).getByRole("radio", { name: /claude cli/i }));
+
+    expect(apiMock.putLlmRole).toHaveBeenCalledWith("jarvis", {
+      provider: "claude_cli",
+      base_url: null,
+      lm_model: null,
+      context_length: {},
     });
-
-    render(<SettingsControl />);
-    await waitFor(() => expect(apiMock.fetchLlmSelection).toHaveBeenCalled());
-    openModal();
-
-    fireEvent.click(screen.getByRole("radio", { name: /claude cli/i }));
-    expect(apiMock.putLlmProvider).toHaveBeenCalledWith("claude_cli");
-
-    // The Claude side shows the read-only model label from the backend
-    // (`claude_model`), with NO model list.
-    await waitFor(() => expect(screen.getByRole("radio", { name: /claude cli/i })).toBeChecked());
-    expect(screen.getByText("claude-opus-4")).toBeInTheDocument();
-    expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
-    // The "modèle fixe" hint replaces the URL field + model list.
-    expect(screen.getByText(/modèle fixe/i)).toBeInTheDocument();
-  });
-
-  test("a failed provider switch reverts the toggle and surfaces the error", async () => {
-    apiMock.putLlmProvider.mockRejectedValue(
-      new LlmModelSwapError("claude_cli_unavailable", "claude binary not found"),
-    );
-
-    render(<SettingsControl />);
-    await waitFor(() => expect(apiMock.fetchLlmSelection).toHaveBeenCalled());
-    openModal();
-
-    fireEvent.click(screen.getByRole("radio", { name: /claude cli/i }));
-
-    // Reverted to LM Studio (the backend kept the previous provider) + error shown.
-    await waitFor(() => expect(screen.getByRole("radio", { name: /lm studio/i })).toBeChecked());
-    expect(screen.getByRole("alert")).toHaveTextContent(/claude binary not found/i);
-  });
-
-  test("toggling to the already-active provider does not fire a PUT", async () => {
-    render(<SettingsControl />);
-    await waitFor(() => expect(apiMock.fetchLlmSelection).toHaveBeenCalled());
-    openModal();
-    // Already on LM Studio (seeded selection).
-    fireEvent.click(screen.getByRole("radio", { name: /lm studio/i }));
-    expect(apiMock.putLlmProvider).not.toHaveBeenCalled();
-  });
-
-  // --- server URL field + presets --------------------------------------------
-
-  test("a preset only PREFILLS the field — it does NOT commit", async () => {
-    await openAndGetRows();
-    fireEvent.click(screen.getByRole("button", { name: "studio.local" }));
-    const input = screen.getByLabelText(/url du serveur lm studio/i) as HTMLInputElement;
-    expect(input.value).toBe("studio.local:1234/v1");
-    // No PUT fired — the chip is just a quick-fill affordance.
-    expect(apiMock.putLlmBaseUrl).not.toHaveBeenCalled();
-  });
-
-  test("« OK » commits the field URL via PUT { base_url }", async () => {
-    await openAndGetRows();
-    fireEvent.click(screen.getByRole("button", { name: "192.168.1.20" }));
-    fireEvent.click(screen.getByTestId("set-url-apply"));
+    // After the map adopts, jarvis shows the Claude side (radio checked, no dropdown).
     await waitFor(() =>
-      expect(apiMock.putLlmBaseUrl).toHaveBeenCalledWith("http://192.168.1.20:1234/v1"),
+      expect(within(jarvis).getByRole("radio", { name: /claude cli/i })).toBeChecked(),
     );
-    await waitFor(() => expect(screen.getByText(/serveur joignable/i)).toBeInTheDocument());
+    expect(screen.queryByTestId("set-role-model-jarvis")).not.toBeInTheDocument();
   });
 
-  test("the initial URL reflects the server actually loaded (GET selection)", async () => {
-    apiMock.fetchLlmSelection.mockResolvedValue({
+  test("toggling a role to its already-active provider does not fire a PUT", async () => {
+    await openPanel();
+    const jarvis = screen.getByTestId("set-role-jarvis");
+    // jarvis is already LM Studio.
+    fireEvent.click(within(jarvis).getByRole("radio", { name: /lm studio/i }));
+    expect(apiMock.putLlmRole).not.toHaveBeenCalled();
+  });
+
+  // --- model selection (per role) --------------------------------------------
+
+  test("selecting a different model fires PUT /roles/{role} carrying the new model", async () => {
+    apiMock.putLlmRole.mockResolvedValue(baseRoleMap());
+    await openPanel();
+    const select = (await screen.findByTestId("set-role-model-jarvis")) as HTMLSelectElement;
+    fireEvent.change(select, { target: { value: "qwen2.5-3b-instruct" } });
+
+    expect(apiMock.putLlmRole).toHaveBeenCalledWith("jarvis", {
       provider: "lm_studio",
-      lm_model: "qwen2.5-7b-instruct",
+      base_url: "http://localhost:1234/v1",
+      lm_model: "qwen2.5-3b-instruct",
       context_length: { "qwen2.5-7b-instruct": 32768 },
-      claude_model: "claude-opus-4",
-      base_url: "http://192.168.4.94:1234/v1",
     });
-    await openAndGetRows();
-    const input = screen.getByLabelText(/url du serveur lm studio/i) as HTMLInputElement;
-    await waitFor(() => expect(input.value).toBe("192.168.4.94:1234/v1"));
   });
 
-  test("an unreachable server shows the offline state from a real ping", async () => {
-    apiMock.pingLm.mockResolvedValue({ reachable: false, host: "" });
-    await openAndGetRows();
-    const input = screen.getByLabelText(/url du serveur lm studio/i);
-    fireEvent.change(input, { target: { value: "192.168.9.9:9999" } });
-    // The debounced ping resolves offline → "serveur introuvable".
-    await waitFor(() => expect(screen.getByText(/serveur introuvable/i)).toBeInTheDocument());
-  });
-
-  // --- ctx-length slider + Apply (feature 0013) ------------------------------
-
-  test("ctx slider is clamped to the active model's max_context_length", async () => {
-    await openAndGetRows();
-
-    const slider = (await screen.findByTestId("set-ctx-slider")) as HTMLInputElement;
-    // Active model is qwen with max 32768; the slider's max mirrors it.
-    expect(slider.max).toBe("32768");
-    expect(Number(slider.min)).toBeLessThanOrEqual(Number(slider.value));
-    // Seeded from the persisted per-model ctx (32768 in the seeded selection).
-    expect(slider.value).toBe("32768");
-  });
-
-  test("dragging the slider updates local state only — no PUT", async () => {
-    await openAndGetRows();
-
-    const slider = await screen.findByTestId("set-ctx-slider");
-    fireEvent.change(slider, { target: { value: "16384" } });
-
-    expect(screen.getByTestId("set-ctx-value")).toHaveTextContent(/16,?384/);
-    expect(apiMock.putLlmModel).not.toHaveBeenCalled();
-  });
-
-  test("Apply fires the blocking reload-with-ctx PUT carrying the slider value", async () => {
-    let resolvePut: (sel: unknown) => void = () => {};
-    apiMock.putLlmModel.mockReturnValue(
-      new Promise((res) => {
+  test("the swap shows a loading state then adopts the returned map", async () => {
+    let resolvePut: (m: RoleMap) => void = () => {};
+    apiMock.putLlmRole.mockReturnValue(
+      new Promise<RoleMap>((res) => {
         resolvePut = res;
       }),
     );
+    await openPanel();
+    const select = (await screen.findByTestId("set-role-model-jarvis")) as HTMLSelectElement;
+    fireEvent.change(select, { target: { value: "qwen2.5-3b-instruct" } });
 
-    await openAndGetRows();
-    const slider = await screen.findByTestId("set-ctx-slider");
+    // loading row visible + the select disabled while in flight.
+    await waitFor(() => expect(select).toBeDisabled());
+
+    const next = baseRoleMap();
+    next.roles.jarvis.lm_model = "qwen2.5-3b-instruct";
+    resolvePut(next);
+    await waitFor(() => expect(select).not.toBeDisabled());
+    await waitFor(() => expect(select.value).toBe("qwen2.5-3b-instruct"));
+  });
+
+  // --- ctx slider (per role) -------------------------------------------------
+
+  test("dragging a role's ctx slider updates local state only — no PUT", async () => {
+    await openPanel();
+    const slider = await screen.findByTestId("set-role-ctx-slider-jarvis");
+    fireEvent.change(slider, { target: { value: "16384" } });
+    expect(apiMock.putLlmRole).not.toHaveBeenCalled();
+  });
+
+  test("Apply on a role's ctx fires PUT with the per-model context_length", async () => {
+    apiMock.putLlmRole.mockResolvedValue(baseRoleMap());
+    await openPanel();
+    const slider = await screen.findByTestId("set-role-ctx-slider-jarvis");
     fireEvent.change(slider, { target: { value: "8192" } });
+    fireEvent.click(screen.getByTestId("set-role-ctx-apply-jarvis"));
 
-    const apply = screen.getByTestId("set-ctx-apply");
-    fireEvent.click(apply);
-
-    expect(apiMock.putLlmModel).toHaveBeenCalledWith("qwen2.5-7b-instruct", 8192);
-    await waitFor(() => expect(apply).toHaveAttribute("aria-busy", "true"));
-    expect(apply).toBeDisabled();
-
-    resolvePut({
+    expect(apiMock.putLlmRole).toHaveBeenCalledWith("jarvis", {
       provider: "lm_studio",
+      base_url: "http://localhost:1234/v1",
       lm_model: "qwen2.5-7b-instruct",
       context_length: { "qwen2.5-7b-instruct": 8192 },
-      claude_model: "claude-opus-4",
     });
-    await waitFor(() => expect(apply).not.toBeDisabled());
   });
 
-  test("a failed ctx Apply surfaces the error and keeps the slider usable", async () => {
-    apiMock.putLlmModel.mockRejectedValue(new LlmModelSwapError("load_failed", "out of memory"));
+  // --- per-role badges (ready / offline) -------------------------------------
 
-    await openAndGetRows();
-    fireEvent.change(await screen.findByTestId("set-ctx-slider"), { target: { value: "8192" } });
-    fireEvent.click(screen.getByTestId("set-ctx-apply"));
+  test("the Claude role badge is always ready; an unreachable LM role goes offline", async () => {
+    // Make the LM host unreachable so the ping resolves offline.
+    apiMock.pingLm.mockResolvedValue({ reachable: false, host: "" });
+    await openPanel();
 
-    await waitFor(() => expect(screen.getByTestId("set-ctx")).toHaveTextContent(/out of memory/i));
-    expect(screen.getByTestId("set-ctx-apply")).not.toBeDisabled();
+    // Claude (subagent) is ready regardless of any ping.
+    expect(screen.getByTestId("set-role-badge-subagent")).toHaveAttribute("data-state", "ready");
+    // jarvis (LM Studio) flips to offline once the debounced ping resolves.
+    await waitFor(() =>
+      expect(screen.getByTestId("set-role-badge-jarvis")).toHaveAttribute("data-state", "offline"),
+    );
   });
 
-  // VOIX section — the TTS toggle moved here from the old bottom-right glyph.
-  // The store is session-global zustand, so assertions are relative to the
-  // toggle's own prior state rather than an absolute default.
-  test("clicking the VOIX toggle flips voice state + glyph", async () => {
+  test("a reachable LM role shows a ready badge", async () => {
+    await openPanel();
+    await waitFor(() =>
+      expect(screen.getByTestId("set-role-badge-jarvis")).toHaveAttribute("data-state", "ready"),
+    );
+  });
+
+  // --- budget over-budget warning --------------------------------------------
+
+  test("a budget_exceeded swap surfaces the over-budget warning on the role", async () => {
+    apiMock.putLlmRole.mockRejectedValue(
+      new LlmRoleSwapError(
+        "budget_exceeded",
+        "chargement refusé : dépasse le plafond mémoire — libère un rôle pour ce host.",
+      ),
+    );
+    await openPanel();
+    const select = (await screen.findByTestId("set-role-model-jarvis")) as HTMLSelectElement;
+    fireEvent.change(select, { target: { value: "qwen2.5-3b-instruct" } });
+
+    const err = await screen.findByTestId("set-role-error-jarvis");
+    expect(err).toHaveTextContent(/dépasse le plafond/i);
+    expect(err).toHaveTextContent(/budget/i);
+    // The role stays on its previous model (we never adopted a new map).
+    expect(select.value).toBe("qwen2.5-7b-instruct");
+  });
+
+  test("the budget section renders the ceiling + reserve config", async () => {
+    await openPanel();
+    expect(screen.getByTestId("budget-section")).toBeInTheDocument();
+    // ceiling_gib null → "détection auto"; reserve 8 Gio.
+    expect(screen.getByTestId("budget-ceiling")).toHaveTextContent(/détection auto/i);
+    expect(screen.getByTestId("budget-reserve")).toHaveTextContent(/8/);
+  });
+
+  test("a pinned ceiling + per-host override render their values", async () => {
+    const map = baseRoleMap();
+    map.budget = {
+      ceiling_gib: 48,
+      reserve_gib: 8,
+      per_host_override: { "192.168.1.20:1234": 64 },
+    };
+    apiMock.fetchLlmRoles.mockResolvedValue(map);
+    await openPanel();
+    expect(screen.getByTestId("budget-ceiling")).toHaveTextContent(/48/);
+    expect(screen.getByTestId("budget-override-192.168.1.20:1234")).toHaveTextContent(/64/);
+  });
+
+  // --- STT section -----------------------------------------------------------
+
+  test("the STT section shows the whisper.cpp engine + the model", async () => {
+    await openPanel();
+    expect(screen.getByTestId("stt-block")).toHaveTextContent(/whisper\.cpp/i);
+    expect((screen.getByTestId("stt-model") as HTMLInputElement).value).toBe("large-v3-turbo");
+  });
+
+  // --- degraded path ---------------------------------------------------------
+
+  test("a failed GET /roles still renders the panel with a degraded notice", async () => {
+    apiMock.fetchLlmRoles.mockRejectedValue(new Error("network"));
     render(<SettingsControl />);
-    await waitFor(() => expect(apiMock.fetchLlmSelection).toHaveBeenCalled());
+    await waitFor(() => expect(apiMock.fetchLlmRoles).toHaveBeenCalled());
     openModal();
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    expect(screen.getByText(/sélection par rôle indisponible/i)).toBeInTheDocument();
+  });
 
+  // --- VOIX toggle (unchanged behaviour) -------------------------------------
+
+  test("clicking the VOIX toggle flips voice state + glyph", async () => {
+    await openPanel();
     const toggle = screen.getByTestId("set-voice-toggle");
     const before = toggle.getAttribute("aria-pressed");
     fireEvent.click(toggle);
     expect(toggle.getAttribute("aria-pressed")).not.toBe(before);
-    // glyph tracks the state: on → speaker, off → barred speaker
     const onNow = toggle.getAttribute("aria-pressed") === "true";
-    expect(
-      screen.queryByTestId(onNow ? "speaker-on-icon" : "speaker-off-icon"),
-    ).not.toBeNull();
+    expect(screen.queryByTestId(onNow ? "speaker-on-icon" : "speaker-off-icon")).not.toBeNull();
   });
 
   test("global `M` toggles voice, but not while typing in an input", async () => {
-    render(<SettingsControl />);
-    await waitFor(() => expect(apiMock.fetchLlmSelection).toHaveBeenCalled());
-    openModal();
-
+    await openPanel();
     const toggle = screen.getByTestId("set-voice-toggle");
     const before = toggle.getAttribute("aria-pressed");
     fireEvent.keyDown(window, { key: "m" });
     const afterM = toggle.getAttribute("aria-pressed");
     expect(afterM).not.toBe(before);
 
-    // typing "m" in the URL field must NOT toggle (input focused)
-    const input = screen.getByLabelText(/URL du serveur LM Studio/i);
+    // typing "m" in a role URL field must NOT toggle (input focused).
+    const input = screen.getByLabelText(/url du serveur · jarvis/i);
     input.focus();
     fireEvent.keyDown(input, { key: "m" });
     expect(toggle.getAttribute("aria-pressed")).toBe(afterM);

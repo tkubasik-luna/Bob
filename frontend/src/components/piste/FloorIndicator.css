@@ -1,0 +1,100 @@
+/* FloorIndicator.css — co-located styles for the voice-floor pill (PRD 0016
+ * Annexe A.2 / issue 0108).
+ *
+ * Reuses the « Nacre » palette tokens defined on the `.piste` shell in
+ * `src/styles/p3d.css` (--ink, --dim, --faint, --line, --bg2, --accent,
+ * --accent2, --font-mono). The pill sits top-left, just below the identity
+ * block (`.piste-id` ends ~top:26px + two lines), out of the way of the
+ * top-right settings gear. It is decorative (`pointer-events:none`) and recedes
+ * with the rest of the chrome while a surface overlay is open. */
+
+.floor-indicator {
+  position: absolute;
+  top: 86px;
+  left: 30px;
+  z-index: 40;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 11px;
+  border-radius: 999px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--dim);
+  background: color-mix(in oklab, var(--bg2) 64%, transparent);
+  border: 1px solid var(--line);
+  pointer-events: none;
+  /* Muted while idle; the .is-active rule lifts it during a voice turn. */
+  opacity: 0.55;
+  transition: opacity 0.4s ease, color 0.4s ease, border-color 0.4s ease;
+}
+
+.floor-indicator.is-active {
+  opacity: 1;
+  color: var(--ink);
+  border-color: color-mix(in oklab, var(--accent) 40%, var(--line));
+}
+
+/* While a surface overlay is open the whole HUD chrome recedes — match the
+ * identity block's behaviour so the indicator doesn't fight the surface. */
+.piste.has-surface .floor-indicator {
+  opacity: 0.3;
+}
+
+.floor-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--faint);
+  flex: none;
+  transition: background 0.4s ease;
+}
+
+/* Per-state dot colour + animation. `idle` is the muted resting dot; the three
+ * active states each get a distinct nacre hue. `user_speaking` (listening) and
+ * `bob_speaking` (talking) pulse; `thinking` breathes slower. */
+.floor-user_speaking .floor-dot {
+  background: var(--accent2);
+  animation: floor-pulse 1.1s ease-in-out infinite;
+}
+
+.floor-thinking .floor-dot {
+  background: var(--accent);
+  animation: floor-breathe 1.8s ease-in-out infinite;
+}
+
+.floor-bob_speaking .floor-dot {
+  background: #fff;
+  box-shadow: 0 0 9px color-mix(in oklab, var(--accent) 75%, transparent);
+  animation: floor-pulse 0.9s ease-in-out infinite;
+}
+
+@keyframes floor-pulse {
+  0%,
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+  50% {
+    transform: scale(1.45);
+    opacity: 0.55;
+  }
+}
+
+@keyframes floor-breathe {
+  0%,
+  100% {
+    opacity: 0.9;
+  }
+  50% {
+    opacity: 0.4;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .floor-dot {
+    animation: none !important;
+  }
+}

@@ -13,6 +13,7 @@ import { BackgroundGrain } from "./piste/BackgroundGrain";
 import { BottomBar } from "./piste/BottomBar";
 import { CoreSlot } from "./piste/CoreSlot";
 import { DataSlot } from "./piste/DataSlot";
+import { FloorIndicator } from "./piste/FloorIndicator";
 import { Identity } from "./piste/Identity";
 import { SettingsControl } from "./piste/SettingsControl";
 import { TaskSlot } from "./piste/TaskSlot";
@@ -183,6 +184,12 @@ export function SphereUI() {
         <div className="drag-region" />
         <BackgroundGrain />
         <Identity />
+        {/* PRD 0016 Annexe A.2 / issue 0108 — the voice-floor pill (top-left,
+         * below the identity). Driven purely by `turn_state` voice events from
+         * `/ws/debug` (via `useTurnState`); mounting it is the whole wiring. It
+         * is orthogonal to the orb state and only animates during a real voice
+         * turn. */}
+        <FloorIndicator />
         {/* The 3D stage: perspective on `.stage-3d`, the slow camera drift +
          * preserve-3d context on `.stage-cam`, then the three depth-positioned
          * slots. The orb is the placeholder SphereCanvas (issue 0084 replaces

@@ -668,3 +668,106 @@
   color: var(--faint);
   font-size: 10px;
 }
+
+/* ── per-role blocks (PRD 0016 / issue 0108) ─────────────────────────────── */
+/* One framed card per role inside the MOTEURS LLM section. Stacked, each with
+ * its own provider toggle + (LM Studio) URL/model/ctx controls. */
+.set-role {
+  margin-top: 12px;
+  padding: 11px 12px 13px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: color-mix(in oklab, var(--bg2) 38%, transparent);
+}
+.set-role:first-of-type {
+  margin-top: 8px;
+}
+.set-role-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 9px;
+}
+.set-role-name {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.05em;
+  color: var(--ink);
+}
+/* ready / offline / loading badge, right of the role name */
+.set-role-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+.set-role-badge.is-ok {
+  color: color-mix(in oklab, #b6f0c8 70%, var(--ink));
+  border-color: color-mix(in oklab, #b6f0c8 30%, var(--line));
+}
+.set-role-badge.is-off {
+  color: color-mix(in oklab, #f0b6c4 72%, var(--ink));
+  border-color: color-mix(in oklab, #f0b6c4 32%, var(--line));
+}
+
+/* native model dropdown (per role). Styled to sit in the nacre language; a
+ * native <select> keeps it keyboard-accessible without bespoke listbox chrome. */
+.set-model-select {
+  width: 100%;
+  margin-top: 6px;
+  padding: 9px 11px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: color-mix(in oklab, var(--bg2) 70%, transparent);
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.01em;
+  cursor: pointer;
+  outline: 0;
+}
+.set-model-select:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* over-budget refusal — a warmer tint than the generic offline row so the
+ * Annexe G "dépasse le plafond" message reads as a budget warning. */
+.set-status.is-budget {
+  border-color: color-mix(in oklab, #f0c98a 40%, var(--line));
+}
+.set-status.is-budget .set-status-state {
+  color: color-mix(in oklab, #f0c98a 75%, var(--ink));
+}
+
+/* ── budget section (issue 0107) ─────────────────────────────────────────── */
+.set-budget-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+.set-budget-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.set-budget-key {
+  color: var(--dim);
+  letter-spacing: 0.04em;
+}
+.set-budget-val {
+  color: var(--ink);
+  text-align: right;
+}

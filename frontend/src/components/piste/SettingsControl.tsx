@@ -1,68 +1,81 @@
-// SettingsControl.tsx — Piste 3D · Nacre top-right « RÉGLAGES » modal
-// (PRD 0014 / issue 0089). Replaces the provisional top-left ProviderPicker.
+// SettingsControl.tsx — Piste 3D · Nacre top-right « RÉGLAGES » modal.
 //
-// A gear button in the top-right zone opens a frosted modal, ported verbatim
-// from `Design Mockup/p3d-panels.jsx` (the `SettingsControl` component) +
-// `Design Mockup/p3d.css` (the `.settings-*` / `.set-*` block) and matched to
-// the screenshot `Design Mockup/screenshots/p3d-settings.png`. The panel:
-//   - a segmented control Claude CLI ↔ LM Studio,
-//   - on Claude: a read-only "connected" status + the fixed CLI model label,
-//   - on LM Studio: a server URL field (http:// prefix) + presets +
-//     reachability state, a live local-model list (name / spec / status) with
-//     selection, and the context-length slider + Apply (feature 0013).
+// PRD 0016 / issue 0108 evolves this panel from a single GLOBAL LLM switch
+// (PRD 0012/0014) into a PER-ROLE picker. The frosted top-right modal now holds
+// four sections:
 //
-// The whole backend wiring is ported from the old `components/sphere/
-// ProviderPicker.tsx` (now deleted): the same `lib/llmApi` calls and the same
-// blocking PUT lifecycles (provider switch, model swap, ctx apply), so the
-// engine/model selection still persists across launches (the backend persists
-// the selection JSON on every PUT). The mockup's hardcoded LM_MODELS catalogue
-// is replaced by the live `GET /api/llm/models` fetch; the URL field + presets
-// keep the mockup's local-edit behaviour (there is no URL REST endpoint — the
-// server endpoint is configured server-side — so the field is informational and
-// drives the reachability heuristic only).
+//   1. MOTEURS LLM (par rôle) — one block per role (`jarvis`/`thinker`/`draft`/
+//      `subagent`): a provider segmented control (Claude CLI ↔ LM Studio), and
+//      under LM Studio a server URL field + a live model dropdown (from the
+//      role's host `GET /models`) + a context-length slider. Each block wires
+//      `PUT /api/llm/roles/{role}` so only that role's client is rebuilt.
+//   2. TRANSCRIPTION (STT) — the whisper.cpp engine (read-only) + the model
+//      (default `large-v3-turbo`). The backend exposes the stt block read-only
+//      in `GET /roles`; there is no STT mutation endpoint yet (seam, below).
+//   3. BUDGET MÉMOIRE — the per-host model-budget config (ceiling / reserve)
+//      surfaced read-only, plus the over-budget warning raised when a per-role
+//      swap is refused with `budget_exceeded` (Annexe G). Per-role `ready` /
+//      `offline` badges come from a live LM Studio ping (Claude roles are always
+//      ready).
+//   4. VOIX — the TTS on/off toggle (unchanged from 0089) + the global `M`
+//      shortcut.
 //
-// Takes NO props — the shell renders `<SettingsControl/>`. Open/close + all LLM
+// Backend contracts consumed (all committed, issues 0106/0107):
+//   - `GET  /api/llm/roles`        → the per-role map (+ stt + budget).
+//   - `PUT  /api/llm/roles/{role}` → swap ONE role; returns the updated map.
+//   - `GET  /api/llm/models`       → the live model list for the dropdown.
+//   - `GET  /api/llm/ping`         → reachability for the per-role badge.
+//
+// SEAMS (documented, NOT faked):
+//   - `GET /models` lists the CURRENTLY-configured server's models only — there
+//     is no `?base_url=` model-list endpoint, so a role pinned to a DIFFERENT
+//     host shows the active server's catalogue. We still PUT the role's own
+//     base_url; the dropdown is a best-effort hint until a per-host list ships.
+//   - The budget block is CONFIG only: the backend has no LIVE resident-usage
+//     endpoint (`model_budget.HostBudget.resident_gib()` is in-process on the
+//     manager). We render the ceiling/reserve + the over-budget refusal, but no
+//     live usage gauge.
+//   - There is no STT mutation endpoint; the STT model field is informational
+//     (read-only display of the persisted value).
+//
+// Takes NO props — the shell renders `<SettingsControl/>`. Open/close + all
 // state is owned here. Co-located styles live in `SettingsControl.css`.
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useVoiceMode } from "../../hooks/useVoiceMode";
 import {
+  LLM_ROLES,
   type LlmModel,
-  LlmModelSwapError,
   LlmModelsUnavailableError,
-  type LlmSelection,
+  type LlmRole,
+  LlmRoleSwapError,
+  type RoleMap,
+  type RoleSelection,
   fetchLlmModels,
-  fetchLlmSelection,
+  fetchLlmRoles,
   pingLm,
-  putLlmBaseUrl,
-  putLlmModel,
-  putLlmProvider,
+  putLlmRole,
 } from "../../lib/llmApi";
 import "./SettingsControl.css";
 
-// Backend provider ids (mirror of the server enum). The mockup used
-// "claude"/"lmstudio"; the REST API speaks these.
+// Backend provider ids (mirror of the server enum).
 const PROVIDER_CLAUDE = "claude_cli";
 const PROVIDER_LM = "lm_studio";
 
-// Fallback Claude label shown before the selection loads (the backend's
-// `claude_model` field is authoritative once `GET /selection` resolves).
-const CLAUDE_MODEL_FALLBACK = "claude-sonnet-4.5";
+// Human label per role (French, matches the HUD language). Order follows
+// LLM_ROLES so the blocks render Speaker → Thinker → Draft → Sub-agent.
+const ROLE_LABEL: Record<LlmRole, string> = {
+  jarvis: "Jarvis · voix",
+  thinker: "Penseur",
+  draft: "Brouillon",
+  subagent: "Sous-agent",
+};
 
-// Server-URL presets. Clicking one COMMITS it (PUT { base_url }) after a real
-// reachability probe. URLs carry the OpenAI-compatible `/v1` suffix the
-// inference client needs (the management SDK host strips it server-side).
-const LM_PRESETS = [
-  { label: "localhost", url: "http://localhost:1234/v1" },
-  { label: "studio.local", url: "http://studio.local:1234/v1" },
-  { label: "192.168.1.20", url: "http://192.168.1.20:1234/v1" },
-];
-const LM_URL_DEFAULT = LM_PRESETS[0].url;
+// Default LM Studio base URL when a role has none pinned (the field seeds from
+// the role's persisted base_url; this is the fallback for an unset one).
+const LM_URL_DEFAULT = "http://localhost:1234/v1";
 
-/** Normalise a raw URL-field value into a committable LM Studio base URL:
- * force the `http://` scheme, strip trailing slashes, and append the
- * OpenAI-compatible `/v1` suffix when absent (LM Studio + most OpenAI servers
- * 404/return non-OpenAI bodies without it). */
+/** Normalise a raw URL-field value into a committable LM Studio base URL. */
 function normalizeLmUrl(raw: string): string {
   let s = raw.trim();
   if (!/^https?:\/\//i.test(s)) s = `http://${s}`;
@@ -71,30 +84,27 @@ function normalizeLmUrl(raw: string): string {
   return s;
 }
 
-/** Compact "architecture · quant" spec line — both come straight off the
- * backend `LLMModel`; falls back gracefully when a field is null. (The mockup's
- * "params · quant" can't be honoured: the live API exposes architecture, not a
- * parameter count.) */
+/** Compact "architecture · quant" spec line off the backend `LLMModel`. */
 function modelSpec(m: LlmModel): string {
   const parts = [m.architecture, m.quantisation].filter((p): p is string => !!p);
   return parts.join(" · ");
 }
 
-// Real reachability of the current URL field, from a live backend probe
-// (GET /api/llm/ping) — no longer a regex heuristic. `checking` is shown while
-// the ping is in flight so the chip reflects a true online/offline state.
-type PingState =
-  | { status: "idle" }
-  | { status: "checking" }
-  | { status: "online" }
-  | { status: "offline" };
+const CTX_SLIDER_MIN = 1024;
+const CTX_SLIDER_STEP = 1024;
 
-// Base-URL commit (PUT { base_url }) lifecycle. The backend probes the target
-// FIRST; on failure the previous URL is kept and `detail` is surfaced.
-type UrlApplyState =
-  | { status: "idle" }
-  | { status: "loading" }
-  | { status: "error"; detail: string };
+/** The ctx value to seed the slider for `model` under `selection`: the persisted
+ * per-model value if present, else the model's max (its default window). */
+function defaultCtxFor(model: LlmModel | null, selection: RoleSelection): number | null {
+  if (model === null) return null;
+  const persisted = selection.context_length?.[model.id];
+  if (typeof persisted === "number" && persisted > 0) return persisted;
+  return model.max_context_length;
+}
+
+// --- per-block async lifecycles ----------------------------------------------
+
+type PingState = "idle" | "checking" | "online" | "offline";
 
 type ListState =
   | { status: "idle" }
@@ -102,76 +112,24 @@ type ListState =
   | { status: "ready"; models: LlmModel[] }
   | { status: "error"; detail: string };
 
-// Swap (PUT) lifecycle. `target` is the model id the user clicked so the row
-// can show its own spinner; `detail` carries the failure message. We stay on
-// the PREVIOUS selection while loading and on failure.
+// Per-role swap (PUT /roles/{role}) lifecycle. `detail` carries the failure
+// message; `code` lets the UI single out `budget_exceeded` for the over-budget
+// warning. We stay on the PREVIOUS selection while loading and on failure.
 type SwapState =
   | { status: "idle" }
-  | { status: "loading"; target: string }
-  | { status: "error"; target: string; detail: string };
-
-// Provider-switch (PUT { provider }) lifecycle. `target` is the provider the
-// user toggled to so the failing message can be attributed; on failure the
-// toggle reverts to the previous provider and shows `detail`.
-type ProviderSwapState =
-  | { status: "idle" }
-  | { status: "loading"; target: string }
-  | { status: "error"; target: string; detail: string };
-
-// Ctx-length Apply (PUT { lm_model, context_length }) lifecycle (feature 0013).
-// Distinct from the model SWAP state so an Apply (reload-with-ctx of the SAME
-// model) shows its own loading/error without colliding with a model switch.
-type CtxApplyState =
-  | { status: "idle" }
   | { status: "loading" }
-  | { status: "error"; detail: string };
-
-// Lower bound for the ctx slider — a sane floor so the thumb never lands on a
-// degenerate window. The upper bound is the selected model's max_context_length.
-const CTX_SLIDER_MIN = 1024;
-// Step the slider in 1k-token increments — smooth enough to feel continuous,
-// coarse enough that the persisted/applied value is a round number.
-const CTX_SLIDER_STEP = 1024;
-
-// The ctx value to seed the slider for `model`: the persisted per-model value
-// from the selection JSON if present, else the model's max (its default window).
-function defaultCtxFor(model: LlmModel | null, selection: LlmSelection | null): number | null {
-  if (model === null) return null;
-  const persisted = selection?.context_length?.[model.id];
-  if (typeof persisted === "number" && persisted > 0) return persisted;
-  return model.max_context_length;
-}
+  | { status: "error"; code: string; detail: string };
 
 export function SettingsControl() {
   const [open, setOpen] = useState(false);
-  // Provider toggle. Seeded from the current selection once it loads; the
-  // explicit toggle fires the blocking provider PUT.
-  const [provider, setProvider] = useState<string>(PROVIDER_LM);
-  const [selection, setSelection] = useState<LlmSelection | null>(null);
-  const [list, setList] = useState<ListState>({ status: "idle" });
-  const [swap, setSwap] = useState<SwapState>({ status: "idle" });
-  const [providerSwap, setProviderSwap] = useState<ProviderSwapState>({ status: "idle" });
-  // LM Studio server URL — seeded from the persisted selection. The URL field +
-  // presets COMMIT via PUT { base_url } (validate-then-swap); `ping` reflects a
-  // real reachability probe of whatever is in the field.
-  const [lmUrl, setLmUrl] = useState<string>(LM_URL_DEFAULT);
-  const [ping, setPing] = useState<PingState>({ status: "idle" });
-  const [urlApply, setUrlApply] = useState<UrlApplyState>({ status: "idle" });
-  // Ctx slider is LOCAL state (feature 0013): dragging mutates only this; the
-  // explicit Apply button fires the blocking reload-with-ctx PUT. `null` until
-  // a model + its bound are known.
-  const [ctxValue, setCtxValue] = useState<number | null>(null);
-  const [ctxApply, setCtxApply] = useState<CtxApplyState>({ status: "idle" });
-  // Whether the live model list has been fetched in this open session. We fetch
-  // once the panel is open under LM Studio (and refetch on a fresh open).
+  // The whole per-role map (roles + stt + budget + claude_model). Seeded once on
+  // mount from `GET /roles`; each successful PUT replaces it with the server's
+  // updated map (so every block re-renders from one source of truth).
+  const [roleMap, setRoleMap] = useState<RoleMap | null>(null);
   const fetchedRef = useRef(false);
 
-  const isLM = provider === PROVIDER_LM;
-
-  // Voice/TTS toggle — moved here from the old bottom-right glyph (MuteToggle).
-  // The control sits in the VOIX section of the panel; the global `M` shortcut
-  // lives at this always-mounted root so muting stays hands-on-keyboard whether
-  // or not the panel is open.
+  // Voice/TTS toggle — unchanged from 0089. The control sits in the VOIX
+  // section; the global `M` shortcut lives at this always-mounted root.
   const { voiceEnabled, toggle: toggleVoice } = useVoiceMode();
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -184,228 +142,47 @@ export function SettingsControl() {
     return () => window.removeEventListener("keydown", onKey);
   }, [toggleVoice]);
 
-  // Load the current selection once on mount to highlight it and seed the
-  // provider toggle. Failure is non-fatal: the modal still renders.
+  // Load the per-role map once on mount. Failure is non-fatal: the modal still
+  // renders (the role blocks show a degraded "indisponible" state).
   useEffect(() => {
     const ctrl = new AbortController();
-    fetchLlmSelection(ctrl.signal)
-      .then((sel) => {
-        setSelection(sel);
-        if (sel.provider) setProvider(sel.provider);
-        if (sel.base_url) setLmUrl(sel.base_url);
-      })
+    fetchLlmRoles(ctrl.signal)
+      .then((map) => setRoleMap(map))
       .catch(() => {
-        // selection unavailable — leave defaults; do not crash the HUD
+        // map unavailable — leave null; do not crash the HUD
       });
     return () => ctrl.abort();
   }, []);
 
-  // Fetch the model list (once per fresh open under LM Studio).
-  const loadModels = useCallback(() => {
-    setList({ status: "loading" });
-    fetchLlmModels()
-      .then((models) => setList({ status: "ready", models }))
-      .catch((err: unknown) => {
-        const detail =
-          err instanceof LlmModelsUnavailableError
-            ? err.message
-            : "Erreur de chargement des modèles";
-        setList({ status: "error", detail });
-      });
-  }, []);
-
-  // Probe a URL's reachability (defaults to the current field value). A real
-  // backend ping — sets `checking` while in flight, then online/offline.
-  const runPing = useCallback((url?: string) => {
-    setPing({ status: "checking" });
-    pingLm(url).then((r) => setPing({ status: r.reachable ? "online" : "offline" }));
-  }, []);
-
-  // When the panel opens under LM Studio, fetch the live list once. Reseting
-  // `fetchedRef` on close means a reopen refetches (the server's loaded set may
-  // have changed). Toggling to Claude closes nothing here — the list section is
-  // simply not rendered.
+  // Re-fetch the map on a fresh open so the picker reflects any server-side
+  // change since the last open (e.g. a role swapped from another window).
   useEffect(() => {
-    if (open && isLM && !fetchedRef.current) {
+    if (open && !fetchedRef.current) {
       fetchedRef.current = true;
-      loadModels();
-    }
-    if (!open) {
-      fetchedRef.current = false;
-    }
-  }, [open, isLM, loadModels]);
-
-  // Live reachability: ping the configured/typed LM URL. Runs whenever LM Studio
-  // is the provider — panel OPEN or CLOSED — so both the in-panel chip AND the
-  // status badge beside the gear reflect a REAL online/offline state. Debounced
-  // on the URL (typing) and refreshed on an interval. Switching to Claude clears
-  // it (the CLI bridge is always "on").
-  useEffect(() => {
-    if (!isLM) {
-      setPing({ status: "idle" });
-      return;
-    }
-    const probe = () => runPing(normalizeLmUrl(lmUrl));
-    const handle = setTimeout(probe, 400);
-    const interval = setInterval(probe, 20000);
-    return () => {
-      clearTimeout(handle);
-      clearInterval(interval);
-    };
-  }, [isLM, lmUrl, runPing]);
-
-  // Fire the BLOCKING swap PUT for the clicked model. No-op when it is already
-  // the current selection or a swap is already in flight. On success we update
-  // the local selection so the status label reflects the new model; on failure
-  // we stay put and surface the detail on the row.
-  const selectModel = useCallback(
-    (modelId: string) => {
-      if (swap.status === "loading") return;
-      if (modelId === (selection?.lm_model ?? null)) return;
-      setSwap({ status: "loading", target: modelId });
-      putLlmModel(modelId)
-        .then((next) => {
-          setSelection(next);
-          setSwap({ status: "idle" });
-        })
-        .catch((err: unknown) => {
-          const detail =
-            err instanceof LlmModelSwapError ? err.message : "Échec du changement de modèle";
-          setSwap({ status: "error", target: modelId, detail });
+      fetchLlmRoles()
+        .then((map) => setRoleMap(map))
+        .catch(() => {
+          /* keep the last map */
         });
-    },
-    [swap.status, selection?.lm_model],
-  );
+    }
+    if (!open) fetchedRef.current = false;
+  }, [open]);
 
-  // Fire the BLOCKING provider-switch PUT. Optimistically flips the local toggle
-  // so the UI responds immediately, then reverts to the previous provider on
-  // failure. No-op when it is already the active provider or a switch is already
-  // in flight. On success the local selection is updated so the status tracks
-  // the new provider.
-  const switchProvider = useCallback(
-    (p: string) => {
-      if (p === provider) return;
-      if (providerSwap.status === "loading") return;
-      const previous = provider;
-      setProvider(p);
-      setProviderSwap({ status: "loading", target: p });
-      putLlmProvider(p)
-        .then((next) => {
-          setSelection(next);
-          setProvider(next.provider);
-          setProviderSwap({ status: "idle" });
-          // Landing on LM Studio: refetch the live list + reprobe — the server's
-          // loaded set may differ from a stale pre-switch fetch.
-          if (next.provider === PROVIDER_LM) {
-            fetchedRef.current = true;
-            loadModels();
-            runPing(normalizeLmUrl(next.base_url ?? lmUrl));
-          }
-        })
-        .catch((err: unknown) => {
-          const detail =
-            err instanceof LlmModelSwapError ? err.message : "Échec du changement de moteur";
-          setProvider(previous); // revert — the backend kept the previous provider
-          setProviderSwap({ status: "error", target: p, detail });
-        });
-    },
-    [provider, providerSwap.status, loadModels, runPing, lmUrl],
-  );
+  // A successful per-role PUT returns the full updated map — adopt it so every
+  // block + the budget section re-render from the new state.
+  const onRoleUpdated = useCallback((next: RoleMap) => setRoleMap(next), []);
 
-  const currentModelId = selection?.lm_model ?? null;
-  const models = list.status === "ready" ? list.models : [];
-  const activeModel = models.find((m) => m.id === currentModelId) ?? null;
-  const claudeModel = selection?.claude_model ?? CLAUDE_MODEL_FALLBACK;
-  const providerSwapping = providerSwap.status === "loading";
-
-  // Seed / reseed the ctx slider whenever the active model (or its persisted
-  // ctx) changes: the persisted per-model value if present, else the model
-  // default (its max). Switching back to a model restores its remembered ctx.
-  const ctxMax = activeModel?.max_context_length ?? null;
-  const seededCtx = defaultCtxFor(activeModel, selection);
-  // biome-ignore lint/correctness/useExhaustiveDependencies: reseed only when the model id / its persisted ctx / its max changes — not on every local drag.
-  useEffect(() => {
-    setCtxValue(seededCtx);
-    setCtxApply({ status: "idle" });
-  }, [currentModelId, ctxMax, selection?.context_length?.[currentModelId ?? ""]]);
-
-  // Fire the BLOCKING ctx Apply (feature 0013): reload the CURRENT model at the
-  // slider's ctx via the same validate-then-swap path. Dragging the slider does
-  // NOT call this — only the explicit Apply button does. No-op without a model /
-  // a value, or while another mutation is in flight.
-  const applyCtx = useCallback(() => {
-    if (currentModelId === null || ctxValue === null) return;
-    if (ctxApply.status === "loading" || swap.status === "loading") return;
-    setCtxApply({ status: "loading" });
-    putLlmModel(currentModelId, ctxValue)
-      .then((next) => {
-        setSelection(next);
-        setCtxApply({ status: "idle" });
-      })
-      .catch((err: unknown) => {
-        const detail =
-          err instanceof LlmModelSwapError ? err.message : "Échec de l'application du contexte";
-        setCtxApply({ status: "error", detail });
-      });
-  }, [currentModelId, ctxValue, ctxApply.status, swap.status]);
-  const ctxApplying = ctxApply.status === "loading";
-
-  // URL field — the protocol is fixed to http:// by the `.set-field-proto`
-  // prefix; the input edits the host[:port][/path] body only.
-  const reachable = ping.status === "online";
-  const pingChecking = ping.status === "checking";
-  const urlBody = lmUrl.replace(/^https?:\/\//i, "");
-  const onUrlChange = (v: string) => setLmUrl(`http://${v.replace(/^https?:\/\//i, "")}`);
-  const urlApplying = urlApply.status === "loading";
-  const activeBaseUrl = selection?.base_url ?? null;
-  const urlDirty = normalizeLmUrl(lmUrl) !== (activeBaseUrl ?? "");
-
-  // Commit a base URL — the BLOCKING PUT { base_url } (validate-then-swap). The
-  // backend probes the target first; on success the new server drives both the
-  // inference client + management SDK, then we refetch the (now different)
-  // model list and reprobe. No-op while another URL commit is in flight.
-  const applyUrl = useCallback(
-    (raw: string) => {
-      if (urlApply.status === "loading") return;
-      const url = normalizeLmUrl(raw);
-      setLmUrl(url);
-      setUrlApply({ status: "loading" });
-      putLlmBaseUrl(url)
-        .then((next) => {
-          setSelection(next);
-          if (next.base_url) setLmUrl(next.base_url);
-          setUrlApply({ status: "idle" });
-          fetchedRef.current = true;
-          loadModels();
-          runPing(next.base_url ?? url);
-        })
-        .catch((err: unknown) => {
-          const detail =
-            err instanceof LlmModelSwapError ? err.message : "Échec du changement de serveur";
-          setUrlApply({ status: "error", detail });
-          runPing(url); // refresh the chip so the user sees it's unreachable
-        });
-    },
-    [urlApply.status, loadModels, runPing],
-  );
-
-  // Status badge beside the gear (shown when the panel is closed — the open
-  // panel already carries the full detail). Reports the active model + a real
-  // online/offline dot: under Claude the CLI bridge is always "on"; under LM
-  // Studio it tracks the live reachability probe.
-  const badgeChecking = isLM && ping.status === "checking";
-  const badgeOnline = isLM ? ping.status === "online" : true;
-  const badgeClass = badgeChecking ? "is-loading" : badgeOnline ? "is-ok" : "is-off";
-  const badgeModel = isLM ? (currentModelId ?? "aucun modèle") : claudeModel;
-  const badgeState = badgeChecking ? "ping" : badgeOnline ? "online" : "offline";
+  const budget = roleMap?.budget ?? null;
+  const stt = roleMap?.stt ?? null;
+  const claudeModel = roleMap?.claude_model ?? "claude-sonnet-4.5";
 
   return (
     <div className="settings-zone">
       {!open && (
-        <div className={`settings-status ${badgeClass}`} data-testid="settings-status">
-          <span className={`set-dot ${badgeClass}`} />
-          <span className="settings-status-model">{badgeModel}</span>
-          <span className="settings-status-state">{badgeState}</span>
+        <div className="settings-status is-ok" data-testid="settings-status">
+          <span className="set-dot is-ok" />
+          <span className="settings-status-model">par rôle</span>
+          <span className="settings-status-state">LLM</span>
         </div>
       )}
       <button
@@ -446,269 +223,60 @@ export function SettingsControl() {
             </div>
 
             <div className="settings-section">
-              <div className="settings-label">MOTEUR LLM</div>
-
-              {/* segmented provider toggle — Claude CLI ↔ LM Studio. Fires the
-                blocking PUT { provider }; disabled while a switch is in flight. */}
-              <div className="set-seg" role="radiogroup" aria-label="Moteur LLM">
-                <button
-                  type="button"
-                  // biome-ignore lint/a11y/useSemanticElements: ARIA radiogroup of buttons per the mockup — <button> is the correct focusable element; the role only adds radio semantics.
-                  role="radio"
-                  aria-checked={!isLM}
-                  disabled={providerSwapping}
-                  className={`set-seg-btn ${!isLM ? "on" : ""}`}
-                  onClick={() => switchProvider(PROVIDER_CLAUDE)}
-                >
-                  <span className="set-seg-glyph">&gt;_</span>Claude CLI
-                </button>
-                <button
-                  type="button"
-                  // biome-ignore lint/a11y/useSemanticElements: ARIA radiogroup of buttons per the mockup — <button> is the correct focusable element; the role only adds radio semantics.
-                  role="radio"
-                  aria-checked={isLM}
-                  disabled={providerSwapping}
-                  className={`set-seg-btn ${isLM ? "on" : ""}`}
-                  onClick={() => switchProvider(PROVIDER_LM)}
-                >
-                  <span className="set-seg-glyph">▦</span>LM Studio
-                </button>
-              </div>
-
-              {/* Provider-switch in flight — a clear global loading row so the
-                blocking swap (model load / CLI probe) is visibly pending. */}
-              {providerSwapping && (
-                <output className="set-status is-loading" aria-busy="true">
-                  <span className="set-dot is-loading" />
-                  <span className="eng-name">
-                    Bascule vers{" "}
-                    {providerSwap.status === "loading" && providerSwap.target === PROVIDER_LM
-                      ? "LM Studio"
-                      : "Claude CLI"}
-                    …
-                  </span>
-                  <span className="set-status-state">chargement…</span>
-                </output>
-              )}
-
-              {/* Provider-switch error — the toggle reverted to the previous
-                provider; surface why so the user can retry / start LM Studio. */}
-              {providerSwap.status === "error" && (
+              <div className="settings-label">MOTEURS LLM · PAR RÔLE</div>
+              {roleMap === null ? (
                 <div className="set-status is-off" role="alert">
                   <span className="set-dot is-off" />
-                  <span className="eng-name">{providerSwap.detail}</span>
-                  <span className="set-status-state">échec</span>
-                </div>
-              )}
-
-              {!isLM ? (
-                <div className="set-detail" key="claude">
-                  {/* Claude side: READ-ONLY model label from the backend
-                    (`claude_model`) — no dropdown, no URL, no ctx control. */}
-                  <div className="set-status is-ok">
-                    <span className="set-dot is-ok" />
-                    <span className="eng-name">{claudeModel}</span>
-                    <span className="set-status-state">CLI · connecté</span>
-                  </div>
-                  <div className="set-field-hint">
-                    <b>Pont CLI local — modèle fixe, aucune URL requise.</b>
-                  </div>
+                  <span className="eng-name">Sélection par rôle indisponible</span>
+                  <span className="set-status-state">hors ligne</span>
                 </div>
               ) : (
-                <div className="set-detail" key="lm">
-                  {/* LM Studio server URL — http:// prefix + editable body +
-                    presets. Local-edit only (no URL endpoint); drives the
-                    reachability chip below. */}
-                  <div className="set-field">
-                    <div className="settings-label">SERVEUR LM STUDIO</div>
-                    <div className="set-field-row">
-                      <span className="set-field-proto">http://</span>
-                      <input
-                        className="set-input"
-                        type="text"
-                        inputMode="url"
-                        spellCheck="false"
-                        value={urlBody}
-                        placeholder="localhost:1234/v1"
-                        disabled={urlApplying}
-                        onChange={(e) => onUrlChange(e.target.value)}
-                        onKeyDown={(e) => {
-                          if (e.key === "Enter") applyUrl(lmUrl);
-                        }}
-                        aria-label="URL du serveur LM Studio"
-                      />
-                      <button
-                        type="button"
-                        className="set-url-apply"
-                        data-testid="set-url-apply"
-                        disabled={urlApplying || !urlDirty}
-                        aria-busy={urlApplying}
-                        onClick={() => applyUrl(lmUrl)}
-                      >
-                        {urlApplying ? "…" : "OK"}
-                      </button>
-                    </div>
-                    {/* Presets only PREFILL the field for quick entry — they do
-                      NOT commit. The URL changes server-side only on « OK ». */}
-                    <div className="set-presets">
-                      {LM_PRESETS.map((p) => (
-                        <button
-                          key={p.url}
-                          type="button"
-                          className={`set-preset ${lmUrl === p.url ? "on" : ""}`}
-                          disabled={urlApplying}
-                          onClick={() => setLmUrl(p.url)}
-                        >
-                          {p.label}
-                        </button>
-                      ))}
-                    </div>
-                    {urlApply.status === "error" && (
-                      <div className="set-ctx-error" role="alert">
-                        {urlApply.detail}
-                      </div>
-                    )}
-                  </div>
-
-                  <div
-                    className={`set-status ${pingChecking ? "is-loading" : reachable ? "is-ok" : "is-off"}`}
-                  >
-                    <span
-                      className={`set-dot ${pingChecking ? "is-loading" : reachable ? "is-ok" : "is-off"}`}
-                    />
-                    <span className="eng-name">
-                      {pingChecking
-                        ? "vérification…"
-                        : reachable
-                          ? "serveur joignable"
-                          : "serveur introuvable"}
-                    </span>
-                    <span className="set-status-state">
-                      {pingChecking ? "ping" : reachable ? "connecté" : "hors ligne"}
-                    </span>
-                  </div>
-
-                  {/* live local-model list — from GET /api/llm/models, fetched on
-                    open. Clicking a non-current row fires the blocking swap PUT. */}
-                  <div className="set-field">
-                    <div className="set-models-head">
-                      <span className="settings-label">MODÈLE LOCAL</span>
-                      <span className="set-models-count">
-                        {list.status === "ready"
-                          ? `${list.models.length} disponibles`
-                          : list.status === "loading"
-                            ? "chargement…"
-                            : list.status === "error"
-                              ? "indisponible"
-                              : ""}
-                      </span>
-                    </div>
-                    <div
-                      className="set-models"
-                      // biome-ignore lint/a11y/useSemanticElements: ARIA listbox ported from the mockup; a native <select> can't carry the per-row metadata chrome. tabIndex below makes the interactive role focusable.
-                      role="listbox"
-                      tabIndex={0}
-                      aria-label="Modèle local"
-                    >
-                      {list.status === "error" && (
-                        <div className="set-model is-error" role="alert">
-                          <span className="set-model-mark">⚠</span>
-                          <span className="set-model-name">Serveur LM Studio injoignable</span>
-                          <span className="set-model-spec">{list.detail}</span>
-                        </div>
-                      )}
-
-                      {list.status === "ready" &&
-                        list.models.map((mm) => {
-                          const on = mm.id === currentModelId;
-                          const isSwapping = swap.status === "loading" && swap.target === mm.id;
-                          const swapFailed = swap.status === "error" && swap.target === mm.id;
-                          const busy = swap.status === "loading";
-                          const ramLabel = isSwapping
-                            ? "chargement…"
-                            : swapFailed
-                              ? "erreur"
-                              : mm.loaded
-                                ? "chargé"
-                                : "";
-                          return (
-                            <button
-                              key={mm.id}
-                              type="button"
-                              // biome-ignore lint/a11y/useSemanticElements: ARIA option inside the listbox above; rows carry custom multi-field metadata chrome a native <option> can't render. <button> keeps it natively focusable + clickable.
-                              role="option"
-                              aria-selected={on}
-                              aria-busy={isSwapping}
-                              disabled={busy}
-                              className={`set-model ${on ? "on" : ""} ${isSwapping ? "is-loading" : ""} ${swapFailed ? "is-error" : ""}`}
-                              data-testid={`set-model-${mm.id}`}
-                              onClick={() => selectModel(mm.id)}
-                            >
-                              <span className="set-model-mark">{on ? "◆" : "◇"}</span>
-                              <span className="set-model-name">{mm.id}</span>
-                              <span className="set-model-spec">
-                                {swapFailed ? swap.detail : modelSpec(mm)}
-                              </span>
-                              <span className="set-model-ram">{ramLabel}</span>
-                            </button>
-                          );
-                        })}
-                    </div>
-                  </div>
-
-                  {/* ctx-length slider + Apply (feature 0013) — only with a known
-                    max for the active model. Dragging mutates LOCAL state only;
-                    Apply fires the blocking reload-with-ctx. Clamped to
-                    [MIN, max_context_length]. */}
-                  {activeModel !== null && ctxMax !== null && ctxValue !== null && (
-                    <div className="set-ctx" data-testid="set-ctx">
-                      <div className="set-ctx-head">
-                        <span className="settings-label">CONTEXTE</span>
-                        <span className="set-ctx-val" data-testid="set-ctx-value">
-                          {ctxValue.toLocaleString()} tok
-                        </span>
-                      </div>
-                      <input
-                        type="range"
-                        className="set-ctx-slider"
-                        data-testid="set-ctx-slider"
-                        aria-label="Longueur de contexte"
-                        min={Math.min(CTX_SLIDER_MIN, ctxMax)}
-                        max={ctxMax}
-                        step={CTX_SLIDER_STEP}
-                        value={Math.min(ctxValue, ctxMax)}
-                        disabled={ctxApplying}
-                        onChange={(e) => setCtxValue(Number(e.target.value))}
-                      />
-                      <div className="set-ctx-actions">
-                        <span className="set-ctx-max">max {ctxMax.toLocaleString()}</span>
-                        <button
-                          type="button"
-                          className="set-ctx-apply"
-                          data-testid="set-ctx-apply"
-                          disabled={ctxApplying}
-                          aria-busy={ctxApplying}
-                          onClick={applyCtx}
-                        >
-                          {ctxApplying ? "application…" : "Appliquer"}
-                        </button>
-                      </div>
-                      {ctxApply.status === "error" && (
-                        <div className="set-ctx-error" role="alert">
-                          {ctxApply.detail}
-                        </div>
-                      )}
-                    </div>
-                  )}
-                </div>
+                LLM_ROLES.map((role) => (
+                  <RoleBlock
+                    key={role}
+                    role={role}
+                    selection={roleMap.roles[role]}
+                    claudeModel={claudeModel}
+                    panelOpen={open}
+                    onUpdated={onRoleUpdated}
+                  />
+                ))
               )}
             </div>
 
+            {/* STT section (Annexe D) — engine read-only, model informational. */}
+            <div className="settings-section">
+              <div className="settings-label">TRANSCRIPTION · STT</div>
+              <div className="set-status is-ok" data-testid="stt-block">
+                <span className="set-dot is-ok" />
+                <span className="eng-name">{sttEngineLabel(stt?.engine)}</span>
+                <span className="set-status-state">moteur</span>
+              </div>
+              <div className="set-field">
+                <div className="set-field-row">
+                  <span className="set-field-proto">modèle</span>
+                  <input
+                    className="set-input"
+                    type="text"
+                    spellCheck="false"
+                    readOnly
+                    value={stt?.model ?? "large-v3-turbo"}
+                    data-testid="stt-model"
+                    aria-label="Modèle de transcription (STT)"
+                  />
+                </div>
+                <div className="set-field-hint">
+                  Moteur whisper.cpp local. Modèle réglable côté serveur (pas d'endpoint d'écriture
+                  STT exposé).
+                </div>
+              </div>
+            </div>
+
+            {/* Budget section (issue 0107) — config + over-budget warning. */}
+            <BudgetSection budget={budget} />
+
             <div className="settings-section">
               <div className="settings-label">VOIX</div>
-              {/* TTS toggle (formerly the bottom-right MuteToggle glyph). One
-                button flips `useVoiceMode().voiceEnabled`; the global `M`
-                shortcut (bound at the component root) mirrors it. */}
               <button
                 type="button"
                 className={`set-voice ${voiceEnabled ? "on" : ""}`}
@@ -728,6 +296,439 @@ export function SettingsControl() {
           </div>
         </>
       )}
+    </div>
+  );
+}
+
+/** Map the backend stt engine id to a friendly label. */
+function sttEngineLabel(engine: string | undefined): string {
+  if (engine === "whisper_cpp") return "whisper.cpp";
+  return engine ?? "whisper.cpp";
+}
+
+// =============================================================================
+// RoleBlock — one role's provider + (LM Studio: URL + model + ctx) controls.
+// =============================================================================
+//
+// Owns the per-role async state (model list, ping, swap lifecycle) so each of
+// the four roles is fully independent. Every mutation goes through ONE blocking
+// `PUT /api/llm/roles/{role}` carrying the role's full {provider, base_url,
+// lm_model, context_length}; on success the parent adopts the returned map.
+
+type RoleBlockProps = {
+  role: LlmRole;
+  selection: RoleSelection;
+  claudeModel: string;
+  panelOpen: boolean;
+  onUpdated: (next: RoleMap) => void;
+};
+
+function RoleBlock({ role, selection, claudeModel, panelOpen, onUpdated }: RoleBlockProps) {
+  const isLM = selection.provider === PROVIDER_LM;
+
+  const [list, setList] = useState<ListState>({ status: "idle" });
+  const [swap, setSwap] = useState<SwapState>({ status: "idle" });
+  const [ping, setPing] = useState<PingState>("idle");
+  // The URL field is LOCAL until committed (mirrors the global picker). Seeded
+  // from the role's persisted base_url.
+  const [lmUrl, setLmUrl] = useState<string>(selection.base_url ?? LM_URL_DEFAULT);
+  // Ctx slider is LOCAL state; the explicit swap fires the blocking PUT.
+  const [ctxValue, setCtxValue] = useState<number | null>(null);
+  const fetchedRef = useRef(false);
+
+  // Reseed the URL field if the persisted base_url changes (e.g. after a swap).
+  const persistedUrl = selection.base_url ?? LM_URL_DEFAULT;
+  useEffect(() => {
+    setLmUrl(persistedUrl);
+  }, [persistedUrl]);
+
+  // Fetch the model list once when the panel opens under LM Studio. The list
+  // comes from the CURRENTLY-configured server (seam: no per-host endpoint).
+  const loadModels = useCallback(() => {
+    setList({ status: "loading" });
+    fetchLlmModels()
+      .then((models) => setList({ status: "ready", models }))
+      .catch((err: unknown) => {
+        const detail =
+          err instanceof LlmModelsUnavailableError
+            ? err.message
+            : "Erreur de chargement des modèles";
+        setList({ status: "error", detail });
+      });
+  }, []);
+
+  useEffect(() => {
+    if (panelOpen && isLM && !fetchedRef.current) {
+      fetchedRef.current = true;
+      loadModels();
+    }
+    if (!panelOpen) fetchedRef.current = false;
+  }, [panelOpen, isLM, loadModels]);
+
+  // Live reachability for the role's host — drives the ready/offline badge. A
+  // Claude-CLI role is always "ready" (the bridge is local); an LM Studio role
+  // pings its OWN base_url. Debounced on the URL, refreshed on an interval.
+  useEffect(() => {
+    if (!isLM) {
+      setPing("idle");
+      return;
+    }
+    const probe = () => {
+      setPing("checking");
+      pingLm(normalizeLmUrl(lmUrl)).then((r) => setPing(r.reachable ? "online" : "offline"));
+    };
+    const handle = setTimeout(probe, 400);
+    const interval = setInterval(probe, 20000);
+    return () => {
+      clearTimeout(handle);
+      clearInterval(interval);
+    };
+  }, [isLM, lmUrl]);
+
+  const currentModelId = selection.lm_model;
+  const models = list.status === "ready" ? list.models : [];
+  const activeModel = models.find((m) => m.id === currentModelId) ?? null;
+  const ctxMax = activeModel?.max_context_length ?? null;
+  const seededCtx = defaultCtxFor(activeModel, selection);
+  // Reseed the ctx slider when the active model / its persisted ctx / its max
+  // changes — not on every local drag.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: intentional — reseed only on the model id / max / persisted-ctx edges.
+  useEffect(() => {
+    setCtxValue(seededCtx);
+  }, [currentModelId, ctxMax, selection.context_length?.[currentModelId ?? ""]]);
+
+  const swapping = swap.status === "loading";
+
+  // The single per-role mutation. Builds the role's next full selection and
+  // PUTs it; the parent adopts the returned map on success. On failure we stay
+  // on the previous selection and surface the detail (singling out
+  // `budget_exceeded` for the over-budget warning).
+  const commit = useCallback(
+    (next: RoleSelection) => {
+      if (swap.status === "loading") return;
+      setSwap({ status: "loading" });
+      putLlmRole(role, next)
+        .then((map) => {
+          onUpdated(map);
+          setSwap({ status: "idle" });
+        })
+        .catch((err: unknown) => {
+          if (err instanceof LlmRoleSwapError) {
+            setSwap({ status: "error", code: err.code, detail: err.message });
+          } else {
+            setSwap({ status: "error", code: "swap_failed", detail: "Échec du changement" });
+          }
+        });
+    },
+    [role, swap.status, onUpdated],
+  );
+
+  // Provider switch — rebuild this role with the target provider. Switching to
+  // Claude drops the LM pins (base_url/model) per the Annexe D shape; switching
+  // to LM Studio keeps the field URL + last model.
+  const switchProvider = (provider: string) => {
+    if (provider === selection.provider) return;
+    if (provider === PROVIDER_CLAUDE) {
+      commit({ provider: PROVIDER_CLAUDE, base_url: null, lm_model: null, context_length: {} });
+    } else {
+      commit({
+        provider: PROVIDER_LM,
+        base_url: normalizeLmUrl(lmUrl),
+        lm_model: selection.lm_model,
+        context_length: selection.context_length,
+      });
+    }
+  };
+
+  // Commit the field URL (the role keeps its current model under the new host).
+  const applyUrl = () => {
+    commit({
+      provider: PROVIDER_LM,
+      base_url: normalizeLmUrl(lmUrl),
+      lm_model: selection.lm_model,
+      context_length: selection.context_length,
+    });
+  };
+
+  // Select a model for this role — no-op if already current. Carries the
+  // role's current base_url + ctx so the swap only changes the model.
+  const selectModel = (modelId: string) => {
+    if (modelId === currentModelId) return;
+    commit({
+      provider: PROVIDER_LM,
+      base_url: selection.base_url ?? normalizeLmUrl(lmUrl),
+      lm_model: modelId,
+      context_length: selection.context_length,
+    });
+  };
+
+  // Apply the ctx slider — reload the current model at the slider window.
+  const applyCtx = () => {
+    if (currentModelId === null || ctxValue === null) return;
+    commit({
+      provider: PROVIDER_LM,
+      base_url: selection.base_url ?? normalizeLmUrl(lmUrl),
+      lm_model: currentModelId,
+      context_length: { ...selection.context_length, [currentModelId]: ctxValue },
+    });
+  };
+
+  // Per-role ready/offline badge. Claude → always ready; LM Studio → live ping.
+  const badge = roleBadge(isLM, ping, swapping);
+  const urlBody = lmUrl.replace(/^https?:\/\//i, "");
+
+  return (
+    <div className="set-role" data-testid={`set-role-${role}`} data-provider={selection.provider}>
+      <div className="set-role-head">
+        <span className="set-role-name">{ROLE_LABEL[role]}</span>
+        <span
+          className={`set-role-badge ${badge.cls}`}
+          data-testid={`set-role-badge-${role}`}
+          data-state={badge.state}
+        >
+          <span className={`set-dot ${badge.cls}`} />
+          {badge.label}
+        </span>
+      </div>
+
+      {/* segmented provider toggle — Claude CLI ↔ LM Studio, per role. */}
+      <div className="set-seg" role="radiogroup" aria-label={`Moteur · ${ROLE_LABEL[role]}`}>
+        <button
+          type="button"
+          // biome-ignore lint/a11y/useSemanticElements: ARIA radiogroup of buttons — <button> is the correct focusable element; the role only adds radio semantics.
+          role="radio"
+          aria-checked={!isLM}
+          disabled={swapping}
+          className={`set-seg-btn ${!isLM ? "on" : ""}`}
+          onClick={() => switchProvider(PROVIDER_CLAUDE)}
+        >
+          <span className="set-seg-glyph">&gt;_</span>Claude CLI
+        </button>
+        <button
+          type="button"
+          // biome-ignore lint/a11y/useSemanticElements: ARIA radiogroup of buttons — <button> is the correct focusable element; the role only adds radio semantics.
+          role="radio"
+          aria-checked={isLM}
+          disabled={swapping}
+          className={`set-seg-btn ${isLM ? "on" : ""}`}
+          onClick={() => switchProvider(PROVIDER_LM)}
+        >
+          <span className="set-seg-glyph">▦</span>LM Studio
+        </button>
+      </div>
+
+      {swapping && (
+        <output className="set-status is-loading" aria-busy="true">
+          <span className="set-dot is-loading" />
+          <span className="eng-name">Application…</span>
+          <span className="set-status-state">chargement…</span>
+        </output>
+      )}
+
+      {swap.status === "error" && (
+        <div
+          className={`set-status is-off ${swap.code === "budget_exceeded" ? "is-budget" : ""}`}
+          role="alert"
+          data-testid={`set-role-error-${role}`}
+        >
+          <span className="set-dot is-off" />
+          <span className="eng-name">{swap.detail}</span>
+          <span className="set-status-state">
+            {swap.code === "budget_exceeded" ? "budget" : "échec"}
+          </span>
+        </div>
+      )}
+
+      {!isLM ? (
+        <div className="set-detail">
+          <div className="set-field-hint">
+            <b>Pont CLI local — modèle {claudeModel}, aucune URL requise.</b>
+          </div>
+        </div>
+      ) : (
+        <div className="set-detail">
+          {/* server URL — http:// prefix + editable body + commit. */}
+          <div className="set-field">
+            <div className="set-field-row">
+              <span className="set-field-proto">http://</span>
+              <input
+                className="set-input"
+                type="text"
+                inputMode="url"
+                spellCheck="false"
+                value={urlBody}
+                placeholder="localhost:1234/v1"
+                disabled={swapping}
+                onChange={(e) => setLmUrl(`http://${e.target.value.replace(/^https?:\/\//i, "")}`)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") applyUrl();
+                }}
+                aria-label={`URL du serveur · ${ROLE_LABEL[role]}`}
+              />
+              <button
+                type="button"
+                className="set-url-apply"
+                data-testid={`set-role-url-apply-${role}`}
+                disabled={swapping || normalizeLmUrl(lmUrl) === (selection.base_url ?? "")}
+                onClick={applyUrl}
+              >
+                OK
+              </button>
+            </div>
+          </div>
+
+          {/* live model dropdown — from GET /api/llm/models (active server). */}
+          <div className="set-field">
+            <div className="set-models-head">
+              <span className="settings-label">MODÈLE</span>
+              <span className="set-models-count">
+                {list.status === "ready"
+                  ? `${list.models.length} dispo`
+                  : list.status === "loading"
+                    ? "chargement…"
+                    : list.status === "error"
+                      ? "indisponible"
+                      : ""}
+              </span>
+            </div>
+            {list.status === "error" ? (
+              <div className="set-status is-off" role="alert">
+                <span className="set-dot is-off" />
+                <span className="eng-name">Serveur LM Studio injoignable</span>
+              </div>
+            ) : (
+              <select
+                className="set-model-select"
+                data-testid={`set-role-model-${role}`}
+                aria-label={`Modèle · ${ROLE_LABEL[role]}`}
+                disabled={swapping || list.status !== "ready"}
+                value={currentModelId ?? ""}
+                onChange={(e) => selectModel(e.target.value)}
+              >
+                {/* When the persisted model isn't in the live list (different
+                  host / not loaded), keep it selectable so we don't silently
+                  drop the role's pin. */}
+                {currentModelId !== null && !models.some((m) => m.id === currentModelId) && (
+                  <option value={currentModelId}>{currentModelId}</option>
+                )}
+                {currentModelId === null && (
+                  <option value="" disabled>
+                    — choisir un modèle —
+                  </option>
+                )}
+                {models.map((m) => (
+                  <option key={m.id} value={m.id}>
+                    {m.id}
+                    {modelSpec(m) ? ` · ${modelSpec(m)}` : ""}
+                    {m.loaded ? " · chargé" : ""}
+                  </option>
+                ))}
+              </select>
+            )}
+          </div>
+
+          {/* ctx-length slider + Apply — only with a known max for the active
+            model. Dragging mutates LOCAL state; Apply fires the blocking PUT. */}
+          {activeModel !== null && ctxMax !== null && ctxValue !== null && (
+            <div className="set-ctx" data-testid={`set-role-ctx-${role}`}>
+              <div className="set-ctx-head">
+                <span className="settings-label">CONTEXTE</span>
+                <span className="set-ctx-val">{ctxValue.toLocaleString()} tok</span>
+              </div>
+              <input
+                type="range"
+                className="set-ctx-slider"
+                data-testid={`set-role-ctx-slider-${role}`}
+                aria-label={`Longueur de contexte · ${ROLE_LABEL[role]}`}
+                min={Math.min(CTX_SLIDER_MIN, ctxMax)}
+                max={ctxMax}
+                step={CTX_SLIDER_STEP}
+                value={Math.min(ctxValue, ctxMax)}
+                disabled={swapping}
+                onChange={(e) => setCtxValue(Number(e.target.value))}
+              />
+              <div className="set-ctx-actions">
+                <span className="set-ctx-max">max {ctxMax.toLocaleString()}</span>
+                <button
+                  type="button"
+                  className="set-ctx-apply"
+                  data-testid={`set-role-ctx-apply-${role}`}
+                  disabled={swapping}
+                  onClick={applyCtx}
+                >
+                  Appliquer
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Resolve the per-role ready/offline badge. A swap-in-flight shows "…"; a
+ * Claude role is always ready; an LM Studio role tracks the live ping. */
+function roleBadge(
+  isLM: boolean,
+  ping: PingState,
+  swapping: boolean,
+): { cls: string; state: string; label: string } {
+  if (swapping) return { cls: "is-loading", state: "loading", label: "…" };
+  if (!isLM) return { cls: "is-ok", state: "ready", label: "prêt" };
+  if (ping === "online") return { cls: "is-ok", state: "ready", label: "prêt" };
+  if (ping === "checking") return { cls: "is-loading", state: "checking", label: "ping" };
+  return { cls: "is-off", state: "offline", label: "hors ligne" };
+}
+
+// =============================================================================
+// BudgetSection — the per-host model-budget CONFIG (issue 0107).
+// =============================================================================
+//
+// Renders the persisted budget block: the global ceiling (or "détection auto"
+// when null), the OS reserve, and any per-host overrides. There is NO live
+// resident-usage endpoint, so this shows config + the over-budget refusal
+// (raised on a per-role PUT with `budget_exceeded`), NOT a live gauge.
+
+function BudgetSection({ budget }: { budget: RoleMap["budget"] | null }) {
+  if (budget === null) {
+    return (
+      <div className="settings-section">
+        <div className="settings-label">BUDGET MÉMOIRE</div>
+        <div className="set-field-hint">Budget indisponible.</div>
+      </div>
+    );
+  }
+  const overrides = Object.entries(budget.per_host_override);
+  return (
+    <div className="settings-section" data-testid="budget-section">
+      <div className="settings-label">BUDGET MÉMOIRE · PAR HOST</div>
+      <div className="set-budget-rows">
+        <div className="set-budget-row">
+          <span className="set-budget-key">Plafond</span>
+          <span className="set-budget-val" data-testid="budget-ceiling">
+            {budget.ceiling_gib === null
+              ? "détection auto (RAM − réserve)"
+              : `${budget.ceiling_gib.toLocaleString()} Gio`}
+          </span>
+        </div>
+        <div className="set-budget-row">
+          <span className="set-budget-key">Réserve OS</span>
+          <span className="set-budget-val" data-testid="budget-reserve">
+            {budget.reserve_gib.toLocaleString()} Gio
+          </span>
+        </div>
+        {overrides.map(([host, gib]) => (
+          <div className="set-budget-row" key={host} data-testid={`budget-override-${host}`}>
+            <span className="set-budget-key">{host}</span>
+            <span className="set-budget-val">{gib.toLocaleString()} Gio</span>
+          </div>
+        ))}
+      </div>
+      <div className="set-field-hint">
+        L'usage résident en direct n'est pas exposé par le backend (vérification au chargement). Un
+        modèle refusé pour dépassement s'affiche sur le rôle concerné.
+      </div>
     </div>
   );
 }
