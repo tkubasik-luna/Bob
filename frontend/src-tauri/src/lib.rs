@@ -1,5 +1,7 @@
 use tauri::Manager;
 
+mod aec_spike;
+
 /// Toggle the visibility of the pre-declared debug window (PRD 0005).
 ///
 /// The `debug` window is declared in `tauri.conf.json` with `visible: false`,
@@ -38,7 +40,11 @@ pub fn run() {
       }
       Ok(())
     })
-    .invoke_handler(tauri::generate_handler![toggle_debug_window])
+    .invoke_handler(tauri::generate_handler![
+      toggle_debug_window,
+      aec_spike::aec_spike_write_verdict,
+      aec_spike::aec_spike_rust_fallback_available
+    ])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
 }

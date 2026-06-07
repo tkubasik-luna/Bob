@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <!--
+      AEC spike (issue 0097 / PRD 0016 Annexe I, criterion 1).
+
+      Tauri v2 auto-detects `src-tauri/Info.plist` and MERGES these keys into
+      the bundle's generated Info.plist (it supplements, it does not replace —
+      so we only declare the keys we need).
+
+      NSMicrophoneUsageDescription is mandatory on macOS: without it the OS
+      terminates the app the instant the webview calls getUserMedia for audio,
+      regardless of any in-app permission handling. The WKWebView media-capture
+      permission prompt itself is granted by wry 0.55.1's built-in UIDelegate
+      (`requestMediaCapturePermissionForOrigin` → WKPermissionDecision::Grant);
+      see `src/aec_spike.rs`.
+    -->
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Bob a besoin du micro pour vous écouter en mode vocal (capture + annulation d'écho).</string>
+  </dict>
+</plist>

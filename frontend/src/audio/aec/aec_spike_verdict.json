@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "produced_at": "2026-06-07T00:00:00.000Z",
+  "ok": false,
+  "chosen_path": "rust",
+  "hardware_pending": true,
+  "criteria": [
+    {
+      "id": "getusermedia_stream",
+      "status": "pending",
+      "detail": "Wired: NSMicrophoneUsageDescription in src-tauri/Info.plist + wry 0.55.1 grants requestMediaCapturePermissionForOrigin. Empirical confirmation needs the bundled app on device."
+    },
+    {
+      "id": "aec_attenuation_25db",
+      "status": "pending",
+      "detail": "Requires a real mic + speaker loop to measure >=25 dB (human/device follow-up)."
+    },
+    {
+      "id": "overlap_word_transcribed",
+      "status": "pending",
+      "detail": "Requires speaking a word over the TTS on a real device + STT (human/device follow-up)."
+    }
+  ],
+  "_note": "AFK headless spike verdict. No empirical hardware PASS asserted (reality constraint): a headless agent cannot measure >=25 dB on a real mic. All criteria pending -> AFK auto-fallback selects `rust`. Re-run the on-device harness (openEchoCancelledMic + measureEchoAttenuationDb in src/audio/aec/micCapture.ts), feed criteria into buildSpikeVerdict, and persist via the Rust `aec_spike_write_verdict` command. The canonical in-app read for issue 0099 is getCaptureDecision() in src/audio/aec/captureDecision.ts."
+}

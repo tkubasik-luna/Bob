@@ -42,6 +42,30 @@ function findWindow(config: TauriConfig, label: string): TauriWindow {
   return win;
 }
 
+describe("Info.plist (AEC spike — issue 0097, mic entitlement)", () => {
+  // Criterion 1 of PRD 0016 Annexe I needs NSMicrophoneUsageDescription in the
+  // bundled Info.plist, or macOS terminates the app on first getUserMedia audio
+  // access. Tauri v2 auto-merges src-tauri/Info.plist into the bundle. This
+  // regression test keeps the key present (a plain-text scan — no plist parser
+  // dependency, the file is a tiny known-shape XML).
+  function loadInfoPlist(): string {
+    const path = resolve(__dirname, "../../src-tauri/Info.plist");
+    return readFileSync(path, "utf-8");
+  }
+
+  test("declares NSMicrophoneUsageDescription with a non-empty purpose string", () => {
+    const plist = loadInfoPlist();
+    expect(plist).toContain("<key>NSMicrophoneUsageDescription</key>");
+    // The key must be followed by a non-empty <string> purpose (Apple rejects
+    // an empty usage description at submission and the prompt looks broken).
+    const match = plist.match(
+      /<key>NSMicrophoneUsageDescription<\/key>\s*<string>([^<]+)<\/string>/,
+    );
+    expect(match).not.toBeNull();
+    expect((match?.[1] ?? "").trim().length).toBeGreaterThan(0);
+  });
+});
+
 describe("tauri.conf.json", () => {
   test("the `new` window is borderless (decorations: false)", () => {
     const config = loadTauriConfig();

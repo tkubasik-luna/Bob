@@ -17,9 +17,34 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [build-dependencies]
 tauri-build = { version = "2.6.2", features = [] }
 
+[features]
+# AEC spike (issue 0097 / PRD 0016 Annexe I) Rust fallback path. OFF by default
+# so the standard build never needs the C++ webrtc-audio-processing toolchain.
+# Turn ON to compile in the cpal + webrtc-audio-processing capture+AEC pipeline
+# when the spike selects `rust`:  `cargo build --features rust-aec-fallback`.
+rust-aec-fallback = ["dep:cpal", "dep:webrtc-audio-processing"]
+
 [dependencies]
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 log = "0.4"
 tauri = { version = "2.11.2", features = [] }
 tauri-plugin-log = "2"
+
+# --- AEC spike Rust fallback seam (issue 0097). Optional: only compiled with
+# the `rust-aec-fallback` feature. `bundled` builds webrtc-audio-processing's
+# C++ from source (no prebuilt system lib needed) but DOES require `meson` +
+# `ninja` on PATH for that source build — `brew install meson ninja`. cpal owns
+# capture+playback. The default build (feature OFF) needs none of this.
+cpal = { version = "0.18.1", optional = true }
+webrtc-audio-processing = { version = "2.1.0", features = ["bundled"], optional = true }
+
+# macOS-only: the objc2 family is already in the dependency tree via wry. We
+# declare it explicitly so the documented WKWebView UIDelegate override seam in
+# `src/aec_spike.rs` can be implemented in-place if a future webview release
+# regresses the built-in `requestMediaCapturePermissionForOrigin` grant. Not
+# used at runtime today (wry 0.55.1 grants it for us).
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-web-kit = "0.3"
+objc2-foundation = "0.3"
