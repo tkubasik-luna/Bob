@@ -460,6 +460,42 @@ class RoleClientRegistry:
             sink(client)
 
 
+class RoleManagerRegistry:
+    """Resolve the per-HOST :class:`LMStudioManager` for a role's ``base_url``.
+
+    PRD 0016 / issue 0107, Annexe J step 6 (reassignment). The multi-load policy
+    is **per host** (a manager owns one host's ref-count + budget), but a role
+    pins its own ``base_url`` and may move between hosts on a swap. This registry
+    maps a derived ``host:port`` to its manager so :meth:`RoleLLMSwitcher.swap_role`
+    can ``assign_role`` / ``release_role`` on the RIGHT host without the switcher
+    knowing how managers are built.
+
+    A ``factory`` builds a manager for a host on first use; pre-seeded managers
+    (the boot path) are passed in ``managers``. The registry is OPTIONAL on the
+    switcher — when absent the per-role swap keeps its pre-0107 behaviour (no
+    load, no budget check), so existing wiring is unchanged.
+    """
+
+    def __init__(
+        self,
+        managers: dict[str, LMStudioManager] | None = None,
+        *,
+        factory: Callable[[str], LMStudioManager] | None = None,
+    ) -> None:
+        self._managers: dict[str, LMStudioManager] = dict(managers or {})
+        self._factory = factory
+
+    def for_base_url(self, base_url: str | None) -> LMStudioManager:
+        """Return (building on first use) the manager for ``base_url``'s host."""
+
+        host = host_from_base_url(base_url)
+        manager = self._managers.get(host)
+        if manager is None:
+            manager = self._factory(host) if self._factory is not None else LMStudioManager(host)
+            self._managers[host] = manager
+        return manager
+
+
 class RoleLLMSwitcher:
     """Serialised coordinator for per-role selection swaps (rebuild ONE role).
 
@@ -469,6 +505,16 @@ class RoleLLMSwitcher:
     rebuilds ONLY that role's client, pushes it through the registry (firing the
     role's sink), and persists the new map. The other three roles' selections
     and client objects round-trip untouched.
+
+    With an OPTIONAL :class:`RoleManagerRegistry` (PRD 0016 / issue 0107) the
+    swap also drives the per-host multi-load policy (Annexe J step 6): an
+    ``lm_studio`` role with a pinned model is ``assign_role``-d on its host's
+    manager (budget-checked, ref-counted) BEFORE the client rebuild, and its
+    OLD model is released (evicted iff unreferenced). A budget refusal
+    (:class:`bob.lm_studio_manager.ModelBudgetExceededError`) or a real OOM
+    (:class:`bob.lm_studio_manager.LMStudioLoadError`) propagates BEFORE any
+    rebuild / write, so the previous state stands (Annexe G "jamais 0 modèle pour
+    un rôle actif"). Without the registry the swap keeps its pre-0107 behaviour.
     """
 
     def __init__(
@@ -477,10 +523,12 @@ class RoleLLMSwitcher:
         settings: Settings,
         selection_store: RoleSelectionStore,
         registry: RoleClientRegistry,
+        manager_registry: RoleManagerRegistry | None = None,
     ) -> None:
         self._settings = settings
         self._selection_store = selection_store
         self._registry = registry
+        self._manager_registry = manager_registry
         self._lock = asyncio.Lock()
 
     async def swap_role(self, role: str, selection: LLMSelection) -> RoleSelection:
@@ -495,7 +543,10 @@ class RoleLLMSwitcher:
 
         Raises :class:`UnknownProviderError` for an unknown role or an invalid
         provider, BEFORE any rebuild / write, so a bad request keeps the
-        previous state.
+        previous state. When a :class:`RoleManagerRegistry` is wired, also
+        applies the per-host multi-load policy (load / budget-check / release)
+        BEFORE the rebuild; a budget refusal or OOM there propagates and the
+        previous state is kept.
         """
 
         if role not in ROLES:
@@ -508,6 +559,15 @@ class RoleLLMSwitcher:
             if current is None:
                 current = _seed_role_selection_for_swap(self._settings)
 
+            # Per-host multi-load policy FIRST (issue 0107). A budget refusal /
+            # OOM raises here, BEFORE any client rebuild or persist, so the
+            # previous selection + clients stand (Annexe G). Blocking SDK work
+            # runs in a worker thread so the event loop is not parked.
+            if self._manager_registry is not None:
+                await asyncio.to_thread(
+                    self._apply_load_policy, role, current.role(role), selection
+                )
+
             next_map = current.with_role(role, selection)
 
             # Rebuild ONLY the changed role's client; the others are untouched.
@@ -516,6 +576,37 @@ class RoleLLMSwitcher:
 
             self._selection_store.write(next_map)
             return next_map
+
+    def _apply_load_policy(self, role: str, previous: LLMSelection, target: LLMSelection) -> None:
+        """Drive the per-host multi-load policy for a role reassignment.
+
+        - target is ``lm_studio`` with a model → ``assign_role`` on the target
+          host's manager (budget-checked, ref-counted). If the role previously
+          used a DIFFERENT host, release it there too (the new host's manager
+          owns the new reference; the old host evicts iff unreferenced). On the
+          SAME host ``assign_role`` already releases the old model first.
+        - target is ``claude_cli`` (or unpinned) → release the role from its
+          previous lm_studio host (frees the old model iff unreferenced); no load.
+
+        Raises :class:`ModelBudgetExceededError` / :class:`LMStudioLoadError` /
+        :class:`LMStudioUnavailableError` unchanged for the route to map.
+        """
+
+        assert self._manager_registry is not None  # guarded by the caller
+        prev_host_changed = (
+            previous.provider == "lm_studio"
+            and previous.lm_model
+            and host_from_base_url(previous.base_url) != host_from_base_url(target.base_url)
+        )
+        if target.provider == "lm_studio" and target.lm_model:
+            if prev_host_changed:
+                self._manager_registry.for_base_url(previous.base_url).release_role(role)
+            manager = self._manager_registry.for_base_url(target.base_url)
+            ctx = target.context_length.get(target.lm_model)
+            manager.assign_role(role, target.lm_model, ctx)
+        elif previous.provider == "lm_studio" and previous.lm_model:
+            # Role left LM Studio — release its old model on the old host.
+            self._manager_registry.for_base_url(previous.base_url).release_role(role)
 
 
 def _seed_role_selection_for_swap(settings: Settings) -> RoleSelection:

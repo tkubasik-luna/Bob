@@ -1,21 +1,47 @@
-"""Deep module owning LM Studio *model management* (PRD 0012 / issue 0079).
+"""Deep module owning LM Studio *model management* (PRD 0012 / issue 0079; v2 0107).
 
 This module is the single boundary onto the official ``lmstudio`` Python SDK.
 It is used ONLY for management concerns — listing the locally downloaded
-models and their metadata. Inference still runs through :mod:`bob.llm_client`
-on the ``openai`` client; the two never share a code path.
+models, their metadata, and (v2) loading / evicting role models with a
+ref-counted, budget-aware policy. Inference still runs through
+:mod:`bob.llm_client` on the ``openai`` client; the two never share a code path.
 
 Public surface:
 
 - :class:`LMStudioModel` — a value object describing one chat-capable model:
   ``id``, ``quantisation``, ``architecture``, ``max_context_length``,
   ``loaded``.
-- :class:`LMStudioManager.list_models` — returns the live list, filtered to
-  chat-capable models only (``type`` in ``{"llm", "vlm"}``; embeddings are
-  excluded).
-- :class:`LMStudioUnavailableError` — a DISTINCT, catchable error raised when
-  the LM Studio server is unreachable, so the REST layer can map it to a clean
-  HTTP error instead of leaking an SDK traceback / 500.
+- :class:`LMStudioManager` — per-host management view: ``list_models`` /
+  ``loaded_model_ids`` / ``probe`` (reads) and the v2 **multi-load** policy
+  (``assign_role`` / ``release_role`` / ``reconcile`` / ``load``).
+- :class:`LMStudioUnavailableError` / :class:`LMStudioModelNotFoundError` /
+  :class:`LMStudioLoadError` / :class:`ModelBudgetExceededError` — DISTINCT,
+  catchable errors so the REST layer maps each cleanly (Annexe G).
+
+LMStudioManager v2 — multi-load vs the old offload-first (issue 0107)
+--------------------------------------------------------------------
+
+The pre-0107 ``load()`` was **offload-first**: it evicted EVERY resident model
+before loading the target, so only one model was ever resident (anti-OOM, the
+2026-06-05 robustness call). The real-time agent (PRD 0016) needs DISTINCT
+models resident per role (jarvis / thinker / draft) at once, so v2 replaces
+offload-first with **multi-load + ref-counted selective offload**:
+
+- Each role references at most one model on this host. The manager keeps a
+  ``model_id -> {roles}`` ref-count map.
+- Loading a model for a role keeps every OTHER role's model resident. A model
+  is evicted ONLY when the LAST role referencing it drops it (ref-count → 0).
+- Re-selecting an already-resident model for another role just bumps the
+  ref-count — it never evicts the others.
+- Before any NEW load the manager sums resident footprints (:mod:`bob.model_budget`)
+  and **refuses + raises** :class:`ModelBudgetExceededError` if the host
+  ceiling would be exceeded (Annexe G "Budget dépassé"). On a real OOM despite
+  a passing budget check the previous state is kept and the role's swap is
+  refused (Annexe G "OOM au load").
+
+The reversion from offload-first is made SAFE by the budget guard-rail: the
+manager never loads past the ceiling, so two roles can be resident together
+without the OOM flakiness offload-first was protecting against.
 
 The SDK is faked at this boundary in tests (see
 ``tests/test_lm_studio_manager.py``), so the test suite is fully offline and
@@ -25,17 +51,27 @@ deterministic — no running LM Studio server is required.
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 from urllib.parse import urlsplit
 
 import lmstudio
+
+if TYPE_CHECKING:
+    from bob.model_budget import HostBudget
 
 #: Default LM Studio API host. The SDK falls back to its own discovery when
 #: ``None`` is passed; we keep an explicit default so a misconfigured host is
 #: visible at the call site.
 DEFAULT_LM_STUDIO_HOST = "localhost:1234"
+
+#: Coarse fallback footprint (GiB) booked for a model whose on-disk size could
+#: not be probed (unknown path / remote catalogue). Conservative so an
+#: un-sized model still consumes a realistic chunk of the budget rather than
+#: appearing free. Only used by the budget check when no hint / probe value is
+#: available.
+DEFAULT_MODEL_FOOTPRINT_GIB = 5.0
 
 
 def host_from_base_url(base_url: str | None) -> str:
@@ -54,9 +90,21 @@ def host_from_base_url(base_url: str | None) -> str:
     parsed = urlsplit(base_url if "//" in base_url else f"//{base_url}")
     return parsed.netloc or DEFAULT_LM_STUDIO_HOST
 
+
 #: ``LlmInfo.type`` values we treat as chat-capable. ``vlm`` (vision LLM) is a
 #: chat model with image input; ``embedding`` models are excluded.
 _CHAT_MODEL_TYPES = frozenset({"llm", "vlm"})
+
+#: Hosts treated as LOCAL (RAM is probeable). Anything else is remote (ceiling
+#: from an override or skipped). ``host:port`` is matched on the bare host.
+_LOCAL_HOSTNAMES = frozenset({"localhost", "127.0.0.1", "::1", "0.0.0.0"})
+
+
+def is_local_host(host: str) -> bool:
+    """Whether ``host`` (``host:port``) is the local machine (RAM probeable)."""
+
+    bare = host.rsplit(":", 1)[0] if ":" in host else host
+    return bare in _LOCAL_HOSTNAMES
 
 
 @dataclass(frozen=True)
@@ -117,6 +165,19 @@ class LMStudioLoadError(RuntimeError):
     but the load itself fails — most commonly VRAM/RAM exhaustion (OOM). The
     swap path catches this, keeps the previous selection and does NOT persist
     the JSON.
+    """
+
+
+class ModelBudgetExceededError(RuntimeError):
+    """Loading the target would exceed the host's resident-memory ceiling.
+
+    Raised by :meth:`LMStudioManager.assign_role` / :meth:`LMStudioManager.load`
+    BEFORE any SDK load when the projected sum of resident footprints exceeds
+    the host ceiling (:mod:`bob.model_budget`). Distinct from
+    :class:`LMStudioLoadError` (a *real* OOM at the SDK): this is the proactive
+    budget refusal (Annexe G "Budget dépassé (check)"). The REST layer maps it
+    to a 4xx with the "dépasse le plafond, libère un rôle" message; nothing is
+    loaded or evicted, so the previous state stands.
     """
 
 
@@ -189,21 +250,61 @@ def _default_client_factory(host: str) -> _SDKClient:
     return lmstudio.Client(host)  # type: ignore[return-value]
 
 
-class LMStudioManager:
-    """Management-only view onto a local LM Studio server.
+@dataclass(frozen=True)
+class RoleLoadResult:
+    """Per-role outcome of a boot / reconcile pass (Annexe J step 5).
 
-    The constructor takes the API host and an optional client factory (the DI
-    seam used by tests to inject a fake SDK client). Inference is out of scope:
-    this object only lists models and their metadata.
+    ``role`` is ready when its model is resident (or it is a ``claude_cli`` role
+    needing no load); offline when the load was refused (budget), failed (OOM)
+    or the host was unreachable. ``detail`` carries a short reason for the
+    picker / logs (never raised — :meth:`LMStudioManager.reconcile` collects
+    these so one bad role never aborts the others).
+    """
+
+    role: str
+    model_id: str | None
+    ready: bool
+    detail: str = ""
+
+
+class LMStudioManager:
+    """Management-only view onto ONE LM Studio host (v2 multi-load).
+
+    The constructor takes the API host, an optional client factory (the DI seam
+    tests use to inject a fake SDK client) and an optional resident-memory
+    budget (:class:`bob.model_budget.HostBudget`). Inference is out of scope.
+
+    v2 state (issue 0107):
+
+    - ``_refs`` — ``model_id -> {roles referencing it}``. The ref-count that
+      decides when a model may be evicted (only when the set empties).
+    - ``_role_model`` — ``role -> model_id`` currently assigned on this host.
+    - ``_budget`` — the per-host ceiling tracker; ``None`` disables the check
+      (legacy / unbudgeted manager → behaves like "no ceiling").
+
+    Concurrency note: the SDK calls are blocking and the v2 mutators are meant
+    to be driven from the swap coordinator's ``asyncio.Lock`` (one host mutation
+    at a time), so the manager itself keeps no internal lock — its in-memory
+    maps are only touched from that serialised path.
     """
 
     def __init__(
         self,
         host: str = DEFAULT_LM_STUDIO_HOST,
         client_factory: ClientFactory | None = None,
+        *,
+        budget: HostBudget | None = None,
+        model_footprint: Callable[[str, int | None], float] | None = None,
     ) -> None:
         self._host = host
         self._client_factory = client_factory or _default_client_factory
+        # ``HostBudget`` is imported under TYPE_CHECKING only — model_budget
+        # imports host_from_base_url from here, so keep the runtime edge
+        # one-way. ``None`` disables the budget check (legacy / unbudgeted).
+        self._budget = budget
+        self._model_footprint = model_footprint
+        self._refs: dict[str, set[str]] = {}
+        self._role_model: dict[str, str] = {}
 
     @property
     def host(self) -> str:
@@ -220,6 +321,8 @@ class LMStudioManager:
         """
 
         self._host = host
+
+    # --- read surface (unchanged from v1) -----------------------------------
 
     def probe(self) -> bool:
         """Return whether the LM Studio server is reachable (a real ping).
@@ -305,73 +408,245 @@ class LMStudioManager:
                 ids.append(identifier)
         return ids
 
+    # --- v2 ref-count + budget surface (issue 0107) -------------------------
+
+    def ref_count(self, model_id: str) -> int:
+        """How many roles currently reference ``model_id`` on this host."""
+
+        return len(self._refs.get(model_id, ()))
+
+    def roles_for(self, model_id: str) -> frozenset[str]:
+        """The set of roles currently referencing ``model_id``."""
+
+        return frozenset(self._refs.get(model_id, frozenset()))
+
+    def model_for_role(self, role: str) -> str | None:
+        """The model id currently assigned to ``role`` on this host (or ``None``)."""
+
+        return self._role_model.get(role)
+
+    def resident_model_ids(self) -> frozenset[str]:
+        """The set of model ids the manager tracks as resident (ref-count ≥ 1)."""
+
+        return frozenset(self._refs)
+
+    def assign_role(
+        self,
+        role: str,
+        model_id: str,
+        context_length: int | None = None,
+        *,
+        reload: bool = False,
+    ) -> None:
+        """Assign ``model_id`` to ``role`` — multi-load, ref-counted, budget-aware.
+
+        The v2 replacement for the old offload-first ``load``:
+
+        1. If ``role`` already points at a DIFFERENT model, release that old
+           reference first (which may evict the old model iff no other role
+           still holds it — selective, ref-counted offload).
+        2. If the target is already resident, just bump its ref-count for this
+           role (NO eviction of peers, NO reload) — the "re-selecting a loaded
+           model doesn't offload the others" invariant — unless ``reload`` forces
+           a fresh load at a new context window.
+        3. Otherwise budget-check the NEW resident set (resident + candidate ≤
+           ceiling). Over budget → raise :class:`ModelBudgetExceededError`
+           BEFORE touching the SDK (nothing loaded / evicted).
+        4. Load the target via the SDK, KEEPING every other resident model. A
+           real OOM raises :class:`LMStudioLoadError` and the ref-count / budget
+           are left exactly as before the attempt (Annexe G "OOM au load").
+
+        Blocking (SDK call). Drive from the swap coordinator's lock.
+        """
+
+        current = self._role_model.get(role)
+        if current is not None and (current != model_id or reload):
+            # Re-pointing the role: drop the old ref (may evict the old model).
+            self.release_role(role)
+
+        already_resident = model_id in self._refs
+        if already_resident and not reload:
+            # Pure ref-count bump — the target stays loaded, peers untouched.
+            self._refs.setdefault(model_id, set()).add(role)
+            self._role_model[role] = model_id
+            self._budget_add(model_id, context_length)
+            return
+
+        # A NEW load (or a forced reload): budget-check FIRST. On a forced
+        # reload of an already-resident model its own footprint is already
+        # counted, so check_add reports it as fitting (candidate 0) — the reload
+        # does not grow the resident set.
+        candidate_gib = self._footprint_for(model_id, context_length)
+        self._check_budget(model_id, candidate_gib)
+
+        self._sdk_load(model_id, context_length, reload=reload)
+
+        # Load succeeded — record the reference + the resident footprint.
+        self._refs.setdefault(model_id, set()).add(role)
+        self._role_model[role] = model_id
+        self._budget_set(model_id, candidate_gib)
+
+    def release_role(self, role: str) -> None:
+        """Drop ``role``'s reference; evict its model iff no role still holds it.
+
+        Selective, ref-counted offload: the model is unloaded from the SDK ONLY
+        when this was the last role referencing it. A model still referenced by
+        another role stays resident. A role with no current assignment is a
+        no-op. Best-effort unload — an SDK unload failure is swallowed (the
+        ref-count is the source of truth).
+        """
+
+        model_id = self._role_model.pop(role, None)
+        if model_id is None:
+            return
+        refs = self._refs.get(model_id)
+        if refs is None:
+            return
+        refs.discard(role)
+        if refs:
+            # Still referenced by another role — keep it resident.
+            return
+        # Last reference gone — evict it from the host.
+        del self._refs[model_id]
+        self._budget_remove(model_id)
+        self._unload(model_id)
+
+    def reconcile(
+        self, role_models: Mapping[str, tuple[str | None, int | None]]
+    ) -> list[RoleLoadResult]:
+        """Boot / re-load sequence for THIS host's roles (Annexe J steps 3-5).
+
+        ``role_models`` maps each role assigned to this host to its
+        ``(model_id, context_length)`` (a ``None`` model id = a role with no LM
+        Studio model on this host, e.g. ``claude_cli`` — marked ready, no load).
+
+        Per role, in iteration order: assign the model (budget-checked,
+        ref-counted multi-load) and mark ``ready``; a budget refusal / real OOM
+        / unreachable host marks THAT role ``offline`` with a reason and moves
+        on — one bad role never aborts its peers, and a role that was already
+        ready is never torn down by a later failure (Annexe G "jamais 0 modèle
+        pour un rôle actif"). Returns one :class:`RoleLoadResult` per role.
+        """
+
+        results: list[RoleLoadResult] = []
+        for role, (model_id, context_length) in role_models.items():
+            if model_id is None:
+                results.append(RoleLoadResult(role=role, model_id=None, ready=True))
+                continue
+            try:
+                self.assign_role(role, model_id, context_length)
+            except ModelBudgetExceededError as exc:
+                results.append(
+                    RoleLoadResult(role=role, model_id=model_id, ready=False, detail=str(exc))
+                )
+            except LMStudioUnavailableError as exc:
+                results.append(
+                    RoleLoadResult(role=role, model_id=model_id, ready=False, detail=str(exc))
+                )
+            except (LMStudioLoadError, LMStudioModelNotFoundError) as exc:
+                results.append(
+                    RoleLoadResult(role=role, model_id=model_id, ready=False, detail=str(exc))
+                )
+            else:
+                results.append(RoleLoadResult(role=role, model_id=model_id, ready=True))
+        return results
+
     def load(
         self, model_id: str, context_length: int | None = None, *, reload: bool = False
     ) -> None:
-        """Load ``model_id`` into LM Studio, offloading every other model first.
+        """Load ``model_id`` into LM Studio — v2 MULTI-LOAD (keeps peers resident).
 
-        Offload-BEFORE-load at the SDK boundary (the user's stated ask — frees
-        VRAM so a fresh load can't OOM against the previous resident model):
+        BEHAVIOUR CHANGE (issue 0107): the pre-0107 ``load`` was offload-first
+        (it evicted EVERY resident model before loading the target). v2 no longer
+        evicts peers — it budget-checks the target against the resident set, then
+        loads it while leaving every other model loaded:
 
-        1. Snapshot the currently-loaded model identifiers.
-        2. **Already loaded + not a forced reload** → no-op: keep the resident
-           instance and simply let the caller pin it as the selection. We do NOT
-           offload it ("if a model is already loaded and I select it, don't
-           offload it, just select it").
-        3. Otherwise unload EVERY currently-loaded model (including the target on
-           a forced ``reload``) so memory is freed before the new load.
-        4. ``load_new_instance(model_id, config={"contextLength": …})`` — load
-           the target (ctx omitted when ``None`` → SDK default).
+        - Already resident + plain select (no ``reload``) → no-op (kept resident,
+          peers untouched), exactly as before.
+        - Over budget → raise :class:`ModelBudgetExceededError` BEFORE the load
+          (nothing loaded / evicted).
+        - Otherwise load the target via the SDK, keeping the other residents.
+        - ``reload`` forces a fresh load even when the target is already resident
+          (the ctx-slider Apply path); peers are still kept.
 
-        ``reload`` forces a fresh load even when the target is already resident —
-        used by the ctx-slider Apply path, which must re-load at the new window.
+        This is the legacy single-selection entry point still used by
+        :class:`bob.llm_swap.LLMSwitcher`. It does NOT touch the role ref-count
+        map (that is the per-role :meth:`assign_role` surface); it only honours
+        the budget + multi-load load policy at the SDK boundary.
 
-        Errors are surfaced as DISTINCT, catchable types so the swap coordinator
-        keeps the previous selection and the REST layer maps them cleanly:
-
-        - server unreachable → :class:`LMStudioUnavailableError`
-        - unknown model id → :class:`LMStudioModelNotFoundError`
-        - load failed (e.g. OOM) → :class:`LMStudioLoadError`
-
-        TRADEOFF: offloading first means a failed load leaves NO model resident
-        (the previous one is already evicted). The caller surfaces the error and
-        the user reselects — accepted to kill the OOM/double-load flakiness.
+        Errors are surfaced as DISTINCT, catchable types (Annexe G):
+        unreachable → :class:`LMStudioUnavailableError`; unknown id →
+        :class:`LMStudioModelNotFoundError`; load failed (OOM) →
+        :class:`LMStudioLoadError`; over budget → :class:`ModelBudgetExceededError`.
         """
 
         client = self._open_client()
         try:
             previous = self._loaded_ids(client)
-
-            # Already loaded + plain select → keep it resident, offload nothing.
             if model_id in previous and not reload:
+                # Already resident, plain select → keep it (and every peer).
                 return
-
-            # Free VRAM BEFORE loading the new model: unload every resident
-            # instance (incl. the target on a forced reload). Best-effort —
-            # an unload that fails must not abort the load.
-            for identifier in previous:
+            # Budget-check against the models the SDK reports resident. A forced
+            # reload of an already-resident model counts it as fitting (its
+            # footprint is already part of the resident total). We sum a coarse
+            # footprint per resident id since per-model context is not known on
+            # this legacy path.
+            candidate_gib = self._footprint_for(model_id, context_length)
+            self._check_budget_against(previous, model_id, candidate_gib)
+            # Forced reload: cycle ONLY the target (free its instance so the new
+            # ctx window takes); peers stay resident (multi-load — NOT
+            # offload-first). Best-effort unload.
+            if reload and model_id in previous:
                 with contextlib.suppress(lmstudio.LMStudioError):
-                    client.llm.unload(identifier)
-
-            config: dict[str, object] | None = None
-            if context_length is not None:
-                config = {"contextLength": context_length}
-            try:
-                client.llm.load_new_instance(model_id, config=config)
-            except lmstudio.LMStudioModelNotFoundError as exc:
-                raise LMStudioModelNotFoundError(
-                    f"LM Studio model not found: {model_id!r}: {exc}"
-                ) from exc
-            except lmstudio.LMStudioError as exc:
-                # Server-side load failure — most commonly OOM. Distinct from the
-                # unreachable-server case (the connection itself succeeded).
-                raise LMStudioLoadError(
-                    f"LM Studio failed to load {model_id!r}: {exc}"
-                ) from exc
+                    client.llm.unload(model_id)
+            self._load_via_client(client, model_id, context_length)
         finally:
             self._safe_close(client)
 
     # --- internals -----------------------------------------------------------
+
+    def _sdk_load(self, model_id: str, context_length: int | None, *, reload: bool) -> None:
+        """Open a client, load the target (no offload), close. Raises typed errors."""
+
+        client = self._open_client()
+        try:
+            if reload and model_id in self._loaded_ids(client):
+                with contextlib.suppress(lmstudio.LMStudioError):
+                    client.llm.unload(model_id)
+            self._load_via_client(client, model_id, context_length)
+        finally:
+            self._safe_close(client)
+
+    @staticmethod
+    def _load_via_client(client: _SDKClient, model_id: str, context_length: int | None) -> None:
+        """Issue the SDK ``load_new_instance`` and map failures to typed errors."""
+
+        config: dict[str, object] | None = None
+        if context_length is not None:
+            config = {"contextLength": context_length}
+        try:
+            client.llm.load_new_instance(model_id, config=config)
+        except lmstudio.LMStudioModelNotFoundError as exc:
+            raise LMStudioModelNotFoundError(
+                f"LM Studio model not found: {model_id!r}: {exc}"
+            ) from exc
+        except lmstudio.LMStudioError as exc:
+            # Server-side load failure — most commonly OOM. Distinct from the
+            # unreachable-server case (the connection itself succeeded).
+            raise LMStudioLoadError(f"LM Studio failed to load {model_id!r}: {exc}") from exc
+
+    def _unload(self, model_id: str) -> None:
+        """Best-effort SDK unload of ``model_id`` (swallows unreachable / errors)."""
+
+        try:
+            client = self._open_client()
+        except LMStudioUnavailableError:
+            return
+        try:
+            with contextlib.suppress(lmstudio.LMStudioError):
+                client.llm.unload(model_id)
+        finally:
+            self._safe_close(client)
 
     def _open_client(self) -> _SDKClient:
         try:
@@ -396,6 +671,69 @@ class LMStudioManager:
         if callable(close):
             with contextlib.suppress(Exception):  # pragma: no cover - defensive close
                 close()
+
+    # --- budget helpers (delegate to the per-host HostBudget) ----------------
+
+    def _footprint_for(self, model_id: str, context_length: int | None) -> float:
+        """Estimate ``model_id``'s footprint (GiB) via the injected probe / default."""
+
+        if self._model_footprint is not None:
+            return self._model_footprint(model_id, context_length)
+        return DEFAULT_MODEL_FOOTPRINT_GIB
+
+    def _check_budget(self, model_id: str, candidate_gib: float) -> None:
+        """Raise :class:`ModelBudgetExceededError` if adding ``model_id`` over budget.
+
+        Uses the per-host :class:`bob.model_budget.HostBudget` ref-count view (so
+        a re-selected resident model fits). No budget configured → no check.
+        """
+
+        if self._budget is None:
+            return
+        decision = self._budget.check_add(model_id, candidate_gib)
+        if not decision.ok:
+            raise ModelBudgetExceededError(decision.message())
+
+    def _check_budget_against(
+        self, resident_ids: set[str], model_id: str, candidate_gib: float
+    ) -> None:
+        """Budget-check the legacy ``load`` path against the SDK-reported residents.
+
+        The legacy single-selection ``load`` does not own the ref-count map, so it
+        budgets against the SDK's ``list_loaded_models`` snapshot: a coarse
+        footprint per already-resident peer plus the candidate. Already-resident
+        target / no-budget → fits.
+        """
+
+        if self._budget is None:
+            return
+        if model_id in resident_ids:
+            return
+        from bob.model_budget import fits
+
+        resident_total = sum(self._footprint_for(mid, None) for mid in resident_ids)
+        if not fits([resident_total, candidate_gib], self._budget.ceiling_gib):
+            ceiling = self._budget.ceiling_gib
+            ceiling_str = "∞" if ceiling is None else f"{ceiling:.1f}"
+            raise ModelBudgetExceededError(
+                f"chargement de {model_id!r} refusé : dépasse le plafond mémoire "
+                f"({resident_total + candidate_gib:.1f} GiB requis > {ceiling_str} GiB) — "
+                f"libère un rôle pour ce host."
+            )
+
+    def _budget_set(self, model_id: str, footprint_gib: float) -> None:
+        if self._budget is not None:
+            self._budget.add(model_id, footprint_gib)
+
+    def _budget_add(self, model_id: str, context_length: int | None) -> None:
+        # Idempotent record for a ref-count bump of an already-resident model
+        # (its footprint is already booked; re-recording keeps the value fresh).
+        if self._budget is not None and not self._budget.is_resident(model_id):
+            self._budget.add(model_id, self._footprint_for(model_id, context_length))
+
+    def _budget_remove(self, model_id: str) -> None:
+        if self._budget is not None:
+            self._budget.remove(model_id)
 
 
 def _opt_str(value: object) -> str | None:

@@ -273,6 +273,66 @@ def check_role_used_model(spec: dict[str, Any], ctx: AssertionContext) -> Assert
     )
 
 
+def check_budget_refused(spec: dict[str, Any], ctx: AssertionContext) -> AssertionResult:
+    """PASS iff a captured event reports a model-budget refusal (issue 0107).
+
+    Spec: ``{kind: budget_refused}`` (optionally ``{kind: budget_refused,
+    role: draft}`` to narrow). Annexe G "Budget dépassé (check)": the per-host
+    multi-load policy refuses a role's model BEFORE loading it when the resident
+    set would exceed the ceiling. The refusal surfaces on the black-box
+    ``/ws/debug`` stream as a system event carrying ``payload.error ==
+    "budget_exceeded"`` (the same code the ``PUT /api/llm/roles/{role}`` route
+    returns) and/or a ``severity == "error"`` event whose summary mentions the
+    "dépasse le plafond" message.
+
+    Scope note (honest seam, mirrors ``role_used_model``): per-role boot/swap
+    wiring is not yet attached to the app boot, so a *running-backend* scenario
+    that triggers a real over-budget load lands when the role-picker boot wiring
+    does (issue 0108). Until then the budget-refusal invariant is attested by a
+    focused integration test on the per-role PUT route (``test_role_router.py``
+    / ``test_role_swap.py``); this assertion ships the harness vocabulary +
+    recognises the refusal event so the e2e scenario is a drop-in once the wire
+    exists. Under the ``fake`` provider no such event is emitted, so a scenario
+    using it runs ``--real`` (documented), never a faked pass.
+    """
+
+    role = spec.get("role")
+    matched = [e for e in ctx.events if _is_budget_refusal(e)]
+    if isinstance(role, str) and role:
+        matched = [e for e in matched if _budget_event_role(e) in (None, role)]
+    return AssertionResult(
+        kind="budget_refused",
+        ok=bool(matched),
+        detail={"role": role, "matched": len(matched)},
+    )
+
+
+def _is_budget_refusal(event: CapturedEvent) -> bool:
+    """True when ``event`` reports a model-budget refusal (Annexe G).
+
+    Recognised shapes (either suffices): a payload ``error == "budget_exceeded"``
+    (the route's structured code, however it is surfaced onto the debug stream),
+    or an ``error``-severity event whose summary mentions the "plafond" refusal.
+    """
+
+    payload = event.get("payload") or {}
+    if isinstance(payload, dict) and payload.get("error") == "budget_exceeded":
+        return True
+    if event.get("severity") == "error":
+        summary = event.get("summary")
+        if isinstance(summary, str) and "plafond" in summary:
+            return True
+    return False
+
+
+def _budget_event_role(event: CapturedEvent) -> str | None:
+    """Best-effort role tag of a budget-refusal event (``None`` when untagged)."""
+
+    payload = event.get("payload") or {}
+    role = payload.get("role") if isinstance(payload, dict) else None
+    return role if isinstance(role, str) and role else None
+
+
 def _stt_final_texts(events: list[CapturedEvent]) -> list[str]:
     """Return the ``text`` of every captured ``stt_final`` voice event.
 
@@ -480,6 +540,7 @@ register_assertion("event_emitted", check_event_emitted)
 register_assertion("no_error_events", check_no_error_events)
 register_assertion("deliverable_nonempty", check_deliverable_nonempty)
 register_assertion("role_used_model", check_role_used_model)
+register_assertion("budget_refused", check_budget_refused)
 register_assertion("stt_final_matches", check_stt_final_matches)
 register_assertion("fsm_reached", check_fsm_reached)
 register_assertion("audio_chunks_gte", check_audio_chunks_gte)

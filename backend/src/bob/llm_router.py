@@ -41,6 +41,7 @@ from bob.lm_studio_manager import (
     LMStudioManager,
     LMStudioModelNotFoundError,
     LMStudioUnavailableError,
+    ModelBudgetExceededError,
     host_from_base_url,
 )
 
@@ -664,6 +665,25 @@ async def put_llm_role(role: str, body: RoleSelectionBody) -> JSONResponse:
         updated = await _role_switcher.swap_role(role, selection)
     except UnknownProviderError as exc:
         return _role_error("unknown_provider", str(exc), status.HTTP_422_UNPROCESSABLE_ENTITY)
+    except ModelBudgetExceededError as exc:
+        # PRD 0016 / issue 0107, Annexe G "Budget dépassé (check)": the per-host
+        # multi-load policy refused this role's model BEFORE loading it because
+        # the resident set would exceed the ceiling. 409 (conflict) carries the
+        # "dépasse le plafond, libère un rôle" message; the previous role state
+        # stands (nothing rebuilt / persisted).
+        return _role_error("budget_exceeded", str(exc), status.HTTP_409_CONFLICT)
+    except LMStudioModelNotFoundError as exc:
+        return _role_error("model_not_found", str(exc), status.HTTP_404_NOT_FOUND)
+    except LMStudioLoadError as exc:
+        # Annexe G "OOM au load (budget OK mais réel KO)": a real OOM at the SDK
+        # despite a passing budget check. The previous state is kept (never 0
+        # models for the active role); the role's swap is refused.
+        return _role_error("load_failed", str(exc), status.HTTP_409_CONFLICT)
+    except LMStudioUnavailableError as exc:
+        # Annexe G "Host distant injoignable": the role's host could not be
+        # reached during the load policy. The role keeps its previous state; the
+        # picker surfaces the host as offline via the ping chip.
+        return _role_error("lm_studio_unavailable", str(exc), status.HTTP_503_SERVICE_UNAVAILABLE)
     return JSONResponse(
         status_code=status.HTTP_200_OK,
         content=_role_map_payload(updated).model_dump(),

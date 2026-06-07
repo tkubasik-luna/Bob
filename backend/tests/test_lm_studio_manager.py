@@ -5,10 +5,19 @@ the suite is fully offline and deterministic — no running LM Studio server is
 required. A fake client replays a scripted ``list_downloaded_models`` /
 ``list_loaded_models`` pair; an "unreachable server" is modelled by a factory
 that raises the SDK's ``LMStudioError``.
+
+Migration note (issue 0107): the ``load``-policy tests were migrated from the
+old **offload-first** behaviour (load evicted EVERY resident model first) to the
+v2 **multi-load** behaviour (peers stay resident; a model is evicted only by
+ref-count via :meth:`LMStudioManager.release_role`). The migrated assertions now
+expect ``unloaded == []`` where they used to expect the previous model evicted.
+The ``--- v2 multi-load …`` section below adds the new ref-counted +
+budget-aware coverage.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any, cast
 
 import lmstudio
@@ -21,13 +30,16 @@ from bob.lm_studio_manager import (
     LMStudioManager,
     LMStudioModelNotFoundError,
     LMStudioUnavailableError,
+    ModelBudgetExceededError,
     _SDKClient,
     _SDKDownloadedModel,
     _SDKLoadedModel,
     _SDKModelInfo,
     host_from_base_url,
+    is_local_host,
 )
 from bob.main import app
+from bob.model_budget import HostBudget
 
 
 def _settings(**overrides: object) -> Settings:
@@ -79,12 +91,19 @@ class _FakeLlmNamespace:
     """Stand-in for the SDK ``client.llm`` session surface.
 
     Records every ``load_new_instance`` / ``unload`` call so tests can assert
-    the validate-then-swap order. ``load_error`` (when set) is raised by
-    ``load_new_instance`` to model an OOM / not-found at the boundary.
+    the validate-then-swap order. ``load_error`` (when set) is raised by EVERY
+    ``load_new_instance``; ``fail_models`` (issue 0107) raises an OOM for ONLY
+    the named model ids so a multi-load test can fail one role's load while the
+    rest succeed.
     """
 
-    def __init__(self, load_error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        load_error: Exception | None = None,
+        fail_models: set[str] | None = None,
+    ) -> None:
         self.load_error = load_error
+        self.fail_models = fail_models or set()
         self.loaded: list[tuple[str, object]] = []
         self.unloaded: list[str] = []
 
@@ -96,6 +115,8 @@ class _FakeLlmNamespace:
     ) -> object:
         if self.load_error is not None:
             raise self.load_error
+        if model_key in self.fail_models:
+            raise lmstudio.LMStudioServerError(f"out of memory loading {model_key}")
         self.loaded.append((model_key, config))
         return object()
 
@@ -213,7 +234,10 @@ def test_list_models_unreachable_server_raises_distinct_error() -> None:
         raise AssertionError("expected LMStudioUnavailableError")
 
 
-def test_load_loads_target_and_unloads_previous() -> None:
+def test_load_loads_target_and_keeps_previous_resident() -> None:
+    # MIGRATED (issue 0107): v2 is multi-load — loading the target NO LONGER
+    # evicts the previously-resident model. (Pre-0107 offload-first evicted
+    # ``old-model`` before the load; that assertion is now the opposite.)
     llm = _FakeLlmNamespace()
     client = _FakeClient(
         _catalogue(),
@@ -230,8 +254,8 @@ def test_load_loads_target_and_unloads_previous() -> None:
 
     # Loaded the target with the default ctx folded into the SDK config.
     assert llm.loaded == [("qwen2.5-7b-instruct", {"contextLength": 8192})]
-    # Previously-loaded model evicted BEFORE the load (offload-first frees VRAM).
-    assert llm.unloaded == ["old-model"]
+    # The previously-loaded peer is KEPT resident — no offload-first eviction.
+    assert llm.unloaded == []
     assert client.closed is True
 
 
@@ -252,9 +276,10 @@ def test_load_already_loaded_plain_select_is_noop() -> None:
     assert llm.unloaded == []  # the resident target (and peers) left untouched
 
 
-def test_load_already_loaded_with_reload_evicts_all_and_reloads() -> None:
-    # Forced reload (ctx Apply): the resident target IS evicted then reloaded at
-    # the new window, and other residents are freed too.
+def test_load_already_loaded_with_reload_reloads_only_target() -> None:
+    # MIGRATED (issue 0107): a forced reload (ctx Apply) evicts ONLY the target
+    # then reloads it at the new window; OTHER residents stay loaded (pre-0107
+    # offload-first freed every peer too — now it does not).
     llm = _FakeLlmNamespace()
     client = _FakeClient(
         _catalogue(),
@@ -266,7 +291,8 @@ def test_load_already_loaded_with_reload_evicts_all_and_reloads() -> None:
     manager.load("qwen2.5-7b-instruct", context_length=4096, reload=True)
 
     assert llm.loaded == [("qwen2.5-7b-instruct", {"contextLength": 4096})]
-    assert set(llm.unloaded) == {"qwen2.5-7b-instruct", "other-model"}
+    # Only the target was cycled; ``other-model`` is untouched (multi-load).
+    assert llm.unloaded == ["qwen2.5-7b-instruct"]
 
 
 def test_load_without_context_length_omits_config() -> None:
@@ -281,6 +307,9 @@ def test_load_without_context_length_omits_config() -> None:
 
 
 def test_load_unknown_model_raises_not_found_and_keeps_previous() -> None:
+    # MIGRATED (issue 0107): multi-load never offloads peers up front, so a
+    # failed load leaves the previously-resident model untouched (pre-0107
+    # offload-first had already evicted it).
     llm = _FakeLlmNamespace(load_error=lmstudio.LMStudioModelNotFoundError("no such model"))
     client = _FakeClient(_catalogue(), loaded=[_FakeLoaded("old-model")], llm=llm)
 
@@ -293,12 +322,13 @@ def test_load_unknown_model_raises_not_found_and_keeps_previous() -> None:
     else:  # pragma: no cover
         raise AssertionError("expected LMStudioModelNotFoundError")
 
-    # Offload-first: the previous model is evicted BEFORE the (failing) load, so
-    # a failed load leaves no model resident (accepted tradeoff to kill OOM).
-    assert llm.unloaded == ["old-model"]
+    # No offload-first: the previous model is still resident after the failed load.
+    assert llm.unloaded == []
 
 
 def test_load_failure_raises_load_error_and_keeps_previous() -> None:
+    # MIGRATED (issue 0107): an OOM at load leaves the previous resident in place
+    # (multi-load never pre-offloads). Annexe G: keep previous state on real OOM.
     llm = _FakeLlmNamespace(load_error=lmstudio.LMStudioServerError("out of memory"))
     client = _FakeClient(_catalogue(), loaded=[_FakeLoaded("old-model")], llm=llm)
 
@@ -311,8 +341,8 @@ def test_load_failure_raises_load_error_and_keeps_previous() -> None:
     else:  # pragma: no cover
         raise AssertionError("expected LMStudioLoadError")
 
-    # Offload-first: previous evicted before the failing load.
-    assert llm.unloaded == ["old-model"]
+    # No offload-first: previous kept on the failing load.
+    assert llm.unloaded == []
 
 
 def test_loaded_model_ids_returns_identifiers() -> None:
@@ -323,6 +353,252 @@ def test_loaded_model_ids_returns_identifiers() -> None:
 
     manager = LMStudioManager(host="h", client_factory=lambda _h: client)
     assert manager.loaded_model_ids() == ["a", "b"]
+
+
+# --- v2 multi-load + ref-counted offload + budget (issue 0107) ---------------
+#
+# These exercise the per-role ``assign_role`` / ``release_role`` / ``reconcile``
+# surface and the budget refusal. The SDK fake records loads/unloads; the
+# ref-count + budget assertions read the manager's in-memory state. A flat
+# per-model footprint is injected so the budget arithmetic is exact.
+
+
+def _fixed_footprint(gib: float) -> Callable[[str, int | None], float]:
+    """A ``(model_id, ctx) -> gib`` footprint probe returning a constant."""
+
+    def _probe(_model_id: str, _ctx: int | None) -> float:
+        return gib
+
+    return _probe
+
+
+def _multiload_manager(
+    *, ceiling_gib: float | None, footprint_gib: float = 4.0
+) -> tuple[LMStudioManager, _FakeLlmNamespace]:
+    """A v2 manager wired to a fresh stateful fake + a fixed per-model footprint."""
+
+    llm = _FakeLlmNamespace()
+    client = _FakeClient(_catalogue(), loaded=[], llm=llm)
+    manager = LMStudioManager(
+        host="localhost:1234",
+        client_factory=lambda _h: client,
+        budget=HostBudget(ceiling_gib=ceiling_gib),
+        model_footprint=_fixed_footprint(footprint_gib),
+    )
+    return manager, llm
+
+
+def test_is_local_host_classifies_loopback_vs_remote() -> None:
+    assert is_local_host("localhost:1234") is True
+    assert is_local_host("127.0.0.1:1234") is True
+    assert is_local_host("192.168.86.21:1234") is False
+    assert is_local_host("studio.lan:1234") is False
+
+
+def test_assign_two_roles_two_models_both_resident_concurrency() -> None:
+    # The headline concurrency invariant: two roles → two DISTINCT models, both
+    # resident at once. Multi-load: assigning the second does NOT evict the first.
+    manager, llm = _multiload_manager(ceiling_gib=100.0)
+
+    manager.assign_role("jarvis", "modelA")
+    manager.assign_role("thinker", "modelB")
+
+    assert manager.resident_model_ids() == frozenset({"modelA", "modelB"})
+    assert manager.model_for_role("jarvis") == "modelA"
+    assert manager.model_for_role("thinker") == "modelB"
+    # Both were loaded; nothing was evicted (no offload-first).
+    assert [m for m, _ in llm.loaded] == ["modelA", "modelB"]
+    assert llm.unloaded == []
+
+
+def test_reselecting_loaded_model_for_another_role_does_not_offload() -> None:
+    # Two roles pick the SAME model → one resident copy, ref-count 2, no reload,
+    # no eviction. (Ref-count: re-selecting a loaded model keeps the peers.)
+    manager, llm = _multiload_manager(ceiling_gib=100.0)
+
+    manager.assign_role("jarvis", "modelA")
+    manager.assign_role("thinker", "modelB")
+    loaded_before = list(llm.loaded)
+
+    manager.assign_role("draft", "modelA")  # already resident
+
+    assert manager.ref_count("modelA") == 2
+    assert manager.roles_for("modelA") == frozenset({"jarvis", "draft"})
+    # No extra load issued for the re-selection, and modelB stays resident.
+    assert llm.loaded == loaded_before
+    assert llm.unloaded == []
+    assert manager.resident_model_ids() == frozenset({"modelA", "modelB"})
+
+
+def test_release_role_evicts_only_unreferenced_model() -> None:
+    # modelA referenced by two roles; releasing ONE keeps it resident. Releasing
+    # the LAST reference evicts it. modelB (single ref) evicts on its release.
+    manager, llm = _multiload_manager(ceiling_gib=100.0)
+    manager.assign_role("jarvis", "modelA")
+    manager.assign_role("draft", "modelA")
+    manager.assign_role("thinker", "modelB")
+
+    manager.release_role("jarvis")  # modelA still held by draft
+    assert manager.ref_count("modelA") == 1
+    assert "modelA" in manager.resident_model_ids()
+    assert llm.unloaded == []  # not evicted — still referenced
+
+    manager.release_role("draft")  # last modelA ref
+    assert "modelA" not in manager.resident_model_ids()
+    assert llm.unloaded == ["modelA"]
+
+    manager.release_role("thinker")  # only modelB ref
+    assert manager.resident_model_ids() == frozenset()
+    assert llm.unloaded == ["modelA", "modelB"]
+
+
+def test_reassigning_role_releases_old_model_when_unreferenced() -> None:
+    # Re-pointing a role to a new model evicts the OLD one iff no other role
+    # holds it (selective ref-counted offload on reassignment, Annexe J step 6).
+    manager, llm = _multiload_manager(ceiling_gib=100.0)
+    manager.assign_role("jarvis", "modelA")
+
+    manager.assign_role("jarvis", "modelB")  # repoint
+
+    assert manager.model_for_role("jarvis") == "modelB"
+    assert manager.resident_model_ids() == frozenset({"modelB"})
+    assert llm.unloaded == ["modelA"]  # old model freed (no other ref)
+    assert [m for m, _ in llm.loaded] == ["modelA", "modelB"]
+
+
+def test_assign_role_refuses_third_model_over_budget() -> None:
+    # Two 4 GiB models fit a 10 GiB ceiling; the third would make 12 > 10 → the
+    # manager REFUSES before any load (Annexe G "Budget dépassé (check)").
+    manager, llm = _multiload_manager(ceiling_gib=10.0, footprint_gib=4.0)
+    manager.assign_role("jarvis", "modelA")
+    manager.assign_role("thinker", "modelB")
+    loaded_before = list(llm.loaded)
+
+    try:
+        manager.assign_role("draft", "modelC")
+    except ModelBudgetExceededError as exc:
+        assert "plafond" in str(exc)  # the "dépasse le plafond" refusal message
+    else:  # pragma: no cover
+        raise AssertionError("expected ModelBudgetExceededError")
+
+    # Nothing loaded for the refused model; the two residents are untouched.
+    assert llm.loaded == loaded_before
+    assert "modelC" not in manager.resident_model_ids()
+    assert manager.model_for_role("draft") is None
+    assert manager.resident_model_ids() == frozenset({"modelA", "modelB"})
+
+
+def test_assign_role_no_budget_never_refuses() -> None:
+    # ``ceiling_gib=None`` (remote host, no override) → the check is skipped and
+    # any number of models load (the real-load try+catch is the only OOM net).
+    manager, _llm = _multiload_manager(ceiling_gib=None, footprint_gib=50.0)
+    manager.assign_role("jarvis", "modelA")
+    manager.assign_role("thinker", "modelB")
+    manager.assign_role("draft", "modelC")
+    assert manager.resident_model_ids() == frozenset({"modelA", "modelB", "modelC"})
+
+
+def test_assign_role_oom_despite_budget_keeps_previous_state() -> None:
+    # Annexe G "OOM au load (budget OK mais réel KO)": the budget check passes
+    # but the SDK load OOMs. The previous role's model stays resident, the new
+    # role gains NO model, and the error propagates (never leaves 0 models for an
+    # already-active role).
+    llm = _FakeLlmNamespace(fail_models={"modelB"})
+    client = _FakeClient(_catalogue(), loaded=[], llm=llm)
+    manager = LMStudioManager(
+        host="localhost:1234",
+        client_factory=lambda _h: client,
+        budget=HostBudget(ceiling_gib=100.0),
+        model_footprint=_fixed_footprint(4.0),
+    )
+    manager.assign_role("jarvis", "modelA")  # succeeds
+
+    try:
+        manager.assign_role("thinker", "modelB")  # budget OK, SDK OOM
+    except LMStudioLoadError:
+        pass
+    else:  # pragma: no cover
+        raise AssertionError("expected LMStudioLoadError")
+
+    # jarvis still has its model; thinker gained nothing; modelB not resident.
+    assert manager.model_for_role("jarvis") == "modelA"
+    assert manager.model_for_role("thinker") is None
+    assert manager.resident_model_ids() == frozenset({"modelA"})
+    assert manager.ref_count("modelB") == 0
+
+
+def test_reconcile_boot_marks_ready_and_offline_per_role() -> None:
+    # Annexe J boot: group is already per-host. Two roles load (ready); a third
+    # that breaks the budget is marked offline with a reason; a claude_cli role
+    # (no model) is ready without a load. One bad role never aborts the peers.
+    manager, llm = _multiload_manager(ceiling_gib=10.0, footprint_gib=4.0)
+
+    results = manager.reconcile(
+        {
+            "jarvis": ("modelA", 16384),
+            "thinker": ("modelB", None),
+            "draft": ("modelC", None),  # 12 > 10 → refused
+            "subagent": (None, None),  # claude_cli — no load
+        }
+    )
+
+    by_role = {r.role: r for r in results}
+    assert by_role["jarvis"].ready is True
+    assert by_role["thinker"].ready is True
+    assert by_role["draft"].ready is False
+    assert "plafond" in by_role["draft"].detail
+    assert by_role["subagent"].ready is True and by_role["subagent"].model_id is None
+    # The two that fit are resident; the refused one is not.
+    assert manager.resident_model_ids() == frozenset({"modelA", "modelB"})
+    assert [m for m, _ in llm.loaded] == ["modelA", "modelB"]
+
+
+def test_reconcile_marks_role_offline_when_host_unreachable() -> None:
+    # Annexe G "Host distant injoignable": the SDK client cannot connect → the
+    # role is marked offline (not crashed), reason carried through.
+    def _boom(_host: str) -> _SDKClient:
+        raise lmstudio.LMStudioWebsocketError("connection refused")
+
+    manager = LMStudioManager(
+        host="studio.lan:1234",
+        client_factory=_boom,
+        budget=None,
+        model_footprint=_fixed_footprint(4.0),
+    )
+
+    results = manager.reconcile({"jarvis": ("modelA", None)})
+
+    assert results[0].ready is False
+    assert "studio.lan:1234" in results[0].detail
+    assert manager.resident_model_ids() == frozenset()
+
+
+def test_legacy_load_refuses_over_budget_against_sdk_residents() -> None:
+    # The legacy single-selection ``load`` (used by LLMSwitcher) is also
+    # budget-aware: a target that would exceed the ceiling alongside the SDK's
+    # already-resident models is refused before the load.
+    llm = _FakeLlmNamespace()
+    client = _FakeClient(
+        _catalogue(),
+        loaded=[_FakeLoaded("resident-1"), _FakeLoaded("resident-2")],
+        llm=llm,
+    )
+    manager = LMStudioManager(
+        host="localhost:1234",
+        client_factory=lambda _h: client,
+        budget=HostBudget(ceiling_gib=10.0),
+        model_footprint=_fixed_footprint(4.0),
+    )
+
+    try:
+        manager.load("qwen2.5-7b-instruct")  # 4+4+4 = 12 > 10
+    except ModelBudgetExceededError:
+        pass
+    else:  # pragma: no cover
+        raise AssertionError("expected ModelBudgetExceededError")
+
+    assert llm.loaded == []  # refused before the SDK load
+    assert llm.unloaded == []
 
 
 # --- GET /api/llm/models endpoint tests -------------------------------------
@@ -437,9 +713,7 @@ class _FakeSwitcher:
         self._error = error
         self.calls: list[tuple[str, int | None]] = []
 
-    async def swap_lm_model(
-        self, model_id: str, context_length: int | None = None
-    ) -> object:
+    async def swap_lm_model(self, model_id: str, context_length: int | None = None) -> object:
         self.calls.append((model_id, context_length))
         if self._error is not None:
             raise self._error
