@@ -92,6 +92,69 @@ def test_user_resumes_during_thinking() -> None:
     assert t.actions == ("cancel_generation", "resume_thinker")
 
 
+# --- barge-in: bob_speaking → user_speaking (issue 0101) ---------------------
+
+
+def test_bargein_confirmed_from_bob_speaking() -> None:
+    fsm = TurnFsm()
+    _walk_to_bob_speaking(fsm, "t1")
+    assert fsm.is_speaking() is True
+    t = fsm.on_event(TurnEvent.BARGEIN_CONFIRMED, turn_id="t1")
+    assert t is not None
+    assert (t.from_state, t.to_state) == (TurnState.BOB_SPEAKING, TurnState.USER_SPEAKING)
+    assert t.reason == "bargein_confirmed"
+    assert t.actions == (
+        "cancel_llm_stream",
+        "cancel_tts",
+        "commit_spoken_partial",
+        "start_thinker",
+    )
+    # The turn id is RETAINED (the user resumes the same turn Bob was answering).
+    assert t.turn_id == "t1"
+    assert fsm.turn_id == "t1"
+    assert fsm.state is TurnState.USER_SPEAKING
+    assert fsm.is_speaking() is False
+
+
+def test_bargein_confirmed_only_legal_from_bob_speaking() -> None:
+    # idle: rejected.
+    fsm = TurnFsm()
+    assert fsm.on_event(TurnEvent.BARGEIN_CONFIRMED, turn_id="t1") is None
+    assert fsm.state is TurnState.IDLE
+
+    # user_speaking: rejected. (``.value`` compare avoids mypy narrowing the
+    # state property from the IDLE assert above through the _start helper.)
+    _start(fsm, "t1")
+    assert fsm.on_event(TurnEvent.BARGEIN_CONFIRMED, turn_id="t1") is None
+    assert fsm.state.value == "user_speaking"
+
+    # thinking: rejected.
+    fsm.on_event(TurnEvent.ENDPOINT, turn_id="t1")
+    assert fsm.on_event(TurnEvent.BARGEIN_CONFIRMED, turn_id="t1") is None
+    assert fsm.state.value == "thinking"
+
+
+def test_bargein_confirmed_rejects_stale_turn_id() -> None:
+    fsm = TurnFsm()
+    _walk_to_bob_speaking(fsm, "t1")
+    # A barge-in tagged with a stale turn id is ignored (state unchanged).
+    assert fsm.on_event(TurnEvent.BARGEIN_CONFIRMED, turn_id="other") is None
+    assert fsm.state is TurnState.BOB_SPEAKING
+    # The correct id cuts.
+    assert fsm.on_event(TurnEvent.BARGEIN_CONFIRMED, turn_id="t1") is not None
+
+
+def test_after_bargein_a_new_endpoint_drives_to_thinking() -> None:
+    """The resumed turn is a normal user_speaking turn: endpoint → thinking."""
+
+    fsm = TurnFsm()
+    _walk_to_bob_speaking(fsm, "t1")
+    fsm.on_event(TurnEvent.BARGEIN_CONFIRMED, turn_id="t1")
+    t = fsm.on_event(TurnEvent.ENDPOINT, turn_id="t1")
+    assert t is not None
+    assert (t.from_state, t.to_state) == (TurnState.USER_SPEAKING, TurnState.THINKING)
+
+
 # --- voice_stop teardown from every non-idle state ---------------------------
 
 

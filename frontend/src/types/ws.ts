@@ -145,6 +145,17 @@ export type VoiceStopMsg = {
   ts_client: number;
 };
 
+/** PRD 0016 / issue 0101, Annexe G — engages (or releases) the half-duplex
+ * gate when runtime AEC is unavailable. The HUD sends this on a measured echo
+ * failure or a manual operator toggle; the backend flips a sticky session flag
+ * and emits the `aec_degraded_half_duplex` warn event, while the mic muting
+ * during `bob_speaking` happens client-side (see `useMicCapture`'s
+ * `muteOutbound`). */
+export type VoiceAecDegradedMsg = {
+  type: "voice_aec_degraded";
+  engaged: boolean;
+};
+
 export type ClientMessage =
   | UserMsg
   | DismissTaskMsg
@@ -153,7 +164,8 @@ export type ClientMessage =
   | ClientTypingMsg
   | VoiceModeMsg
   | VoiceStartMsg
-  | VoiceStopMsg;
+  | VoiceStopMsg
+  | VoiceAecDegradedMsg;
 
 // Server → client
 export type SessionMsg = {

@@ -360,3 +360,93 @@ async def inject_audio_ws(
         # the socket closes (close also finalises, but an explicit settle keeps
         # the event ordering deterministic for the capture).
         await asyncio.sleep(max(settle_ms, 0) / 1000.0)
+
+
+async def inject_bargein_ws(
+    ws_base: str,
+    *,
+    transcript: str,
+    bargein_after_ms: int = 50,
+    bargein_span_ms: int = 280,
+    bargein_frame_gap_ms: int = 10,
+    open_timeout_ms: int = 10000,
+    speak_timeout_ms: int = 30000,
+    settle_ms: int = 600,
+    samples_per_frame: int = 480,
+) -> None:
+    """Drive a turn that Bob starts speaking, then BARGE IN on it (issue 0101).
+
+    One chat socket spanning the whole interrupt sequence (the barge-in must land
+    *while Bob speaks*, so it cannot be two independent ``inject_audio`` opens):
+
+    1. ``voice_start`` + a turn-1 voiced burst + trailing silence → the loop hits
+       ``endpoint`` and runs the say-path. (The fake TTS is paced via
+       ``BOB_FAKE_TTS_CHUNK_MS`` so Bob holds the floor long enough — see the
+       runner's ``extra_env``.)
+    2. Read chat frames until ``audio_start`` — the moment Bob's first chunk
+       leaves, i.e. the FSM is in ``bob_speaking``.
+    3. After ``bargein_after_ms``, stream a CONTINUOUS voiced burst spaced over
+       wall-clock (``bargein_frame_gap_ms`` between frames) so it spans
+       ``bargein_span_ms`` of continuous speech — comfortably past the server's
+       confirmation window — tripping :class:`bob.bargein.BargeInController`.
+    4. Settle (the ``bargein`` + ``turn_state`` events land on ``/ws/debug``,
+       captured separately), then ``voice_stop`` + close.
+
+    The frames are spaced in real time on purpose: the controller measures
+    elapsed wall-clock of continuous speech, and a back-to-back WS burst would
+    span microseconds — never crossing the window. Content is irrelevant (the
+    fake STT converges to ``transcript`` regardless).
+    """
+
+    # Turn-1 burst: enough voiced frames to open the turn + feed STT, then
+    # trailing silence to cross the endpoint silence floor (same sizing as the
+    # 0100 voiced path).
+    words = max(1, len(transcript.split()))
+    voiced_count = max(8, (words * 1600) // 480 + 4)
+    turn1 = synth_voiced_frames(voiced_count=voiced_count, samples_per_frame=samples_per_frame)
+
+    bargein_frames = max(1, bargein_span_ms // max(1, bargein_frame_gap_ms))
+    voiced = _voiced_frame(samples_per_frame)
+
+    async with websockets.connect(
+        f"{ws_base}/ws/chat", open_timeout=open_timeout_ms / 1000.0
+    ) as conn:
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(conn.recv(), timeout=2.0)
+
+        await conn.send(json.dumps({"type": "voice_start", "window": "new"}))
+        for frame in turn1:
+            await conn.send(frame)
+
+        # Wait until Bob actually starts speaking (audio_start) before barging.
+        deadline = asyncio.get_event_loop().time() + (speak_timeout_ms / 1000.0)
+        speaking = False
+        while not speaking:
+            remaining = deadline - asyncio.get_event_loop().time()
+            if remaining <= 0:
+                break
+            try:
+                raw = await asyncio.wait_for(conn.recv(), timeout=remaining)
+            except (TimeoutError, websockets.ConnectionClosed):
+                break
+            if isinstance(raw, bytes):
+                continue
+            try:
+                frame = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if isinstance(frame, dict) and frame.get("type") == "audio_start":
+                speaking = True
+
+        # Hold off, then stream the confirmation-window burst (continuous voiced
+        # frames spaced over wall-clock). Keep draining inbound chat frames is
+        # unnecessary — the cut emits no chat frame; the debug capture records it.
+        await asyncio.sleep(max(bargein_after_ms, 0) / 1000.0)
+        for _ in range(bargein_frames):
+            await conn.send(voiced)
+            await asyncio.sleep(max(bargein_frame_gap_ms, 0) / 1000.0)
+
+        # Settle so the bargein / turn_state events reach /ws/debug, then stop.
+        await asyncio.sleep(max(settle_ms, 0) / 1000.0)
+        await conn.send(json.dumps({"type": "voice_stop"}))
+        await asyncio.sleep(0.1)

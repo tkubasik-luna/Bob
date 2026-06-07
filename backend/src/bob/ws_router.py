@@ -159,7 +159,16 @@ async def chat_ws(websocket: WebSocket) -> None:
     # 0099 STT spine): created on ``voice_start``, torn down on ``voice_stop`` /
     # socket close. ``None`` when the mic is not armed. The loop owns the
     # per-utterance :class:`bob.voice_turn.VoiceTurn` STT sessions internally.
-    _sessions[session_id] = {"active_tts": [], "voice_mode": False, "voice_loop": None}
+    # ``half_duplex_gate`` (issue 0101 / Annexe G): sticky per-session flag set
+    # when the client reports runtime AEC failure via ``voice_aec_degraded``.
+    # The mic muting itself is client-side; the flag + the emitted warn event are
+    # the observable backend half of the net.
+    _sessions[session_id] = {
+        "active_tts": [],
+        "voice_mode": False,
+        "voice_loop": None,
+        "half_duplex_gate": False,
+    }
     orchestrator = _orchestrator_provider()
 
     # Slice 0039: connect-time debug event. Lives outside any user turn so
@@ -586,6 +595,11 @@ async def _handle_voice_start(
         say_path=_make_say_path_driver(websocket, session_id, orchestrator),
         settings=settings,
         session_id=session_id,
+        # Barge-in (issue 0101): persist what Bob actually played before the cut
+        # into the Jarvis history, and restart the Thinker (no-op hook until
+        # 0102) so the resumed turn re-plans from the partial.
+        commit_spoken=_make_commit_spoken(session_id),
+        on_thinker_restart=_make_thinker_restart(session_id),
     )
     started = await loop.start()
     if not started:
@@ -624,6 +638,7 @@ def _make_say_path_driver(
         *,
         turn_id: str,
         on_first_audio: Callable[[], Awaitable[None]],
+        on_spoken_progress: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
         if not transcript.strip():
             return
@@ -646,9 +661,65 @@ def _make_say_path_driver(
             msg_id,
             response.speech,
             on_first_audio=on_first_audio,
+            # Barge-in needs to know what Bob actually played (issue 0101).
+            on_spoken_progress=on_spoken_progress,
         )
 
     return _drive
+
+
+def _make_commit_spoken(session_id: str) -> Callable[[str, str], Awaitable[None]]:
+    """Build the barge-in ``commit_spoken_partial`` hook (PRD 0016 / issue 0101).
+
+    On a confirmed barge-in the loop hands us the (interrupted) ``turn_id`` and
+    the ``committed_spoken_text`` — the text Bob actually played before the cut.
+    We append it to the persistent Jarvis history as the assistant turn, marked
+    truncated, so the resumed turn (and any later context build) sees what Bob
+    *did* say rather than the full un-played reply. Persisting to the
+    ``voice_turns`` table (Annexe E.1 ``spoken_text``) is a later slice; the
+    Jarvis-history commit is the load-bearing one for conversational continuity.
+    Silently skips when the store is not primed (narrow test setups).
+    """
+
+    async def _commit(turn_id: str, committed_spoken_text: str) -> None:
+        try:
+            store = jarvis_store_module.get_default_store()
+        except RuntimeError:
+            return
+        # Mark the truncation so the history reflects that Bob was cut off — the
+        # ellipsis is a cheap, human-readable signal (no schema change needed).
+        store.append("assistant", f"{committed_spoken_text}…")
+        emit_debug(
+            category="voice",
+            severity="debug",
+            source="bob.ws_router._commit_spoken",
+            summary=f"barge-in committed spoken partial (turn={turn_id})",
+            payload={"session_id": session_id, "turn_id": turn_id},
+        )
+
+    return _commit
+
+
+def _make_thinker_restart(session_id: str) -> Callable[[str], Awaitable[None]]:
+    """Build the barge-in ``start_thinker`` hook (PRD 0016 / issue 0101).
+
+    A documented NO-OP until issue 0102 wires the real ``ThinkerLoop``: on a
+    confirmed barge-in the resumed turn should re-arm the live-transcript thinker
+    so it plans from the user's new utterance. Today we only emit a breadcrumb so
+    the Debug View shows the restart intent; 0102 replaces the body with the
+    actual ThinkerLoop (re)start.
+    """
+
+    async def _restart(turn_id: str) -> None:
+        emit_debug(
+            category="voice",
+            severity="debug",
+            source="bob.ws_router._thinker_restart",
+            summary=f"thinker restart hook (turn={turn_id}) — no-op until 0102",
+            payload={"session_id": session_id, "turn_id": turn_id},
+        )
+
+    return _restart
 
 
 async def _handle_voice_stop(
@@ -669,6 +740,52 @@ async def _handle_voice_stop(
     if isinstance(loop, FullDuplexLoop):
         await loop.stop()
     session["voice_loop"] = None
+
+
+async def _handle_voice_aec_degraded(
+    websocket: WebSocket, payload: dict[str, Any], session_id: str
+) -> None:
+    """Client → ``voice_aec_degraded`` engages the half-duplex gate (Annexe G).
+
+    PRD 0016 / issue 0101. When the webview detects that AEC is unavailable at
+    runtime (echo re-detected, or a manual operator toggle) it sends
+    ``{type: "voice_aec_degraded", engaged: true/false}``. We persist the sticky
+    session flag and emit the ``aec_degraded_half_duplex`` ``voice`` warn event —
+    the exact ``type`` the frontend handoff (``HALF_DUPLEX_GATE_SPEC``) names — so
+    the Debug View and the attestation harness can assert the degradation. The
+    actual mic muting is done client-side (the gate mutes outbound frames during
+    ``bob_speaking``); this is the observable backend half of the net.
+
+    Returns ``bad_aec_degraded`` when ``engaged`` is not a bool.
+    """
+
+    engaged = payload.get("engaged", True)
+    if not isinstance(engaged, bool):
+        await websocket.send_json(
+            {
+                "type": "error",
+                "code": "bad_aec_degraded",
+                "message": "voice_aec_degraded.engaged must be a boolean",
+            }
+        )
+        return
+    session = _sessions.get(session_id)
+    if session is not None:
+        session["half_duplex_gate"] = engaged
+    await emit_event(
+        {
+            "type": "aec_degraded_half_duplex",
+            "engaged": engaged,
+            "session_id": session_id,
+        },
+        category="voice",
+        severity="warn",
+        source="bob.ws_router.aec_degraded_half_duplex",
+        summary=(
+            "AEC indisponible — half-duplex gate "
+            f"{'engagé' if engaged else 'relâché'} (session={session_id})"
+        ),
+    )
 
 
 async def _handle_binary_frame(data: bytes, session_id: str) -> None:
@@ -802,6 +919,10 @@ async def _handle_client_message(
 
     if msg_type == "voice_stop":
         await _handle_voice_stop(websocket, payload, session_id)
+        return
+
+    if msg_type == "voice_aec_degraded":
+        await _handle_voice_aec_degraded(websocket, payload, session_id)
         return
 
     if msg_type != "user_msg":
@@ -953,6 +1074,7 @@ async def _synthesize_and_stream(
     text: str,
     *,
     on_first_audio: Callable[[], Awaitable[None]] | None = None,
+    on_spoken_progress: Callable[[str], Awaitable[None]] | None = None,
 ) -> None:
     """Segment ``text``, stream PCM chunks straight from KPipeline to the WS.
 
@@ -966,10 +1088,19 @@ async def _synthesize_and_stream(
     header so the client knows the sample rate. ``first_audio_ms`` is
     logged once per ``msg_id`` for latency telemetry.
 
+    ``on_spoken_progress`` (PRD 0016 / issue 0101): invoked after each sentence's
+    chunks have fully left the socket, with the cumulative cleaned text spoken so
+    far. The full-duplex loop uses it to know exactly what Bob *played* — so a
+    barge-in cut commits that prefix (``committed_spoken_text``) and never the
+    un-played tail. ``None`` on the text path (no barge-in there).
+
     Cancellation: this coroutine runs as a background task and may be
     cancelled by :func:`_cancel_active_tts` when a new user message
-    arrives. The cancelling path emits the final ``audio_end``; we bubble
-    :class:`asyncio.CancelledError` here and do not emit it ourselves.
+    arrives, OR by the full-duplex loop on a confirmed barge-in. The cancelling
+    path emits the final ``audio_end``; we bubble :class:`asyncio.CancelledError`
+    here and do not emit it ourselves. Because the cut lands between/within
+    sentences, the last ``on_spoken_progress`` value is exactly the played
+    prefix.
     """
 
     cleaned = clean_for_speech(text)
@@ -1087,6 +1218,14 @@ async def _synthesize_and_stream(
                         source="bob.ws_router.audio_chunk",
                         summary=f"audio_chunk #{audio_chunks - 1} (msg={msg_id})",
                     )
+                # This sentence's chunks have all left the socket — report the
+                # cumulative text Bob has actually played (issue 0101). A
+                # barge-in cancel between sentences lands here with the last
+                # fully-played prefix already reported. Reconstructed from the
+                # cleaned sentences so it matches what TTS spoke (not the raw
+                # reply): the committed_spoken_text basis.
+                if on_spoken_progress is not None:
+                    await on_spoken_progress(" ".join(sentences[: idx + 1]))
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

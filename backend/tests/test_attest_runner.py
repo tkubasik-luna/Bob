@@ -184,8 +184,11 @@ async def test_timeline_wait_event_records_timeout_as_error() -> None:
 
 
 async def test_timeline_wait_event_unknown_type_is_loud() -> None:
+    # ``backchannel`` is a documented Annexe A.2 logical type not yet wired (its
+    # slice is 0105); ``bargein`` is now known (issue 0101). An unknown type must
+    # record a loud timeline error rather than passing silently.
     scenario = Scenario.from_dict(
-        {"name": "x", "timeline": [{"do": "wait_event", "type": "bargein"}]}
+        {"name": "x", "timeline": [{"do": "wait_event", "type": "backchannel"}]}
     )
     runner = ScenarioRunner(scenario)
     errors: list[str] = []

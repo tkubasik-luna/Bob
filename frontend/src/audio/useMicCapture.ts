@@ -24,6 +24,15 @@
  * Errors (mic permission denied, worklet load failure) are reported via the
  * optional `onError` callback and leave the turn un-armed; they never throw
  * into React render.
+ *
+ * Half-duplex gate (PRD 0016 Annexe G / issue 0101): when runtime AEC is
+ * unavailable, full-duplex barge-in would trip on Bob's own voice. The net is
+ * to MUTE the mic while Bob speaks. The gate *decision* lives in the consumer
+ * (HUD) — it combines {@link HALF_DUPLEX_GATE_SPEC} with the live FSM state and
+ * passes the result as `muteOutbound`; when true, this hook keeps the capture
+ * graph alive but DROPS outbound PCM frames (so STT/barge-in see silence during
+ * `bob_speaking`). Kept here (not as a separate teardown) so flipping the gate
+ * never re-prompts for the mic.
  */
 
 import { useEffect, useRef } from "react";
@@ -40,6 +49,13 @@ type Options = {
   sendBinary: (data: ArrayBuffer) => void;
   /** Which window owns the mic (defaults to "new"). */
   windowName?: string;
+  /**
+   * Half-duplex net (issue 0101 / Annexe G): when true, outbound PCM frames are
+   * dropped (the mic is effectively muted) while keeping the capture graph
+   * armed. The HUD sets this to `gateEngaged && fsmState === "bob_speaking"`
+   * per {@link HALF_DUPLEX_GATE_SPEC}. Defaults to false (full-duplex).
+   */
+  muteOutbound?: boolean;
   /** Optional error sink (permission denied, worklet load failure). */
   onError?: (error: unknown) => void;
 };
@@ -59,6 +75,7 @@ export function useMicCapture({
   send,
   sendBinary,
   windowName = "new",
+  muteOutbound = false,
   onError,
 }: Options): void {
   // Latest callbacks via refs so the capture effect doesn't re-run (and
@@ -66,12 +83,18 @@ export function useMicCapture({
   const sendRef = useRef(send);
   const sendBinaryRef = useRef(sendBinary);
   const onErrorRef = useRef(onError);
+  // The half-duplex mute flag is read inside the worklet message handler via a
+  // ref so toggling it never re-runs the capture effect (no mic re-prompt).
+  const muteOutboundRef = useRef(muteOutbound);
   useEffect(() => {
     sendRef.current = send;
   }, [send]);
   useEffect(() => {
     sendBinaryRef.current = sendBinary;
   }, [sendBinary]);
+  useEffect(() => {
+    muteOutboundRef.current = muteOutbound;
+  }, [muteOutbound]);
   useEffect(() => {
     onErrorRef.current = onError;
   }, [onError]);
@@ -126,6 +149,10 @@ export function useMicCapture({
         node.port.onmessage = (event: MessageEvent) => {
           const samples = event.data as Float32Array;
           if (!samples || samples.length === 0) return;
+          // Half-duplex net (issue 0101): drop the frame while the gate mutes
+          // the mic (Bob is speaking + AEC unavailable). The graph stays armed
+          // so un-muting on `tts_end` resumes instantly without a re-prompt.
+          if (muteOutboundRef.current) return;
           const frame = buildMicFrame(samples, inputRate);
           if (frame) sendBinaryRef.current(frame);
         };

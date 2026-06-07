@@ -317,6 +317,24 @@ class Settings(BaseSettings):
     TTS_ENGINE: Literal["kokoro", "fake"] = "kokoro"
     BOB_FAKE_TTS_CHUNKS: int = 2
 
+    # Barge-in (PRD 0016 / issue 0101, Annexe B + F). While Bob speaks
+    # (``bob_speaking``), the user can cut him off; :class:`bob.bargein.BargeInController`
+    # requires this many ms of *continuous* user speech (the energy-VAD
+    # decision) before confirming the interrupt — short backchannels / noise
+    # below the window do NOT cut. Annexe B's band is 200-300 ms; the default
+    # sits at the low end for snappy turn-taking (the derived ``bargein_cut_ms``
+    # target is <300 ms end-to-end).
+    BARGEIN_CONFIRM_MS: int = 200
+
+    # Attestation harness only (PRD 0016 / issue 0101): per-chunk delay (ms) the
+    # ``fake`` TTS engine sleeps between outbound chunks. Default 0 = the
+    # instant streaming the 0100 audio scenario relies on (no regression). The
+    # barge-in scenario raises it so Bob stays in ``bob_speaking`` long enough
+    # for the injected confirmation window to land mid-reply (real TTS naturally
+    # takes hundreds of ms; the fake otherwise finishes in microseconds, leaving
+    # no window to barge into). Ignored unless ``TTS_ENGINE=fake``.
+    BOB_FAKE_TTS_CHUNK_MS: int = 0
+
     def mcp_server_configs(self) -> tuple[MCPServerConfig, ...]:
         """Parse :attr:`MCP_SERVERS` into typed :class:`MCPServerConfig` records.
 

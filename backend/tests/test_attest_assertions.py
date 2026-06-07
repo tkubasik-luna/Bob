@@ -62,8 +62,11 @@ def test_event_emitted_fails_when_say_absent() -> None:
 
 
 def test_event_emitted_unknown_logical_type_fails_loudly() -> None:
+    # ``backchannel`` is a documented Annexe A.2 logical type whose matcher has
+    # NOT been wired yet (its slice is 0105) — referencing it must FAIL loudly.
+    # (``bargein`` landed in issue 0101 and is exercised in test_attest_bargein.)
     ctx = _ctx([_say_event("hi")])
-    result = run_assertion({"kind": "event_emitted", "type": "bargein"}, ctx)
+    result = run_assertion({"kind": "event_emitted", "type": "backchannel"}, ctx)
     assert result.ok is False
     assert "unknown logical event type" in result.detail["error"]
 
@@ -132,14 +135,14 @@ def test_project_deliverable_empty_when_no_say() -> None:
 
 
 def test_unknown_kind_is_loud_fail_not_silent_pass() -> None:
-    # ``bargein_within_ms`` is a documented Annexe C kind that has NOT been
-    # implemented yet (its slice is 0101) — referencing it must FAIL loudly,
-    # naming the kind, never silently pass. (``fsm_reached`` / ``audio_chunks_gte``
-    # landed in issue 0100 and are exercised in test_attest_fsm.)
-    result = run_assertion({"kind": "bargein_within_ms", "max": 300}, _ctx([]))
+    # ``latency_lt_ms`` is a documented Annexe C kind that has NOT been
+    # implemented yet — referencing it must FAIL loudly, naming the kind, never
+    # silently pass. (``bargein_within_ms`` / ``committed_equals_spoken`` landed
+    # in issue 0101 and are exercised in test_attest_bargein.)
+    result = run_assertion({"kind": "latency_lt_ms", "max": 300}, _ctx([]))
     assert result.ok is False
     assert "not implemented yet" in result.detail["error"]
-    assert "bargein_within_ms" in result.detail["error"]
+    assert "latency_lt_ms" in result.detail["error"]
 
 
 def test_missing_kind_fails() -> None:

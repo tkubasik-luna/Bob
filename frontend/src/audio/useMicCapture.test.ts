@@ -95,6 +95,37 @@ describe("useMicCapture", () => {
     expect(bytes.byteLength).toBe(480 * 2 + 1);
   });
 
+  test("half-duplex gate: muteOutbound drops frames but keeps the graph armed", async () => {
+    // PRD 0016 / issue 0101 Annexe G — when the gate is engaged the mic stays
+    // open (no re-prompt / no voice_stop) but outbound PCM frames are dropped.
+    const send = vi.fn();
+    const sendBinary = vi.fn();
+    const { rerender } = renderHook(
+      ({ mute }: { mute: boolean }) =>
+        useMicCapture({ enabled: true, send, sendBinary, muteOutbound: mute }),
+      { initialProps: { mute: false } },
+    );
+    await waitFor(() => expect(lastNode).not.toBeNull());
+
+    const block = new Float32Array(1440).fill(0.25);
+    // Un-muted: the frame is forwarded.
+    act(() => lastNode?.port.onmessage?.({ data: block }));
+    expect(sendBinary).toHaveBeenCalledTimes(1);
+
+    // Engage the gate (no effect re-run: same graph, no new voice_start).
+    rerender({ mute: true });
+    act(() => lastNode?.port.onmessage?.({ data: block }));
+    // Still only one frame ever sent — the muted frame was dropped.
+    expect(sendBinary).toHaveBeenCalledTimes(1);
+    // The mic was NOT closed (no voice_stop emitted by the gate).
+    expect(send.mock.calls.some(([m]) => m?.type === "voice_stop")).toBe(false);
+
+    // Release the gate: frames flow again.
+    rerender({ mute: false });
+    act(() => lastNode?.port.onmessage?.({ data: block }));
+    expect(sendBinary).toHaveBeenCalledTimes(2);
+  });
+
   test("disarms on disable: voice_stop + tracks stopped", async () => {
     const sent: ClientMessage[] = [];
     const send = (m: ClientMessage) => sent.push(m);

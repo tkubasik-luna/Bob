@@ -108,12 +108,19 @@ class EphemeralBackend:
         host: str = "127.0.0.1",
         boot_timeout_seconds: float = 30.0,
         python_executable: str | None = None,
+        extra_env: dict[str, str] | None = None,
     ) -> None:
         self._fake_llm_script = fake_llm_script
         self._fake_stt_transcript = fake_stt_transcript
         self._host = host
         self._boot_timeout = boot_timeout_seconds
         self._python = python_executable or sys.executable
+        # Extra Bob knobs a scenario needs (issue 0101: BARGEIN_CONFIRM_MS +
+        # BOB_FAKE_TTS_CHUNK_MS so Bob holds the floor long enough to barge into).
+        # Applied LAST so a scenario can tune harness-only dials, but it cannot
+        # override the isolation/provider keys forced below — those are re-set
+        # after this is merged (see ``_build_env``).
+        self._extra_env = dict(extra_env or {})
         self._proc: subprocess.Popen[bytes] | None = None
         self._data_dir: Path | None = None
         self._port: int | None = None
@@ -223,6 +230,9 @@ class EphemeralBackend:
         """
 
         env = dict(os.environ)
+        # Scenario-supplied harness dials first, so the forced isolation +
+        # provider keys below always win (a scenario can't break isolation).
+        env.update(self._extra_env)
         env.update(
             {
                 "BOB_DATA_DIR": str(data_dir),

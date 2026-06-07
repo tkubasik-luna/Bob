@@ -130,6 +130,9 @@ LOGICAL_EVENT_MATCHERS: dict[str, EventMatcher] = {
     # ``wait_state`` synchronise on these.
     "turn_state": _voice_subtype_matcher("turn_state"),
     "audio_chunk": _voice_subtype_matcher("audio_chunk"),
+    # PRD 0016 / issue 0101 (Annexe A.2 + B): the confirmed barge-in cut.
+    # ``wait_event type: bargein`` blocks until Bob was interrupted.
+    "bargein": _voice_subtype_matcher("bargein"),
 }
 
 
@@ -544,3 +547,155 @@ register_assertion("budget_refused", check_budget_refused)
 register_assertion("stt_final_matches", check_stt_final_matches)
 register_assertion("fsm_reached", check_fsm_reached)
 register_assertion("audio_chunks_gte", check_audio_chunks_gte)
+
+
+# --- barge-in assertions (PRD 0016 / issue 0101) -----------------------------
+
+
+def _bargein_events(events: list[CapturedEvent]) -> list[dict[str, Any]]:
+    """Return the ``ws_event`` body of every captured ``bargein`` voice event.
+
+    Each body is the Annexe A.2 ``bargein`` payload
+    (``{turn_id, detected_ts, cut_ts, committed_spoken_text}``). The
+    ``committed_spoken_text`` here is the **scrubbed** ring-buffer copy (Privacy,
+    Annexe A.2) — a scenario keeps its reply short so it survives the leading
+    window whole.
+    """
+
+    matcher = _voice_subtype_matcher("bargein")
+    out: list[dict[str, Any]] = []
+    for event in events:
+        if not matcher(event):
+            continue
+        ws_event = (event.get("payload") or {}).get("ws_event") or {}
+        if isinstance(ws_event, dict):
+            out.append(ws_event)
+    return out
+
+
+def check_bargein_within_ms(spec: dict[str, Any], ctx: AssertionContext) -> AssertionResult:
+    """PASS iff a barge-in was cut within ``spec['max']`` ms (Annexe B + F).
+
+    Spec: ``{kind: bargein_within_ms, max: 300}`` (Annexe C). The cut latency is
+    ``cut_ts - detected_ts`` of the captured ``bargein`` event (seconds → ms) —
+    exactly the Annexe F derived ``bargein_cut_ms`` (target <300). FAILs loudly
+    when no ``bargein`` event was captured (Bob was never cut) so a scenario that
+    expected an interrupt and got none is red, not silently green.
+    """
+
+    raw_max = spec.get("max", 300)
+    try:
+        maximum = float(raw_max)
+    except (TypeError, ValueError):
+        return AssertionResult(
+            kind="bargein_within_ms",
+            ok=False,
+            detail={"error": "bargein_within_ms 'max' must be a number", "max": raw_max},
+        )
+    bargeins = _bargein_events(ctx.events)
+    if not bargeins:
+        return AssertionResult(
+            kind="bargein_within_ms",
+            ok=False,
+            detail={"error": "no bargein event captured", "expected_max": maximum},
+        )
+    # Best (smallest) cut across captured barge-ins; a scenario triggers one.
+    measured: list[float] = []
+    for ev in bargeins:
+        detected = ev.get("detected_ts")
+        cut = ev.get("cut_ts")
+        if isinstance(detected, (int, float)) and isinstance(cut, (int, float)):
+            measured.append(round((float(cut) - float(detected)) * 1000.0, 3))
+    if not measured:
+        return AssertionResult(
+            kind="bargein_within_ms",
+            ok=False,
+            detail={"error": "bargein event missing detected_ts/cut_ts", "expected_max": maximum},
+        )
+    actual = min(measured)
+    return AssertionResult(
+        kind="bargein_within_ms",
+        ok=actual <= maximum,
+        detail={"expected_max": maximum, "actual": actual},
+    )
+
+
+def _norm_spoken(text: str) -> str:
+    """Normalise spoken text for prefix comparison (collapse whitespace, casefold).
+
+    The committed text is reconstructed from cleaned TTS sentences while the
+    deliverable is the orchestrator's reply; both pass through here so the
+    ``committed_equals_spoken`` check is robust to trailing/internal whitespace
+    and case differences rather than asserting a brittle exact string.
+    """
+
+    return " ".join(text.split()).casefold()
+
+
+def check_committed_equals_spoken(spec: dict[str, Any], ctx: AssertionContext) -> AssertionResult:
+    """PASS iff the barge-in's committed text matches what Bob actually played.
+
+    Spec: ``{kind: committed_equals_spoken}`` (Annexe C — "texte committé ==
+    prononcé"). The invariant: the ``committed_spoken_text`` of the captured
+    ``bargein`` event is a **non-empty prefix** of Bob's full reply (the ``say``
+    deliverable). A prefix — not equality — because a barge-in cuts Bob
+    mid-reply, so he committed the *played leading portion*, never the whole
+    thing and never the un-played tail. This is the decode-fidelity-independent
+    contract (it would still hold under a real TTS that plays the same prefix).
+
+    FAILs when there is no ``bargein`` event, when its committed text is empty
+    (nothing was played but a cut fired — a bug), or when the committed text is
+    not a prefix of the reply (Bob committed text he did not play).
+    """
+
+    bargeins = _bargein_events(ctx.events)
+    if not bargeins:
+        return AssertionResult(
+            kind="committed_equals_spoken",
+            ok=False,
+            detail={"error": "no bargein event captured"},
+        )
+    committed = ""
+    for ev in bargeins:
+        value = ev.get("committed_spoken_text")
+        if isinstance(value, str) and value.strip():
+            committed = value
+            break
+    if not committed.strip():
+        return AssertionResult(
+            kind="committed_equals_spoken",
+            ok=False,
+            detail={"error": "committed_spoken_text empty", "committed": committed},
+        )
+    deliverable = ctx.deliverable
+    # The /ws/debug copy is scrubbed (Privacy, Annexe A.2): text over the debug
+    # window arrives elided as ``"<window>… [+N chars]"``. Recover the verbatim
+    # leading window so the prefix check works regardless of played length.
+    verbatim = _strip_scrub_elision(committed)
+    norm_committed = _norm_spoken(verbatim)
+    norm_deliverable = _norm_spoken(deliverable)
+    ok = bool(norm_committed) and norm_deliverable.startswith(norm_committed)
+    return AssertionResult(
+        kind="committed_equals_spoken",
+        ok=ok,
+        detail={"committed": committed, "deliverable_prefix": deliverable[:64]},
+    )
+
+
+#: Matches the elision suffix :func:`bob.voice_turn._scrub_text` appends.
+_SCRUB_ELISION_RE = re.compile(r"…\s*\[\+\d+ chars\]\s*$")
+
+
+def _strip_scrub_elision(text: str) -> str:
+    """Return the verbatim leading window of a (possibly) scrubbed transcript.
+
+    :func:`bob.voice_turn._scrub_text` keeps the first N chars verbatim then
+    appends ``"… [+M chars]"``. We strip that suffix so the kept prefix can be
+    matched against the full reply; a non-elided string is returned unchanged.
+    """
+
+    return _SCRUB_ELISION_RE.sub("", text)
+
+
+register_assertion("bargein_within_ms", check_bargein_within_ms)
+register_assertion("committed_equals_spoken", check_committed_equals_spoken)

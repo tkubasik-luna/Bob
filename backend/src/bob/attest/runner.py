@@ -44,6 +44,7 @@ from bob.attest.assertions import (
 from bob.attest.drive import (
     DebugCapture,
     inject_audio_ws,
+    inject_bargein_ws,
     inject_text,
     synth_mic_frames,
     synth_voiced_frames,
@@ -177,6 +178,7 @@ class ScenarioRunner:
         backend = EphemeralBackend(
             fake_llm_script=script.to_json(),
             fake_stt_transcript=self._audio_transcript(),
+            extra_env=self._extra_env(),
         )
         handle = backend.start()
         capture = DebugCapture(handle.ws_base)
@@ -247,9 +249,9 @@ class ScenarioRunner:
         """Run each timeline step in order. Unknown ops are loud errors.
 
         Supported ops: ``inject_text``, ``inject_audio`` (issue 0099 — binary
-        mic frames over the real WS), ``wait_event``, ``wait_ms``.
-        ``wait_state`` (FSM) raises a recorded error rather than passing
-        silently — its slice wires it in.
+        mic frames over the real WS), ``inject_bargein`` (issue 0101 — drive Bob
+        into ``bob_speaking`` then interrupt him on the same socket),
+        ``wait_event``, ``wait_state`` (FSM), ``wait_ms``.
         """
 
         import asyncio
@@ -264,6 +266,8 @@ class ScenarioRunner:
                     await inject_text(ws_base, text)
                 elif op == "inject_audio":
                     await self._do_inject_audio(ws_base, step)
+                elif op == "inject_bargein":
+                    await self._do_inject_bargein(ws_base, step)
                 elif op == "wait_event":
                     await self._do_wait_event(step, capture, errors)
                 elif op == "wait_ms":
@@ -279,17 +283,44 @@ class ScenarioRunner:
     def _audio_transcript(self) -> str:
         """The transcript the fake STT engine should converge to for this run.
 
-        Scans the timeline for the first ``inject_audio`` step's ``transcript``
-        (the deterministic fake engine is single-transcript per backend, so the
-        first audio turn defines it). Empty when the scenario injects no audio —
-        a text-only run leaves the fake engine idle.
+        Scans the timeline for the first ``inject_audio`` / ``inject_bargein``
+        step's ``transcript`` (the deterministic fake engine is single-transcript
+        per backend, so the first audio turn defines it). Empty when the scenario
+        injects no audio — a text-only run leaves the fake engine idle.
         """
 
         for step in self._scenario.timeline:
-            if step.get("do") == "inject_audio":
+            if step.get("do") in ("inject_audio", "inject_bargein"):
                 transcript = step.get("transcript", "")
                 return transcript if isinstance(transcript, str) else ""
         return ""
+
+    def _extra_env(self) -> dict[str, str]:
+        """Harness-only env dials a scenario's ops need (issue 0101).
+
+        A scenario with an ``inject_bargein`` step needs Bob to hold the floor
+        long enough to be interrupted, so the fake TTS is paced
+        (``BOB_FAKE_TTS_CHUNK_MS``) and the barge-in confirmation window
+        (``BARGEIN_CONFIRM_MS``) is pinned to a deterministic value. Derived from
+        the op's params (with sane defaults) so the YAML stays declarative; empty
+        for scenarios that don't barge in (zero behaviour change for 0100/0099
+        scenarios).
+        """
+
+        for step in self._scenario.timeline:
+            if step.get("do") != "inject_bargein":
+                continue
+            confirm_ms = int(step.get("confirm_ms", 200))
+            chunk_ms = int(step.get("tts_chunk_ms", 60))
+            return {
+                "BARGEIN_CONFIRM_MS": str(max(1, confirm_ms)),
+                "BOB_FAKE_TTS_CHUNK_MS": str(max(0, chunk_ms)),
+                # A handful of chunks at chunk_ms each = the speaking window the
+                # barge-in lands in; the fake yields BOB_FAKE_TTS_CHUNKS per
+                # sentence, so a multi-chunk reply spans well past the window.
+                "BOB_FAKE_TTS_CHUNKS": str(max(1, int(step.get("tts_chunks", 4)))),
+            }
+        return {}
 
     async def _do_inject_audio(self, ws_base: str, step: dict[str, Any]) -> None:
         """Stream synthetic mic frames for one voice turn over the binary WS.
@@ -320,6 +351,25 @@ class ScenarioRunner:
         else:
             frames = synth_mic_frames(frame_count=voiced_count)
             await inject_audio_ws(ws_base, frames)
+
+    async def _do_inject_bargein(self, ws_base: str, step: dict[str, Any]) -> None:
+        """Drive a turn Bob starts speaking, then BARGE IN on it (issue 0101).
+
+        Delegates to :func:`bob.attest.drive.inject_bargein_ws` (one socket
+        spanning turn-1 → Bob speaks → confirmation-window burst). The pacing /
+        confirmation env is set by :meth:`_extra_env` from this same step's
+        params; here we just translate the timeline knobs to the drive call.
+        """
+
+        transcript = step.get("transcript", "")
+        if not isinstance(transcript, str) or not transcript:
+            raise ScenarioError("inject_bargein 'transcript' must be a non-empty string")
+        await inject_bargein_ws(
+            ws_base,
+            transcript=transcript,
+            bargein_after_ms=int(step.get("at_ms", 50)),
+            bargein_span_ms=int(step.get("span_ms", 280)),
+        )
 
     async def _do_wait_event(
         self, step: dict[str, Any], capture: DebugCapture, errors: list[str]

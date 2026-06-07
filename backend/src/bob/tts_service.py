@@ -271,6 +271,10 @@ class FakeTtsService(KokoroTtsService):
         super().__init__(settings)
         resolved = chunks if chunks is not None else self._settings.BOB_FAKE_TTS_CHUNKS
         self._chunks = max(1, resolved)
+        # Per-chunk pacing (issue 0101): 0 = instant (default). The barge-in
+        # scenario sets a small delay so Bob holds the floor long enough to be
+        # interrupted mid-reply.
+        self._chunk_ms = max(0, self._settings.BOB_FAKE_TTS_CHUNK_MS)
 
     def is_model_cached(self) -> bool:
         return True
@@ -292,6 +296,10 @@ class FakeTtsService(KokoroTtsService):
             return
         pcm = b"\x00\x00" * self._CHUNK_SAMPLES
         for _ in range(self._chunks):
+            if self._chunk_ms:
+                # Pacing so a barge-in window can land mid-reply (issue 0101).
+                # Cooperative: a cancel (barge-in / new turn) interrupts here.
+                await asyncio.sleep(self._chunk_ms / 1000.0)
             yield SynthesisChunk(pcm16=pcm, sample_rate=self.sample_rate)
 
 

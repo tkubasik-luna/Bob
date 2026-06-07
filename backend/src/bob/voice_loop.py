@@ -1,12 +1,28 @@
 """Full-duplex turn loop — audio-in → existing brain → audio-out (issue 0100).
 
-PRD 0016 / Annexe B + F. This is the **bare** full-duplex loop: it stitches the
+PRD 0016 / Annexe B + F. This is the full-duplex loop: it stitches the
 already-built « Listen » STT spine (:class:`bob.voice_turn.VoiceTurn`, issue
 0099) to the already-built Jarvis say-path + Kokoro TTS (the text turn's
 ``process_user_message`` → ``speech_delta`` / ``audio_chunk`` path) via the
-real-time turn FSM (:class:`bob.turn_fsm.TurnFsm`). NO Thinker, NO Draft, NO
-barge-in (those are 0101-0104) - this proves the audio->brain->audio skeleton and
-the FSM lifecycle.
+real-time turn FSM (:class:`bob.turn_fsm.TurnFsm`). Issue 0100 built the bare
+audio→brain→audio skeleton + FSM lifecycle; issue 0101 adds **barge-in** (the
+``bob_speaking`` interrupt). NO Thinker, NO Draft (those are 0102/0104 — the
+``start_thinker`` restart on barge-in is a documented no-op hook here).
+
+Barge-in (issue 0101, Annexe B + F)
+-----------------------------------
+
+While Bob holds the floor (``bob_speaking``), the inbound mic frames still feed
+STT (the 0100 seam) AND now feed a :class:`bob.bargein.BargeInController`: once
+it confirms a continuous-speech window (~200-300 ms, configurable — filters
+short backchannels), the loop fires the ``bargein_confirmed`` FSM edge and
+performs its Annexe B actions — cancel the in-flight say-path (which cancels the
+LLM stream + the TTS), commit the text Bob actually *played*
+(``committed_spoken_text``, derived from the say-path's per-sentence playback
+progress) to the Jarvis history, restart the Thinker (no-op hook today), and
+re-arm STT for the resumed utterance. It emits a ``bargein`` voice event
+(Annexe A.2) + the ``t_bargein_detected`` / ``t_cut`` latency marks (Annexe F),
+whose derived ``bargein_cut_ms`` targets <300 ms.
 
 What it owns
 ------------
@@ -60,13 +76,14 @@ from typing import Protocol
 
 import structlog
 
+from bob.bargein import BargeInConfirmation, BargeInController
 from bob.config import Settings
 from bob.endpointer import Endpointer
 from bob.event_bus_v2 import emit_event
 from bob.stt_engine import SttFrameError, decode_pcm_frame
 from bob.turn_fsm import Transition, TurnEvent, TurnFsm, TurnState
 from bob.vad import EnergyVad, VadEvent, rms_normalised
-from bob.voice_turn import VoiceTurn
+from bob.voice_turn import VoiceTurn, _scrub_text
 
 _logger = structlog.get_logger(__name__)
 
@@ -82,6 +99,13 @@ class SayPathDriver(Protocol):
     the outbound audio has finished (or there was none) so the loop can flip the
     FSM back to ``idle``. Implementations must not raise on a degraded turn — a
     turn that produced no audio simply never calls ``on_first_audio``.
+
+    ``on_spoken_progress`` (issue 0101) is invoked after each *fully streamed*
+    unit of speech (a sentence's chunks) with the **cumulative cleaned text Bob
+    has actually played so far**. The loop holds the latest value so that, on a
+    barge-in cut, ``committed_spoken_text`` is exactly what left the speaker
+    before the interrupt — never the un-played tail. A driver that streams
+    nothing simply never calls it (``committed_spoken_text`` stays empty).
     """
 
     async def __call__(
@@ -90,6 +114,7 @@ class SayPathDriver(Protocol):
         *,
         turn_id: str,
         on_first_audio: Callable[[], Awaitable[None]],
+        on_spoken_progress: Callable[[str], Awaitable[None]] | None = None,
     ) -> None: ...
 
 
@@ -100,6 +125,11 @@ class _Marks:
     t_first_mic_frame: float | None = None
     t_endpoint: float | None = None
     t_first_audio_chunk: float | None = None
+    # Barge-in marks (issue 0101): ``t_bargein_detected`` is when the user's
+    # continuous speech that confirmed the cut began; ``t_cut`` is when the loop
+    # actually cancelled Bob's reply. Only set on a barged-in turn.
+    t_bargein_detected: float | None = None
+    t_cut: float | None = None
 
     def as_payload(self) -> dict[str, float]:
         """The non-null marks as a plain dict (the ``turn_latency.marks`` body)."""
@@ -111,16 +141,26 @@ class _Marks:
             out["t_endpoint"] = self.t_endpoint
         if self.t_first_audio_chunk is not None:
             out["t_first_audio_chunk"] = self.t_first_audio_chunk
+        if self.t_bargein_detected is not None:
+            out["t_bargein_detected"] = self.t_bargein_detected
+        if self.t_cut is not None:
+            out["t_cut"] = self.t_cut
         return out
 
     def derived(self) -> dict[str, float]:
-        """Derived metrics (Annexe F): ``endpoint_to_first_audio_ms`` when both marks exist."""
+        """Derived metrics (Annexe F).
+
+        ``endpoint_to_first_audio_ms`` when both marks exist; ``bargein_cut_ms =
+        t_cut - t_bargein_detected`` (target <300 ms) on a barged-in turn.
+        """
 
         out: dict[str, float] = {}
         if self.t_endpoint is not None and self.t_first_audio_chunk is not None:
             out["endpoint_to_first_audio_ms"] = round(
                 (self.t_first_audio_chunk - self.t_endpoint) * 1000.0, 3
             )
+        if self.t_bargein_detected is not None and self.t_cut is not None:
+            out["bargein_cut_ms"] = round((self.t_cut - self.t_bargein_detected) * 1000.0, 3)
         return out
 
 
@@ -139,13 +179,26 @@ class FullDuplexLoop:
     say_path: SayPathDriver
     settings: Settings
     session_id: str
+    #: Restart-the-Thinker hook fired on the barge-in ``start_thinker`` action
+    #: (issue 0101). A no-op by default — issue 0102 wires the real ThinkerLoop.
+    #: Receives the (interrupted) ``turn_id``.
+    on_thinker_restart: Callable[[str], Awaitable[None]] | None = None
+    #: Commit-to-history hook for the barge-in ``commit_spoken_partial`` action
+    #: (issue 0101): persist what Bob actually played before the cut. Defaults to
+    #: the Jarvis store append (wired by ws_router); ``None`` = skip (tests).
+    commit_spoken: Callable[[str, str], Awaitable[None]] | None = None
 
     _fsm: TurnFsm = field(default_factory=TurnFsm)
     _vad: EnergyVad = field(init=False)
     _endpointer: Endpointer = field(init=False)
+    _bargein: BargeInController = field(init=False)
     _turn: VoiceTurn | None = None
     _marks: _Marks = field(default_factory=_Marks)
     _say_task: asyncio.Task[None] | None = None
+    #: Cumulative cleaned text Bob has actually played in the active say-path
+    #: (updated by the say-path's ``on_spoken_progress``); the basis for
+    #: ``committed_spoken_text`` on a barge-in cut.
+    _spoken_text: str = ""
     _stopped: bool = False
     _started: bool = False
 
@@ -160,6 +213,7 @@ class FullDuplexLoop:
             silence_floor_frames=max(1, round(self.settings.ENDPOINT_SILENCE_MS / frame_ms)),
             speech_rms=self.settings.VAD_SPEECH_RMS,
         )
+        self._bargein = BargeInController(confirm_ms=self.settings.BARGEIN_CONFIRM_MS)
 
     # -- public API ----------------------------------------------------------
 
@@ -190,9 +244,10 @@ class FullDuplexLoop:
         kills a turn). The decoded PCM is fanned out: the active STT turn
         (partials / final — 0099), the VAD (speech / pause edges) and the
         Endpointer (silence floor). The first frame stamps ``t_first_mic_frame``.
-        Frames that arrive while Bob is mid-reply (``thinking`` /
-        ``bob_speaking``) still feed STT but cannot open a new turn — there is no
-        barge-in in this slice (0101).
+        Frames that arrive while Bob is mid-reply still feed STT; during
+        ``bob_speaking`` they also feed the :class:`bob.bargein.BargeInController`,
+        which can cut Bob off once a confirmation window of continuous speech
+        elapses (issue 0101).
         """
 
         if self._stopped:
@@ -206,17 +261,30 @@ class FullDuplexLoop:
         if self._marks.t_first_mic_frame is None:
             self._marks.t_first_mic_frame = self._now()
 
-        # One RMS pass; the same per-frame speech/silence decision feeds both
-        # the VAD (speech/pause edges) and the Endpointer (silence floor).
+        # One RMS pass; the same per-frame speech/silence decision feeds the VAD
+        # (speech/pause edges), the Endpointer (silence floor) AND the barge-in
+        # controller (confirmation window during bob_speaking).
         is_speech = rms_normalised(pcm) >= self.settings.VAD_SPEECH_RMS
 
         # 1) Feed STT first so the 0099 partial/final path is identical whether
         #    or not the FSM ever leaves idle (silent test frames never trip the
-        #    VAD, but must still transcribe).
+        #    VAD, but must still transcribe). This also keeps capturing the
+        #    user's audio while Bob speaks, so the barged-in utterance is
+        #    transcribed for the resumed turn.
         turn = self._turn
         advanced = False
         if turn is not None:
             advanced = await self._feed_stt(turn, pcm)
+
+        # 1b) Barge-in (issue 0101): while Bob holds the floor, run the
+        #     confirmation window. On confirmation we cut Bob and re-open the
+        #     user's turn; nothing else on this frame applies (the VAD/endpoint
+        #     fan-out below is for the user_speaking / idle states), so return.
+        if self._fsm.state is TurnState.BOB_SPEAKING:
+            confirmation = self._bargein.observe(is_speech=is_speech, now=self._now())
+            if confirmation is not None:
+                await self._on_bargein(confirmation)
+            return
 
         # 2) VAD edge — opens a turn (idle -> user_speaking) or, while thinking,
         #    the legal "user resumes" edge.
@@ -340,9 +408,14 @@ class FullDuplexLoop:
             if final is not None:
                 transcript = final.text
 
+        # Reset the per-reply barge-in state for the turn we are about to speak:
+        # a fresh confirmation window + an empty played-text accumulator.
+        self._bargein.reset()
+        self._spoken_text = ""
+
         # Launch the say-path as a background task so a long generation does not
-        # block the frame pump. Frames keep feeding the next STT turn (opened
-        # when we return to idle); they cannot barge in this slice.
+        # block the frame pump. Frames keep feeding STT while Bob speaks; once a
+        # confirmation window of user speech elapses the barge-in path cuts in.
         self._say_task = asyncio.create_task(self._run_say_path(transcript, transition.turn_id))
 
     async def _run_say_path(self, transcript: str, turn_id: str) -> None:
@@ -367,8 +440,21 @@ class FullDuplexLoop:
             if moved is not None:
                 await self._emit_turn_state(moved)
 
+        async def _on_spoken_progress(played: str) -> None:
+            # The say-path reports the cumulative cleaned text Bob has actually
+            # played after each fully-streamed sentence; hold the latest so a
+            # barge-in cut commits exactly that (issue 0101). Guard against a
+            # late callback from a say-path we no longer own.
+            if self._fsm.turn_id == turn_id:
+                self._spoken_text = played
+
         try:
-            await self.say_path(transcript, turn_id=turn_id, on_first_audio=_on_first_audio)
+            await self.say_path(
+                transcript,
+                turn_id=turn_id,
+                on_first_audio=_on_first_audio,
+                on_spoken_progress=_on_spoken_progress,
+            )
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -405,6 +491,60 @@ class FullDuplexLoop:
         await self._emit_turn_latency(turn_id)
         # Re-arm STT for the next utterance unless we have been stopped or a
         # resumed turn already opened one.
+        if not self._stopped and self._turn is None:
+            await self._open_stt_turn()
+
+    async def _on_bargein(self, confirmation: BargeInConfirmation) -> None:
+        """Perform the Annexe B ``bargein_confirmed`` actions (issue 0101).
+
+        The order matters and mirrors the ``thinking`` resume edge:
+
+        1. Capture ``committed_spoken_text`` (what Bob actually played) BEFORE we
+           cancel anything — once the say task is gone the accumulator is moot.
+        2. Stamp ``t_bargein_detected`` (the confirmation's run start) + ``t_cut``
+           (now) for the latency summary (``bargein_cut_ms`` derived).
+        3. Move the FSM ``bob_speaking`` → ``user_speaking`` FIRST, so the
+           cancelled say task's ``_finalize_say`` ownership guard sees the FSM no
+           longer in ``bob_speaking`` and does NOT drive a second transition.
+        4. Cancel the in-flight say-path (``cancel_llm_stream`` + ``cancel_tts``):
+           cancelling the task aborts both the orchestrator generation and the
+           TTS stream cooperatively (the say-path bubbles ``CancelledError``).
+        5. Commit the played text to history (``commit_spoken_partial``) and
+           restart the Thinker (``start_thinker`` — no-op hook until 0102).
+        6. Emit the ``bargein`` voice event (Annexe A.2) + re-arm STT for the
+           resumed utterance.
+        """
+
+        committed_spoken_text = self._spoken_text
+        self._marks.t_bargein_detected = confirmation.detected_ts
+        self._marks.t_cut = self._now()
+
+        transition = self._fsm.on_event(TurnEvent.BARGEIN_CONFIRMED, turn_id=self._fsm.turn_id)
+        if transition is None:
+            # Defensive: the FSM moved off bob_speaking between the frame check
+            # and here (e.g. tts_end raced). Nothing to cut.
+            return
+        turn_id = transition.turn_id
+        await self._emit_turn_state(transition)
+
+        # cancel_llm_stream + cancel_tts — tearing the say task down cancels both.
+        await self._cancel_say_task()
+
+        # commit_spoken_partial — persist exactly what left the speaker.
+        if committed_spoken_text.strip() and self.commit_spoken is not None:
+            with contextlib.suppress(Exception):
+                await self.commit_spoken(turn_id, committed_spoken_text)
+
+        # start_thinker — no-op hook today (issue 0102 wires the ThinkerLoop).
+        if self.on_thinker_restart is not None:
+            with contextlib.suppress(Exception):
+                await self.on_thinker_restart(turn_id)
+
+        await self._emit_bargein(turn_id, confirmation, committed_spoken_text)
+
+        # Re-arm STT for the resumed utterance (the user is now speaking on the
+        # SAME turn id). The cancelled say task's ``_finalize_say`` may already
+        # have opened one; only open if still detached.
         if not self._stopped and self._turn is None:
             await self._open_stt_turn()
 
@@ -475,6 +615,43 @@ class FullDuplexLoop:
             severity="debug",
             source="bob.voice_loop.turn_latency",
             summary=f"turn_latency (turn={turn_id})",
+        )
+
+    async def _emit_bargein(
+        self, turn_id: str, confirmation: BargeInConfirmation, committed_spoken_text: str
+    ) -> None:
+        """Emit the Annexe A.2 ``bargein`` voice event for a confirmed cut.
+
+        Payload (Annexe A.2): ``{turn_id, detected_ts, cut_ts,
+        committed_spoken_text}``. ``cut_ts`` is the ``t_cut`` mark (when the loop
+        actually cancelled Bob). Privacy (Annexe A.2): ``committed_spoken_text``
+        carries spoken content, so the full text reaches the client while the
+        ring-buffer copy scrubs it to the same leading window as ``stt_*`` (the
+        attest harness reads that scrubbed copy, so a short fixture survives
+        whole).
+        """
+
+        cut_ts = self._marks.t_cut if self._marks.t_cut is not None else self._now()
+        payload = {
+            "type": "bargein",
+            "turn_id": turn_id,
+            "detected_ts": confirmation.detected_ts,
+            "cut_ts": cut_ts,
+            "committed_spoken_text": committed_spoken_text,
+        }
+        debug_payload = {
+            **payload,
+            "committed_spoken_text": _scrub_text(
+                committed_spoken_text, max_chars=self.settings.STT_DEBUG_TEXT_MAX_CHARS
+            ),
+        }
+        await emit_event(
+            payload,
+            category="voice",
+            severity="info",
+            source="bob.voice_loop.bargein",
+            summary=f"bargein (turn={turn_id})",
+            debug_payload=debug_payload,
         )
 
     def _frame_ms(self) -> int:

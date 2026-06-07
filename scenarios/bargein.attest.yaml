@@ -1,0 +1,70 @@
+# Barge-in attest scenario (PRD 0016 / issue 0101, Annexe A.2 + B + F + G).
+#
+# Proves the BARGE-IN end-to-end against an ephemeral backend with the
+# deterministic fake LLM + fake STT + fake TTS (no native models):
+#
+#   1. inject_bargein — a voiced turn drives the FSM to `bob_speaking` and the
+#      say-path starts streaming the reply. The fake TTS is PACED (the runner
+#      sets BOB_FAKE_TTS_CHUNK_MS / BOB_FAKE_TTS_CHUNKS from this step) so Bob
+#      holds the floor for several hundred ms — long enough to be interrupted.
+#   2. Mid-reply (after `at_ms`), a CONTINUOUS voiced burst spanning past the
+#      confirmation window (`confirm_ms`) trips BargeInController → the loop
+#      cancels the LLM stream + TTS, commits what Bob actually PLAYED
+#      (`committed_spoken_text`), restarts the Thinker (no-op hook) and emits the
+#      `bargein` voice event + the t_bargein_detected / t_cut latency marks.
+#
+# The wait_state steps assert the FSM reached `bob_speaking` then came back to
+# `user_speaking` (the barge-in edge); wait_event blocks on the `bargein` event.
+# The assertions re-check the invariants: barge-in cut < 300 ms, the committed
+# text is the played prefix of the reply, the FSM reached `user_speaking`.
+#
+# The reply's first sentence ("Bonjour.") is short so it plays whole before the
+# cut AND survives the debug-scrub window — the committed text the harness reads
+# off /ws/debug is exactly that played prefix.
+#
+# Run:  uv run bob attest scenarios/bargein.attest.yaml   (exit 0, ok: true)
+name: bargein-cuts-within-300ms
+description: >-
+  Bob is interrupted mid-reply; the FSM goes bob_speaking -> user_speaking, the
+  cut lands < 300 ms, and committed_spoken_text is the played prefix.
+backend: ephemeral
+llm: fake
+fake_llm:
+  - role: jarvis
+    on_input_contains: "temps"
+    reply: "Bonjour. Je suis Bob. Comment puis-je aider."
+timeline:
+  # Drive Bob into bob_speaking, then barge in mid-reply on the same socket.
+  # at_ms = delay after Bob starts speaking before the confirmation burst;
+  # confirm_ms = continuous-speech window required; tts_chunk_ms / tts_chunks
+  # pace the fake TTS so the reply spans well past the cut.
+  - do: inject_bargein
+    transcript: "quel temps fait il"
+    at_ms: 250
+    span_ms: 320
+    confirm_ms: 200
+    tts_chunk_ms: 60
+    tts_chunks: 4
+  # The FSM got the floor, then the barge-in handed it back to the user.
+  - do: wait_state
+    state: bob_speaking
+    timeout_ms: 8000
+  - do: wait_event
+    type: bargein
+    timeout_ms: 8000
+  - do: wait_state
+    state: user_speaking
+    timeout_ms: 8000
+assertions:
+  # Bob actually started speaking before the cut.
+  - kind: fsm_reached
+    state: bob_speaking
+  # The barge-in edge handed the floor back to the user.
+  - kind: fsm_reached
+    state: user_speaking
+  # The cut was fast (Annexe F bargein_cut_ms target).
+  - kind: bargein_within_ms
+    max: 300
+  # Bob committed exactly what he played (the leading prefix of the reply).
+  - kind: committed_equals_spoken
+  - kind: no_error_events

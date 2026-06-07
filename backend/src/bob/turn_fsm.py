@@ -1,10 +1,10 @@
-"""Real-time turn finite-state machine (PRD 0016 / Annexe B, issue 0100).
+"""Real-time turn finite-state machine (PRD 0016 / Annexe B, issues 0100 + 0101).
 
 The full-duplex loop is governed by a compact FSM over four states —
 ``idle`` / ``user_speaking`` / ``thinking`` / ``bob_speaking`` — driven by the
 audio + STT + TTS edges (Annexe B transition table). This module implements the
-**basic** transitions only: NO barge-in (the ``bob_speaking`` + VAD →
-interrupt edge lands in issue 0101), NO Thinker/Draft (0102/0104). The
+basic 0100 transitions PLUS the issue-0101 **barge-in** edge (``bob_speaking``
++ confirmed VAD → ``user_speaking``); NO Thinker/Draft (0102/0104). The
 ``thinking`` → ``bob_speaking`` edge is therefore always the *cold* path
 (``draft_miss`` in Annexe B vocabulary): there is no speculative draft to
 commit yet.
@@ -23,8 +23,8 @@ layer (:mod:`bob.ws_router`), which calls :meth:`on_event` and interprets the
 returned actions. That keeps this module free of asyncio / event-bus / TTS
 concerns and makes the table the single source of truth.
 
-Annexe B (basic subset implemented here)
------------------------------------------
+Annexe B (subset implemented here)
+----------------------------------
 
 | from           | event             | to             | actions                                   |
 |----------------|-------------------|----------------|-------------------------------------------|
@@ -34,12 +34,21 @@ Annexe B (basic subset implemented here)
 | user_speaking  | endpoint          | thinking       | freeze_transcript, request_commit_or_gen  |
 | thinking       | speak_start       | bob_speaking   | speak                                     |
 | thinking       | vad_speech_start  | user_speaking  | cancel_generation, resume_thinker         |
+| bob_speaking   | bargein_confirmed | user_speaking  | (barge-in actions — see below)            |
 | bob_speaking   | tts_end           | idle           | finalize_turn, persist_transcript         |
 | *              | voice_stop        | idle           | teardown_turn                             |
 
 ``speak_start`` is this slice's name for Annexe B's ``draft_miss`` / "no draft"
 edge (``thinking`` → ``bob_speaking``): the loop wiring fires it once the
 existing Jarvis say-path has produced its first outbound audio.
+
+``bargein_confirmed`` (issue 0101) is the ``bob_speaking`` → ``user_speaking``
+interrupt: the loop fires it once :class:`bob.bargein.BargeInController` confirms
+a continuous-speech window over the inbound mic frames. Its actions are the
+Annexe B set the loop interprets: cancel the in-flight LLM stream + the TTS,
+commit the text Bob actually *played* (``committed_spoken_text``) to history,
+restart the Thinker. It is legal ONLY from ``bob_speaking`` (a stray
+``bargein_confirmed`` in any other state is rejected like every illegal pair).
 
 Events that are not legal in the current state are **rejected** (no transition,
 ``Transition`` is ``None``) rather than raising — a stray ``stt_partial`` after
@@ -65,12 +74,12 @@ class TurnState(StrEnum):
 
 
 class TurnEvent(StrEnum):
-    """The events that drive the basic FSM (Annexe B subset, issue 0100).
+    """The events that drive the FSM (Annexe B subset, issues 0100 + 0101).
 
-    Barge-in (``bargein_confirmed``), the draft-commit edge
-    (``draft_committed``) and the explicit backchannel emission are deferred to
-    later slices; ``speak_start`` is the cold ``thinking`` → ``bob_speaking``
-    edge used here.
+    The draft-commit edge (``draft_committed``) and the explicit backchannel
+    emission are deferred to later slices; ``speak_start`` is the cold
+    ``thinking`` → ``bob_speaking`` edge used here. ``bargein_confirmed`` is the
+    issue-0101 ``bob_speaking`` → ``user_speaking`` interrupt.
     """
 
     VAD_SPEECH_START = "vad_speech_start"
@@ -78,6 +87,7 @@ class TurnEvent(StrEnum):
     VAD_PAUSE = "vad_pause"
     ENDPOINT = "endpoint"
     SPEAK_START = "speak_start"
+    BARGEIN_CONFIRMED = "bargein_confirmed"
     TTS_END = "tts_end"
     VOICE_STOP = "voice_stop"
 
@@ -127,6 +137,14 @@ _TABLE: Mapping[tuple[TurnState, TurnEvent], tuple[TurnState, tuple[str, ...]]] 
     (TurnState.THINKING, TurnEvent.VAD_SPEECH_START): (
         TurnState.USER_SPEAKING,
         ("cancel_generation", "resume_thinker"),
+    ),
+    # Issue 0101 — the barge-in interrupt. ``user_speaking`` (not ``idle``) so
+    # the turn id is retained: the user is resuming the SAME turn Bob was
+    # answering. The loop interprets these symbolic actions (cancel the LLM
+    # stream + TTS, commit what Bob actually played, restart the Thinker).
+    (TurnState.BOB_SPEAKING, TurnEvent.BARGEIN_CONFIRMED): (
+        TurnState.USER_SPEAKING,
+        ("cancel_llm_stream", "cancel_tts", "commit_spoken_partial", "start_thinker"),
     ),
     (TurnState.BOB_SPEAKING, TurnEvent.TTS_END): (
         TurnState.IDLE,
