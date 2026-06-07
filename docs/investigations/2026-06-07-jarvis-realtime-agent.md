@@ -224,9 +224,176 @@ Livrer le léger d'abord, ajouter le micro après sans rien jeter.
 - STT + Thinker/Draft + Speaker + Kokoro TTS en concurrence locale. Cible hardware
   (GPU / VRAM) à fixer.
 
-**Décisions ouvertes qui restent (communes, cf. Blockers) :** snapshot live vs
-contexte par-tour ; draft spéculatif vs codec tool-call/validation ; baseline
-latence + métriques (taux commit/jet, compute gaspillé).
+**Décisions ouvertes qui restent** → ✅ résolues par le grill du 2026-06-07, voir
+« Design verrouillé — grill 2026-06-07 » ci-dessous.
+
+---
+
+## Design verrouillé — grill 2026-06-07
+
+Scope : **tout d'un coup** (audio I/O + Thinker + Draft + picker par-rôle ensemble).
+
+### Pipeline & placement
+- **STT** : backend. Frontend capture micro + **AEC WebRTC** (`getUserMedia`
+  `echoCancellation:true`) → frames **binaires PCM 16kHz mono s16le** (~20-40ms) sur
+  un nouveau canal WS client→serveur.
+- **Moteur STT** : **whisper.cpp** (Metal/CoreML), modèle défaut **large-v3-turbo**
+  (settable). faster-whisper écarté (CTranslate2 = CPU-only sur Mac).
+- **Matériel** : Mac Apple Silicon **32 Go+** unifiés.
+
+### Orchestration
+- **FSM turn-taking compact** : `idle / user_speaking / thinking / bob_speaking` +
+  transition **barge-in**. Backchannel = action, pas un état (pas d'état overlap).
+- **Endpointing** : hybride **VAD silence (~500-700ms) + endpoint sémantique**
+  (classifieur léger : déclenche tôt sur clause complète / retient si inachevé).
+- **Barge-in** : déclenché par **VAD + fenêtre de confirmation ~200-300ms** (filtre
+  backchannels/bruits courts). Action : annuler stream LLM + TTS, **committer le
+  texte déjà prononcé** dans l'historique, → `user_speaking`.
+- **Backchannels** : légers ("mm", "ok"), **dans les pauses** (pas en overlap),
+  gated par le Thinker + seuil de proactivité (Inner Thoughts when-to-speak).
+
+### Penser en parallèle
+- **Concurrence** : **modèles locaux distincts** (Thinker & Draft = mini 1-3B,
+  Speaker = 7-8B) pour une vraie concurrence — un seul moteur d'inférence sérialise.
+  Un rôle peut aussi être Claude (réseau, concurrence gratuite).
+- **Thinker** : boucle de fond → écrit un **`LiveTranscriptState`** en mémoire ; un
+  **provider pur `ThinkerStateProvider`** lit le dernier snapshot à l'assemblage
+  (pattern `StateBlockProvider`→`TaskStore`). Assemblage reste pur, déclenché par
+  l'endpoint du FSM.
+- **Draft spéculatif** : **texte brut hors codec** sur le transcript partiel ; à
+  l'endpoint, si aligné → adopté dans le say-path normal → TTS, sinon jeté. Ne
+  spécule **que la réponse conversationnelle**, pas les tours qui dispatchent un
+  outil. Commit recommandé : fast-path préfixe + garde de similarité sémantique.
+
+### Picker par-rôle (évolution feature 0013)
+- **Map complète par-rôle** : `{role: LLMSelection}` pour
+  `speaker (jarvis) / thinker / draft / subagent`. **Chaque rôle choisit Claude CLI
+  *ou* LM Studio** + modèle (pas juste un modèle LM). `LLMSelection` porte déjà
+  `provider` → réutilisé. Migration : la sélection globale actuelle initialise chaque
+  rôle. UI : `SettingsControl` passe d'un switch global à une section par-rôle.
+
+### Contraintes & cibles
+- **Cerveau réseau (Claude)** = pas de tokens précoces → pour un TTFT bas, mettre un
+  modèle **LM Studio local** sur les rôles latence-critiques (Speaker/Draft). Le
+  picker **expose** le compromis, ne le tranche pas.
+- **Latence (DoD)** : barge-in **<300ms**, endpoint→premier audio **<800ms** (Draft
+  committé) / **<1.5s** (à froid), backchannel **<500ms**. Instrumenté via Debug View.
+- **Mic** : **always-on quand le mode voix est ON** (réutilise le toggle existant =
+  kill-switch privacy).
+- **Rétention** : persister transcripts + partiels + audio (Debug/replay/tuning) →
+  **ajouter une retention policy bornée** (âge/taille), façon `EventRetentionPolicy`.
+
+### Reste à trancher — ✅ résolu (grill 2026-06-07, 2e passe)
+- **Endpoint sémantique** : pas de classifieur dédié → le **Thinker émet
+  `user_turn_complete`** dans son snapshot ; VAD silence = filet robuste. (Le Thinker
+  fait triple emploi : snapshot d'état + signal d'endpoint + trigger backchannel.)
+- **Multi-modèles LM Studio** : faisable (SDK = multi-instances `load_new_instance`
+  + `list_loaded_models` pluriel + inférence routée par `model`), **MAIS ⚠️ conflit
+  code** — `LMStudioManager.load()` est **offload-first** (`lm_studio_manager.py:308` :
+  évince tous les autres modèles avant de charger). Décision : **multi-load
+  budget-aware + offload sélectif** (check budget RAM ≤ plafond − marge ; n'évince que
+  les modèles non assignés à un rôle). + **factory par-rôle**
+  (`build_thinker_client` / `build_draft_client`, chacun épingle son `model` ;
+  `LMStudioClient` route par `model` ; `factory.py` ne gère qu'un `LLM_MODEL` global
+  aujourd'hui).
+- **Commit Draft** : **fast-path préfixe** (commit instantané, cas commun avec
+  l'endpoint sémantique) + **garde de similarité légère** (token-overlap/embedding) sur
+  divergence (slow-path, on regénère de toute façon).
+- **Rétention** : **âge + taille** façon `EventRetentionPolicy`, caps séparés audio
+  (~1-2 Go) vs transcripts (~30j), purge auto.
+
+### ⚠️ Conflits code identifiés (à intégrer au PRD)
+- `LMStudioManager.load()` offload-first (`lm_studio_manager.py:308`) → réécrire en
+  multi-load budget-aware + offload sélectif (revient en partie sur la décision
+  robustesse du 2026-06-05, voir mémoire `bob-llm-picker-robustness`).
+- `factory.py` (`_apply_selection` + `build_*_client`) ne porte qu'**une** sélection
+  globale → étendre en map par-rôle (cf. picker Q10/Q14).
+- WS de Bob = JSON texte only → ajouter un **canal binaire** (frames PCM entrants).
+
+### Conflits — sous-décisions tranchées (grill 2e passe, 2026-06-07)
+
+**#3 Audio / AEC (le plus risqué) :**
+- **Webview-natif + spike de validation d'abord.** `getUserMedia({audio:{echoCancellation:true}})`
+  dans le webview → WKWebView annule sa propre sortie (capture + lecture restent en
+  webview). **Spike gate early** : ajouter `NSMicrophoneUsageDescription` + vérifier le
+  délégué de permission média Tauri v2. **DoD spike** : getUserMedia renvoie un stream
+  ET l'AEC atténue la voix de Bob sous un seuil mesurable. **Fallback** si échec :
+  Rust-natif (`cpal` + `webrtc-audio-processing`, capture + lecture + AEC en Rust,
+  webview = UI). Le PRD **branche sur l'issue de spike**.
+- Canal **WS binaire** entrant (frames PCM 16k) dans `ws_router` ; capture via
+  AudioWorklet (downsample 16k). Mic possédé par la fenêtre HUD `new`.
+
+**#1 `LMStudioManager` offload-first → multi-load budget-aware :**
+- **Footprint** = taille fichier disque (GGUF/MLX) + marge KV-cache (∝ `context_length`).
+- **Plafond** = RAM détectée (sysctl) − marge OS (~8 Go), **override + marge réglables**
+  en settings.
+- **Per-host** : manager + budget **par host** (conséquence du base_url par-rôle). Host
+  local → plafond détecté ; **host distant → override settings, sinon skip** (try+catch OOM).
+- **Offload sélectif ref-compté** : un modèle n'est évincé que quand **aucun rôle ne le
+  référence** (sur le même host). Fin de l'offload-first.
+
+**#2 `factory.py` une sélection → map par-rôle :**
+- **4 rôles** : `jarvis(=speaker)` / `thinker` / `draft` / `subagent`. STT = section
+  settings à part (pas un rôle LLM).
+- Sélection par-rôle = `{provider (claude_cli|lm_studio), base_url, lm_model,
+  context_length}`. **base_url par-rôle complet** (chaque rôle son serveur → Thinker
+  local + Speaker GPU distant possible).
+- `build_<role>_client` épingle provider/base_url/model ; **`LMStudioClient` route par
+  param `model`** ; `llm_swap` rebuild **uniquement le rôle changé**. Migration : la
+  sélection globale actuelle seed les 4 rôles.
+
+**Scope :** input texte **conservé** (hybride voix+texte additif, zéro régression).
+
+**Tunables (PRD, non-bloquants) :** cadence boucle Thinker (par partiel vs intervalle
+debounced) ; seuils VAD/confirmation/endpoint ; seuil similarité commit Draft ; marges
+budget/rétention.
+
+---
+
+## Harnais d'attestation agent (`bob` CLI) — grill 2026-06-07
+
+**Besoin (user)** : une mécanique pour que l'agent (Claude) **teste en autonomie
+réelle** et atteste que chaque slice marche, au fur et à mesure. Contrainte :
+full-duplex = hardware/humain (micro, audio temps réel) → l'agent ne peut pas
+parler/entendre → injection de fixtures + assertions machine-lisibles.
+
+**Forme** : un **`bob` CLI** (greenfield — aucun CLI aujourd'hui ; console_script via
+`pyproject`, sous-commandes, sortie JSON, exit non-zéro). Driver headless + asserteur
+par-dessus le spine d'events existant (`/ws/debug`, `event_bus_v2`).
+
+- **Drive layer** : **black-box sur le vrai WS/HTTP** ; asserte sur le flux
+  `/ws/debug`. Teste la vraie pile (transport inclus).
+- **Injection entrée** : 2 modes — **`--audio fixture.wav`** (frames micro → STT →
+  e2e, dépend du canal binaire WS) et **`--text`** (inject transcript, skip whisper →
+  rapide + déterministe). Texte au quotidien, audio pour valider STT/endpoint.
+- **Assertions** : **invariants/contrats**, pas le texte exact — FSM a atteint l'état
+  X, `say` émis, latence < cible, **barge-in coupé <300ms**, rôle R a servi modèle M,
+  deliverable non-vide, **texte committé == texte prononcé**. temp=0 où l'exactitude
+  compte.
+- **Validation TTS** (l'agent n'entend pas) : **texte pré-synthèse + count/octets/timing
+  des `audio_chunk`** (couvre le barge-in = chunks coupés). Option **`--deep`** :
+  round-trip TTS→whisper→compare (intelligibilité réelle, lent/non-déterministe).
+- **Scénarios** : **déclaratifs YAML/JSON**, timeline d'événements timés (`inject à
+  t=X`, `attendre état Y`) + assertions ; **verdict JSON** ; hook Python en
+  échappatoire. **Un scénario par slice**, versionné.
+- **Intégration build** : **chaque issue livre son scénario**, DoD =
+  `bob attest <scenario>` au vert. L'agent lance la suite après chaque slice + en CI
+  → atteste l'empilement au fur et à mesure, régressions vues tôt. Se branche sur
+  l'adversarial-verify d'`implement-feature-v2`.
+- **Backend** : **éphémère auto-géré + isolé** (BOB_DATA_DIR temp, DB fraîche, port
+  dédié) ; boot→run→teardown en un ordre. Zéro pollution de l'état réel. `--external`
+  plus tard.
+- **LLM** : **fake scriptable par défaut** (déterministe, offline, CI) ; **`--real`**
+  opt-in pour l'e2e vrai. Précédent : Bob fake déjà le SDK LM Studio en test.
+
+**Conséquences PRD :**
+- Nouveau **fake LLM backend** scriptable (via le switch provider de `factory.py`, ou
+  injection de test) — réutilise le pattern de fake SDK existant.
+- Le mode `--audio` **dépend du canal binaire WS** (conflit #3) + STT → atterrit après ;
+  le **squelette harnais** (mode text, black-box WS, fake LLM, runner de scénarios,
+  verdict JSON) peut être la **1re issue** (foundation) → tout le reste devient
+  attestable dès le départ.
+- Rend la feature **auto-vérifiante** : chaque slice ship + son attestation.
 
 ---
 
