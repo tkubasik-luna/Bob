@@ -48,6 +48,7 @@ class _FakeSwitcher:
         self.provider_error = provider_error
         self.provider_calls: list[str] = []
         self.model_calls: list[tuple[str, int | None]] = []
+        self.base_url_calls: list[str] = []
 
     async def swap_provider(self, provider: str) -> SwapResult:
         self.provider_calls.append(provider)
@@ -60,6 +61,13 @@ class _FakeSwitcher:
         self, model_id: str, context_length: int | None = None
     ) -> SwapResult:
         self.model_calls.append((model_id, context_length))
+        assert self.provider_result is not None
+        return self.provider_result
+
+    async def swap_base_url(self, base_url: str) -> SwapResult:
+        self.base_url_calls.append(base_url)
+        if self.provider_error is not None:
+            raise self.provider_error
         assert self.provider_result is not None
         return self.provider_result
 
@@ -251,3 +259,57 @@ def test_put_provider_503_when_switcher_not_wired() -> None:
 
     assert response.status_code == 503
     assert response.json()["error"] == "swap_unavailable"
+
+
+def test_put_base_url_dispatches_to_swap_base_url() -> None:
+    selection = LLMSelection(
+        provider="lm_studio",
+        lm_model="qwen2.5-7b-instruct",
+        context_length={},
+        base_url="http://192.168.1.20:1234/v1",
+    )
+    switcher = _FakeSwitcher(provider_result=SwapResult(selection=selection))
+    client = _client(switcher)
+    try:
+        resp = client.put("/api/llm/selection", json={"base_url": "http://192.168.1.20:1234/v1"})
+    finally:
+        _reset()
+    assert resp.status_code == 200
+    assert switcher.base_url_calls == ["http://192.168.1.20:1234/v1"]
+    assert resp.json()["base_url"] == "http://192.168.1.20:1234/v1"
+
+
+def test_put_base_url_swaps_even_when_server_unreachable() -> None:
+    """No reachability gate — user must be able to re-point a dead server."""
+    switcher = _FakeSwitcher(
+        provider_result=SwapResult(
+            selection=LLMSelection(
+                provider="lm_studio",
+                lm_model="boot-model",
+                context_length={},
+                base_url="http://10.0.0.9:9999/v1",
+            )
+        )
+    )
+    client = _client(switcher)
+    try:
+        resp = client.put("/api/llm/selection", json={"base_url": "http://10.0.0.9:9999/v1"})
+    finally:
+        _reset()
+    assert resp.status_code == 200
+    assert switcher.base_url_calls == ["http://10.0.0.9:9999/v1"]
+
+
+def test_put_rejects_two_mutations_at_once() -> None:
+    switcher = _FakeSwitcher()
+    client = _client(switcher)
+    try:
+        resp = client.put(
+            "/api/llm/selection",
+            json={"provider": "lm_studio", "base_url": "http://x/v1"},
+        )
+    finally:
+        _reset()
+    assert resp.status_code == 422
+    assert switcher.base_url_calls == []
+    assert switcher.provider_calls == []

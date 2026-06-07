@@ -46,6 +46,11 @@ def _apply_selection(settings: Settings, selection: LLMSelection | None) -> Sett
     update: dict[str, object] = {"LLM_PROVIDER": selection.provider}
     if selection.lm_model:
         update["LLM_MODEL"] = selection.lm_model
+    # Runtime URL swap (picker URL field): the persisted base_url overrides the
+    # frozen ``.env`` ``LLM_BASE_URL`` so the inference ``openai`` client points
+    # at the chosen server. ``None`` keeps the ``.env`` value.
+    if selection.base_url:
+        update["LLM_BASE_URL"] = selection.base_url
     return settings.model_copy(update=update)
 
 

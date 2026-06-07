@@ -43,7 +43,7 @@ from bob.context.policy import (
 from bob.llm.factory import build_jarvis_client, build_subagent_client
 from bob.llm_client import LLMClient
 from bob.llm_selection_store import LLMSelection, LLMSelectionStore
-from bob.lm_studio_manager import LMStudioManager
+from bob.lm_studio_manager import LMStudioManager, host_from_base_url
 from bob.orchestrator import Orchestrator
 
 #: Providers the live switch (issue 0081) accepts. The selection model uses the
@@ -163,9 +163,18 @@ class LLMSwitcher:
                 else self._resolve_context_length(current, model_id)
             )
 
-            # 1. Load the target (+ unload previous). Blocking SDK call → thread.
-            #    A raised error exits the lock with NO state mutation.
-            await asyncio.to_thread(self._manager.load, model_id, effective_ctx)
+            # 1. Load the target (offload others first). Blocking SDK call →
+            #    thread. A raised error exits the lock with NO state mutation.
+            #    ``reload`` is forced only on an EXPLICIT ctx Apply (issue 0082):
+            #    a plain re-select of an already-resident model is a no-op load
+            #    (kept resident, just re-pinned) so we don't needlessly offload
+            #    + reload a model that is already loaded.
+            await asyncio.to_thread(
+                self._manager.load,
+                model_id,
+                effective_ctx,
+                reload=context_length is not None,
+            )
 
             # 2. Build the next selection (preserve provider + the ctx map, and
             #    pin an explicit ctx override for this model when supplied).
@@ -193,9 +202,10 @@ class LLMSwitcher:
         consumers read their client reference per request / per task), and
         validate-the-TARGET-before-mutating-anything:
 
-        - ``lm_studio`` target → probe the LM Studio server is reachable
-          (:meth:`LMStudioManager.list_models`, a no-load management call). An
-          unreachable server raises :class:`~bob.lm_studio_manager.LMStudioUnavailableError`.
+        - ``lm_studio`` target → NO reachability gate. User must be able to
+          switch to LM Studio even when the currently-configured server is
+          offline (so they can then re-point ``base_url`` to a live one).
+          Reachability surfaces in the UI's ping chip post-swap.
         - ``claude_cli`` target → verify the ``claude`` binary is on ``PATH``
           via ``shutil.which(settings.CLAUDE_CLI_BIN)``; absence raises
           :class:`ClaudeCliUnavailableError`.
@@ -217,13 +227,10 @@ class LLMSwitcher:
         async with self._lock:
             current = self._selection_store.read()
 
-            # 1. Validate the TARGET before touching any state. A raised error
-            #    exits the lock with no rebuild and no write.
-            if provider == "lm_studio":
-                # Reachability probe — a management list call (no model load).
-                # Blocking SDK call → worker thread so the loop is not parked.
-                await asyncio.to_thread(self._manager.list_models)
-            else:  # claude_cli
+            # 1. Validate the TARGET. lm_studio: no gate (user must be able
+            #    to switch even when the current server is offline). claude_cli:
+            #    binary must exist on PATH.
+            if provider == "claude_cli":
                 if shutil.which(self._settings.CLAUDE_CLI_BIN) is None:
                     raise ClaudeCliUnavailableError(
                         f"Claude CLI binary not found on PATH: "
@@ -260,6 +267,55 @@ class LLMSwitcher:
             self._selection_store.write(new_selection)
             return SwapResult(selection=new_selection)
 
+    async def swap_base_url(self, base_url: str) -> SwapResult:
+        """Swap the LM Studio inference/management base URL — no reachability gate.
+
+        Lock-guarded. The new URL drives BOTH the ``openai`` inference client
+        (via the factory's ``LLM_BASE_URL`` override) and the management SDK
+        host (derived ``host:port``).
+
+        The target is NOT probed: the user must be able to re-point the server
+        even when the current one is dead (and the next one not yet up). The
+        UI's ping chip reflects live reachability post-swap.
+
+        Steps: derive host → repoint manager → build next selection → rebuild
+        both role clients → persist. Token budget left untouched.
+        """
+
+        url = base_url.strip()
+        if not url:
+            raise UnknownProviderError("base_url must be a non-empty string")
+
+        async with self._lock:
+            current = self._selection_store.read()
+            new_host = host_from_base_url(url)
+
+            self._manager.set_host(new_host)
+            new_selection = self._next_base_url_selection(current, url)
+
+            self._orchestrator.set_jarvis_client(
+                build_jarvis_client(self._settings, new_selection)
+            )
+            self._subagent_holder.set(build_subagent_client(self._settings, new_selection))
+
+            self._selection_store.write(new_selection)
+            return SwapResult(selection=new_selection)
+
+    @staticmethod
+    def _next_base_url_selection(current: LLMSelection | None, base_url: str) -> LLMSelection:
+        """Build the selection to persist after a successful base-URL swap.
+
+        Only ``base_url`` changes; provider / pinned model / ctx map round-trip
+        unchanged.
+        """
+
+        return LLMSelection(
+            provider=current.provider if current is not None else "lm_studio",
+            lm_model=current.lm_model if current is not None else None,
+            context_length=dict(current.context_length) if current is not None else {},
+            base_url=base_url,
+        )
+
     @staticmethod
     def _next_provider_selection(current: LLMSelection | None, provider: str) -> LLMSelection:
         """Build the selection to persist after a successful provider switch.
@@ -271,10 +327,12 @@ class LLMSwitcher:
 
         lm_model = current.lm_model if current is not None else None
         context_length = dict(current.context_length) if current is not None else {}
+        base_url = current.base_url if current is not None else None
         return LLMSelection(
             provider=provider,
             lm_model=lm_model,
             context_length=context_length,
+            base_url=base_url,
         )
 
     @staticmethod
@@ -308,12 +366,14 @@ class LLMSwitcher:
 
         provider = current.provider if current is not None else "lm_studio"
         ctx_map = dict(current.context_length) if current is not None else {}
+        base_url = current.base_url if current is not None else None
         if context_length is not None:
             ctx_map[model_id] = context_length
         return LLMSelection(
             provider=provider,
             lm_model=model_id,
             context_length=ctx_map,
+            base_url=base_url,
         )
 
 

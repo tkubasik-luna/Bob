@@ -211,6 +211,30 @@ class LMStudioManager:
 
         return self._host
 
+    def set_host(self, host: str) -> None:
+        """Repoint the manager at a new ``host:port`` (runtime URL swap).
+
+        Each management call opens a fresh client at ``self._host``, so a later
+        call simply targets the new host — no persistent connection to rebuild.
+        Used by :meth:`bob.llm_swap.LLMSwitcher.swap_base_url`.
+        """
+
+        self._host = host
+
+    def probe(self) -> bool:
+        """Return whether the LM Studio server is reachable (a real ping).
+
+        A lightweight management round-trip (``list_loaded_models``) that never
+        raises: an unreachable server collapses to ``False``. Backs the
+        ``GET /api/llm/ping`` health check the picker uses to confirm "online".
+        """
+
+        try:
+            self.loaded_model_ids()
+        except LMStudioUnavailableError:
+            return False
+        return True
+
     def list_models(self) -> list[LMStudioModel]:
         """Return the live list of chat-capable downloaded models.
 
@@ -281,17 +305,26 @@ class LMStudioManager:
                 ids.append(identifier)
         return ids
 
-    def load(self, model_id: str, context_length: int | None = None) -> None:
-        """Load ``model_id`` into LM Studio, unloading any previously-loaded models.
+    def load(
+        self, model_id: str, context_length: int | None = None, *, reload: bool = False
+    ) -> None:
+        """Load ``model_id`` into LM Studio, offloading every other model first.
 
-        Validate-then-swap at the SDK boundary (issue 0080):
+        Offload-BEFORE-load at the SDK boundary (the user's stated ask — frees
+        VRAM so a fresh load can't OOM against the previous resident model):
 
         1. Snapshot the currently-loaded model identifiers.
-        2. ``load_new_instance(model_id, config={"contextLength": …})`` — load
-           the target with the default context length (omitted when ``None`` so
-           the SDK applies the model default).
-        3. On success, unload every *previously*-loaded model so memory does not
-           grow unbounded across swaps; the freshly-loaded target is kept.
+        2. **Already loaded + not a forced reload** → no-op: keep the resident
+           instance and simply let the caller pin it as the selection. We do NOT
+           offload it ("if a model is already loaded and I select it, don't
+           offload it, just select it").
+        3. Otherwise unload EVERY currently-loaded model (including the target on
+           a forced ``reload``) so memory is freed before the new load.
+        4. ``load_new_instance(model_id, config={"contextLength": …})`` — load
+           the target (ctx omitted when ``None`` → SDK default).
+
+        ``reload`` forces a fresh load even when the target is already resident —
+        used by the ctx-slider Apply path, which must re-load at the new window.
 
         Errors are surfaced as DISTINCT, catchable types so the swap coordinator
         keeps the previous selection and the REST layer maps them cleanly:
@@ -300,13 +333,26 @@ class LMStudioManager:
         - unknown model id → :class:`LMStudioModelNotFoundError`
         - load failed (e.g. OOM) → :class:`LMStudioLoadError`
 
-        The unload of the previous models happens only AFTER a successful load,
-        so a failed load leaves the prior model resident (non-destructive).
+        TRADEOFF: offloading first means a failed load leaves NO model resident
+        (the previous one is already evicted). The caller surfaces the error and
+        the user reselects — accepted to kill the OOM/double-load flakiness.
         """
 
         client = self._open_client()
         try:
             previous = self._loaded_ids(client)
+
+            # Already loaded + plain select → keep it resident, offload nothing.
+            if model_id in previous and not reload:
+                return
+
+            # Free VRAM BEFORE loading the new model: unload every resident
+            # instance (incl. the target on a forced reload). Best-effort —
+            # an unload that fails must not abort the load.
+            for identifier in previous:
+                with contextlib.suppress(lmstudio.LMStudioError):
+                    client.llm.unload(identifier)
+
             config: dict[str, object] | None = None
             if context_length is not None:
                 config = {"contextLength": context_length}
@@ -322,15 +368,6 @@ class LMStudioManager:
                 raise LMStudioLoadError(
                     f"LM Studio failed to load {model_id!r}: {exc}"
                 ) from exc
-
-            # Load succeeded — evict the models that were resident before so a
-            # long-running session does not accumulate loaded instances. The new
-            # target id is excluded even if it collides with a previous id.
-            for identifier in previous:
-                if identifier == model_id:
-                    continue
-                with contextlib.suppress(lmstudio.LMStudioError):
-                    client.llm.unload(identifier)
         finally:
             self._safe_close(client)
 

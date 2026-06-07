@@ -11,7 +11,8 @@ shape::
     {
         "provider": "lm_studio",
         "lm_model": "qwen2.5-7b-instruct",
-        "context_length": {"qwen2.5-7b-instruct": 32768}
+        "context_length": {"qwen2.5-7b-instruct": 32768},
+        "base_url": "http://192.168.1.20:1234/v1"
     }
 
 Precedence / seeding (PRD 0012 / issue 0078):
@@ -58,6 +59,12 @@ class LLMSelection:
     provider: str
     lm_model: str | None
     context_length: dict[str, int] = field(default_factory=dict)
+    #: The OpenAI-compatible inference base URL for the LM Studio provider (e.g.
+    #: ``http://192.168.1.20:1234/v1``). Drives BOTH the inference ``openai``
+    #: client (via the factory) and the management SDK host (derived host:port).
+    #: ``None`` falls back to ``settings.LLM_BASE_URL``. Runtime-swappable via the
+    #: picker's URL field (``PUT /api/llm/selection {base_url}``).
+    base_url: str | None = None
 
     def as_dict(self) -> dict[str, object]:
         """Serialise to the on-disk / REST JSON shape."""
@@ -66,6 +73,7 @@ class LLMSelection:
             "provider": self.provider,
             "lm_model": self.lm_model,
             "context_length": dict(self.context_length),
+            "base_url": self.base_url,
         }
 
 
@@ -109,6 +117,7 @@ class LLMSelectionStore:
                 provider=settings.LLM_PROVIDER,
                 lm_model=settings.LLM_MODEL,
                 context_length={},
+                base_url=settings.LLM_BASE_URL or None,
             )
             self._write_unlocked(seeded)
             return seeded
@@ -177,7 +186,15 @@ def _decode_selection(raw: object) -> LLMSelection:
             if isinstance(key, str) and isinstance(value, int) and not isinstance(value, bool):
                 context_length[key] = value
 
-    return LLMSelection(provider=provider, lm_model=lm_model, context_length=context_length)
+    base_url_raw = data.get("base_url")
+    base_url = base_url_raw if isinstance(base_url_raw, str) and base_url_raw else None
+
+    return LLMSelection(
+        provider=provider,
+        lm_model=lm_model,
+        context_length=context_length,
+        base_url=base_url,
+    )
 
 
 # --- Singleton plumbing -------------------------------------------------------

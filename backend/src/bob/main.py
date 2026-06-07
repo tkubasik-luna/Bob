@@ -131,7 +131,12 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
     # LM Studio management manager (PRD 0012 / issue 0079-0080). Single boundary
     # onto the ``lmstudio`` SDK for cold-start resolution + the live model swap.
-    lm_studio_manager = LMStudioManager(host=host_from_base_url(settings.LLM_BASE_URL))
+    # Host derives from the PERSISTED base_url (picker URL swap) when set, else
+    # the frozen .env LLM_BASE_URL — so a server chosen in a prior session is
+    # honoured on the next boot.
+    lm_studio_manager = LMStudioManager(
+        host=host_from_base_url(seeded_selection.base_url or settings.LLM_BASE_URL)
+    )
 
     # Cold-start resolution (issue 0080): provider is LM Studio with no model
     # pinned anywhere → adopt the model already loaded in LM Studio if any, else
@@ -144,6 +149,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
                 provider=seeded_selection.provider,
                 lm_model=resolved,
                 context_length=seeded_selection.context_length,
+                base_url=seeded_selection.base_url,
             )
             llm_selection_store.write(seeded_selection)
             _logger.info("bob.llm.cold_start_resolved", lm_model=resolved)

@@ -230,9 +230,43 @@ def test_load_loads_target_and_unloads_previous() -> None:
 
     # Loaded the target with the default ctx folded into the SDK config.
     assert llm.loaded == [("qwen2.5-7b-instruct", {"contextLength": 8192})]
-    # Previously-loaded model evicted AFTER the successful load.
+    # Previously-loaded model evicted BEFORE the load (offload-first frees VRAM).
     assert llm.unloaded == ["old-model"]
     assert client.closed is True
+
+
+def test_load_already_loaded_plain_select_is_noop() -> None:
+    # The target is already resident and this is a plain select (no reload):
+    # keep it loaded, offload nothing, load nothing ("just select it").
+    llm = _FakeLlmNamespace()
+    client = _FakeClient(
+        _catalogue(),
+        loaded=[_FakeLoaded("qwen2.5-7b-instruct"), _FakeLoaded("other-model")],
+        llm=llm,
+    )
+
+    manager = LMStudioManager(host="h", client_factory=lambda _h: client)
+    manager.load("qwen2.5-7b-instruct")
+
+    assert llm.loaded == []  # no reload
+    assert llm.unloaded == []  # the resident target (and peers) left untouched
+
+
+def test_load_already_loaded_with_reload_evicts_all_and_reloads() -> None:
+    # Forced reload (ctx Apply): the resident target IS evicted then reloaded at
+    # the new window, and other residents are freed too.
+    llm = _FakeLlmNamespace()
+    client = _FakeClient(
+        _catalogue(),
+        loaded=[_FakeLoaded("qwen2.5-7b-instruct"), _FakeLoaded("other-model")],
+        llm=llm,
+    )
+
+    manager = LMStudioManager(host="h", client_factory=lambda _h: client)
+    manager.load("qwen2.5-7b-instruct", context_length=4096, reload=True)
+
+    assert llm.loaded == [("qwen2.5-7b-instruct", {"contextLength": 4096})]
+    assert set(llm.unloaded) == {"qwen2.5-7b-instruct", "other-model"}
 
 
 def test_load_without_context_length_omits_config() -> None:
@@ -259,8 +293,9 @@ def test_load_unknown_model_raises_not_found_and_keeps_previous() -> None:
     else:  # pragma: no cover
         raise AssertionError("expected LMStudioModelNotFoundError")
 
-    # The previous model is NOT unloaded on a failed load (non-destructive).
-    assert llm.unloaded == []
+    # Offload-first: the previous model is evicted BEFORE the (failing) load, so
+    # a failed load leaves no model resident (accepted tradeoff to kill OOM).
+    assert llm.unloaded == ["old-model"]
 
 
 def test_load_failure_raises_load_error_and_keeps_previous() -> None:
@@ -276,7 +311,8 @@ def test_load_failure_raises_load_error_and_keeps_previous() -> None:
     else:  # pragma: no cover
         raise AssertionError("expected LMStudioLoadError")
 
-    assert llm.unloaded == []
+    # Offload-first: previous evicted before the failing load.
+    assert llm.unloaded == ["old-model"]
 
 
 def test_loaded_model_ids_returns_identifiers() -> None:
@@ -345,6 +381,46 @@ def test_get_models_endpoint_server_down_returns_503() -> None:
     assert "localhost:1234" in body["detail"]
 
 
+# --- GET /api/llm/ping endpoint tests ---------------------------------------
+
+
+def test_ping_endpoint_reachable_server_returns_true() -> None:
+    from bob import llm_router
+
+    client = _FakeClient(_catalogue(), loaded=[_FakeLoaded("qwen2.5-7b-instruct")])
+    manager = LMStudioManager(host="localhost:1234", client_factory=lambda _h: client)
+
+    llm_router.set_manager_provider(lambda: manager)
+    try:
+        api = TestClient(app)
+        response = api.get("/api/llm/ping")
+    finally:
+        llm_router.reset_manager_provider()
+
+    assert response.status_code == 200
+    assert response.json() == {"reachable": True, "host": "localhost:1234"}
+
+
+def test_ping_endpoint_unreachable_server_returns_false_not_error() -> None:
+    from bob import llm_router
+
+    def _boom(_host: str) -> _SDKClient:
+        raise lmstudio.LMStudioWebsocketError("connection refused")
+
+    manager = LMStudioManager(host="localhost:1234", client_factory=_boom)
+
+    llm_router.set_manager_provider(lambda: manager)
+    try:
+        api = TestClient(app)
+        response = api.get("/api/llm/ping")
+    finally:
+        llm_router.reset_manager_provider()
+
+    # Always 200 — the picker reads `reachable`, never an error status.
+    assert response.status_code == 200
+    assert response.json() == {"reachable": False, "host": "localhost:1234"}
+
+
 # --- PUT /api/llm/selection endpoint tests ----------------------------------
 #
 # The route delegates to a :class:`bob.llm_swap.LLMSwitcher`. We inject a fake
@@ -401,6 +477,8 @@ def test_put_selection_success_returns_new_selection() -> None:
         "lm_model": "target-model",
         "context_length": {"target-model": 8192},
         "claude_model": "claude-opus-4",
+        # No pinned base_url on the swap result → falls back to LLM_BASE_URL.
+        "base_url": "http://localhost:1234/v1",
     }
 
 

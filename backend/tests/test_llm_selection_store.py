@@ -40,11 +40,13 @@ def test_first_boot_seeds_from_settings_and_persists(tmp_path: Path) -> None:
 
     # The JSON file now exists with the seeded shape.
     assert path.exists()
+    assert seeded.base_url == "http://localhost:1234/v1"
     on_disk = json.loads(path.read_text(encoding="utf-8"))
     assert on_disk == {
         "provider": "lm_studio",
         "lm_model": "qwen2.5-7b-instruct",
         "context_length": {},
+        "base_url": "http://localhost:1234/v1",
     }
 
 
@@ -134,6 +136,9 @@ def test_get_endpoint_returns_current_selection(tmp_path: Path) -> None:
         "lm_model": "endpoint-model",
         "context_length": {"endpoint-model": 16384},
         "claude_model": "claude-opus-4",
+        # base_url falls back to the active LLM_BASE_URL when the selection
+        # pins none (so the picker shows the server actually loaded).
+        "base_url": "http://localhost:1234/v1",
     }
 
 

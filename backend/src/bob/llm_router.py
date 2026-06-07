@@ -36,6 +36,7 @@ from bob.lm_studio_manager import (
     LMStudioManager,
     LMStudioModelNotFoundError,
     LMStudioUnavailableError,
+    host_from_base_url,
 )
 
 router = APIRouter(prefix="/api/llm", tags=["llm"])
@@ -124,6 +125,7 @@ class LLMSelectionResponse(BaseModel):
     lm_model: str | None
     context_length: dict[str, int]
     claude_model: str
+    base_url: str | None = None
 
 
 @router.get("/selection", response_model=LLMSelectionResponse)
@@ -141,12 +143,20 @@ def get_llm_selection() -> LLMSelectionResponse:
     provider = selection.provider if selection is not None else "lm_studio"
     lm_model = selection.lm_model if selection is not None else None
     context_length = selection.context_length if selection is not None else {}
-    claude_model = _settings_provider().CLAUDE_CLI_MODEL or DEFAULT_CLAUDE_MODEL_LABEL
+    settings = _settings_provider()
+    # Report the EFFECTIVE base URL: the picker must show the server actually in
+    # use. A selection with no pinned base_url (legacy JSON / .env-seeded) falls
+    # back to the active LLM_BASE_URL rather than a UI placeholder.
+    base_url = (selection.base_url if selection is not None else None) or (
+        settings.LLM_BASE_URL or None
+    )
+    claude_model = settings.CLAUDE_CLI_MODEL or DEFAULT_CLAUDE_MODEL_LABEL
     return LLMSelectionResponse(
         provider=provider,
         lm_model=lm_model,
         context_length=context_length,
         claude_model=claude_model,
+        base_url=base_url,
     )
 
 
@@ -211,6 +221,35 @@ def get_llm_models() -> JSONResponse:
     return JSONResponse(status_code=status.HTTP_200_OK, content=payload.model_dump())
 
 
+class LLMPingResponse(BaseModel):
+    """Body for ``GET /api/llm/ping`` — a real LM Studio reachability probe."""
+
+    reachable: bool
+    host: str
+
+
+@router.get("/ping", response_model=LLMPingResponse)
+def ping_llm(base_url: str | None = None) -> JSONResponse:
+    """Probe whether an LM Studio server is reachable (a real online ping).
+
+    With ``?base_url=`` set, probes that CANDIDATE server (used by the picker's
+    URL field to confirm a typed/preset URL before committing it). Without it,
+    probes the CURRENTLY-configured server. Always 200 with ``{reachable, host}``
+    — never an error status — so the picker can render an online/offline chip
+    without exception handling.
+    """
+
+    if base_url:
+        host = host_from_base_url(base_url)
+        manager: LMStudioManager = LMStudioManager(host=host)
+    else:
+        manager = _manager_provider()
+        host = manager.host
+    reachable = manager.probe()
+    body = LLMPingResponse(reachable=reachable, host=host)
+    return JSONResponse(status_code=status.HTTP_200_OK, content=body.model_dump())
+
+
 class LLMSelectionUpdateRequest(BaseModel):
     """Body for ``PUT /api/llm/selection``.
 
@@ -232,6 +271,7 @@ class LLMSelectionUpdateRequest(BaseModel):
     lm_model: str | None = None
     provider: str | None = None
     context_length: int | None = None
+    base_url: str | None = None
 
 
 class LLMSelectionUpdateErrorResponse(BaseModel):
@@ -255,12 +295,15 @@ def _selection_payload(selection: object) -> JSONResponse:
 
     # ``selection`` is an ``LLMSelection``; typed loosely to keep the import
     # surface here unchanged (the value object lives in the swap result).
-    claude_model = _settings_provider().CLAUDE_CLI_MODEL or DEFAULT_CLAUDE_MODEL_LABEL
+    settings = _settings_provider()
+    claude_model = settings.CLAUDE_CLI_MODEL or DEFAULT_CLAUDE_MODEL_LABEL
+    base_url = selection.base_url or (settings.LLM_BASE_URL or None)  # type: ignore[attr-defined]
     payload = LLMSelectionResponse(
         provider=selection.provider,  # type: ignore[attr-defined]
         lm_model=selection.lm_model,  # type: ignore[attr-defined]
         context_length=selection.context_length,  # type: ignore[attr-defined]
         claude_model=claude_model,
+        base_url=base_url,
     )
     return JSONResponse(status_code=status.HTTP_200_OK, content=payload.model_dump())
 
@@ -299,14 +342,15 @@ async def put_llm_selection(body: LLMSelectionUpdateRequest) -> JSONResponse:
 
     has_model = body.lm_model is not None
     has_provider = body.provider is not None
-    if has_model == has_provider:
+    has_base_url = body.base_url is not None
+    if (has_model + has_provider + has_base_url) != 1:
         return _error_response(
             "invalid_request",
-            "Exactly one of 'lm_model' or 'provider' must be provided",
+            "Exactly one of 'lm_model', 'provider' or 'base_url' must be provided",
             status.HTTP_422_UNPROCESSABLE_ENTITY,
         )
 
-    if has_provider and body.context_length is not None:
+    if not has_model and body.context_length is not None:
         return _error_response(
             "invalid_request",
             "'context_length' is only valid alongside 'lm_model'",
@@ -329,6 +373,8 @@ async def put_llm_selection(body: LLMSelectionUpdateRequest) -> JSONResponse:
 
     if has_provider:
         return await _handle_provider_swap(body.provider or "")
+    if has_base_url:
+        return await _handle_base_url_swap(body.base_url or "")
     return await _handle_model_swap(body.lm_model or "", body.context_length)
 
 
@@ -385,4 +431,24 @@ async def _handle_provider_swap(provider: str) -> JSONResponse:
         return _error_response(
             "lm_studio_unavailable", str(exc), status.HTTP_503_SERVICE_UNAVAILABLE
         )
+    return _selection_payload(result.selection)
+
+
+async def _handle_base_url_swap(base_url: str) -> JSONResponse:
+    """Run the LM Studio base-URL swap and map outcomes to HTTP.
+
+    The target is NOT probed: the user must be able to re-point the server
+    even when the current one is dead. Reachability surfaces in the UI's ping
+    chip post-swap.
+    """
+
+    assert _switcher is not None  # guarded by the caller
+    url = base_url.strip()
+    if not url:
+        return _error_response(
+            "invalid_request",
+            "base_url must be a non-empty string",
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+        )
+    result = await _switcher.swap_base_url(url)
     return _selection_payload(result.selection)

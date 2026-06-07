@@ -56,19 +56,27 @@ class _FakeManager:
     def __init__(self, load_error: Exception | None = None) -> None:
         self.load_error = load_error
         self.loads: list[tuple[str, int | None]] = []
+        self.reloads: list[bool] = []
+        self.host = "localhost:1234"
         self._loaded_ids: list[str] = []
         self._models: list[LMStudioModel] = []
 
-    def load(self, model_id: str, context_length: int | None = None) -> None:
+    def load(
+        self, model_id: str, context_length: int | None = None, *, reload: bool = False
+    ) -> None:
         if self.load_error is not None:
             raise self.load_error
         self.loads.append((model_id, context_length))
+        self.reloads.append(reload)
 
     def loaded_model_ids(self) -> list[str]:
         return list(self._loaded_ids)
 
     def list_models(self) -> list[LMStudioModel]:
         return list(self._models)
+
+    def set_host(self, host: str) -> None:
+        self.host = host
 
 
 class _OrchestratorSpy:
@@ -205,7 +213,9 @@ async def test_lock_serialises_concurrent_swaps(tmp_path: Path) -> None:
     guard = threading.Lock()
 
     class _SerialManager(_FakeManager):
-        def load(self, model_id: str, context_length: int | None = None) -> None:
+        def load(
+            self, model_id: str, context_length: int | None = None, *, reload: bool = False
+        ) -> None:
             # Runs in a worker thread (via to_thread). If the asyncio.Lock
             # failed to serialise, the two ``load`` bodies would overlap here;
             # we hold the body open with a sleep so any overlap is observable.
@@ -415,8 +425,8 @@ async def test_swap_provider_to_lm_studio_when_reachable(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
-async def test_swap_provider_to_lm_studio_unreachable_keeps_previous(tmp_path: Path) -> None:
-    """LM Studio target with an unreachable server → error, previous provider kept, no write."""
+async def test_swap_provider_to_lm_studio_unreachable_still_swaps(tmp_path: Path) -> None:
+    """No reachability gate — user must be able to switch to LM Studio even when offline."""
 
     class _UnreachableManager(_FakeManager):
         def list_models(self) -> list[LMStudioModel]:
@@ -429,14 +439,14 @@ async def test_swap_provider_to_lm_studio_unreachable_keeps_previous(tmp_path: P
     old_jarvis = orch.jarvis_client
     old_subagent = holder.client
 
-    with pytest.raises(LMStudioUnavailableError):
-        await switcher.swap_provider("lm_studio")
+    result = await switcher.swap_provider("lm_studio")
 
-    assert orch.jarvis_client is old_jarvis
-    assert holder.client is old_subagent
+    assert orch.jarvis_client is not old_jarvis
+    assert holder.client is not old_subagent
     persisted = store.read()
     assert persisted is not None
-    assert persisted.provider == "claude_cli"
+    assert persisted.provider == "lm_studio"
+    assert result.selection.provider == "lm_studio"
 
 
 @pytest.mark.asyncio
@@ -502,3 +512,65 @@ def test_cold_start_unreachable_server_returns_none() -> None:
     manager = _BoomManager()
     selection = LLMSelection(provider="lm_studio", lm_model=None, context_length={})
     assert resolve_cold_start_model(selection, cast(Any, manager)) is None
+
+
+# --- base-URL swap (runtime LM Studio server reconfig) ----------------------
+
+
+@pytest.mark.asyncio
+async def test_swap_base_url_repoints_host_rebuilds_and_persists(tmp_path: Path) -> None:
+    manager = _FakeManager()
+    initial = LLMSelection(
+        provider="lm_studio",
+        lm_model="boot-model",
+        context_length={},
+        base_url="http://localhost:1234/v1",
+    )
+    switcher, orch, holder, store = _switcher(tmp_path, manager=manager, initial=initial)
+    jarvis_before, sub_before = orch.jarvis_client, holder.client
+
+    result = await switcher.swap_base_url("http://192.168.1.20:1234/v1")
+
+    # Manager repointed to the derived host:port (scheme + /v1 stripped).
+    assert manager.host == "192.168.1.20:1234"
+    # Both role clients rebuilt + swapped.
+    assert orch.jarvis_client is not jarvis_before
+    assert holder.client is not sub_before
+    # Persisted: only base_url changed; model + provider preserved.
+    persisted = store.read()
+    assert persisted is not None
+    assert persisted.base_url == "http://192.168.1.20:1234/v1"
+    assert persisted.lm_model == "boot-model"
+    assert persisted.provider == "lm_studio"
+    assert result.selection.base_url == "http://192.168.1.20:1234/v1"
+
+
+@pytest.mark.asyncio
+async def test_swap_base_url_unreachable_still_swaps(tmp_path: Path) -> None:
+    """No reachability gate: user must be able to re-point a dead server."""
+
+    class _UnreachableManager(_FakeManager):
+        def list_models(self) -> list[LMStudioModel]:
+            raise LMStudioUnavailableError("connection refused")
+
+    manager = _UnreachableManager()
+    manager.set_host("localhost:1234")
+    initial = LLMSelection(
+        provider="lm_studio",
+        lm_model="boot-model",
+        context_length={},
+        base_url="http://localhost:1234/v1",
+    )
+    switcher, orch, holder, store = _switcher(tmp_path, manager=manager, initial=initial)
+    jarvis_before, sub_before = orch.jarvis_client, holder.client
+
+    result = await switcher.swap_base_url("http://10.0.0.9:9999/v1")
+
+    # Host repointed; both clients rebuilt; selection persisted.
+    assert manager.host == "10.0.0.9:9999"
+    assert orch.jarvis_client is not jarvis_before
+    assert holder.client is not sub_before
+    persisted = store.read()
+    assert persisted is not None
+    assert persisted.base_url == "http://10.0.0.9:9999/v1"
+    assert result.selection.base_url == "http://10.0.0.9:9999/v1"
