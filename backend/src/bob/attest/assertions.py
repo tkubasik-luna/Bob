@@ -199,6 +199,53 @@ def check_deliverable_nonempty(spec: dict[str, Any], ctx: AssertionContext) -> A
     )
 
 
+def _llm_call_model(event: CapturedEvent) -> str | None:
+    """Return the model of an ``category="llm"`` call event, else ``None``.
+
+    Every real :class:`bob.llm_client.LLMClient` emits a ``category="llm"`` debug
+    event carrying ``payload.model`` at each call site (see ``llm_client.py``).
+    That is the only place a served model surfaces on the black-box ``/ws/debug``
+    stream the harness sees.
+    """
+
+    if event.get("category") != "llm":
+        return None
+    payload = event.get("payload") or {}
+    model = payload.get("model")
+    return model if isinstance(model, str) and model else None
+
+
+def check_role_used_model(spec: dict[str, Any], ctx: AssertionContext) -> AssertionResult:
+    """PASS iff a model named ``spec['model']`` served at least one LLM call.
+
+    Spec: ``{kind: role_used_model, role: jarvis, model: modelA}`` (Annexe C).
+    Reads the ``payload.model`` of captured ``category="llm"`` events.
+
+    Scope note (PRD 0016 / issue 0106): per-role clients are not yet wired into
+    the app boot, and LLM-call events do not yet carry the role, so this checks
+    the *model* invariant (the expected model served a call) rather than the full
+    role→model correlation. ``role`` is echoed into the detail and the assertion
+    tightens to require a role-tagged event once per-role boot wiring lands (the
+    role-picker slice). Under the ``fake`` provider no ``category="llm"`` event is
+    emitted, so the end-to-end scenario runs with ``--real`` until then.
+    """
+
+    role = spec.get("role")
+    expected = spec.get("model")
+    if not isinstance(expected, str) or not expected:
+        return AssertionResult(
+            kind="role_used_model",
+            ok=False,
+            detail={"error": "role_used_model requires a 'model' string", "role": role},
+        )
+    models_seen = sorted({m for m in (_llm_call_model(e) for e in ctx.events) if m})
+    return AssertionResult(
+        kind="role_used_model",
+        ok=expected in models_seen,
+        detail={"role": role, "expected_model": expected, "models_seen": models_seen},
+    )
+
+
 # --- registry ----------------------------------------------------------------
 
 #: Assertion implementation type — pure function over (spec, context).
@@ -260,3 +307,4 @@ def run_assertion(spec: dict[str, Any], ctx: AssertionContext) -> AssertionResul
 register_assertion("event_emitted", check_event_emitted)
 register_assertion("no_error_events", check_no_error_events)
 register_assertion("deliverable_nonempty", check_deliverable_nonempty)
+register_assertion("role_used_model", check_role_used_model)

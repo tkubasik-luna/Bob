@@ -398,8 +398,16 @@ class LMStudioClient(LLMClient):
     endpoint) via :class:`Settings`.
     """
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, *, model: str | None = None) -> None:
         self._settings = settings
+        # PRD 0016 / issue 0106 — per-role model routing. Each role builds its
+        # own ``LMStudioClient`` pinned to the role's model + base_url; the wire
+        # ``model`` param is this pinned value (``model`` arg) when given, else
+        # the frozen ``settings.LLM_MODEL``. The base_url is already per-role via
+        # the factory's ``LLM_BASE_URL`` override, so a request goes to the
+        # role's server carrying the role's model. ``None`` preserves the
+        # pre-0106 single-selection behaviour byte-for-byte.
+        self._model_override = model
         self._client = AsyncOpenAI(
             base_url=settings.LLM_BASE_URL,
             api_key=settings.LLM_API_KEY,
@@ -413,6 +421,18 @@ class LMStudioClient(LLMClient):
             self._capability,
             settings.LLM_TOOL_MODE,
         )
+
+    @property
+    def _model(self) -> str | None:
+        """The model id sent on every request (per-role override, else .env).
+
+        Issue 0106 per-role routing: a role-built client pins its own model via
+        the ``model`` constructor arg; the rest of the class reads this property
+        so the wire ``model`` param and every observability payload report the
+        EFFECTIVE model — the role's, not the global ``LLM_MODEL``.
+        """
+
+        return self._model_override or self._settings.LLM_MODEL
 
     def supports_guided_json(self) -> bool:
         """LM Studio gates ``chat(schema=…)`` via ``response_format`` (issue 0060).
@@ -440,7 +460,7 @@ class LMStudioClient(LLMClient):
         messages = _normalise_validator_role(messages, allow_arbitrary_roles=False)
         _assert_standard_roles(messages)
         kwargs: dict[str, Any] = {
-            "model": self._settings.LLM_MODEL,
+            "model": self._model,
             "messages": messages,
             "timeout": self._settings.LLM_TIMEOUT_SECONDS,
             "max_tokens": 4096,
@@ -458,13 +478,10 @@ class LMStudioClient(LLMClient):
             category="llm",
             severity="info",
             source="bob.llm_client.chat",
-            summary=(
-                f"LLM call démarré ({token_estimate} tokens prompt, "
-                f"model={self._settings.LLM_MODEL})"
-            ),
+            summary=(f"LLM call démarré ({token_estimate} tokens prompt, model={self._model})"),
             payload={
                 "messages": messages,
-                "model": self._settings.LLM_MODEL,
+                "model": self._model,
                 "tokens_prompt_estimate": token_estimate,
                 "has_schema": schema is not None,
                 "session_id": session_id,
@@ -483,7 +500,7 @@ class LMStudioClient(LLMClient):
                 source="bob.llm_client.chat",
                 summary=f"LLM call échoué en {latency_ms:.0f}ms: {exc}",
                 payload={
-                    "model": self._settings.LLM_MODEL,
+                    "model": self._model,
                     "latency_ms": latency_ms,
                     "exception": str(exc),
                     "exception_type": exc.__class__.__name__,
@@ -503,7 +520,7 @@ class LMStudioClient(LLMClient):
                 source="bob.llm_client.chat",
                 summary=f"LLM call returned no choices ({latency_ms:.0f}ms)",
                 payload={
-                    "model": self._settings.LLM_MODEL,
+                    "model": self._model,
                     "base_url": self._settings.LLM_BASE_URL,
                     "latency_ms": latency_ms,
                     "raw_completion": completion.model_dump()
@@ -536,7 +553,7 @@ class LMStudioClient(LLMClient):
                 source="bob.llm_client.chat",
                 summary=(f"LLM call returned empty content ({latency_ms:.0f}ms)"),
                 payload={
-                    "model": self._settings.LLM_MODEL,
+                    "model": self._model,
                     "base_url": self._settings.LLM_BASE_URL,
                     "latency_ms": latency_ms,
                     "finish_reason": getattr(choices[0], "finish_reason", None),
@@ -579,7 +596,7 @@ class LMStudioClient(LLMClient):
                 "latency_ms": latency_ms,
                 "tokens_in": tokens_in,
                 "tokens_out": tokens_out,
-                "model": self._settings.LLM_MODEL,
+                "model": self._model,
                 "session_id": session_id,
             },
             correlation_id=correlation_id,
@@ -608,7 +625,7 @@ class LMStudioClient(LLMClient):
         messages = _normalise_validator_role(messages, allow_arbitrary_roles=False)
         _assert_standard_roles(messages)
         kwargs: dict[str, Any] = {
-            "model": self._settings.LLM_MODEL,
+            "model": self._model,
             "messages": messages,
             "timeout": self._settings.LLM_TIMEOUT_SECONDS,
             "max_tokens": 4096,
@@ -631,12 +648,11 @@ class LMStudioClient(LLMClient):
             severity="info",
             source="bob.llm_client.stream_chat",
             summary=(
-                f"LLM chat stream démarré ({token_estimate} tokens prompt, "
-                f"model={self._settings.LLM_MODEL})"
+                f"LLM chat stream démarré ({token_estimate} tokens prompt, model={self._model})"
             ),
             payload={
                 "messages": messages,
-                "model": self._settings.LLM_MODEL,
+                "model": self._model,
                 "tokens_prompt_estimate": token_estimate,
                 "has_schema": schema is not None,
                 "session_id": session_id,
@@ -656,7 +672,7 @@ class LMStudioClient(LLMClient):
                 source="bob.llm_client.stream_chat",
                 summary=f"LLM chat stream échoué en {latency_ms:.0f}ms: {exc}",
                 payload={
-                    "model": self._settings.LLM_MODEL,
+                    "model": self._model,
                     "latency_ms": latency_ms,
                     "exception": str(exc),
                     "exception_type": exc.__class__.__name__,
@@ -755,7 +771,7 @@ class LMStudioClient(LLMClient):
                     "latency_ms": latency_ms,
                     "tokens_in": tokens_in,
                     "tokens_out": tokens_out,
-                    "model": self._settings.LLM_MODEL,
+                    "model": self._model,
                     "session_id": session_id,
                     "streaming": True,
                 },
@@ -773,7 +789,7 @@ class LMStudioClient(LLMClient):
         messages = _normalise_validator_role(messages, allow_arbitrary_roles=False)
         _assert_standard_roles(messages)
         kwargs: dict[str, Any] = {
-            "model": self._settings.LLM_MODEL,
+            "model": self._model,
             "messages": messages,
             "timeout": self._settings.LLM_TIMEOUT_SECONDS,
             "max_tokens": 4096,
@@ -794,13 +810,10 @@ class LMStudioClient(LLMClient):
             category="llm",
             severity="info",
             source="bob.llm_client.complete",
-            summary=(
-                f"LLM call démarré ({token_estimate} tokens prompt, "
-                f"model={self._settings.LLM_MODEL})"
-            ),
+            summary=(f"LLM call démarré ({token_estimate} tokens prompt, model={self._model})"),
             payload={
                 "messages": messages,
-                "model": self._settings.LLM_MODEL,
+                "model": self._model,
                 "tokens_prompt_estimate": token_estimate,
                 "has_tools": bool(tools),
                 "session_id": session_id,
@@ -819,7 +832,7 @@ class LMStudioClient(LLMClient):
                 source="bob.llm_client.complete",
                 summary=f"LLM call échoué en {latency_ms:.0f}ms: {exc}",
                 payload={
-                    "model": self._settings.LLM_MODEL,
+                    "model": self._model,
                     "latency_ms": latency_ms,
                     "exception": str(exc),
                     "exception_type": exc.__class__.__name__,
@@ -839,7 +852,7 @@ class LMStudioClient(LLMClient):
                 source="bob.llm_client.complete",
                 summary=f"LLM call returned no choices ({latency_ms:.0f}ms)",
                 payload={
-                    "model": self._settings.LLM_MODEL,
+                    "model": self._model,
                     "base_url": self._settings.LLM_BASE_URL,
                     "latency_ms": latency_ms,
                     "raw_completion": completion.model_dump()
@@ -872,7 +885,7 @@ class LMStudioClient(LLMClient):
                     source="bob.llm_client.complete",
                     summary=f"LLM call malformed tool args ({latency_ms:.0f}ms)",
                     payload={
-                        "model": self._settings.LLM_MODEL,
+                        "model": self._model,
                         "latency_ms": latency_ms,
                         "arguments_raw": exc.arguments_raw,
                         "exception": str(exc),
@@ -901,7 +914,7 @@ class LMStudioClient(LLMClient):
                     source="bob.llm_client.complete",
                     summary=f"LLM call empty response ({latency_ms:.0f}ms)",
                     payload={
-                        "model": self._settings.LLM_MODEL,
+                        "model": self._model,
                         "latency_ms": latency_ms,
                         "session_id": session_id,
                     },
@@ -944,7 +957,7 @@ class LMStudioClient(LLMClient):
                 "latency_ms": latency_ms,
                 "tokens_in": tokens_in,
                 "tokens_out": tokens_out,
-                "model": self._settings.LLM_MODEL,
+                "model": self._model,
                 "session_id": session_id,
             },
             correlation_id=correlation_id,
@@ -995,7 +1008,7 @@ class LMStudioClient(LLMClient):
         messages = _normalise_validator_role(messages, allow_arbitrary_roles=False)
         _assert_standard_roles(messages)
         kwargs: dict[str, Any] = {
-            "model": self._settings.LLM_MODEL,
+            "model": self._model,
             "messages": messages,
             "timeout": self._settings.LLM_TIMEOUT_SECONDS,
             "max_tokens": 4096,
@@ -1015,13 +1028,10 @@ class LMStudioClient(LLMClient):
             category="llm",
             severity="info",
             source="bob.llm_client.stream_complete",
-            summary=(
-                f"LLM stream démarré ({token_estimate} tokens prompt, "
-                f"model={self._settings.LLM_MODEL})"
-            ),
+            summary=(f"LLM stream démarré ({token_estimate} tokens prompt, model={self._model})"),
             payload={
                 "messages": messages,
-                "model": self._settings.LLM_MODEL,
+                "model": self._model,
                 "tokens_prompt_estimate": token_estimate,
                 "has_tools": bool(tools),
                 "session_id": session_id,
@@ -1045,7 +1055,7 @@ class LMStudioClient(LLMClient):
                 source="bob.llm_client.stream_complete",
                 summary=f"LLM stream échoué en {latency_ms:.0f}ms: {exc}",
                 payload={
-                    "model": self._settings.LLM_MODEL,
+                    "model": self._model,
                     "latency_ms": latency_ms,
                     "exception": str(exc),
                     "exception_type": exc.__class__.__name__,
@@ -1158,7 +1168,7 @@ class LMStudioClient(LLMClient):
                         source="bob.llm_client.stream_complete",
                         summary=(f"LLM stream malformed final args ({latency_ms:.0f}ms)"),
                         payload={
-                            "model": self._settings.LLM_MODEL,
+                            "model": self._model,
                             "latency_ms": latency_ms,
                             "arguments_raw": exc.arguments_raw,
                             "exception": str(exc),
@@ -1205,7 +1215,7 @@ class LMStudioClient(LLMClient):
                     "latency_ms": latency_ms,
                     "tokens_in": tokens_in,
                     "tokens_out": tokens_out,
-                    "model": self._settings.LLM_MODEL,
+                    "model": self._model,
                     "session_id": session_id,
                     "streaming": True,
                 },

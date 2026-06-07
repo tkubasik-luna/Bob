@@ -23,12 +23,17 @@ from pydantic import BaseModel
 
 from bob.config import Settings, get_settings
 from bob.llm_selection_store import (
+    ROLES,
+    LLMSelection,
     LLMSelectionStore,
+    RoleSelectionStore,
+    get_default_role_store,
     get_default_store,
 )
 from bob.llm_swap import (
     ClaudeCliUnavailableError,
     LLMSwitcher,
+    RoleLLMSwitcher,
     UnknownProviderError,
 )
 from bob.lm_studio_manager import (
@@ -52,6 +57,7 @@ def set_switcher(switcher: LLMSwitcher | None) -> None:
 
     global _switcher
     _switcher = switcher
+
 
 # DI seam so the route test can swap the store factory without booting the
 # whole app. Defaults to the process-wide singleton primed by the lifespan.
@@ -106,6 +112,42 @@ def reset_manager_provider() -> None:
 
     global _manager_provider
     _manager_provider = LMStudioManager
+
+
+# --- Per-role DI seams (PRD 0016 / issue 0106) -------------------------------
+#
+# The per-role endpoints (``GET /api/llm/roles`` + ``PUT /api/llm/roles/{role}``)
+# resolve the v2 :class:`RoleSelectionStore` and the per-role swap coordinator
+# through their own seams, mirroring the global ones above so route tests can
+# prime fakes without booting the app lifespan.
+
+_role_store_provider: Callable[[], RoleSelectionStore] = get_default_role_store
+
+#: Per-role swap coordinator. Primed by the app lifespan (needs the orchestrator
+#: + holders). ``None`` until then; the PUT route returns 503 if called before
+#: boot wiring (tests inject their own).
+_role_switcher: RoleLLMSwitcher | None = None
+
+
+def set_role_store_provider(provider: Callable[[], RoleSelectionStore]) -> None:
+    """Override the per-role selection-store factory used by the endpoints."""
+
+    global _role_store_provider
+    _role_store_provider = provider
+
+
+def reset_role_store_provider() -> None:
+    """Restore the default per-role selection-store factory (the singleton)."""
+
+    global _role_store_provider
+    _role_store_provider = get_default_role_store
+
+
+def set_role_switcher(switcher: RoleLLMSwitcher | None) -> None:
+    """Install (or clear) the per-role swap coordinator used by ``PUT /roles/{role}``."""
+
+    global _role_switcher
+    _role_switcher = switcher
 
 
 #: Fallback Claude model label when ``CLAUDE_CLI_MODEL`` is unset, so the
@@ -420,9 +462,7 @@ async def _handle_provider_swap(provider: str) -> JSONResponse:
     try:
         result = await _switcher.swap_provider(provider_id)
     except UnknownProviderError as exc:
-        return _error_response(
-            "unknown_provider", str(exc), status.HTTP_422_UNPROCESSABLE_ENTITY
-        )
+        return _error_response("unknown_provider", str(exc), status.HTTP_422_UNPROCESSABLE_ENTITY)
     except ClaudeCliUnavailableError as exc:
         return _error_response(
             "claude_cli_unavailable", str(exc), status.HTTP_503_SERVICE_UNAVAILABLE
@@ -452,3 +492,179 @@ async def _handle_base_url_swap(base_url: str) -> JSONResponse:
         )
     result = await _switcher.swap_base_url(url)
     return _selection_payload(result.selection)
+
+
+# =============================================================================
+# Per-role selection endpoints — PRD 0016 / issue 0106
+# =============================================================================
+#
+# ``GET  /api/llm/roles``        → the full per-role map (+ stt + budget).
+# ``PUT  /api/llm/roles/{role}`` → swap ONE role's selection; rebuilds ONLY that
+#                                  role's client (the other three are untouched).
+#
+# These sit ALONGSIDE the global ``/selection`` endpoints (unchanged) so the
+# pre-0016 picker keeps working while the per-role picker (frontend, later
+# slice) targets the new surface.
+
+
+class RoleSelectionBody(BaseModel):
+    """One role's selection in the ``GET /roles`` map / the ``PUT`` body.
+
+    Mirrors the flat :class:`bob.llm_selection_store.LLMSelection` on the wire:
+    ``provider`` is ``lm_studio`` | ``claude_cli``; ``base_url`` / ``lm_model``
+    are per-role (a role may pin its own server + model); ``context_length`` is
+    the per-model ctx map round-tripped for budgeting.
+    """
+
+    provider: str
+    base_url: str | None = None
+    lm_model: str | None = None
+    context_length: dict[str, int] = {}
+
+
+class SttSelectionBody(BaseModel):
+    """The ``stt`` block in the ``GET /roles`` response."""
+
+    engine: str
+    model: str
+
+
+class BudgetSelectionBody(BaseModel):
+    """The ``budget`` block in the ``GET /roles`` response."""
+
+    ceiling_gib: float | None = None
+    reserve_gib: float
+    per_host_override: dict[str, float] = {}
+
+
+class RoleMapResponse(BaseModel):
+    """Body for ``GET /api/llm/roles`` (and a successful ``PUT``).
+
+    ``roles`` maps each role id to its :class:`RoleSelectionBody`; ``stt`` /
+    ``budget`` carry the speech + model-budget blocks. ``claude_model`` is the
+    read-only Claude label (mirrors ``GET /selection``) so a per-role Claude
+    pick can render a model name without a separate fetch.
+    """
+
+    schema_version: int
+    roles: dict[str, RoleSelectionBody]
+    stt: SttSelectionBody
+    budget: BudgetSelectionBody
+    claude_model: str
+
+
+def _role_map_payload(selection: object) -> RoleMapResponse:
+    """Project a :class:`RoleSelection` onto the wire response."""
+
+    # Typed loosely to keep the import surface small; ``selection`` is a
+    # :class:`bob.llm_selection_store.RoleSelection`.
+    settings = _settings_provider()
+    claude_model = settings.CLAUDE_CLI_MODEL or DEFAULT_CLAUDE_MODEL_LABEL
+    roles: dict[str, RoleSelectionBody] = {}
+    for role in ROLES:
+        sel = selection.roles[role]  # type: ignore[attr-defined]
+        roles[role] = RoleSelectionBody(
+            provider=sel.provider,
+            base_url=sel.base_url,
+            lm_model=sel.lm_model,
+            context_length=sel.context_length,
+        )
+    stt = selection.stt  # type: ignore[attr-defined]
+    budget = selection.budget  # type: ignore[attr-defined]
+    return RoleMapResponse(
+        schema_version=selection.schema_version,  # type: ignore[attr-defined]
+        roles=roles,
+        stt=SttSelectionBody(engine=stt.engine, model=stt.model),
+        budget=BudgetSelectionBody(
+            ceiling_gib=budget.ceiling_gib,
+            reserve_gib=budget.reserve_gib,
+            per_host_override=budget.per_host_override,
+        ),
+        claude_model=claude_model,
+    )
+
+
+@router.get("/roles", response_model=RoleMapResponse)
+def get_llm_roles() -> RoleMapResponse:
+    """Return the full per-role LLM selection map (+ stt + budget).
+
+    Reads through the per-role store. The boot path seeds it (migrating a flat
+    v1 file forward), so ``read`` never returns ``None`` in the running app; the
+    response falls back to the all-default seed regardless.
+    """
+
+    store = _role_store_provider()
+    selection = store.read()
+    if selection is None:
+        # Not yet seeded (e.g. a test hitting the route without boot): synthesise
+        # the all-default map from .env so the picker always has four roles.
+        selection = _role_store_provider().seed_from_settings(_settings_provider())
+    return _role_map_payload(selection)
+
+
+class RoleSelectionUpdateErrorResponse(BaseModel):
+    """Structured error body for a failed ``PUT /api/llm/roles/{role}``."""
+
+    error: str
+    detail: str
+
+
+def _role_error(code: str, detail: str, http_status: int) -> JSONResponse:
+    """Build a structured ``{error, detail}`` body at ``http_status``."""
+
+    return JSONResponse(
+        status_code=http_status,
+        content=RoleSelectionUpdateErrorResponse(error=code, detail=detail).model_dump(),
+    )
+
+
+@router.put(
+    "/roles/{role}",
+    response_model=RoleMapResponse,
+    responses={
+        status.HTTP_404_NOT_FOUND: {"model": RoleSelectionUpdateErrorResponse},
+        status.HTTP_422_UNPROCESSABLE_ENTITY: {"model": RoleSelectionUpdateErrorResponse},
+        status.HTTP_503_SERVICE_UNAVAILABLE: {"model": RoleSelectionUpdateErrorResponse},
+    },
+)
+async def put_llm_role(role: str, body: RoleSelectionBody) -> JSONResponse:
+    """Swap ONE role's selection; rebuild ONLY that role's client.
+
+    Validates the role id (must be one of the four) and the provider (``lm_studio``
+    | ``claude_cli``) BEFORE any mutation, then delegates to the per-role swap
+    coordinator (:class:`bob.llm_swap.RoleLLMSwitcher`), which rebuilds only the
+    changed role's client and persists the v2 map. The other three roles' clients
+    are untouched.
+
+    Errors → HTTP: unknown role → 404; invalid provider / request → 422; swap not
+    wired (lifespan not running) → 503. Returns the full updated role map.
+    """
+
+    if role not in ROLES:
+        return _role_error(
+            "unknown_role",
+            f"Unknown LLM role: {role!r}. Expected one of {sorted(ROLES)}.",
+            status.HTTP_404_NOT_FOUND,
+        )
+
+    if _role_switcher is None:
+        return _role_error(
+            "swap_unavailable",
+            "Per-role LLM swap coordinator not initialised (app lifespan not running)",
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+
+    selection = LLMSelection(
+        provider=body.provider,
+        lm_model=body.lm_model,
+        context_length=dict(body.context_length),
+        base_url=body.base_url,
+    )
+    try:
+        updated = await _role_switcher.swap_role(role, selection)
+    except UnknownProviderError as exc:
+        return _role_error("unknown_provider", str(exc), status.HTTP_422_UNPROCESSABLE_ENTITY)
+    return JSONResponse(
+        status_code=status.HTTP_200_OK,
+        content=_role_map_payload(updated).model_dump(),
+    )

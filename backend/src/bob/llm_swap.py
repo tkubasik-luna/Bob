@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import shutil
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from bob.config import Settings
@@ -40,9 +41,15 @@ from bob.context.policy import (
     DEFAULT_TOKEN_BUDGET,
     token_budget_for_context_length,
 )
-from bob.llm.factory import build_jarvis_client, build_subagent_client
+from bob.llm.factory import build_jarvis_client, build_role_client, build_subagent_client
 from bob.llm_client import LLMClient
-from bob.llm_selection_store import LLMSelection, LLMSelectionStore
+from bob.llm_selection_store import (
+    ROLES,
+    LLMSelection,
+    LLMSelectionStore,
+    RoleSelection,
+    RoleSelectionStore,
+)
 from bob.lm_studio_manager import LMStudioManager, host_from_base_url
 from bob.orchestrator import Orchestrator
 
@@ -128,9 +135,7 @@ class LLMSwitcher:
         self._subagent_holder = subagent_holder
         self._lock = asyncio.Lock()
 
-    async def swap_lm_model(
-        self, model_id: str, context_length: int | None = None
-    ) -> SwapResult:
+    async def swap_lm_model(self, model_id: str, context_length: int | None = None) -> SwapResult:
         """Validate-then-swap to ``model_id`` (LM Studio provider).
 
         Blocking + serialised. On success: the target is loaded, the previous
@@ -181,15 +186,11 @@ class LLMSwitcher:
             new_selection = self._next_selection(current, model_id, context_length)
 
             # 3. Rebuild + swap both role clients from the NEW selection.
-            self._orchestrator.set_jarvis_client(
-                build_jarvis_client(self._settings, new_selection)
-            )
+            self._orchestrator.set_jarvis_client(build_jarvis_client(self._settings, new_selection))
             self._subagent_holder.set(build_subagent_client(self._settings, new_selection))
 
             # 4. Couple the bounded-context budget to the loaded ctx window.
-            self._orchestrator.set_token_budget(
-                token_budget_for_context_length(effective_ctx)
-            )
+            self._orchestrator.set_token_budget(token_budget_for_context_length(effective_ctx))
 
             # 5. Persist only after a fully successful swap.
             self._selection_store.write(new_selection)
@@ -230,12 +231,10 @@ class LLMSwitcher:
             # 1. Validate the TARGET. lm_studio: no gate (user must be able
             #    to switch even when the current server is offline). claude_cli:
             #    binary must exist on PATH.
-            if provider == "claude_cli":
-                if shutil.which(self._settings.CLAUDE_CLI_BIN) is None:
-                    raise ClaudeCliUnavailableError(
-                        f"Claude CLI binary not found on PATH: "
-                        f"{self._settings.CLAUDE_CLI_BIN!r}"
-                    )
+            if provider == "claude_cli" and shutil.which(self._settings.CLAUDE_CLI_BIN) is None:
+                raise ClaudeCliUnavailableError(
+                    f"Claude CLI binary not found on PATH: {self._settings.CLAUDE_CLI_BIN!r}"
+                )
 
             # 2. Build the next selection (provider changed, ctx map + pinned
             #    LM model preserved so a later switch back is cheap).
@@ -243,9 +242,7 @@ class LLMSwitcher:
 
             # 3. Rebuild + swap both role clients from the NEW selection. The
             #    factory dispatches the backend off ``new_selection.provider``.
-            self._orchestrator.set_jarvis_client(
-                build_jarvis_client(self._settings, new_selection)
-            )
+            self._orchestrator.set_jarvis_client(build_jarvis_client(self._settings, new_selection))
             self._subagent_holder.set(build_subagent_client(self._settings, new_selection))
 
             # 4. Recouple the bounded-context budget. Claude CLI has no ctx
@@ -257,9 +254,7 @@ class LLMSwitcher:
                     if new_selection.lm_model is not None
                     else None
                 )
-                self._orchestrator.set_token_budget(
-                    token_budget_for_context_length(pinned_ctx)
-                )
+                self._orchestrator.set_token_budget(token_budget_for_context_length(pinned_ctx))
             else:
                 self._orchestrator.set_token_budget(DEFAULT_TOKEN_BUDGET)
 
@@ -293,9 +288,7 @@ class LLMSwitcher:
             self._manager.set_host(new_host)
             new_selection = self._next_base_url_selection(current, url)
 
-            self._orchestrator.set_jarvis_client(
-                build_jarvis_client(self._settings, new_selection)
-            )
+            self._orchestrator.set_jarvis_client(build_jarvis_client(self._settings, new_selection))
             self._subagent_holder.set(build_subagent_client(self._settings, new_selection))
 
             self._selection_store.write(new_selection)
@@ -407,3 +400,136 @@ def resolve_cold_start_model(
     except Exception:  # boot probe must never crash startup
         return None
     return models[0].id if models else None
+
+
+# =============================================================================
+# Per-role swap coordinator — PRD 0016 / issue 0106
+# =============================================================================
+#
+# Where :class:`LLMSwitcher` rebuilds BOTH role clients on every swap (the
+# pre-0016 single-selection world), :class:`RoleLLMSwitcher` rebuilds ONLY the
+# changed role's client and leaves the other three untouched. It owns:
+#
+# - a :class:`RoleClientRegistry` (the current client per role), and
+# - a per-role *sink* callback (where a rebuilt client is pushed: the
+#   orchestrator's ``set_jarvis_client`` for ``jarvis``, the sub-agent holder's
+#   ``set`` for ``subagent``; ``thinker`` / ``draft`` are self-held in the
+#   registry until the slices that consume them wire their own sinks).
+#
+# It deliberately does NOT touch the LM Studio manager's load/offload policy —
+# multi-load + budget is a later slice (S11, Annexe J). A model swap that needs
+# a load still goes through :class:`LLMSwitcher`; this coordinator owns the
+# *selection + client rebuild* half of the per-role contract.
+
+
+class RoleClientRegistry:
+    """Mutable per-role :class:`LLMClient` registry with optional sinks.
+
+    For each role the registry holds the current client and an optional *sink*
+    — a setter invoked when the role's client is rebuilt so a downstream
+    consumer (the orchestrator, the sub-agent holder) picks up the replacement.
+    Roles with no sink are simply held here (read by a future consumer).
+
+    The indirection is the point: swapping one role replaces exactly one entry
+    and fires exactly one sink, so the other roles' client OBJECTS are unchanged
+    (the read-per-request consumers therefore never see a foreign-role swap).
+    """
+
+    def __init__(
+        self,
+        clients: dict[str, LLMClient],
+        *,
+        sinks: dict[str, Callable[[LLMClient], None]] | None = None,
+    ) -> None:
+        self._clients: dict[str, LLMClient] = dict(clients)
+        self._sinks: dict[str, Callable[[LLMClient], None]] = dict(sinks or {})
+
+    def get(self, role: str) -> LLMClient:
+        """Return the current client for ``role`` (KeyError if unknown)."""
+
+        return self._clients[role]
+
+    def set(self, role: str, client: LLMClient) -> None:
+        """Replace ``role``'s client and fire its sink (if any)."""
+
+        if role not in ROLES:
+            raise KeyError(f"Unknown LLM role: {role!r}")
+        self._clients[role] = client
+        sink = self._sinks.get(role)
+        if sink is not None:
+            sink(client)
+
+
+class RoleLLMSwitcher:
+    """Serialised coordinator for per-role selection swaps (rebuild ONE role).
+
+    Owns the :class:`asyncio.Lock` serialising concurrent per-role swaps, the
+    :class:`RoleSelectionStore`, and the :class:`RoleClientRegistry`. A
+    :meth:`swap_role` call mutates exactly one role of the persisted map,
+    rebuilds ONLY that role's client, pushes it through the registry (firing the
+    role's sink), and persists the new map. The other three roles' selections
+    and client objects round-trip untouched.
+    """
+
+    def __init__(
+        self,
+        *,
+        settings: Settings,
+        selection_store: RoleSelectionStore,
+        registry: RoleClientRegistry,
+    ) -> None:
+        self._settings = settings
+        self._selection_store = selection_store
+        self._registry = registry
+        self._lock = asyncio.Lock()
+
+    async def swap_role(self, role: str, selection: LLMSelection) -> RoleSelection:
+        """Replace ``role``'s selection with ``selection``; rebuild only that role.
+
+        Lock-guarded. Reads the current map (seeding from defaults when the file
+        is somehow absent), swaps in the new per-role :class:`LLMSelection`,
+        rebuilds ONLY that role's client via
+        :func:`bob.llm.factory.build_role_client`, pushes it through the
+        registry, and persists the v2 map. Returns the full persisted
+        :class:`RoleSelection`.
+
+        Raises :class:`UnknownProviderError` for an unknown role or an invalid
+        provider, BEFORE any rebuild / write, so a bad request keeps the
+        previous state.
+        """
+
+        if role not in ROLES:
+            raise UnknownProviderError(f"Unknown LLM role: {role!r}")
+        if selection.provider not in _VALID_PROVIDERS:
+            raise UnknownProviderError(f"Unknown LLM provider: {selection.provider!r}")
+
+        async with self._lock:
+            current = self._selection_store.read()
+            if current is None:
+                current = _seed_role_selection_for_swap(self._settings)
+
+            next_map = current.with_role(role, selection)
+
+            # Rebuild ONLY the changed role's client; the others are untouched.
+            rebuilt = build_role_client(next_map, role, self._settings)
+            self._registry.set(role, rebuilt)
+
+            self._selection_store.write(next_map)
+            return next_map
+
+
+def _seed_role_selection_for_swap(settings: Settings) -> RoleSelection:
+    """Fallback role map when the per-role store is unexpectedly empty.
+
+    The boot path always seeds the store, so this is a belt-and-suspenders path
+    (e.g. a test that swaps before seeding): build a flat ``.env`` selection and
+    fan it across the four roles, identical to the store's own first-boot seed.
+    """
+
+    flat = LLMSelection(
+        provider=settings.LLM_PROVIDER,
+        lm_model=settings.LLM_MODEL,
+        context_length={},
+        base_url=settings.LLM_BASE_URL or None,
+    )
+    return RoleSelection(roles={role: flat for role in ROLES})

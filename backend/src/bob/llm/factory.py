@@ -14,9 +14,14 @@ Jarvis, ``claude-cli`` for sub-agents). When ``JARVIS_BACKEND`` /
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from bob.config import Settings
 from bob.llm_client import ClaudeCliClient, LLMClient, LMStudioClient
-from bob.llm_selection_store import LLMSelection
+from bob.llm_selection_store import LLMSelection, RoleSelection
+
+#: Signature of a per-role client builder: ``(role_selection, settings) -> client``.
+RoleClientBuilder = Callable[[RoleSelection, Settings], LLMClient]
 
 
 def _build_for_backend(backend: str, settings: Settings, *, role: str | None = None) -> LLMClient:
@@ -92,3 +97,95 @@ def build_subagent_client(
     effective = _apply_selection(settings, selection)
     backend = effective.SUBAGENT_BACKEND or effective.LLM_PROVIDER
     return _build_for_backend(backend, effective, role="subagent")
+
+
+# =============================================================================
+# Per-role builders — PRD 0016 / issue 0106 (Annexe D)
+# =============================================================================
+#
+# The realtime agent drives FOUR roles, each pinning its OWN
+# provider / base_url / lm_model / context_length (see
+# :class:`bob.llm_selection_store.RoleSelection`). The builders below fold the
+# role's :class:`LLMSelection` into a frozen ``model_copy`` of ``settings`` and
+# dispatch the backend off the role's provider. The key difference from the
+# pre-0106 global builders: the backend is read STRICTLY from the role's
+# ``provider`` — there is no ``JARVIS_BACKEND`` / ``SUBAGENT_BACKEND`` env
+# override at the role granularity (each role's provider IS the selection), so
+# ``jarvis=lm_studio`` and ``subagent=claude_cli`` can coexist in one process.
+#
+# Per-request model routing: ``_apply_selection`` overrides ``LLM_MODEL`` AND
+# ``LLM_BASE_URL`` from the role, so the role's :class:`LMStudioClient` sends the
+# role's ``model`` on every request toward the role's server — i.e. the wire
+# ``model`` param is the role's pinned model, routed to the role's base_url.
+# ``claude_cli`` roles ignore the LM model / base_url (the CLI has neither).
+
+
+def _build_role_client(role_selection: RoleSelection, role: str, settings: Settings) -> LLMClient:
+    """Build the :class:`LLMClient` for ``role`` from its per-role selection.
+
+    Folds ``role_selection.role(role)`` into ``settings`` and dispatches the
+    backend off the role's ``provider`` (NOT the global ``LLM_PROVIDER`` or the
+    per-role-agnostic ``*_BACKEND`` env knobs). Shared by every public
+    ``build_<role>_client`` below so the four roles are byte-identically wired.
+    """
+
+    selection = role_selection.role(role)
+    effective = _apply_selection(settings, selection)
+    # The role's provider is authoritative — an unset provider falls back to the
+    # decoded default (``lm_studio``), never to a foreign role's backend.
+    if selection.provider == "claude_cli":
+        return ClaudeCliClient(effective)
+    if selection.provider == "lm_studio":
+        # Pin the wire ``model`` EXPLICITLY to the role's model so two roles on
+        # the same LM Studio host still route each request to their own model.
+        # base_url is already per-role via the folded ``LLM_BASE_URL``.
+        return LMStudioClient(effective, model=selection.lm_model)
+    raise ValueError(f"Unknown LLM backend: {selection.provider!r}")
+
+
+def build_jarvis_role_client(role_selection: RoleSelection, settings: Settings) -> LLMClient:
+    """Return the :class:`LLMClient` for the ``jarvis`` (Speaker) role."""
+
+    return _build_role_client(role_selection, "jarvis", settings)
+
+
+def build_thinker_role_client(role_selection: RoleSelection, settings: Settings) -> LLMClient:
+    """Return the :class:`LLMClient` for the ``thinker`` role.
+
+    Wired into the map for completeness; the Thinker loop that consumes it lands
+    in a later slice (S6).
+    """
+
+    return _build_role_client(role_selection, "thinker", settings)
+
+
+def build_draft_role_client(role_selection: RoleSelection, settings: Settings) -> LLMClient:
+    """Return the :class:`LLMClient` for the ``draft`` (speculative) role.
+
+    Wired into the map for completeness; the speculative drafter that consumes
+    it lands in a later slice (S8).
+    """
+
+    return _build_role_client(role_selection, "draft", settings)
+
+
+def build_subagent_role_client(role_selection: RoleSelection, settings: Settings) -> LLMClient:
+    """Return the :class:`LLMClient` for the ``subagent`` role."""
+
+    return _build_role_client(role_selection, "subagent", settings)
+
+
+#: Dispatch table ``role -> builder`` so the swap coordinator / router can build
+#: exactly one role's client by name without a four-way branch.
+ROLE_BUILDERS: dict[str, RoleClientBuilder] = {
+    "jarvis": build_jarvis_role_client,
+    "thinker": build_thinker_role_client,
+    "draft": build_draft_role_client,
+    "subagent": build_subagent_role_client,
+}
+
+
+def build_role_client(role_selection: RoleSelection, role: str, settings: Settings) -> LLMClient:
+    """Build the client for ``role`` via :data:`ROLE_BUILDERS` (KeyError if unknown)."""
+
+    return ROLE_BUILDERS[role](role_selection, settings)
