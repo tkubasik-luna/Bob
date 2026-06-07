@@ -19,11 +19,19 @@ from bob.llm_client import ClaudeCliClient, LLMClient, LMStudioClient
 from bob.llm_selection_store import LLMSelection
 
 
-def _build_for_backend(backend: str, settings: Settings) -> LLMClient:
+def _build_for_backend(backend: str, settings: Settings, *, role: str | None = None) -> LLMClient:
     if backend == "claude_cli":
         return ClaudeCliClient(settings)
     if backend == "lm_studio":
         return LMStudioClient(settings)
+    if backend == "fake":
+        # PRD 0016 / issue 0098 — the attestation harness provider. Built lazily
+        # so production paths never import the attest package. ``role`` is
+        # threaded through so role-scoped scripted rules (and the future
+        # ``role_used_model`` assertion) can target the right client.
+        from bob.attest.fake_backend import build_fake_client_from_settings
+
+        return build_fake_client_from_settings(role)
     raise ValueError(f"Unknown LLM backend: {backend!r}")
 
 
@@ -67,7 +75,7 @@ def build_jarvis_client(
 
     effective = _apply_selection(settings, selection)
     backend = effective.JARVIS_BACKEND or effective.LLM_PROVIDER
-    return _build_for_backend(backend, effective)
+    return _build_for_backend(backend, effective, role="jarvis")
 
 
 def build_subagent_client(
@@ -83,4 +91,4 @@ def build_subagent_client(
 
     effective = _apply_selection(settings, selection)
     backend = effective.SUBAGENT_BACKEND or effective.LLM_PROVIDER
-    return _build_for_backend(backend, effective)
+    return _build_for_backend(backend, effective, role="subagent")

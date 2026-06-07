@@ -1,0 +1,18 @@
+# Deliberately-RED scenario: it asserts a `say` event + a non-empty deliverable
+# but the timeline injects NO turn, so Bob never speaks. Both assertions fail
+# and `bob attest` exits 1. This proves the harness reports failure correctly
+# (and is the negative half of the issue-0098 demo pair).
+#
+# Run:  bob attest scenarios/text-say-fail.attest.yaml   (exit 1, ok: false)
+name: text-say-missing-reply
+description: Aucun tour injecté → aucun `say` → l'attestation échoue (exit 1).
+backend: ephemeral
+llm: fake
+fake_llm: []
+timeline:
+  - do: wait_ms
+    ms: 50
+assertions:
+  - kind: event_emitted
+    type: say
+  - kind: deliverable_nonempty

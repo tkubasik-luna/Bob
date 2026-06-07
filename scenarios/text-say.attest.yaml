@@ -1,0 +1,25 @@
+# Attests the CURRENT (text-only) Bob: one injected text turn must produce a
+# spoken reply (`say`) with a non-empty deliverable — no voice/FSM features
+# needed. This is the green proof that the harness works against today's Bob
+# before any real-time slice lands.
+#
+# Run:  bob attest scenarios/text-say.attest.yaml   (exit 0, ok: true)
+name: text-say-roundtrip
+description: Un tour texte produit une réponse `say` avec un deliverable non vide.
+backend: ephemeral
+llm: fake
+fake_llm:
+  - role: jarvis
+    on_input_contains: "bonjour"
+    reply: "Bonjour ! Je suis Bob, ton assistant. Comment puis-je t'aider ?"
+timeline:
+  - do: inject_text
+    text: "bonjour Bob"
+  - do: wait_event
+    type: say
+    timeout_ms: 15000
+assertions:
+  - kind: event_emitted
+    type: say
+  - kind: deliverable_nonempty
+  - kind: no_error_events

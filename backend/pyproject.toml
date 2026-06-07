@@ -26,7 +26,18 @@ dependencies = [
     "lmstudio>=1.5.0",
     "httpx>=0.27",
     "mcp>=1.27.2",
+    # Attestation harness (PRD 0016 / issue 0098). ``pyyaml`` parses scenario
+    # files; ``websockets`` is the black-box WS client the drive layer uses to
+    # hit the real ``/ws/chat`` + ``/ws/debug`` of the ephemeral backend. Both
+    # already resolve transitively (uvicorn[standard] ships websockets) — pinned
+    # here as direct deps because the ``bob`` CLI imports them directly.
+    "pyyaml>=6.0",
+    "websockets>=13.0",
 ]
+
+[project.scripts]
+# Greenfield ``bob`` CLI — the attestation harness front door (issue 0098).
+bob = "bob.attest.cli:main"
 
 [dependency-groups]
 dev = [
@@ -34,6 +45,8 @@ dev = [
     "pytest-asyncio>=0.24",
     "ruff>=0.7",
     "mypy>=1.13",
+    # Type stubs for the harness' YAML parsing (issue 0098).
+    "types-pyyaml>=6.0",
 ]
 
 [build-system]

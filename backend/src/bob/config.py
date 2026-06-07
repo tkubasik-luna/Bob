@@ -38,8 +38,16 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # LLM provider selection
-    LLM_PROVIDER: Literal["lm_studio", "claude_cli"] = "lm_studio"
+    # LLM provider selection.
+    #
+    # ``fake`` (PRD 0016 / issue 0098) is the attestation harness provider: a
+    # deterministic, offline, scriptable backend selected by the ``bob attest``
+    # CLI's :class:`EphemeralBackend`. It is NEVER the default and requires no
+    # LM Studio / Claude CLI configuration — its scripted replies come from
+    # :attr:`BOB_FAKE_LLM_SCRIPT`. Production configs only ever use the first
+    # two providers; ``fake`` exists purely so the harness can boot an isolated
+    # backend with a predictable LLM.
+    LLM_PROVIDER: Literal["lm_studio", "claude_cli", "fake"] = "lm_studio"
 
     # LM Studio / OpenAI-compatible backend (required when LLM_PROVIDER=lm_studio)
     LLM_BASE_URL: str | None = None
@@ -78,6 +86,17 @@ class Settings(BaseSettings):
     # the default keeps everything on a single backend.
     JARVIS_BACKEND: str | None = None
     SUBAGENT_BACKEND: str | None = None
+
+    # Attestation harness scripted-LLM payload (PRD 0016 / issue 0098). A JSON
+    # string carrying the scenario's ``fake_llm`` rules — a list of
+    # ``{"role", "on_input_contains", "reply"}`` entries. Read ONLY by the
+    # ``fake`` provider (:class:`bob.attest.fake_backend.FakeLlmClient`). The
+    # ``bob attest`` CLI's :class:`EphemeralBackend` serialises the scenario
+    # rules into this env var before booting the isolated subprocess, so the
+    # scripted replies travel across the process boundary without a side
+    # channel. Empty string ⇒ the fake replies with a generic deterministic
+    # line (still attestable). Ignored entirely unless ``LLM_PROVIDER=fake``.
+    BOB_FAKE_LLM_SCRIPT: str = ""
 
     # Tool-calling wire-format selection (PRD 0008 / issue 0058).
     # ``auto`` (default) lets :func:`bob.llm.tooling.select_codec` pick the
@@ -147,6 +166,16 @@ class Settings(BaseSettings):
     KOKORO_DEFAULT_VOICE: str = "ff_siwis"
     KOKORO_DEFAULT_SPEED: float = 1.0
     KOKORO_HF_REPO_ID: str = "hexgrad/Kokoro-82M"
+
+    # Skip the boot-time Kokoro preload + warmup (PRD 0016 / issue 0098). The
+    # lifespan normally downloads + warms the TTS pipeline so the first reply is
+    # fast; that pulls in espeak-ng / misaki G2P which may be unavailable or
+    # native-abort in a headless CI / harness environment. The attestation
+    # harness drives only the TEXT path (no audio), so it boots its isolated
+    # backend with this true to stay offline + fast. TTS still lazy-loads on the
+    # first real synthesis if voice is ever requested. Default false preserves
+    # production warm-start behaviour exactly.
+    BOB_SKIP_TTS_PRELOAD: bool = False
 
     # Gmail connector (PRD 0007) — paths to the OAuth client secrets file
     # downloaded from the user's GCP project and the cached user token

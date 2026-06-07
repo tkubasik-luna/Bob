@@ -292,14 +292,21 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         llm_model=seeded_selection.lm_model,
     )
 
-    tts = get_default_tts_service()
-    _logger.info("startup.preload.kokoro.begin")
-    try:
-        await asyncio.to_thread(tts.preload)
-        _logger.info("startup.preload.kokoro.done")
-        await asyncio.to_thread(tts.warmup)
-    except Exception:
-        _logger.exception("startup.preload.kokoro.failed")
+    # Issue 0098 — the attestation harness boots a headless, text-only backend
+    # and sets ``BOB_SKIP_TTS_PRELOAD`` so the Kokoro download + espeak-ng G2P
+    # warmup (which can be absent / native-abort in CI) never runs. Voice still
+    # lazy-loads on first synthesis if it is ever requested.
+    if settings.BOB_SKIP_TTS_PRELOAD:
+        _logger.info("startup.preload.kokoro.skipped")
+    else:
+        tts = get_default_tts_service()
+        _logger.info("startup.preload.kokoro.begin")
+        try:
+            await asyncio.to_thread(tts.preload)
+            _logger.info("startup.preload.kokoro.done")
+            await asyncio.to_thread(tts.warmup)
+        except Exception:
+            _logger.exception("startup.preload.kokoro.failed")
 
     try:
         yield
