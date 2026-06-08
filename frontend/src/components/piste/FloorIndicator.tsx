@@ -23,8 +23,10 @@ const FLOOR_LABEL: Record<FloorState, string> = {
   bob_speaking: "réponse",
 };
 
-export function FloorIndicator() {
-  const floor = useTurnState();
+/** Presentational pill — renders a given floor state, owns no socket. Use this
+ * when the parent already has the live floor (the HUD lifts `useTurnState` so
+ * the pill and the half-duplex mute gate share ONE `/ws/debug` socket). */
+export function FloorIndicatorView({ floor }: { floor: FloorState }) {
   const active = floor !== "idle";
 
   return (
@@ -38,4 +40,11 @@ export function FloorIndicator() {
       <span className="floor-label">{FLOOR_LABEL[floor]}</span>
     </output>
   );
+}
+
+/** Standalone pill — owns its own `useTurnState` socket. Kept for tests and any
+ * mount point that doesn't already have the floor. */
+export function FloorIndicator() {
+  const floor = useTurnState();
+  return <FloorIndicatorView floor={floor} />;
 }

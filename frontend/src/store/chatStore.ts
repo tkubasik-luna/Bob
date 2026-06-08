@@ -52,6 +52,20 @@ export type StreamingAssistant = {
   ui: ComponentDescriptor | null;
 };
 
+/** PRD 0016 / issue 0099 — the live STT hypothesis for the in-flight voice
+ * turn. Populated by `stt_partial` frames as the user speaks and settled by
+ * `stt_final`; cleared when Bob's reply lands. `stablePrefixLen` is the count
+ * of leading characters the engine considers settled (render solid; the tail
+ * is tentative). Without this slice the STT events were silently dropped and
+ * the user saw nothing while speaking — the "voice module doesn't work" gap. */
+export type LiveUserTranscript = {
+  turnId: string;
+  text: string;
+  stablePrefixLen: number;
+  /** True once `stt_final` froze the turn (the say-path now owns the text). */
+  final: boolean;
+};
+
 type ChatState = {
   messages: ChatMessage[];
   connectionStatus: ConnectionStatus;
@@ -64,6 +78,9 @@ type ChatState = {
   /** PRD 0006 / issue 0049 — live state of the streaming Jarvis turn, or
    * `null` when no turn is in flight. */
   streamingAssistant: StreamingAssistant | null;
+  /** PRD 0016 / issue 0099 — live STT hypothesis for the in-flight voice turn,
+   * or `null` when the user isn't speaking / the turn settled into a reply. */
+  liveUserTranscript: LiveUserTranscript | null;
   /** Sub-tasks driven by `task_*` WS events (slice #0019). Keyed by id so
    * each event is an idempotent upsert. */
   tasks: Record<string, Task>;
@@ -122,6 +139,16 @@ type ChatState = {
    *  the closing `assistant_msg` lands (so the persisted bubble takes over)
    *  AND on user submit (interrupts any leftover stream). */
   clearStreamingAssistant: () => void;
+  /** PRD 0016 / issue 0099 — record the latest STT hypothesis for the voice
+   *  turn. `final` settles the turn (frozen transcript). */
+  setLiveTranscript: (
+    turnId: string,
+    text: string,
+    stablePrefixLen: number,
+    final?: boolean,
+  ) => void;
+  /** PRD 0016 / issue 0099 — drop the live transcript (Bob replied / aborted). */
+  clearLiveTranscript: () => void;
 };
 
 function randomId(): string {
@@ -140,6 +167,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   toasts: [],
   speakingMsgId: null,
   streamingAssistant: null,
+  liveUserTranscript: null,
   tasks: {},
   taskMessages: {},
   openTaskId: null,
@@ -342,4 +370,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       return { streamingAssistant: { ...current, ui } };
     }),
   clearStreamingAssistant: () => set({ streamingAssistant: null }),
+  setLiveTranscript: (turnId, text, stablePrefixLen, final = false) =>
+    set({ liveUserTranscript: { turnId, text, stablePrefixLen, final } }),
+  clearLiveTranscript: () => set({ liveUserTranscript: null }),
 }));

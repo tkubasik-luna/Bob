@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { useMicCapture } from "../audio/useMicCapture";
 import { useChatWsBridge } from "../hooks/useChatWsBridge";
+import { useTurnState } from "../hooks/useTurnState";
 import { useVoiceMode } from "../hooks/useVoiceMode";
 import { useAudioLevel } from "../sphere/useAudioLevel";
 import { type SphereDerivedState, useSphereState } from "../sphere/useSphereState";
@@ -13,7 +14,7 @@ import { BackgroundGrain } from "./piste/BackgroundGrain";
 import { BottomBar } from "./piste/BottomBar";
 import { CoreSlot } from "./piste/CoreSlot";
 import { DataSlot } from "./piste/DataSlot";
-import { FloorIndicator } from "./piste/FloorIndicator";
+import { FloorIndicatorView } from "./piste/FloorIndicator";
 import { Identity } from "./piste/Identity";
 import { SettingsControl } from "./piste/SettingsControl";
 import { TaskSlot } from "./piste/TaskSlot";
@@ -90,11 +91,21 @@ export function SphereUI() {
   // `useMicCapture` handles getUserMedia + the AudioWorklet + the
   // voice_start/voice_stop framing; mounting it here is the whole wiring.
   const { voiceEnabled } = useVoiceMode();
+  // PRD 0016 Annexe G / issue 0101 — the half-duplex mute gate. The live voice
+  // floor is lifted HERE (one `/ws/debug` socket) and shared with the
+  // FloorIndicator pill below. Browser AEC is enabled in getUserMedia but is
+  // imperfect, so without this gate Bob's own TTS leaks into the mic during
+  // `bob_speaking` and the 200 ms barge-in window cuts him off mid-reply — the
+  // single biggest perceived voice-reliability bug. Muting outbound PCM while
+  // Bob speaks keeps the capture graph armed (no mic re-prompt) and resumes the
+  // instant the floor leaves `bob_speaking`.
+  const floor = useTurnState();
   useMicCapture({
     enabled: voiceEnabled && wsStatus === "open",
     send,
     sendBinary,
     windowName: "new",
+    muteOutbound: floor === "bob_speaking",
   });
 
   // PRD 0014 / issue 0091 — cold-start ↔ rest orchestration. `hasActivity` is
@@ -189,7 +200,7 @@ export function SphereUI() {
          * `/ws/debug` (via `useTurnState`); mounting it is the whole wiring. It
          * is orthogonal to the orb state and only animates during a real voice
          * turn. */}
-        <FloorIndicator />
+        <FloorIndicatorView floor={floor} />
         {/* The 3D stage: perspective on `.stage-3d`, the slow camera drift +
          * preserve-3d context on `.stage-cam`, then the three depth-positioned
          * slots. The orb is the placeholder SphereCanvas (issue 0084 replaces

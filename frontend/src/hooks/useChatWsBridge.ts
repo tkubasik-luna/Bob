@@ -49,6 +49,8 @@ export function useChatWsBridge(): UseChatWsBridgeResult {
   const appendSpeechDelta = useChatStore((s) => s.appendSpeechDelta);
   const setStreamingUi = useChatStore((s) => s.setStreamingUi);
   const clearStreamingAssistant = useChatStore((s) => s.clearStreamingAssistant);
+  const setLiveTranscript = useChatStore((s) => s.setLiveTranscript);
+  const clearLiveTranscript = useChatStore((s) => s.clearLiveTranscript);
   const appendReasoningDelta = useActivityFeedStore((s) => s.appendReasoningDelta);
   const appendActivity = useActivityFeedStore((s) => s.appendActivity);
   const setPerf = useActivityFeedStore((s) => s.setPerf);
@@ -71,6 +73,9 @@ export function useChatWsBridge(): UseChatWsBridgeResult {
   // Stable id for the "Préparation de la voix…" toast — keyed by msg_id
   // so concurrent first-message scenarios stay isolated.
   const prepToastId = useCallback((msgId: string) => `tts-prep:${msgId}`, []);
+  // Stable id for the "Préparation de la transcription…" toast, keyed by the
+  // voice turn so a first-use whisper download doesn't look like a frozen app.
+  const sttPrepToastId = useCallback((turnId: string) => `stt-prep:${turnId}`, []);
 
   // Tracks the msg_id of the most recently received assistant_msg. Audio
   // frames carrying a different msg_id are stale (the user interrupted Bob)
@@ -122,6 +127,9 @@ export function useChatWsBridge(): UseChatWsBridgeResult {
           // stops mirroring a duplicate of the same text and `SphereUI`
           // falls back to the final `messages` array.
           clearStreamingAssistant();
+          // Bob has replied — the user's live STT transcript has served its
+          // purpose; drop it so it doesn't linger over the new turn.
+          clearLiveTranscript();
           break;
         case "speech_delta":
           // PRD 0006 / issue 0049 — accumulate the streamed `say.speech`
@@ -166,6 +174,39 @@ export function useChatWsBridge(): UseChatWsBridgeResult {
         case "error":
           pushToast(msg.message, msg.code);
           setWaiting(false);
+          break;
+        case "stt_partial":
+          // Live whisper hypothesis as the user speaks. Without this the STT
+          // events were silently dropped and the user got zero feedback.
+          setLiveTranscript(msg.turn_id, msg.text, msg.stable_prefix_len, false);
+          break;
+        case "stt_final":
+          // Frozen transcript at endpoint — settle the live line; the say-path
+          // now owns the text. Kept on screen until Bob's reply clears it.
+          setLiveTranscript(msg.turn_id, msg.text, msg.text.length, true);
+          break;
+        case "stt_preparing":
+          // First-use whisper download — surface a toast so the wait isn't a
+          // silent freeze (mirrors tts_preparing).
+          pushToast("Préparation de la transcription…", {
+            kind: "info",
+            id: sttPrepToastId(msg.turn_id),
+          });
+          break;
+        case "stt_ready":
+          dismissToast(sttPrepToastId(msg.turn_id));
+          break;
+        case "voice_turn_error":
+          // STT engine unavailable / failed mid-turn / download failed. The
+          // backend aborted the turn cleanly; surface it + return to idle
+          // instead of leaving the user staring at a dead mic.
+          dismissToast(sttPrepToastId(msg.turn_id));
+          clearLiveTranscript();
+          setWaiting(false);
+          pushToast(`Transcription indisponible : ${msg.reason}`, {
+            kind: "error",
+            code: "STT",
+          });
           break;
         case "task_created":
           upsertTaskCreated(msg);
@@ -253,6 +294,9 @@ export function useChatWsBridge(): UseChatWsBridgeResult {
       pushToast,
       dismissToast,
       prepToastId,
+      sttPrepToastId,
+      setLiveTranscript,
+      clearLiveTranscript,
       upsertTaskCreated,
       upsertTaskUpdated,
       setTaskResult,
