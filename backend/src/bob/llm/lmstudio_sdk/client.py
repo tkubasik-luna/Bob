@@ -47,7 +47,7 @@ from bob.llm.lmstudio_sdk.tools import (
     tool_call_request_to_tool_call,
     tool_definitions_to_sdk,
 )
-from bob.llm.types import LLMResponse, ToolDefinition
+from bob.llm.types import LLMResponse, StreamChunk, ToolDefinition
 from bob.llm_client import (
     LLMClient,
     LLMClientError,
@@ -60,8 +60,6 @@ from bob.logging_setup import log_llm_call
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
-
-    from bob.llm.types import StreamChunk
 
 #: Hardcoded generation cap, matching :class:`LMStudioClient`'s ``max_tokens=4096``
 #: on every request — kept identical so the two transports produce comparable
@@ -770,17 +768,297 @@ class LMStudioSDKClient(LLMClient):
         tools: list[ToolDefinition] | None = None,
         session_id: str | None = None,
     ) -> AsyncIterator[StreamChunk]:
-        """Not implemented in issue 0111 — SDK streaming tool-calls land in 0114.
+        """Streaming tool-calling ``complete`` over the SDK transport (M6, issue 0114).
 
-        Same rationale as :meth:`stream_chat`: fail loudly rather than replay the
-        unimplemented :meth:`complete` as a degraded single-chunk stream.
+        The voice-latency-critical slice: the SDK-transport counterpart of
+        :meth:`bob.llm_client.LMStudioClient.stream_complete`, producing the SAME
+        :class:`StreamChunk` lifecycle so the ``say`` tool's ``PartialJsonParser``
+        → ``speech_delta`` → TTS path is byte-unchanged across transports.
+
+        Same validator-role fold + standard-role assertion + ``LLM_TOOL_MODE``
+        policy as :meth:`complete`, then drives the M6
+        :class:`bob.llm.lmstudio_sdk.endpoint.BobChatResponseEndpoint` (the ONLY
+        place that touches the SDK's private *streaming* tool-call surface — it
+        resurfaces the argument fragments the base SDK throws away) over an
+        :class:`lmstudio.async_api.AsyncPredictionStream`. The yielded chunk
+        sequence (:meth:`_consume_complete_stream`):
+
+        - text / reasoning fragments → ``text`` / ``reasoning`` chunks (reuse M5
+          :func:`bob.llm.lmstudio_sdk.streaming.fragment_to_chunk`);
+        - the FIRST resurfaced arg fragment for a call → ``tool_call_start``,
+          then that fragment + every subsequent one → ``tool_call_args_delta``
+          (incremental suffix, feeding ``say`` → early TTS);
+        - the terminal ``toolCallGenerationEnd`` → ``tool_call_end`` (final parse;
+          malformed args → :class:`LLMClientError`, parity with :meth:`complete`);
+        - the final SDK stats → one terminal ``perf`` chunk (reuse M5
+          :func:`bob.llm.lmstudio_sdk.streaming.build_perf_chunk`).
+
+        No tool is executed (reuse 0113's no-execution guarantee — the orchestrator
+        dispatches captured calls). ``log_llm_call`` + the end debug event run in a
+        ``finally``, exactly like the OpenAI transport.
+
+        This is an async generator: the per-call ``AsyncClient`` (``async with``)
+        wraps the whole iteration so the websocket is closed when the consumer
+        drains (or abandons) the stream; the long-lived per-role client lands in
+        issue 0115.
         """
 
-        raise LLMClientError(
-            "LMStudioSDKClient.stream_complete() is not implemented yet — SDK "
-            "streaming tool-calls arrive in issue 0114. Use "
-            "LLM_LMSTUDIO_TRANSPORT=openai for streaming tool-calls until then."
+        messages = _normalise_validator_role(messages, allow_arbitrary_roles=False)
+        _assert_standard_roles(messages)
+
+        # Same tool-mode policy as ``complete``: the SDK has a single native tool
+        # surface, so guided / hermes are rejected loudly rather than silently
+        # degraded.
+        tool_mode = self._settings.LLM_TOOL_MODE
+        if tools and tool_mode in ("guided", "hermes"):
+            raise LLMClientError(
+                f"LLM_TOOL_MODE={tool_mode!r} is not supported on the LM Studio "
+                "SDK transport — the SDK exposes only native tool definitions. "
+                "Use LLM_TOOL_MODE=auto or native (or LLM_LMSTUDIO_TRANSPORT=openai "
+                f"for {tool_mode} tool-calling)."
+            )
+
+        chat = messages_to_chat(messages)
+        config = self._build_config()
+
+        llm_tools = None
+        client_tool_map = None
+        if tools:
+            llm_tools, client_tool_map = tool_definitions_to_sdk(tools)
+
+        correlation_id = uuid4().hex
+        token_estimate = _estimate_tokens(messages)
+        emit_debug(
+            category="llm",
+            severity="info",
+            source="bob.llm.lmstudio_sdk.stream_complete",
+            summary=(f"LLM stream démarré ({token_estimate} tokens prompt, model={self._model})"),
+            payload={
+                "messages": messages,
+                "model": self._model,
+                "reasoning": self._reasoning,
+                "tokens_prompt_estimate": token_estimate,
+                "has_tools": bool(tools),
+                "session_id": session_id,
+                "streaming": True,
+            },
+            correlation_id=correlation_id,
         )
+
+        return self._consume_complete_stream(
+            chat,
+            llm_tools=llm_tools,
+            client_tool_map=client_tool_map,
+            config=config,
+            session_id=session_id,
+            correlation_id=correlation_id,
+            messages=messages,
+        )
+
+    async def _consume_complete_stream(
+        self,
+        chat: Any,
+        *,
+        llm_tools: Any,
+        client_tool_map: Any,
+        config: LlmPredictionConfigDict,
+        session_id: str | None,
+        correlation_id: str,
+        messages: list[dict[str, Any]],
+    ) -> AsyncIterator[StreamChunk]:
+        """Drive the M6 endpoint and adapt its events to ``StreamChunk``s.
+
+        Mirrors :meth:`bob.llm_client.LMStudioClient._consume_stream`: walk the
+        prediction events, emit the ``text`` / ``reasoning`` / ``tool_call_*``
+        lifecycle, end with one terminal ``perf`` chunk, and always run
+        ``log_llm_call`` + the end debug event in a ``finally``. SDK
+        ``LMStudioError`` failures map to :class:`LLMClientError`.
+
+        Tool-call lifecycle (parity with the OpenAI ``_consume_stream``):
+
+        - the first resurfaced arg fragment for a given call index emits a
+          ``tool_call_start`` (id/name from the tracked start/name messages) THEN
+          the fragment as the first ``tool_call_args_delta``; subsequent fragments
+          for that index are further ``tool_call_args_delta`` chunks;
+        - the terminal ``toolCallGenerationEnd`` (a SDK ``PredictionToolCallEvent``,
+          ``.arg`` is a ``ToolCallRequest``) emits ``tool_call_end`` with the final
+          parsed arguments. If no fragment ever streamed for that call (a model
+          that emits only the whole-call end), we still emit ``tool_call_start``
+          here first so the lifecycle is well-formed — but the streaming arg path
+          is the normal, latency-preserving case (HARD criterion: ≥1
+          ``tool_call_args_delta`` before ``tool_call_end``).
+        - a malformed final-args request raises :class:`LLMClientError`
+          (:func:`tool_call_request_to_tool_call`), same surface as ``complete``.
+        """
+
+        from lmstudio.async_api import AsyncPredictionStream
+        from lmstudio.json_api import PredictionFragmentEvent, PredictionToolCallEvent
+
+        from bob.llm.lmstudio_sdk.endpoint import (
+            BobChatResponseEndpoint,
+            PredictionToolCallArgFragmentEvent,
+        )
+        from bob.llm.lmstudio_sdk.streaming import build_perf_chunk, fragment_to_chunk
+
+        text_buffer = ""
+        log_calls: list[dict[str, Any]] = []
+        tokens_in: int | None = None
+        tokens_out: int | None = None
+        started = time.perf_counter()
+        first_token_at: float | None = None
+        # Per-call streaming state, keyed by the M6 fragment ``index`` so a
+        # ``tool_call_start`` is emitted exactly once per call before its deltas.
+        started_calls: dict[int, str] = {}
+
+        def _resolve_call_id(index: int, raw_id: str | None, name: str | None) -> str:
+            # Deterministic, non-empty handle (parity with ``complete`` /
+            # ``tool_call_request_to_tool_call``): prefer the server id, else the
+            # name, else an index-derived placeholder.
+            return raw_id or name or f"call_{index}"
+
+        try:
+            async with self._client_factory(self._host) as client:
+                model = await client.llm.model(self._model)
+                endpoint = BobChatResponseEndpoint(
+                    model.identifier,
+                    chat,
+                    None,  # response_format — tool-calling does not gate via JSON schema
+                    config,
+                    None,  # preset_config
+                    None,  # on_message
+                    None,  # on_first_token
+                    None,  # on_prediction_fragment
+                    None,  # on_prompt_processing_progress
+                    None,  # handle_invalid_tool_request — unused (no act() loop)
+                    llm_tools,
+                    client_tool_map,
+                )
+                try:
+                    channel_cm = model._session._create_channel(endpoint)
+                except lmstudio.LMStudioError as exc:
+                    latency_ms = (time.perf_counter() - started) * 1000.0
+                    emit_debug(
+                        category="llm",
+                        severity="error",
+                        source="bob.llm.lmstudio_sdk.stream_complete",
+                        summary=f"LLM stream échoué en {latency_ms:.0f}ms: {exc}",
+                        payload={
+                            "model": self._model,
+                            "latency_ms": latency_ms,
+                            "exception": str(exc),
+                            "exception_type": exc.__class__.__name__,
+                            "traceback": traceback.format_exc(),
+                            "session_id": session_id,
+                        },
+                        correlation_id=correlation_id,
+                    )
+                    raise LLMClientError(f"LM Studio SDK stream failed: {exc}") from exc
+
+                stream = AsyncPredictionStream(channel_cm, endpoint)
+                async for event in stream._iter_events():
+                    if isinstance(event, PredictionFragmentEvent):
+                        chunk = fragment_to_chunk(event.arg)
+                        if chunk is None:
+                            continue
+                        if first_token_at is None:
+                            first_token_at = time.perf_counter()
+                        if chunk.kind == "text":
+                            text_buffer += chunk.text_delta
+                        yield chunk
+                    elif isinstance(event, PredictionToolCallArgFragmentEvent):
+                        if first_token_at is None:
+                            first_token_at = time.perf_counter()
+                        call_id = started_calls.get(event.index)
+                        if call_id is None:
+                            # First fragment for this call → emit ``tool_call_start``.
+                            call_id = _resolve_call_id(event.index, event.id, event.name)
+                            started_calls[event.index] = call_id
+                            yield StreamChunk(
+                                kind="tool_call_start",
+                                tool_call_id=call_id,
+                                name=event.name,
+                            )
+                        yield StreamChunk(
+                            kind="tool_call_args_delta",
+                            tool_call_id=call_id,
+                            args_delta=event.fragment,
+                        )
+                    elif isinstance(event, PredictionToolCallEvent):
+                        # Terminal whole-call: final parse → ``tool_call_end``.
+                        # Malformed args raise ``LLMClientError`` (parity).
+                        tool_call = tool_call_request_to_tool_call(event.arg)
+                        if first_token_at is None:
+                            first_token_at = time.perf_counter()
+                        # Find the index this end corresponds to. The wire gives
+                        # no index on the end event, so match by call id, else
+                        # fall back to the next unstarted index.
+                        index = next(
+                            (i for i, cid in started_calls.items() if cid == tool_call.id),
+                            len(started_calls),
+                        )
+                        if index not in started_calls:
+                            # No fragment streamed for this call (whole-call only,
+                            # uncommon) — still emit a well-formed ``tool_call_start``.
+                            started_calls[index] = tool_call.id
+                            yield StreamChunk(
+                                kind="tool_call_start",
+                                tool_call_id=tool_call.id,
+                                name=tool_call.name,
+                            )
+                        log_calls.append(
+                            {
+                                "id": tool_call.id,
+                                "name": tool_call.name,
+                                "arguments": tool_call.arguments,
+                            }
+                        )
+                        yield StreamChunk(
+                            kind="tool_call_end",
+                            tool_call_id=tool_call.id,
+                            name=tool_call.name,
+                            final_arguments=tool_call.arguments,
+                        )
+
+                perf = build_perf_chunk(
+                    getattr(stream, "stats", None),
+                    started=started,
+                    first_token_at=first_token_at,
+                )
+                tokens_in = perf.tokens_in
+                tokens_out = perf.tokens_out
+                yield perf
+        finally:
+            latency_ms = (time.perf_counter() - started) * 1000.0
+            raw_for_log = json.dumps(log_calls, ensure_ascii=False) if log_calls else text_buffer
+            log_llm_call(
+                session_id=session_id,
+                messages=messages,
+                raw_response=raw_for_log,
+                latency_ms=latency_ms,
+                tokens_in=tokens_in,
+                tokens_out=tokens_out,
+            )
+            emit_debug(
+                category="llm",
+                severity="info",
+                source="bob.llm.lmstudio_sdk.stream_complete",
+                summary=(
+                    f"LLM stream terminé en {latency_ms:.0f}ms "
+                    f"({tokens_out if tokens_out is not None else '?'} tokens response)"
+                ),
+                payload={
+                    "response": raw_for_log,
+                    "is_tool_call": bool(log_calls),
+                    "tool_calls": log_calls,
+                    "latency_ms": latency_ms,
+                    "tokens_in": tokens_in,
+                    "tokens_out": tokens_out,
+                    "model": self._model,
+                    "session_id": session_id,
+                    "streaming": True,
+                },
+                correlation_id=correlation_id,
+            )
 
 
 __all__ = ["LMStudioSDKClient", "schema_to_response_format"]
