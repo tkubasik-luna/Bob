@@ -398,7 +398,9 @@ class LMStudioClient(LLMClient):
     endpoint) via :class:`Settings`.
     """
 
-    def __init__(self, settings: Settings, *, model: str | None = None) -> None:
+    def __init__(
+        self, settings: Settings, *, model: str | None = None, reasoning: str | None = None
+    ) -> None:
         self._settings = settings
         # PRD 0016 / issue 0106 — per-role model routing. Each role builds its
         # own ``LMStudioClient`` pinned to the role's model + base_url; the wire
@@ -408,6 +410,11 @@ class LMStudioClient(LLMClient):
         # role's server carrying the role's model. ``None`` preserves the
         # pre-0106 single-selection behaviour byte-for-byte.
         self._model_override = model
+        # Per-role LM Studio ``reasoning`` level (``"off"|"low"|"medium"|"high"|
+        # "on"``). Sent on every request via ``extra_body`` (a non-OpenAI field,
+        # so the ``openai`` SDK only forwards it through ``extra_body``). ``None``
+        # omits it entirely so the model's auto-chosen setting applies.
+        self._reasoning = reasoning
         self._client = AsyncOpenAI(
             base_url=settings.LLM_BASE_URL,
             api_key=settings.LLM_API_KEY,
@@ -433,6 +440,20 @@ class LMStudioClient(LLMClient):
         """
 
         return self._model_override or self._settings.LLM_MODEL
+
+    def _apply_reasoning(self, kwargs: dict[str, Any]) -> None:
+        """Fold the per-role ``reasoning`` level into the request ``kwargs``.
+
+        LM Studio's ``reasoning`` is a non-OpenAI body field, so it must ride in
+        ``extra_body`` for the ``openai`` SDK to forward it. A ``None`` level
+        leaves ``kwargs`` untouched so the request omits the field and the model
+        picks its own setting. Merges into any existing ``extra_body``.
+        """
+
+        if self._reasoning is None:
+            return
+        extra_body = kwargs.setdefault("extra_body", {})
+        extra_body["reasoning"] = self._reasoning
 
     def supports_guided_json(self) -> bool:
         """LM Studio gates ``chat(schema=…)`` via ``response_format`` (issue 0060).
@@ -470,6 +491,7 @@ class LMStudioClient(LLMClient):
                 "type": "json_schema",
                 "json_schema": schema,
             }
+        self._apply_reasoning(kwargs)
 
         # Slice 0039: pair start / end debug events for this call.
         correlation_id = uuid4().hex
@@ -482,6 +504,7 @@ class LMStudioClient(LLMClient):
             payload={
                 "messages": messages,
                 "model": self._model,
+                "reasoning": self._reasoning,
                 "tokens_prompt_estimate": token_estimate,
                 "has_schema": schema is not None,
                 "session_id": session_id,
@@ -640,6 +663,7 @@ class LMStudioClient(LLMClient):
                 "type": "json_schema",
                 "json_schema": schema,
             }
+        self._apply_reasoning(kwargs)
 
         correlation_id = uuid4().hex
         token_estimate = _estimate_tokens(messages)
@@ -653,6 +677,7 @@ class LMStudioClient(LLMClient):
             payload={
                 "messages": messages,
                 "model": self._model,
+                "reasoning": self._reasoning,
                 "tokens_prompt_estimate": token_estimate,
                 "has_schema": schema is not None,
                 "session_id": session_id,
@@ -799,6 +824,7 @@ class LMStudioClient(LLMClient):
         if tools:
             specs = order_specs([ToolSpec.from_tool_definition(tool) for tool in tools])
             kwargs.update(self._tool_codec.inject(messages, specs))
+        self._apply_reasoning(kwargs)
 
         # Slice 0039: pair start / end debug events via a local correlation_id
         # so the UI can group them. The id is regenerated per call (no cross-
@@ -814,6 +840,7 @@ class LMStudioClient(LLMClient):
             payload={
                 "messages": messages,
                 "model": self._model,
+                "reasoning": self._reasoning,
                 "tokens_prompt_estimate": token_estimate,
                 "has_tools": bool(tools),
                 "session_id": session_id,
@@ -1021,6 +1048,7 @@ class LMStudioClient(LLMClient):
         if tools:
             specs = order_specs([ToolSpec.from_tool_definition(tool) for tool in tools])
             kwargs.update(self._tool_codec.inject(messages, specs))
+        self._apply_reasoning(kwargs)
 
         correlation_id = uuid4().hex
         token_estimate = _estimate_tokens(messages)
@@ -1032,6 +1060,7 @@ class LMStudioClient(LLMClient):
             payload={
                 "messages": messages,
                 "model": self._model,
+                "reasoning": self._reasoning,
                 "tokens_prompt_estimate": token_estimate,
                 "has_tools": bool(tools),
                 "session_id": session_id,

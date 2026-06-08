@@ -43,9 +43,14 @@ class _FakeRoleSwitcher:
     def __init__(self, result: RoleSelection) -> None:
         self._result = result
         self.calls: list[tuple[str, LLMSelection]] = []
+        self.reasoning_calls: list[tuple[str, str | None]] = []
 
     async def swap_role(self, role: str, selection: LLMSelection) -> RoleSelection:
         self.calls.append((role, selection))
+        return self._result
+
+    async def set_reasoning(self, role: str, reasoning: str | None) -> RoleSelection:
+        self.reasoning_calls.append((role, reasoning))
         return self._result
 
 
@@ -89,6 +94,7 @@ def test_get_roles_returns_full_map(tmp_path: Path) -> None:
         "lm_model": "modelA",
         "context_length": {"modelA": 16384},
         "base_url": "http://localhost:1234/v1",
+        "reasoning": None,
     }
     assert body["roles"]["subagent"]["provider"] == "claude_cli"
     assert body["stt"] == {"engine": "whisper_cpp", "model": "large-v3-turbo"}
@@ -158,6 +164,62 @@ def test_put_lm_studio_role_threads_model_and_base_url(tmp_path: Path) -> None:
     assert sel.lm_model == "modelB"
     assert sel.base_url == "http://host-b:9999/v1"
     assert sel.context_length == {"modelB": 8192}
+
+
+def test_put_reasoning_delegates_to_set_reasoning(tmp_path: Path) -> None:
+    result = RoleSelection(
+        roles={r: LLMSelection(provider="lm_studio", lm_model="x") for r in ROLES}
+    )
+    switcher = _FakeRoleSwitcher(result)
+    llm_router.set_role_switcher(switcher)  # type: ignore[arg-type]
+    llm_router.set_settings_provider(lambda: _settings())
+    try:
+        client = TestClient(app)
+        response = client.put("/api/llm/roles/thinker/reasoning", json={"reasoning": "high"})
+    finally:
+        llm_router.set_role_switcher(None)
+        llm_router.reset_settings_provider()
+
+    assert response.status_code == 200
+    # Reasoning hit the lightweight path, NOT the model-reloading swap_role.
+    assert switcher.reasoning_calls == [("thinker", "high")]
+    assert switcher.calls == []
+
+
+def test_put_reasoning_invalid_level_maps_to_422() -> None:
+    switcher = _FakeRoleSwitcher(
+        RoleSelection(roles={r: LLMSelection(provider="lm_studio", lm_model=None) for r in ROLES})
+    )
+    llm_router.set_role_switcher(switcher)  # type: ignore[arg-type]
+    llm_router.set_settings_provider(lambda: _settings())
+    try:
+        client = TestClient(app)
+        response = client.put("/api/llm/roles/jarvis/reasoning", json={"reasoning": "extreme"})
+    finally:
+        llm_router.set_role_switcher(None)
+        llm_router.reset_settings_provider()
+
+    assert response.status_code == 422
+    assert response.json()["error"] == "invalid_reasoning"
+    # Rejected before reaching the switcher.
+    assert switcher.reasoning_calls == []
+
+
+def test_put_reasoning_unknown_role_maps_to_404() -> None:
+    switcher = _FakeRoleSwitcher(
+        RoleSelection(roles={r: LLMSelection(provider="lm_studio", lm_model=None) for r in ROLES})
+    )
+    llm_router.set_role_switcher(switcher)  # type: ignore[arg-type]
+    llm_router.set_settings_provider(lambda: _settings())
+    try:
+        client = TestClient(app)
+        response = client.put("/api/llm/roles/speaker/reasoning", json={"reasoning": "low"})
+    finally:
+        llm_router.set_role_switcher(None)
+        llm_router.reset_settings_provider()
+
+    assert response.status_code == 404
+    assert response.json()["error"] == "unknown_role"
 
 
 def test_put_unknown_role_maps_to_404() -> None:

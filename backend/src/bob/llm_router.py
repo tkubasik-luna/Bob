@@ -23,6 +23,7 @@ from pydantic import BaseModel
 
 from bob.config import Settings, get_settings
 from bob.llm_selection_store import (
+    REASONING_LEVELS,
     ROLES,
     LLMSelection,
     LLMSelectionStore,
@@ -231,8 +232,13 @@ class LLMModelsErrorResponse(BaseModel):
     response_model=LLMModelsResponse,
     responses={status.HTTP_503_SERVICE_UNAVAILABLE: {"model": LLMModelsErrorResponse}},
 )
-def get_llm_models() -> JSONResponse:
+def get_llm_models(base_url: str | None = None) -> JSONResponse:
     """Return the live list of chat-capable LM Studio models.
+
+    With ``?base_url=`` set, lists the CANDIDATE server's models (used by the
+    per-role picker so each role's model list follows its OWN typed/committed
+    URL, not the globally-configured server). Without it, lists the
+    currently-configured server's models.
 
     Embedding models are excluded by the manager. When the LM Studio server is
     unreachable, returns HTTP 503 with a DISTINCT, structured error body rather
@@ -240,7 +246,10 @@ def get_llm_models() -> JSONResponse:
     show "serveur LM Studio injoignable" and the picker degrades gracefully.
     """
 
-    manager = _manager_provider()
+    if base_url:
+        manager: LMStudioManager = LMStudioManager(host=host_from_base_url(base_url))
+    else:
+        manager = _manager_provider()
     try:
         models = manager.list_models()
     except LMStudioUnavailableError as exc:
@@ -521,6 +530,10 @@ class RoleSelectionBody(BaseModel):
     base_url: str | None = None
     lm_model: str | None = None
     context_length: dict[str, int] = {}
+    #: LM Studio reasoning level — ``"off"|"low"|"medium"|"high"|"on"`` or
+    #: ``None`` (omit → the model's auto setting). Only meaningful for an
+    #: ``lm_studio`` role; the store drops an out-of-range value to ``None``.
+    reasoning: str | None = None
 
 
 class SttSelectionBody(BaseModel):
@@ -569,6 +582,7 @@ def _role_map_payload(selection: object) -> RoleMapResponse:
             base_url=sel.base_url,
             lm_model=sel.lm_model,
             context_length=sel.context_length,
+            reasoning=sel.reasoning,
         )
     stt = selection.stt  # type: ignore[attr-defined]
     budget = selection.budget  # type: ignore[attr-defined]
@@ -660,6 +674,7 @@ async def put_llm_role(role: str, body: RoleSelectionBody) -> JSONResponse:
         lm_model=body.lm_model,
         context_length=dict(body.context_length),
         base_url=body.base_url,
+        reasoning=body.reasoning,
     )
     try:
         updated = await _role_switcher.swap_role(role, selection)
@@ -684,6 +699,66 @@ async def put_llm_role(role: str, body: RoleSelectionBody) -> JSONResponse:
         # reached during the load policy. The role keeps its previous state; the
         # picker surfaces the host as offline via the ping chip.
         return _role_error("lm_studio_unavailable", str(exc), status.HTTP_503_SERVICE_UNAVAILABLE)
+    return JSONResponse(
+        status_code=status.HTTP_200_OK,
+        content=_role_map_payload(updated).model_dump(),
+    )
+
+
+class RoleReasoningUpdateBody(BaseModel):
+    """Body for ``PUT /api/llm/roles/{role}/reasoning``.
+
+    ``reasoning`` is one of :data:`REASONING_LEVELS` or ``None`` (omit → the
+    model's auto-chosen setting). This is a per-REQUEST chat param, not a
+    load-time setting, so updating it never reloads the model or runs the budget
+    policy — distinct from the model/provider/url swaps on ``PUT /roles/{role}``.
+    """
+
+    reasoning: str | None = None
+
+
+@router.put(
+    "/roles/{role}/reasoning",
+    response_model=RoleMapResponse,
+    responses={
+        status.HTTP_404_NOT_FOUND: {"model": RoleSelectionUpdateErrorResponse},
+        status.HTTP_422_UNPROCESSABLE_ENTITY: {"model": RoleSelectionUpdateErrorResponse},
+        status.HTTP_503_SERVICE_UNAVAILABLE: {"model": RoleSelectionUpdateErrorResponse},
+    },
+)
+async def put_llm_role_reasoning(role: str, body: RoleReasoningUpdateBody) -> JSONResponse:
+    """Update ONLY a role's reasoning level — no model reload, no budget check.
+
+    Reasoning rides on every chat request (LM Studio ``reasoning`` body field),
+    so changing it must not rebuild the model load: this delegates to
+    :meth:`bob.llm_swap.RoleLLMSwitcher.set_reasoning`, which persists the new
+    level and refreshes only the role's cheap client object. Validates the role
+    id (404) and the level (422) before any write. Returns the full updated map.
+    """
+
+    if role not in ROLES:
+        return _role_error(
+            "unknown_role",
+            f"Unknown LLM role: {role!r}. Expected one of {sorted(ROLES)}.",
+            status.HTTP_404_NOT_FOUND,
+        )
+
+    if body.reasoning is not None and body.reasoning not in REASONING_LEVELS:
+        return _role_error(
+            "invalid_reasoning",
+            f"Unknown reasoning level: {body.reasoning!r}. "
+            f"Expected one of {sorted(REASONING_LEVELS)} or null.",
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+        )
+
+    if _role_switcher is None:
+        return _role_error(
+            "swap_unavailable",
+            "Per-role LLM swap coordinator not initialised (app lifespan not running)",
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+
+    updated = await _role_switcher.set_reasoning(role, body.reasoning)
     return JSONResponse(
         status_code=status.HTTP_200_OK,
         content=_role_map_payload(updated).model_dump(),

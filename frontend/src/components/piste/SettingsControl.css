@@ -114,27 +114,32 @@
   z-index: 55;
   background: transparent;
 }
+/* Full settings SCREEN (not a top-right dropdown overlay): the panel fills the
+ * viewport so the per-role blocks lay out side-by-side with room to breathe. */
 .settings-panel {
-  position: absolute;
-  top: calc(100% + 10px);
-  right: 0;
+  position: fixed;
+  inset: 0;
   z-index: 60;
-  width: 326px;
-  padding: 16px 18px 18px;
-  border-radius: 16px;
-  background: color-mix(in oklab, var(--bg2) 78%, transparent);
-  border: 1px solid var(--line);
-  box-shadow: 0 30px 80px rgba(0, 0, 0, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.06);
-  backdrop-filter: blur(16px);
-  -webkit-backdrop-filter: blur(16px);
+  width: 100vw;
+  height: 100vh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 28px clamp(24px, 5vw, 72px) 40px;
+  background: color-mix(in oklab, var(--bg2) 92%, transparent);
+  border: 0;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
   opacity: 1;
   animation: settings-in 0.3s cubic-bezier(0.34, 1.28, 0.4, 1);
 }
 @keyframes settings-in {
   from {
-    transform: translateY(-8px) scale(0.98);
+    opacity: 0;
+    transform: scale(0.99);
   }
   to {
+    opacity: 1;
     transform: none;
   }
 }
@@ -230,6 +235,48 @@
 .set-seg-glyph {
   font-size: 12px;
   opacity: 0.85;
+}
+
+/* ── reasoning level — LM Studio `reasoning` (auto/off/low/med/high/on) ────── */
+.set-reason {
+  margin-top: 10px;
+}
+.set-reason-head {
+  margin-bottom: 6px;
+}
+.set-reason-seg {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 3px;
+  padding: 4px;
+  border-radius: 12px;
+  background: color-mix(in oklab, var(--bg) 55%, transparent);
+  border: 1px solid var(--line);
+}
+.set-reason-btn {
+  padding: 7px 4px;
+  border: 0;
+  border-radius: 8px;
+  cursor: pointer;
+  background: transparent;
+  color: var(--dim);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.02em;
+  transition: background 0.28s ease, color 0.28s ease, box-shadow 0.28s ease;
+}
+.set-reason-btn:hover {
+  color: var(--ink);
+}
+.set-reason-btn:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+.set-reason-btn.on {
+  color: var(--ink);
+  background: color-mix(in oklab, var(--accent) 22%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--accent) 45%, transparent), 0 4px 14px
+    color-mix(in oklab, var(--accent) 22%, transparent);
 }
 
 /* ── the engine detail block beneath the toggle — swaps per provider ──────── */
@@ -670,17 +717,21 @@
 }
 
 /* ── per-role blocks (PRD 0016 / issue 0108) ─────────────────────────────── */
-/* One framed card per role inside the MOTEURS LLM section. Stacked, each with
- * its own provider toggle + (LM Studio) URL/model/ctx controls. */
+/* One framed card per role inside the MOTEURS LLM section. Laid side-by-side in
+ * a row grid (full settings screen), each with its own provider toggle +
+ * (LM Studio) URL/model/ctx controls. */
+.set-roles-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 14px;
+  align-items: start;
+  margin-top: 6px;
+}
 .set-role {
-  margin-top: 12px;
-  padding: 11px 12px 13px;
+  padding: 13px 14px 15px;
   border: 1px solid var(--line);
   border-radius: 12px;
   background: color-mix(in oklab, var(--bg2) 38%, transparent);
-}
-.set-role:first-of-type {
-  margin-top: 8px;
 }
 .set-role-head {
   display: flex;
@@ -716,27 +767,6 @@
 .set-role-badge.is-off {
   color: color-mix(in oklab, #f0b6c4 72%, var(--ink));
   border-color: color-mix(in oklab, #f0b6c4 32%, var(--line));
-}
-
-/* native model dropdown (per role). Styled to sit in the nacre language; a
- * native <select> keeps it keyboard-accessible without bespoke listbox chrome. */
-.set-model-select {
-  width: 100%;
-  margin-top: 6px;
-  padding: 9px 11px;
-  border: 1px solid var(--line);
-  border-radius: 9px;
-  background: color-mix(in oklab, var(--bg2) 70%, transparent);
-  color: var(--ink);
-  font-family: var(--font-mono);
-  font-size: 11px;
-  letter-spacing: 0.01em;
-  cursor: pointer;
-  outline: 0;
-}
-.set-model-select:disabled {
-  opacity: 0.5;
-  cursor: default;
 }
 
 /* over-budget refusal — a warmer tint than the generic offline row so the

@@ -104,6 +104,7 @@ def test_on_disk_shape_matches_annexe_d(tmp_path: Path) -> None:
         "lm_model": None,
         "context_length": {},
         "base_url": None,
+        "reasoning": None,
     }
     assert on_disk["stt"] == {"engine": "whisper_cpp", "model": "large-v3-turbo"}
     assert on_disk["budget"] == {

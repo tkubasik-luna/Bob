@@ -44,6 +44,12 @@ from bob.config import Settings
 #: Filename of the selection JSON under ``BOB_DATA_DIR``.
 LLM_SELECTION_FILENAME = "llm_selection.json"
 
+#: Accepted LM Studio ``reasoning`` levels (mirrors the LM Studio REST docs:
+#: ``"off" | "low" | "medium" | "high" | "on"``). ``None`` means "unset" — the
+#: field is omitted from the request so the model's auto-chosen setting applies.
+#: A value outside this set is dropped on decode (collapses to ``None``).
+REASONING_LEVELS: tuple[str, ...] = ("off", "low", "medium", "high", "on")
+
 
 @dataclass(frozen=True)
 class LLMSelection:
@@ -65,6 +71,11 @@ class LLMSelection:
     #: ``None`` falls back to ``settings.LLM_BASE_URL``. Runtime-swappable via the
     #: picker's URL field (``PUT /api/llm/selection {base_url}``).
     base_url: str | None = None
+    #: The LM Studio ``reasoning`` level for this selection — one of
+    #: :data:`REASONING_LEVELS`. ``None`` (the default) omits the field from the
+    #: request so the model's auto-chosen setting applies. Only meaningful for the
+    #: ``lm_studio`` provider; a ``claude_cli`` selection carries ``None``.
+    reasoning: str | None = None
 
     def as_dict(self) -> dict[str, object]:
         """Serialise to the on-disk / REST JSON shape."""
@@ -74,6 +85,7 @@ class LLMSelection:
             "lm_model": self.lm_model,
             "context_length": dict(self.context_length),
             "base_url": self.base_url,
+            "reasoning": self.reasoning,
         }
 
 
@@ -189,11 +201,15 @@ def _decode_selection(raw: object) -> LLMSelection:
     base_url_raw = data.get("base_url")
     base_url = base_url_raw if isinstance(base_url_raw, str) and base_url_raw else None
 
+    reasoning_raw = data.get("reasoning")
+    reasoning = reasoning_raw if reasoning_raw in REASONING_LEVELS else None
+
     return LLMSelection(
         provider=provider,
         lm_model=lm_model,
         context_length=context_length,
         base_url=base_url,
+        reasoning=reasoning,
     )
 
 

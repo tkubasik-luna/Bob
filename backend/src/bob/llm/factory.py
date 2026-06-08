@@ -138,8 +138,10 @@ def _build_role_client(role_selection: RoleSelection, role: str, settings: Setti
     if selection.provider == "lm_studio":
         # Pin the wire ``model`` EXPLICITLY to the role's model so two roles on
         # the same LM Studio host still route each request to their own model.
-        # base_url is already per-role via the folded ``LLM_BASE_URL``.
-        return LMStudioClient(effective, model=selection.lm_model)
+        # base_url is already per-role via the folded ``LLM_BASE_URL``. The
+        # per-role ``reasoning`` level rides on the client so every request from
+        # this role carries it (``None`` omits it → model's auto setting).
+        return LMStudioClient(effective, model=selection.lm_model, reasoning=selection.reasoning)
     if selection.provider == "fake":
         # PRD 0016 / issue 0098 — the attestation harness provider, at the
         # per-role granularity (the seeded role map inherits ``LLM_PROVIDER=fake``

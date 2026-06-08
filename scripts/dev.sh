@@ -43,7 +43,7 @@ trap cleanup EXIT INT TERM
 echo "[bob] backend → http://$HOST:$PORT"
 (
   cd "$ROOT/backend"
-  uv sync --quiet
+  uv sync --extra stt --quiet
   exec uv run uvicorn bob.main:app --reload --host "$HOST" --port "$PORT"
 ) &
 PIDS+=($!)

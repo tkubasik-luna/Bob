@@ -49,8 +49,11 @@ export class LlmModelsUnavailableError extends Error {
  * On the backend's 503 (LM Studio down) this throws
  * {@link LlmModelsUnavailableError} so the picker can show an explicit error
  * row instead of an empty/loading list forever. */
-export async function fetchLlmModels(signal?: AbortSignal): Promise<LlmModel[]> {
-  const res = await fetch(`${API_BASE_URL}/api/llm/models`, { signal });
+export async function fetchLlmModels(baseUrl?: string, signal?: AbortSignal): Promise<LlmModel[]> {
+  // With `baseUrl`, list the CANDIDATE server's models (per-role picker — each
+  // role's list follows its own committed URL). Without it, the active server.
+  const qs = baseUrl ? `?base_url=${encodeURIComponent(baseUrl)}` : "";
+  const res = await fetch(`${API_BASE_URL}/api/llm/models${qs}`, { signal });
   if (res.status === 503) {
     let detail = "LM Studio injoignable";
     try {
@@ -244,6 +247,10 @@ export type RoleSelection = {
   base_url: string | null;
   lm_model: string | null;
   context_length: Record<string, number>;
+  /** LM Studio reasoning level — `"off"|"low"|"medium"|"high"|"on"` or `null`
+   * (omit → the model's auto-chosen setting). Only meaningful for an
+   * `lm_studio` role; a Claude role carries `null`. */
+  reasoning: string | null;
 };
 
 /** The `stt` block — mirror of the backend `SttSelectionBody` (Annexe D). */
@@ -332,6 +339,40 @@ export async function putLlmRole(
   if (!res.ok) {
     let code = "swap_failed";
     let detail = `PUT /api/llm/roles/${role} failed: ${res.status}`;
+    try {
+      const body = (await res.json()) as { error?: string; detail?: string };
+      if (typeof body.error === "string" && body.error) code = body.error;
+      if (typeof body.detail === "string" && body.detail) detail = body.detail;
+    } catch {
+      // keep the defaults
+    }
+    throw new LlmRoleSwapError(code, detail);
+  }
+  return (await res.json()) as RoleMap;
+}
+
+/** Update ONLY a role's LM Studio reasoning level — LIGHTWEIGHT, no model reload.
+ *
+ * Reasoning is a per-REQUEST chat param, so the backend persists the level and
+ * refreshes only the role's client object — it never reloads the model or runs
+ * the budget policy (unlike {@link putLlmRole}). `level` is one of
+ * `"off"|"low"|"medium"|"high"|"on"` or `null` (omit → the model's auto setting).
+ * On failure throws {@link LlmRoleSwapError} (404 unknown role / 422 invalid
+ * level / 503 not wired); the picker keeps the previous level. */
+export async function putLlmRoleReasoning(
+  role: LlmRole,
+  level: string | null,
+  signal?: AbortSignal,
+): Promise<RoleMap> {
+  const res = await fetch(`${API_BASE_URL}/api/llm/roles/${role}/reasoning`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ reasoning: level }),
+    signal,
+  });
+  if (!res.ok) {
+    let code = "swap_failed";
+    let detail = `PUT /api/llm/roles/${role}/reasoning failed: ${res.status}`;
     try {
       const body = (await res.json()) as { error?: string; detail?: string };
       if (typeof body.error === "string" && body.error) code = body.error;

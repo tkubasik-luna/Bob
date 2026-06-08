@@ -6,9 +6,10 @@
 //
 //   1. MOTEURS LLM (par rôle) — one block per role (`jarvis`/`thinker`/`draft`/
 //      `subagent`): a provider segmented control (Claude CLI ↔ LM Studio), and
-//      under LM Studio a server URL field + a live model dropdown (from the
-//      role's host `GET /models`) + a context-length slider. Each block wires
-//      `PUT /api/llm/roles/{role}` so only that role's client is rebuilt.
+//      under LM Studio a server URL field + a live model ROW-LIST (clickable,
+//      from the role's committed host via `GET /models?base_url=`) + a
+//      context-length slider. Each block wires `PUT /api/llm/roles/{role}` so
+//      only that role's client is rebuilt.
 //   2. TRANSCRIPTION (STT) — the whisper.cpp engine (read-only) + the model
 //      (default `large-v3-turbo`). The backend exposes the stt block read-only
 //      in `GET /roles`; there is no STT mutation endpoint yet (seam, below).
@@ -23,14 +24,14 @@
 // Backend contracts consumed (all committed, issues 0106/0107):
 //   - `GET  /api/llm/roles`        → the per-role map (+ stt + budget).
 //   - `PUT  /api/llm/roles/{role}` → swap ONE role; returns the updated map.
-//   - `GET  /api/llm/models`       → the live model list for the dropdown.
+//   - `PUT  /api/llm/roles/{role}/reasoning` → set ONE role's LM Studio
+//     reasoning level. LIGHTWEIGHT: reasoning is a per-request chat param, so
+//     this persists + refreshes the client WITHOUT reloading the model.
+//   - `GET  /api/llm/models?base_url=` → the live model list for the role's
+//     committed host (so each role's catalogue follows its OWN URL).
 //   - `GET  /api/llm/ping`         → reachability for the per-role badge.
 //
 // SEAMS (documented, NOT faked):
-//   - `GET /models` lists the CURRENTLY-configured server's models only — there
-//     is no `?base_url=` model-list endpoint, so a role pinned to a DIFFERENT
-//     host shows the active server's catalogue. We still PUT the role's own
-//     base_url; the dropdown is a best-effort hint until a per-host list ships.
 //   - The budget block is CONFIG only: the backend has no LIVE resident-usage
 //     endpoint (`model_budget.HostBudget.resident_gib()` is in-process on the
 //     manager). We render the ceiling/reserve + the over-budget refusal, but no
@@ -55,6 +56,7 @@ import {
   fetchLlmRoles,
   pingLm,
   putLlmRole,
+  putLlmRoleReasoning,
 } from "../../lib/llmApi";
 import "./SettingsControl.css";
 
@@ -74,6 +76,19 @@ const ROLE_LABEL: Record<LlmRole, string> = {
 // Default LM Studio base URL when a role has none pinned (the field seeds from
 // the role's persisted base_url; this is the fallback for an unset one).
 const LM_URL_DEFAULT = "http://localhost:1234/v1";
+
+// LM Studio reasoning levels (mirror of the backend `REASONING_LEVELS` + an
+// "auto" sentinel for `null`). `null` omits the field so the model picks its
+// own setting; the others map 1:1 to the LM Studio `reasoning` body field.
+// Errors server-side if the model doesn't support the chosen level.
+const REASONING_OPTIONS: { value: string | null; label: string }[] = [
+  { value: null, label: "auto" },
+  { value: "off", label: "off" },
+  { value: "low", label: "bas" },
+  { value: "medium", label: "moyen" },
+  { value: "high", label: "haut" },
+  { value: "on", label: "on" },
+];
 
 /** Normalise a raw URL-field value into a committable LM Studio base URL. */
 function normalizeLmUrl(raw: string): string {
@@ -114,11 +129,14 @@ type ListState =
 
 // Per-role swap (PUT /roles/{role}) lifecycle. `detail` carries the failure
 // message; `code` lets the UI single out `budget_exceeded` for the over-budget
-// warning. We stay on the PREVIOUS selection while loading and on failure.
+// warning. `target` is the model id a model-select swap is loading (null for a
+// provider/url/ctx swap) so the clicked ROW can show its own spinner/error in
+// the restored row-list picker. We stay on the PREVIOUS selection while loading
+// and on failure.
 type SwapState =
   | { status: "idle" }
-  | { status: "loading" }
-  | { status: "error"; code: string; detail: string };
+  | { status: "loading"; target: string | null }
+  | { status: "error"; code: string; detail: string; target: string | null };
 
 export function SettingsControl() {
   const [open, setOpen] = useState(false);
@@ -231,16 +249,18 @@ export function SettingsControl() {
                   <span className="set-status-state">hors ligne</span>
                 </div>
               ) : (
-                LLM_ROLES.map((role) => (
-                  <RoleBlock
-                    key={role}
-                    role={role}
-                    selection={roleMap.roles[role]}
-                    claudeModel={claudeModel}
-                    panelOpen={open}
-                    onUpdated={onRoleUpdated}
-                  />
-                ))
+                <div className="set-roles-grid">
+                  {LLM_ROLES.map((role) => (
+                    <RoleBlock
+                      key={role}
+                      role={role}
+                      selection={roleMap.roles[role]}
+                      claudeModel={claudeModel}
+                      panelOpen={open}
+                      onUpdated={onRoleUpdated}
+                    />
+                  ))}
+                </div>
               )}
             </div>
 
@@ -334,7 +354,6 @@ function RoleBlock({ role, selection, claudeModel, panelOpen, onUpdated }: RoleB
   const [lmUrl, setLmUrl] = useState<string>(selection.base_url ?? LM_URL_DEFAULT);
   // Ctx slider is LOCAL state; the explicit swap fires the blocking PUT.
   const [ctxValue, setCtxValue] = useState<number | null>(null);
-  const fetchedRef = useRef(false);
 
   // Reseed the URL field if the persisted base_url changes (e.g. after a swap).
   const persistedUrl = selection.base_url ?? LM_URL_DEFAULT;
@@ -342,11 +361,18 @@ function RoleBlock({ role, selection, claudeModel, panelOpen, onUpdated }: RoleB
     setLmUrl(persistedUrl);
   }, [persistedUrl]);
 
-  // Fetch the model list once when the panel opens under LM Studio. The list
-  // comes from the CURRENTLY-configured server (seam: no per-host endpoint).
-  const loadModels = useCallback(() => {
+  // The role's COMMITTED server (null until a URL is applied). The model list
+  // follows THIS — not the live-typed field — so the catalogue reflects the
+  // server actually in use for the role. Refetched whenever it changes (after
+  // an « OK » URL apply / a provider switch to LM Studio), mirroring the old
+  // single-picker behaviour where committing a URL re-pointed the model list.
+  const committedUrl = selection.base_url ?? null;
+
+  // Fetch the model list for `url` (the role's committed server, or the active
+  // server when null). A 503 surfaces an explicit error row.
+  const loadModels = useCallback((url: string | null) => {
     setList({ status: "loading" });
-    fetchLlmModels()
+    fetchLlmModels(url ?? undefined)
       .then((models) => setList({ status: "ready", models }))
       .catch((err: unknown) => {
         const detail =
@@ -358,12 +384,8 @@ function RoleBlock({ role, selection, claudeModel, panelOpen, onUpdated }: RoleB
   }, []);
 
   useEffect(() => {
-    if (panelOpen && isLM && !fetchedRef.current) {
-      fetchedRef.current = true;
-      loadModels();
-    }
-    if (!panelOpen) fetchedRef.current = false;
-  }, [panelOpen, isLM, loadModels]);
+    if (panelOpen && isLM) loadModels(committedUrl);
+  }, [panelOpen, isLM, committedUrl, loadModels]);
 
   // Live reachability for the role's host — drives the ready/offline badge. A
   // Claude-CLI role is always "ready" (the bridge is local); an LM Studio role
@@ -404,9 +426,9 @@ function RoleBlock({ role, selection, claudeModel, panelOpen, onUpdated }: RoleB
   // on the previous selection and surface the detail (singling out
   // `budget_exceeded` for the over-budget warning).
   const commit = useCallback(
-    (next: RoleSelection) => {
+    (next: RoleSelection, target: string | null = null) => {
       if (swap.status === "loading") return;
-      setSwap({ status: "loading" });
+      setSwap({ status: "loading", target });
       putLlmRole(role, next)
         .then((map) => {
           onUpdated(map);
@@ -414,9 +436,14 @@ function RoleBlock({ role, selection, claudeModel, panelOpen, onUpdated }: RoleB
         })
         .catch((err: unknown) => {
           if (err instanceof LlmRoleSwapError) {
-            setSwap({ status: "error", code: err.code, detail: err.message });
+            setSwap({ status: "error", code: err.code, detail: err.message, target });
           } else {
-            setSwap({ status: "error", code: "swap_failed", detail: "Échec du changement" });
+            setSwap({
+              status: "error",
+              code: "swap_failed",
+              detail: "Échec du changement",
+              target,
+            });
           }
         });
     },
@@ -429,13 +456,21 @@ function RoleBlock({ role, selection, claudeModel, panelOpen, onUpdated }: RoleB
   const switchProvider = (provider: string) => {
     if (provider === selection.provider) return;
     if (provider === PROVIDER_CLAUDE) {
-      commit({ provider: PROVIDER_CLAUDE, base_url: null, lm_model: null, context_length: {} });
+      // Claude has no reasoning knob — drop the LM pins AND the reasoning level.
+      commit({
+        provider: PROVIDER_CLAUDE,
+        base_url: null,
+        lm_model: null,
+        context_length: {},
+        reasoning: null,
+      });
     } else {
       commit({
         provider: PROVIDER_LM,
         base_url: normalizeLmUrl(lmUrl),
         lm_model: selection.lm_model,
         context_length: selection.context_length,
+        reasoning: selection.reasoning,
       });
     }
   };
@@ -447,6 +482,7 @@ function RoleBlock({ role, selection, claudeModel, panelOpen, onUpdated }: RoleB
       base_url: normalizeLmUrl(lmUrl),
       lm_model: selection.lm_model,
       context_length: selection.context_length,
+      reasoning: selection.reasoning,
     });
   };
 
@@ -454,12 +490,16 @@ function RoleBlock({ role, selection, claudeModel, panelOpen, onUpdated }: RoleB
   // role's current base_url + ctx so the swap only changes the model.
   const selectModel = (modelId: string) => {
     if (modelId === currentModelId) return;
-    commit({
-      provider: PROVIDER_LM,
-      base_url: selection.base_url ?? normalizeLmUrl(lmUrl),
-      lm_model: modelId,
-      context_length: selection.context_length,
-    });
+    commit(
+      {
+        provider: PROVIDER_LM,
+        base_url: selection.base_url ?? normalizeLmUrl(lmUrl),
+        lm_model: modelId,
+        context_length: selection.context_length,
+        reasoning: selection.reasoning,
+      },
+      modelId,
+    );
   };
 
   // Apply the ctx slider — reload the current model at the slider window.
@@ -470,7 +510,36 @@ function RoleBlock({ role, selection, claudeModel, panelOpen, onUpdated }: RoleB
       base_url: selection.base_url ?? normalizeLmUrl(lmUrl),
       lm_model: currentModelId,
       context_length: { ...selection.context_length, [currentModelId]: ctxValue },
+      reasoning: selection.reasoning,
     });
+  };
+
+  // Set the LM Studio reasoning level for this role — no-op if unchanged.
+  // Reasoning is a per-REQUEST chat param, so this hits the LIGHTWEIGHT
+  // `/reasoning` endpoint: it persists the level + refreshes the role's client
+  // WITHOUT reloading the model or running the budget policy. We still drive the
+  // shared swap state for in-flight feedback (it returns fast — no SDK load).
+  const selectReasoning = (level: string | null) => {
+    if (level === (selection.reasoning ?? null)) return;
+    if (swap.status === "loading") return;
+    setSwap({ status: "loading", target: null });
+    putLlmRoleReasoning(role, level)
+      .then((map) => {
+        onUpdated(map);
+        setSwap({ status: "idle" });
+      })
+      .catch((err: unknown) => {
+        if (err instanceof LlmRoleSwapError) {
+          setSwap({ status: "error", code: err.code, detail: err.message, target: null });
+        } else {
+          setSwap({
+            status: "error",
+            code: "swap_failed",
+            detail: "Échec du réglage",
+            target: null,
+          });
+        }
+      });
   };
 
   // Per-role ready/offline badge. Claude → always ready; LM Studio → live ping.
@@ -525,7 +594,7 @@ function RoleBlock({ role, selection, claudeModel, panelOpen, onUpdated }: RoleB
         </output>
       )}
 
-      {swap.status === "error" && (
+      {swap.status === "error" && swap.target === null && (
         <div
           className={`set-status is-off ${swap.code === "budget_exceeded" ? "is-budget" : ""}`}
           role="alert"
@@ -577,7 +646,9 @@ function RoleBlock({ role, selection, claudeModel, panelOpen, onUpdated }: RoleB
             </div>
           </div>
 
-          {/* live model dropdown — from GET /api/llm/models (active server). */}
+          {/* live local-model list — from GET /api/llm/models (active server).
+            Restored pre-0108 row-list layout: clicking a non-current row fires
+            the blocking per-role swap; the clicked row shows its own spinner. */}
           <div className="set-field">
             <div className="set-models-head">
               <span className="settings-label">MODÈLE</span>
@@ -591,40 +662,67 @@ function RoleBlock({ role, selection, claudeModel, panelOpen, onUpdated }: RoleB
                       : ""}
               </span>
             </div>
-            {list.status === "error" ? (
-              <div className="set-status is-off" role="alert">
-                <span className="set-dot is-off" />
-                <span className="eng-name">Serveur LM Studio injoignable</span>
-              </div>
-            ) : (
-              <select
-                className="set-model-select"
-                data-testid={`set-role-model-${role}`}
-                aria-label={`Modèle · ${ROLE_LABEL[role]}`}
-                disabled={swapping || list.status !== "ready"}
-                value={currentModelId ?? ""}
-                onChange={(e) => selectModel(e.target.value)}
-              >
-                {/* When the persisted model isn't in the live list (different
-                  host / not loaded), keep it selectable so we don't silently
-                  drop the role's pin. */}
-                {currentModelId !== null && !models.some((m) => m.id === currentModelId) && (
-                  <option value={currentModelId}>{currentModelId}</option>
+            <div
+              className="set-models"
+              // biome-ignore lint/a11y/useSemanticElements: ARIA listbox ported from the mockup; a native <select> can't carry the per-row metadata chrome. tabIndex makes the interactive role focusable.
+              role="listbox"
+              tabIndex={0}
+              aria-label={`Modèle · ${ROLE_LABEL[role]}`}
+            >
+              {list.status === "error" && (
+                <div className="set-model is-error" role="alert">
+                  <span className="set-model-mark">⚠</span>
+                  <span className="set-model-name">Serveur LM Studio injoignable</span>
+                  <span className="set-model-spec">{list.detail}</span>
+                </div>
+              )}
+              {/* When the persisted model isn't in the live list (different host
+                / not loaded), keep it as a selected row so we don't silently
+                drop the role's pin. */}
+              {list.status === "ready" &&
+                currentModelId !== null &&
+                !models.some((m) => m.id === currentModelId) && (
+                  <div className="set-model on" aria-selected="true">
+                    <span className="set-model-mark">◆</span>
+                    <span className="set-model-name">{currentModelId}</span>
+                    <span className="set-model-spec">non chargé sur cet hôte</span>
+                  </div>
                 )}
-                {currentModelId === null && (
-                  <option value="" disabled>
-                    — choisir un modèle —
-                  </option>
-                )}
-                {models.map((m) => (
-                  <option key={m.id} value={m.id}>
-                    {m.id}
-                    {modelSpec(m) ? ` · ${modelSpec(m)}` : ""}
-                    {m.loaded ? " · chargé" : ""}
-                  </option>
-                ))}
-              </select>
-            )}
+              {list.status === "ready" &&
+                models.map((m) => {
+                  const on = m.id === currentModelId;
+                  const isSwapping = swap.status === "loading" && swap.target === m.id;
+                  const swapFailed = swap.status === "error" && swap.target === m.id;
+                  const ramLabel = isSwapping
+                    ? "chargement…"
+                    : swapFailed
+                      ? "erreur"
+                      : m.loaded
+                        ? "chargé"
+                        : "";
+                  return (
+                    <button
+                      key={m.id}
+                      type="button"
+                      // biome-ignore lint/a11y/useSemanticElements: ARIA option inside the listbox above; rows carry custom multi-field metadata chrome a native <option> can't render. <button> keeps it natively focusable + clickable.
+                      role="option"
+                      aria-selected={on}
+                      aria-busy={isSwapping}
+                      disabled={swapping}
+                      className={`set-model ${on ? "on" : ""} ${isSwapping ? "is-loading" : ""} ${swapFailed ? "is-error" : ""}`}
+                      data-testid={`set-role-model-${role}-${m.id}`}
+                      onClick={() => selectModel(m.id)}
+                    >
+                      <span className="set-model-mark">{on ? "◆" : "◇"}</span>
+                      <span className="set-model-name">{m.id}</span>
+                      <span className="set-model-spec">
+                        {swapFailed ? swap.detail : modelSpec(m)}
+                      </span>
+                      <span className="set-model-ram">{ramLabel}</span>
+                    </button>
+                  );
+                })}
+            </div>
           </div>
 
           {/* ctx-length slider + Apply — only with a known max for the active
@@ -661,6 +759,40 @@ function RoleBlock({ role, selection, claudeModel, panelOpen, onUpdated }: RoleB
               </div>
             </div>
           )}
+
+          {/* reasoning level — LM Studio `reasoning` body field. "auto" omits
+            it (model default); the others map 1:1. Errors server-side if the
+            model doesn't support the chosen level (surfaced on the role error
+            row). Each click fires the blocking per-role swap. */}
+          <div className="set-reason" data-testid={`set-role-reason-${role}`}>
+            <div className="set-reason-head">
+              <span className="settings-label">RAISONNEMENT</span>
+            </div>
+            <div
+              className="set-reason-seg"
+              role="radiogroup"
+              aria-label={`Raisonnement · ${ROLE_LABEL[role]}`}
+            >
+              {REASONING_OPTIONS.map((opt) => {
+                const on = (selection.reasoning ?? null) === opt.value;
+                return (
+                  <button
+                    key={opt.label}
+                    type="button"
+                    // biome-ignore lint/a11y/useSemanticElements: ARIA radiogroup of buttons — <button> is the correct focusable element; the role only adds radio semantics.
+                    role="radio"
+                    aria-checked={on}
+                    disabled={swapping}
+                    className={`set-reason-btn ${on ? "on" : ""}`}
+                    data-testid={`set-role-reason-${role}-${opt.value ?? "auto"}`}
+                    onClick={() => selectReasoning(opt.value)}
+                  >
+                    {opt.label}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
         </div>
       )}
     </div>

@@ -34,16 +34,18 @@ from __future__ import annotations
 import asyncio
 import shutil
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from bob.config import Settings
 from bob.context.policy import (
     DEFAULT_TOKEN_BUDGET,
     token_budget_for_context_length,
 )
+from bob.debug_log import emit_debug
 from bob.llm.factory import build_jarvis_client, build_role_client, build_subagent_client
 from bob.llm_client import LLMClient
 from bob.llm_selection_store import (
+    REASONING_LEVELS,
     ROLES,
     LLMSelection,
     LLMSelectionStore,
@@ -575,6 +577,65 @@ class RoleLLMSwitcher:
             self._registry.set(role, rebuilt)
 
             self._selection_store.write(next_map)
+            return next_map
+
+    async def set_reasoning(self, role: str, reasoning: str | None) -> RoleSelection:
+        """Update ONLY a role's reasoning level — no model load, no budget check.
+
+        LM Studio's ``reasoning`` is a per-REQUEST chat param (sent in the chat
+        body), NOT a load-time setting, so changing it must NOT reload the model
+        or run the per-host budget policy — unlike :meth:`swap_role`. Lock-guarded:
+        reads the map, replaces the role's selection with a copy carrying the new
+        level (provider / model / base_url / context_length untouched), rebuilds
+        ONLY that role's client so the live consumer picks up the new level via
+        its sink, persists, and returns the full map. The rebuild reconstructs
+        the cheap openai client object — it does NOT touch the LM Studio manager,
+        so no model load / eviction / budget check happens.
+
+        Raises :class:`UnknownProviderError` for an unknown role or an invalid
+        reasoning level, BEFORE any write, so a bad request keeps the previous
+        state.
+        """
+
+        if role not in ROLES:
+            raise UnknownProviderError(f"Unknown LLM role: {role!r}")
+        if reasoning is not None and reasoning not in REASONING_LEVELS:
+            raise UnknownProviderError(f"Unknown reasoning level: {reasoning!r}")
+
+        async with self._lock:
+            current = self._selection_store.read()
+            if current is None:
+                current = _seed_role_selection_for_swap(self._settings)
+
+            updated = replace(current.role(role), reasoning=reasoning)
+            next_map = current.with_role(role, updated)
+
+            # Rebuild ONLY this role's client so the new level rides on the next
+            # request. No manager / load policy — reasoning is request-scoped.
+            rebuilt = build_role_client(next_map, role, self._settings)
+            self._registry.set(role, rebuilt)
+
+            self._selection_store.write(next_map)
+
+            # Instrumentation (Debug View): make it explicit that a reasoning
+            # change persists + refreshes the client only — it issues NO LM
+            # Studio load. If a reload is observed, it is LM Studio applying the
+            # new level on the NEXT inference call, not this swap.
+            emit_debug(
+                category="llm",
+                severity="info",
+                source="bob.llm_swap.set_reasoning",
+                summary=(
+                    f"reasoning {role}={reasoning!r} — persist + client refresh only, no model load"
+                ),
+                payload={
+                    "role": role,
+                    "reasoning": reasoning,
+                    "lm_model": updated.lm_model,
+                    "base_url": updated.base_url,
+                    "model_loaded": False,
+                },
+            )
             return next_map
 
     def _apply_load_policy(self, role: str, previous: LLMSelection, target: LLMSelection) -> None:

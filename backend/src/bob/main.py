@@ -43,21 +43,31 @@ from bob.debug_router import router as debug_router
 from bob.event_bus import EventBus, set_event_bus
 from bob.jarvis_prompt_loader import load_jarvis_prompt
 from bob.jarvis_store import JarvisStore
-from bob.llm.factory import build_jarvis_client, build_subagent_client
+from bob.llm.factory import (
+    build_jarvis_role_client,
+    build_role_client,
+    build_subagent_role_client,
+)
 from bob.llm_router import reset_manager_provider as reset_llm_manager_provider
 from bob.llm_router import router as llm_router
 from bob.llm_router import set_manager_provider as set_llm_manager_provider
+from bob.llm_router import set_role_switcher
 from bob.llm_router import set_switcher as set_llm_switcher
 from bob.llm_selection_store import (
     LLM_SELECTION_FILENAME,
     LLMSelection,
     LLMSelectionStore,
+    RoleSelectionStore,
+    set_default_role_store,
 )
 from bob.llm_selection_store import (
     set_default_store as set_default_llm_selection_store,
 )
 from bob.llm_swap import (
     LLMSwitcher,
+    RoleClientRegistry,
+    RoleLLMSwitcher,
+    RoleManagerRegistry,
     SubAgentClientHolder,
     resolve_cold_start_model,
 )
@@ -166,6 +176,15 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             llm_selection_store.write(seeded_selection)
             _logger.info("bob.llm.cold_start_resolved", lm_model=resolved)
 
+    # Per-role LLM selection store (PRD 0016 / issue 0106). Shares the same JSON
+    # file as the legacy flat store; seed migrates a v1 flat file forward to the
+    # four-role v2 shape and guarantees a canonical file. Wiring this default
+    # singleton is what GET /api/llm/roles reads through — without it the route
+    # raises and the HUD picker shows "Sélection par rôle indisponible".
+    role_selection_store = RoleSelectionStore(data_dir / LLM_SELECTION_FILENAME)
+    seeded_role_selection = role_selection_store.seed_from_settings(settings)
+    set_default_role_store(role_selection_store)
+
     # Sub-agent runner factory used by the scheduler. We build the LLM client
     # once and reuse it across every runner invocation — the underlying
     # client is stateless and the orchestrator's previous wiring did the
@@ -179,7 +198,11 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     # live model swap can replace it without rebuilding the scheduler. The
     # runner factory reads ``holder.client`` PER TASK: a task spawned after a
     # swap gets the new client; one already running keeps the one it captured.
-    subagent_holder = SubAgentClientHolder(build_subagent_client(settings, seeded_selection))
+    # PRD 0016 — built from the PER-ROLE store (the Réglages picker drives the
+    # `subagent` role), pushed live on a per-role swap via the registry sink.
+    subagent_holder = SubAgentClientHolder(
+        build_subagent_role_client(seeded_role_selection, settings)
+    )
     subagent_policy = default_policy()
     subagent_registry = build_default_subagent_registry()
 
@@ -269,10 +292,11 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     # PRD 0006 / issue 0050 — late-bind the addendum factory now that
     # the live runner pool exists.
     orchestrator.set_addendum_queue_factory(_addendum_queue_factory)
-    # Issue 0080 — the singleton builds its Jarvis client from frozen .env; align
-    # it with the (possibly cold-start-resolved) live selection so boot and a
-    # later swap agree on the active model.
-    orchestrator.set_jarvis_client(build_jarvis_client(settings, seeded_selection))
+    # Issue 0080 — the singleton builds its Jarvis client from frozen .env;
+    # align it with the live selection so boot and a later swap agree.
+    # PRD 0016 — built from the PER-ROLE store (the Réglages picker drives the
+    # `jarvis` voice role), pushed live on a per-role swap via the registry sink.
+    orchestrator.set_jarvis_client(build_jarvis_role_client(seeded_role_selection, settings))
     orchestrator.start_proactive_loop()
     proactivity = ProactivityHandler(orchestrator_factory=get_default_orchestrator)
     bus.subscribe("task_state_changed", proactivity.on_task_state_changed)
@@ -292,6 +316,43 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     # (localhost:1234). Point it at the same host-configured manager the swap
     # path uses, so the listing reaches the real LM Studio server (LLM_BASE_URL).
     set_llm_manager_provider(lambda: lm_studio_manager)
+
+    # Issue 0106 — per-role swap coordinator behind PUT /api/llm/roles/{role}.
+    # Holds the four seeded role clients in a registry (no sinks: the thinker /
+    # draft consumers rebuild fresh from the persisted store each turn, so a swap
+    # takes effect by persisting the new selection). Without this wiring PUT
+    # returns 503 "swap coordinator not initialised".
+    # Sinks push a rebuilt role client to its LIVE consumer on a swap: `jarvis`
+    # → the orchestrator's Jarvis client, `subagent` → the holder the runner
+    # factory reads per task. `thinker` / `draft` have no sink — their loops
+    # rebuild from the per-role store at each voice session, so a swap takes
+    # effect on the next session (no live-loop setter).
+    role_client_registry = RoleClientRegistry(
+        {
+            role: build_role_client(seeded_role_selection, role, settings)
+            for role in seeded_role_selection.roles
+        },
+        sinks={
+            "jarvis": orchestrator.set_jarvis_client,
+            "subagent": subagent_holder.set,
+        },
+    )
+    # Per-host multi-load registry (issue 0107): drives the LIVE LM Studio load
+    # on a role swap. Without it a selected model is only PERSISTED — never
+    # loaded into LM Studio. Pre-seed the boot manager under its own host (so
+    # the host already in use shares its ref-count state) and build a fresh
+    # manager per other host on first use.
+    role_manager_registry = RoleManagerRegistry(
+        {lm_studio_manager.host: lm_studio_manager},
+        factory=lambda host: LMStudioManager(host=host),
+    )
+    role_llm_switcher = RoleLLMSwitcher(
+        settings=settings,
+        selection_store=role_selection_store,
+        registry=role_client_registry,
+        manager_registry=role_manager_registry,
+    )
+    set_role_switcher(role_llm_switcher)
 
     load_jarvis_prompt(data_dir)
 
@@ -339,6 +400,8 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         jarvis_store_module.set_default_store(None)
         voice_store_module.set_default_store(None)
         set_default_llm_selection_store(None)
+        set_default_role_store(None)
+        set_role_switcher(None)
         conn.close()
         uninstall_file_sink()
 

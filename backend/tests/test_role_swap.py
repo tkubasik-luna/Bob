@@ -26,6 +26,7 @@ from bob.llm_selection_store import (
 from bob.llm_swap import (
     RoleClientRegistry,
     RoleLLMSwitcher,
+    RoleManagerRegistry,
     UnknownProviderError,
 )
 
@@ -225,3 +226,90 @@ async def test_swap_role_without_seed_uses_defaults(tmp_path: Path) -> None:
     # The other roles seeded from .env defaults.
     assert updated.role("thinker").provider == "lm_studio"
     assert cast(RoleSelection, store.read()).role("jarvis").provider == "claude_cli"
+
+
+# --- set_reasoning: per-request param, no model reload -----------------------
+
+
+@pytest.mark.asyncio
+async def test_set_reasoning_persists_and_keeps_model(tmp_path: Path) -> None:
+    """Reasoning update persists the level + keeps the role's model/base_url."""
+
+    switcher, registry, fired, store = _switcher(tmp_path)
+
+    updated = await switcher.set_reasoning("jarvis", "high")
+
+    # Level persisted; provider/model/base_url untouched.
+    assert updated.role("jarvis").reasoning == "high"
+    assert updated.role("jarvis").lm_model == "jarvis-model"
+    assert updated.role("jarvis").base_url == "http://localhost:1234/v1"
+    persisted = store.read()
+    assert persisted is not None
+    assert persisted.role("jarvis").reasoning == "high"
+
+    # Only jarvis' client was refreshed (so the new level rides the next request);
+    # the rebuilt client carries the level. Other roles untouched.
+    jarvis = registry.get("jarvis")
+    assert isinstance(jarvis, LMStudioClient)
+    assert jarvis._reasoning == "high"
+    assert len(fired["jarvis"]) == 1
+    for role in ("thinker", "draft", "subagent"):
+        assert fired[role] == []
+
+
+@pytest.mark.asyncio
+async def test_set_reasoning_clears_with_none(tmp_path: Path) -> None:
+    """Passing None clears the level (→ model's auto setting)."""
+
+    switcher, _registry, _fired, store = _switcher(tmp_path)
+    await switcher.set_reasoning("jarvis", "low")
+    await switcher.set_reasoning("jarvis", None)
+
+    assert cast(RoleSelection, store.read()).role("jarvis").reasoning is None
+
+
+@pytest.mark.asyncio
+async def test_set_reasoning_rejects_invalid_level(tmp_path: Path) -> None:
+    """An out-of-range level is rejected before any write."""
+
+    switcher, _registry, _fired, store = _switcher(tmp_path)
+    with pytest.raises(UnknownProviderError):
+        await switcher.set_reasoning("jarvis", "extreme")
+    assert cast(RoleSelection, store.read()).role("jarvis").reasoning is None
+
+
+@pytest.mark.asyncio
+async def test_set_reasoning_rejects_unknown_role(tmp_path: Path) -> None:
+    switcher, _registry, _fired, _store = _switcher(tmp_path)
+    with pytest.raises(UnknownProviderError):
+        await switcher.set_reasoning("speaker", "high")
+
+
+@pytest.mark.asyncio
+async def test_set_reasoning_never_touches_load_policy(tmp_path: Path) -> None:
+    """The key contract: reasoning is request-scoped — set_reasoning must NOT run
+    the per-host multi-load policy (no model load / eviction / budget check),
+    even when a manager registry is wired. Any manager call would explode here."""
+
+    store = RoleSelectionStore(tmp_path / "llm_selection.json")
+    _seed(store)
+    registry, _fired = _registry_with_sinks()
+
+    class _ExplodingManager:
+        def assign_role(self, *_args: object, **_kwargs: object) -> None:
+            raise AssertionError("assign_role must not run for a reasoning update")
+
+        def release_role(self, *_args: object, **_kwargs: object) -> None:
+            raise AssertionError("release_role must not run for a reasoning update")
+
+    manager_registry = RoleManagerRegistry(factory=lambda _host: _ExplodingManager())  # type: ignore[arg-type]
+    switcher = RoleLLMSwitcher(
+        settings=_settings(),
+        selection_store=store,
+        registry=registry,
+        manager_registry=manager_registry,
+    )
+
+    # No AssertionError → the load policy was never invoked.
+    updated = await switcher.set_reasoning("jarvis", "medium")
+    assert updated.role("jarvis").reasoning == "medium"

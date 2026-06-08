@@ -47,6 +47,7 @@ def test_first_boot_seeds_from_settings_and_persists(tmp_path: Path) -> None:
         "lm_model": "qwen2.5-7b-instruct",
         "context_length": {},
         "base_url": "http://localhost:1234/v1",
+        "reasoning": None,
     }
 
 

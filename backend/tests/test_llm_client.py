@@ -69,6 +69,32 @@ async def test_chat_calls_openai_with_expected_params() -> None:
 
 
 @pytest.mark.asyncio
+async def test_chat_omits_reasoning_by_default() -> None:
+    # No per-role reasoning level → the field is absent so the model's auto
+    # setting applies (never sends an empty/null reasoning).
+    client = LMStudioClient(_make_settings())
+    create = _patch_openai(client)
+
+    await client.chat(messages=[{"role": "user", "content": "hi"}])
+
+    assert create.await_args is not None
+    assert "extra_body" not in create.await_args.kwargs
+
+
+@pytest.mark.asyncio
+async def test_chat_threads_reasoning_via_extra_body() -> None:
+    # A per-role reasoning level rides in extra_body so the openai SDK forwards
+    # the non-OpenAI ``reasoning`` body field to LM Studio.
+    client = LMStudioClient(_make_settings(), reasoning="high")
+    create = _patch_openai(client)
+
+    await client.chat(messages=[{"role": "user", "content": "hi"}])
+
+    assert create.await_args is not None
+    assert create.await_args.kwargs["extra_body"] == {"reasoning": "high"}
+
+
+@pytest.mark.asyncio
 async def test_chat_with_schema_passes_response_format() -> None:
     client = LMStudioClient(_make_settings())
     create = _patch_openai(client, response_text='{"ok": true}')
