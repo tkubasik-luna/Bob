@@ -1,0 +1,199 @@
+/* SetupScreen — calm full-screen gate shown before the HUD. Loosely follows
+ * the Piste 3D · Nacre palette (deep cool background, pearl accents) without
+ * pulling in the HUD's heavier layout machinery. */
+
+.setup-screen {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: radial-gradient(120% 120% at 50% 20%, #18202c 0%, #0b0f16 60%, #070a10 100%);
+  color: #e7edf5;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  z-index: 1000;
+}
+
+.setup-card {
+  width: min(440px, 90vw);
+  padding: 2.2rem 2rem;
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.45);
+  backdrop-filter: blur(12px);
+}
+
+.setup-title {
+  margin: 0;
+  font-size: 1.4rem;
+  letter-spacing: 0.3em;
+  font-weight: 600;
+}
+
+.setup-subtitle {
+  margin: 0.3rem 0 1.4rem;
+  font-size: 0.85rem;
+  color: rgba(231, 237, 245, 0.6);
+}
+
+.setup-providers {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 1.4rem;
+}
+
+.setup-provider {
+  flex: 1;
+  padding: 0.6rem;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: transparent;
+  color: inherit;
+  font-size: 0.9rem;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.setup-provider:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.setup-provider.is-active {
+  background: rgba(140, 190, 255, 0.16);
+  border-color: rgba(140, 190, 255, 0.55);
+}
+
+.setup-field {
+  display: block;
+  margin-bottom: 1rem;
+}
+
+.setup-label {
+  display: block;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: rgba(231, 237, 245, 0.55);
+  margin-bottom: 0.4rem;
+}
+
+.setup-url-row {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.setup-input {
+  flex: 1;
+  padding: 0.55rem 0.7rem;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(0, 0, 0, 0.25);
+  color: inherit;
+  font-size: 0.85rem;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+}
+
+.setup-ping {
+  font-size: 0.72rem;
+  white-space: nowrap;
+  color: rgba(231, 237, 245, 0.5);
+}
+
+.setup-ping.is-online {
+  color: #7ee0a4;
+}
+
+.setup-ping.is-offline {
+  color: #ff9090;
+}
+
+.setup-models {
+  min-height: 3rem;
+  margin-bottom: 1rem;
+}
+
+.setup-model-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 220px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.setup-model {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.5rem 0.65rem;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: transparent;
+  color: inherit;
+  font-size: 0.82rem;
+  cursor: pointer;
+  text-align: left;
+}
+
+.setup-model:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.setup-model.is-active {
+  background: rgba(140, 190, 255, 0.16);
+  border-color: rgba(140, 190, 255, 0.55);
+}
+
+.setup-model-id {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.setup-model-loaded {
+  font-size: 0.68rem;
+  color: #7ee0a4;
+  flex-shrink: 0;
+}
+
+.setup-hint {
+  font-size: 0.82rem;
+  color: rgba(231, 237, 245, 0.6);
+  margin: 0.3rem 0;
+}
+
+.setup-error {
+  font-size: 0.82rem;
+  color: #ff9090;
+  margin: 0.3rem 0;
+}
+
+.setup-start {
+  width: 100%;
+  margin-top: 0.6rem;
+  padding: 0.7rem;
+  border-radius: 10px;
+  border: none;
+  background: linear-gradient(180deg, #9cc6ff 0%, #6ea3f0 100%);
+  color: #0b0f16;
+  font-size: 0.95rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: opacity 0.15s, filter 0.15s;
+}
+
+.setup-start:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.setup-start:not(:disabled):hover {
+  filter: brightness(1.05);
+}
