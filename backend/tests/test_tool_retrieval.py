@@ -115,6 +115,39 @@ def test_junk_goal_advertises_nothing_without_always_on() -> None:
     assert tools == []
 
 
+def test_ensure_non_empty_falls_back_on_junk_goal() -> None:
+    """RC-A: ``ensure_non_empty`` never leaves the model tool-less.
+
+    A goal scoring every tool zero would otherwise advertise nothing (the run
+    then silently has no tools). With the safety net on, the full registry is
+    surfaced (top-k by score → here all-zero → first k by ascending name).
+    """
+
+    tools = select_tools(
+        _registry(), "azerty qwerty zzz", k=8, min_score=1, ensure_non_empty=True
+    )
+    assert _names(tools) == ["gmail_search", "web_fetch", "web_search"]
+
+
+def test_ensure_non_empty_respects_k_cap_on_fallback() -> None:
+    """The fallback honours ``k`` — it surfaces the best guesses, not everything."""
+
+    tools = select_tools(
+        _registry(), "azerty qwerty zzz", k=2, min_score=1, ensure_non_empty=True
+    )
+    assert len(tools) == 2
+
+
+def test_ensure_non_empty_is_a_noop_when_gate_already_matches() -> None:
+    """When the lexical gate already returns tools, the flag changes nothing."""
+
+    gated = select_tools(_registry(), "Trouve le dernier mail reçu", k=8, min_score=1)
+    safety = select_tools(
+        _registry(), "Trouve le dernier mail reçu", k=8, min_score=1, ensure_non_empty=True
+    )
+    assert _names(gated) == _names(safety) == ["gmail_search"]
+
+
 # ---------------------------------------------------------------------------
 # Ordering — accent / stop-word normalisation, deterministic tie-break by name.
 # ---------------------------------------------------------------------------

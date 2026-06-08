@@ -1705,6 +1705,10 @@ class SubAgentRunner:
             task.goal,
             k=settings.TOOL_RETRIEVAL_K,
             min_score=settings.TOOL_RETRIEVAL_MIN_SCORE,
+            # RC-A: never hand the model an empty catalogue. The lexical gate is
+            # paraphrase-sensitive; a goal that scores every tool zero would
+            # otherwise silently disable tool use for the entire run.
+            ensure_non_empty=True,
         )
         board = score_tools(self._tool_registry, task.goal)
         # PRD 0015 / issue 0092 — make the retrieval decision observable: the

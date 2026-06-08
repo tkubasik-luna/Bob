@@ -1308,3 +1308,44 @@ async def test_subtask_runner_inherits_parent_turn_id() -> None:
     assert all(e.turn_id == parent_turn for e in runner_events), [
         (e.source, e.summary, e.turn_id) for e in runner_events
     ]
+
+
+# ---------------------------------------------------------------------------
+# RC-B — failed-synthesis recovers the failure cause when ``task.result`` is
+# empty (the common case: most failure paths leave it None and persist the
+# reason only as the last ``system`` message).
+# ---------------------------------------------------------------------------
+
+
+def test_latest_failure_reason_translates_bare_reason_code() -> None:
+    """A bare reason-code system message is rendered as its human description."""
+
+    orchestrator, _jc, _sc, _js, task_store, _sch = _make_orchestrator()
+    task_id = task_store.create_task(title="t", goal="g")
+    task_store.append_message(task_id, role="system", content="wall_clock_cap")
+    task_store.update_state(task_id, "failed")
+
+    reason = orchestrator._latest_failure_reason(task_id)
+    assert reason == "La sous-tâche a atteint la limite temporelle."
+
+
+def test_latest_failure_reason_returns_salvaged_text_verbatim() -> None:
+    """A non-reason-code system message (salvaged detail) is returned as-is."""
+
+    orchestrator, _jc, _sc, _js, task_store, _sch = _make_orchestrator()
+    task_id = task_store.create_task(title="t", goal="g")
+    task_store.append_message(
+        task_id, role="system", content="L'outil web_search a renvoyé une erreur 503."
+    )
+    task_store.update_state(task_id, "failed")
+
+    reason = orchestrator._latest_failure_reason(task_id)
+    assert reason == "L'outil web_search a renvoyé une erreur 503."
+
+
+def test_latest_failure_reason_empty_when_no_system_message() -> None:
+    """No system message → empty string (best-effort, never raises)."""
+
+    orchestrator, _jc, _sc, _js, task_store, _sch = _make_orchestrator()
+    task_id = task_store.create_task(title="t", goal="g")
+    assert orchestrator._latest_failure_reason(task_id) == ""

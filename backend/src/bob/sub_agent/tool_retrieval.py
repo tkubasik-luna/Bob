@@ -236,6 +236,7 @@ def select_tools(
     *,
     k: int,
     min_score: int,
+    ensure_non_empty: bool = False,
 ) -> list[SubAgentToolDefinition]:
     """Return the tools worth advertising for ``goal`` — pure + deterministic.
 
@@ -248,6 +249,18 @@ def select_tools(
     - ``always_on`` tools are always kept and do NOT consume the ``k`` budget;
     - when no tool clears the threshold the result is exactly the ``always_on``
       core (the model is never left tool-less).
+
+    ``ensure_non_empty`` is the production safety net (RC-A). The lexical gate is
+    paraphrase-sensitive: a goal whose tokens hit no tool name/tag/description
+    (e.g. "cherche des infos sur X" against an English-named registry) scores
+    everything zero and — with no ``always_on`` tool configured — hands the model
+    an EMPTY catalogue, which silently disables tool use for that whole run. When
+    ``ensure_non_empty=True`` and the selection above would be empty, fall back to
+    the top-``k`` tools by descending score (ties by ascending name) IGNORING the
+    threshold, so the model always sees the best lexical guesses (and, when every
+    score is zero, simply the first ``k`` tools by name). The runner opts in; the
+    default stays ``False`` so the gate's mathematical contract — and its
+    "advertises nothing for a junk goal" tests — are preserved for pure callers.
 
     Ordering: ``always_on`` tools first (registry-name order), then the scored
     survivors by descending score, ties broken by ascending name. ``registry``
@@ -264,23 +277,30 @@ def select_tools(
     always_on = [d for d in definitions if d.always_on]
     always_on_names = {d.name for d in always_on}
 
-    # Score the non-always-on tools; a tool that is BOTH always_on and relevant
-    # is already guaranteed a slot, so it is excluded from the scored pool to
-    # avoid double-listing and to keep the k budget for genuinely-retrieved
-    # tools.
-    scored: list[tuple[int, SubAgentToolDefinition]] = []
-    for definition in definitions:
-        if definition.name in always_on_names:
-            continue
-        score = _score_tool(definition, goal_tokens)
-        if score >= min_score and score > 0:
-            scored.append((score, definition))
-
+    # Score the non-always-on tools once; a tool that is BOTH always_on and
+    # relevant is already guaranteed a slot, so it is excluded from the scored
+    # pool to avoid double-listing and to keep the k budget for genuinely-
+    # retrieved tools. Keep ALL scores (not just the threshold survivors) so the
+    # ``ensure_non_empty`` fallback can reuse them.
+    scored_all: list[tuple[int, SubAgentToolDefinition]] = [
+        (_score_tool(definition, goal_tokens), definition)
+        for definition in definitions
+        if definition.name not in always_on_names
+    ]
     # Descending score, then ascending name — fully deterministic tie-break.
-    scored.sort(key=lambda pair: (-pair[0], pair[1].name))
-    capped = scored[: max(k, 0)]
+    scored_all.sort(key=lambda pair: (-pair[0], pair[1].name))
 
-    return [*always_on, *(definition for _score, definition in capped)]
+    survivors = [pair for pair in scored_all if pair[0] >= min_score and pair[0] > 0]
+    capped = survivors[: max(k, 0)]
+    result = [*always_on, *(definition for _score, definition in capped)]
+
+    if result or not ensure_non_empty:
+        return result
+
+    # Safety net: nothing cleared the gate and the caller refuses an empty
+    # catalogue. Advertise the top-k by score regardless of threshold (already
+    # sorted), so the model is never silently left tool-less.
+    return [definition for _score, definition in scored_all[: max(k, 0)]]
 
 
 def score_tools(registry: object, goal: str) -> list[tuple[str, int]]:

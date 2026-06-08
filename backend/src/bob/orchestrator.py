@@ -150,6 +150,7 @@ from bob.validation import (
     get_policy,
     render_feedback,
 )
+from bob.validation.reason_codes import DEFAULT_REGISTRY as _REASON_CODES
 
 if TYPE_CHECKING:  # pragma: no cover — typing-only.
     from bob.context.eviction import EvictionStrategy
@@ -1399,7 +1400,18 @@ class Orchestrator:
             )
             return
 
+        # RC-B: a ``failed`` row usually leaves ``task.result is None`` (the
+        # runner mirrors legacy ``_fail`` semantics for most failure paths), so
+        # reading ONLY ``task.result`` here would hand Jarvis an empty "Raison
+        # brute" and it would confabulate or stay silent — the user-visible
+        # "the model doesn't know a tool failed" bug. The runner ALWAYS appends
+        # the failure reason (``result_summary`` or the reason code) as the
+        # task's last ``system`` message, so fall back to that when ``result``
+        # is empty. Jarvis can then say *why* (timeout / tool error / invalid
+        # output) instead of nothing.
         result_text = task.result if task.result is not None else ""
+        if not result_text.strip():
+            result_text = self._latest_failure_reason(task_id)
         prompt = _FAILED_SYNTHESIS_TEMPLATE.format(
             task_title=task.title,
             result=result_text,
@@ -1408,6 +1420,32 @@ class Orchestrator:
         if text is None:
             return
         await self._push_proactive_assistant_msg(text)
+
+    def _latest_failure_reason(self, task_id: str) -> str:
+        """Return the most recent ``system`` message — the persisted failure reason.
+
+        The runner records every failure's reason (the salvaged ``result_summary``
+        or, failing that, the bare reason code) as the task's last ``system``
+        message even when it leaves ``task.result is None``. This is the
+        fallback source for :meth:`_do_generate_failed_synthesis` so a failed
+        sub-task always reaches Jarvis with a *cause* rather than an empty
+        string. Best-effort: returns ``""`` if the log can't be read.
+        """
+
+        try:
+            messages = self._task_store.get_task_messages(task_id)
+        except TaskStoreError:
+            _logger.warning("orchestrator.failure_reason_reload_failed", task_id=task_id)
+            return ""
+        for message in reversed(messages):
+            if message.role == "system" and message.content.strip():
+                # A bare-reason failure persists the machine reason code (e.g.
+                # ``wall_clock_cap``) as the system message. Translate it to its
+                # human French description so Jarvis explains the failure in
+                # plain language rather than echoing a token.
+                entry = _REASON_CODES.get(message.content.strip())
+                return entry.description if entry is not None else message.content
+        return ""
 
     async def _render_proactive_text(self, task_id: str, prompt: str) -> str | None:
         """Run a single-turn chat() and return the trimmed text (or None)."""

@@ -155,9 +155,18 @@ def test_runner_runs_select_tools_with_config_knobs(monkeypatch: pytest.MonkeyPa
     )
     calls: list[dict[str, Any]] = []
 
-    def _spy(registry: object, goal: str, *, k: int, min_score: int) -> list[Any]:
-        calls.append({"k": k, "min_score": min_score})
-        return select_tools(registry, goal, k=k, min_score=min_score)
+    def _spy(
+        registry: object,
+        goal: str,
+        *,
+        k: int,
+        min_score: int,
+        ensure_non_empty: bool = False,
+    ) -> list[Any]:
+        calls.append({"k": k, "min_score": min_score, "ensure_non_empty": ensure_non_empty})
+        return select_tools(
+            registry, goal, k=k, min_score=min_score, ensure_non_empty=ensure_non_empty
+        )
 
     import bob.sub_agent.runner as runner_mod
 
@@ -167,7 +176,8 @@ def test_runner_runs_select_tools_with_config_knobs(monkeypatch: pytest.MonkeyPa
     runner._build_messages(runner._task_store.get_task(task_id), [])
 
     assert len(calls) == 1
-    assert calls[0] == {"k": 8, "min_score": 1}
+    # RC-A: the runner always opts into the never-empty safety net.
+    assert calls[0] == {"k": 8, "min_score": 1, "ensure_non_empty": True}
 
 
 def test_mail_goal_advertises_only_gmail_search() -> None:
