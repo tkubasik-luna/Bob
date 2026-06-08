@@ -92,6 +92,67 @@ def test_fake_engine_empty_transcript_yields_no_partials() -> None:
     assert session.finalize().text == ""
 
 
+# --- Windowed partials (anti-quadratic) — native-free via a stub engine ------
+
+
+class _RecordingEngine:
+    """A WhisperCppSttEngine stand-in that records each transcribe call size.
+
+    Returns a deterministic text derived from the byte length so partials
+    "change" and get emitted, while letting the test assert that PARTIAL passes
+    are capped to the trailing window and the FINAL pass sees the whole buffer.
+    """
+
+    def __init__(self) -> None:
+        self.partial_sizes: list[int] = []
+        self.calls: list[int] = []
+
+    def transcribe_pcm(self, pcm: bytes) -> str:
+        self.calls.append(len(pcm))
+        return f"len={len(pcm)}"
+
+
+def test_whisper_session_windows_partial_pass_but_finalizes_full_buffer() -> None:
+    from bob.stt_engine import _WhisperCppSession  # internal: bounded-window logic
+
+    engine = _RecordingEngine()
+    # window = 4 samples (8 bytes); cadence = every 2 samples of new audio.
+    session = _WhisperCppSession(
+        engine,  # type: ignore[arg-type]
+        partial_every_samples=2,
+        partial_window_samples=4,
+    )
+
+    # Feed 10 samples (20 bytes) in 5 frames of 2 samples each.
+    frame = struct.pack("<2h", 0, 0)  # 2 samples, 4 bytes
+    for _ in range(5):
+        session.accept_frame(frame)
+
+    # Every PARTIAL pass transcribed at most the trailing window (4 samples = 8 B).
+    assert engine.calls, "expected at least one partial pass"
+    assert max(engine.calls) <= 4 * 2  # window_samples * bytes_per_sample
+    # The FINAL pass sees the FULL 10-sample buffer (20 bytes), not the window.
+    final = session.finalize()
+    assert engine.calls[-1] == 10 * 2
+    assert final.text == "len=20"
+
+
+def test_whisper_session_whole_buffer_when_window_disabled() -> None:
+    from bob.stt_engine import _WhisperCppSession
+
+    engine = _RecordingEngine()
+    session = _WhisperCppSession(
+        engine,  # type: ignore[arg-type]
+        partial_every_samples=2,
+        partial_window_samples=0,  # disabled → legacy whole-buffer partials
+    )
+    frame = struct.pack("<2h", 0, 0)
+    for _ in range(5):
+        session.accept_frame(frame)
+    # With the cap disabled, the last partial pass saw the full buffer so far.
+    assert max(engine.calls) == 10 * 2
+
+
 # --- Real engine (slow / optional) ------------------------------------------
 
 

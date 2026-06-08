@@ -285,13 +285,27 @@ class _WhisperCppSession:
     """Accumulate PCM for a turn; transcribe on finalize (and on partials).
 
     whisper.cpp transcribes a *buffer*, not a stream, so we accumulate the
-    decoded s16le frames and run a transcription pass over the growing buffer
-    to produce partials, and a final pass on :meth:`finalize`. Partials are
-    debounced: a re-transcription only runs once ``_partial_every_samples``
-    of new audio has arrived since the last pass, and a partial is only
-    emitted when the hypothesis text actually changed. The stable-prefix
-    length is the common prefix between the previous and the new hypothesis —
-    a cheap, monotone-ish proxy that lets the client render settled text.
+    decoded s16le frames and run a transcription pass to refresh the live
+    partial, plus one final pass on :meth:`finalize`.
+
+    Two bounds keep the partial passes cheap and independent of how long the
+    user talks (the original code re-transcribed the WHOLE growing buffer every
+    pass — O(utterance length) per pass, so partials fell seconds behind the
+    speaker on long turns, which is the dominant "voice doesn't work" symptom):
+
+    - *cadence* — ``_partial_every`` samples of NEW audio must arrive between two
+      passes (debounce), and a partial is only emitted when the hypothesis text
+      changed;
+    - *window* — a partial pass transcribes only the trailing ``_window_samples``
+      of audio (``0`` = whole buffer). For a normal command-length turn the
+      window covers the whole buffer so the result is identical to before; the
+      cap only bites on long monologues, where it trades a windowed (head-
+      truncated) LIVE partial for bounded, keeping-up latency.
+
+    :meth:`finalize` always transcribes the FULL buffer once, so the frozen
+    transcript handed to the say-path is never windowed — accuracy is unchanged.
+    The stable-prefix length is the common prefix between the previous and the
+    new hypothesis — a cheap proxy that lets the client render settled text.
     """
 
     def __init__(
@@ -299,12 +313,25 @@ class _WhisperCppSession:
         engine: WhisperCppSttEngine,
         *,
         partial_every_samples: int,
+        partial_window_samples: int = 0,
     ) -> None:
         self._engine = engine
         self._buf = bytearray()
         self._partial_every = max(1, partial_every_samples)
+        # 0 (or negative) disables the cap → whole-buffer partials (legacy).
+        self._window_samples = max(0, partial_window_samples)
         self._samples_at_last_pass = 0
         self._last_text = ""
+
+    def _partial_buffer(self) -> bytes:
+        """The trailing slice a partial pass transcribes (windowed)."""
+
+        if self._window_samples <= 0:
+            return bytes(self._buf)
+        window_bytes = self._window_samples * _BYTES_PER_SAMPLE
+        if len(self._buf) <= window_bytes:
+            return bytes(self._buf)
+        return bytes(self._buf[-window_bytes:])
 
     def accept_frame(self, pcm: bytes) -> list[SttPartial]:
         self._buf.extend(pcm)
@@ -312,7 +339,7 @@ class _WhisperCppSession:
         if total - self._samples_at_last_pass < self._partial_every:
             return []
         self._samples_at_last_pass = total
-        text = self._engine.transcribe_pcm(bytes(self._buf))
+        text = self._engine.transcribe_pcm(self._partial_buffer())
         if not text or text == self._last_text:
             return []
         stable = _common_prefix_len(self._last_text, text)
@@ -322,6 +349,7 @@ class _WhisperCppSession:
     def finalize(self) -> SttFinal:
         if not self._buf:
             return SttFinal(text=self._last_text)
+        # FULL-buffer pass — the frozen transcript is never windowed.
         text = self._engine.transcribe_pcm(bytes(self._buf))
         return SttFinal(text=text or self._last_text)
 
@@ -436,9 +464,13 @@ class WhisperCppSttEngine:
         # Load eagerly here so a download/import failure surfaces at session
         # open (the WS layer's degradation path), not mid-frame.
         self._ensure_loaded()
+        rate = self._settings.STT_SAMPLE_RATE
+        cadence = max(1, round(self._settings.STT_PARTIAL_INTERVAL_SECONDS * rate))
+        window = max(0, round(self._settings.STT_PARTIAL_WINDOW_SECONDS * rate))
         return _WhisperCppSession(
             self,
-            partial_every_samples=self._settings.STT_SAMPLE_RATE,  # ~1s windows
+            partial_every_samples=cadence,
+            partial_window_samples=window,
         )
 
 

@@ -294,6 +294,28 @@ class Settings(BaseSettings):
     STT_SAMPLE_RATE: int = 16_000
     STT_PARTIAL_MIN_CHARS: int = 1
     STT_DEBUG_TEXT_MAX_CHARS: int = 16
+    # Real-time STT bounds (anti-quadratic). whisper.cpp transcribes a BUFFER,
+    # not a stream, so the per-turn session re-runs a pass to refresh the live
+    # partial. Two knobs keep that cost bounded and independent of how long the
+    # user has been talking:
+    #
+    # ``STT_PARTIAL_INTERVAL_SECONDS`` — minimum wall of NEW audio between two
+    # partial passes (the cadence). Decoupled from ``STT_SAMPLE_RATE`` so the
+    # refresh rate is a real dial; higher = fewer passes = less load (at the cost
+    # of a slightly staler on-screen partial).
+    #
+    # ``STT_PARTIAL_WINDOW_SECONDS`` — the MAX trailing audio a single PARTIAL
+    # pass transcribes. Without it each partial re-transcribed the WHOLE growing
+    # buffer, so a long utterance made every pass cost O(utterance length) and
+    # the partials fell seconds behind the speaker. Capping the partial to a
+    # trailing window makes each pass O(window) regardless of utterance length.
+    # The FINAL (frozen) transcript still runs ONE full-buffer pass, so accuracy
+    # of the text handed to the say-path is unchanged; only the live partials are
+    # windowed. For a normal command-length turn the window covers the whole
+    # buffer, so behaviour is identical to before — the cap only bites on long
+    # monologues. ``0`` disables the cap (whole-buffer partials, legacy).
+    STT_PARTIAL_INTERVAL_SECONDS: float = 1.5
+    STT_PARTIAL_WINDOW_SECONDS: float = 14.0
 
     # Attestation harness only (PRD 0016 / issue 0099): the canned transcript
     # the deterministic ``fake`` STT engine converges to. Injected by the
