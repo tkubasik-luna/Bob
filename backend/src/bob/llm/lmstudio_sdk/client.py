@@ -30,6 +30,7 @@ without a running LM Studio server. Downstream issues reuse this same seam.
 
 from __future__ import annotations
 
+import json
 import time
 import traceback
 from collections.abc import Callable
@@ -42,6 +43,10 @@ from lmstudio import AsyncClient, LlmPredictionConfigDict
 from bob.config import Settings
 from bob.debug_log import emit_debug
 from bob.llm.lmstudio_sdk.history import messages_to_chat
+from bob.llm.lmstudio_sdk.tools import (
+    tool_call_request_to_tool_call,
+    tool_definitions_to_sdk,
+)
 from bob.llm.types import LLMResponse, ToolDefinition
 from bob.llm_client import (
     LLMClient,
@@ -333,8 +338,6 @@ class LMStudioSDKClient(LLMClient):
             return content if isinstance(content, str) else ""
         if isinstance(parsed, str):
             return parsed
-        import json
-
         try:
             return json.dumps(parsed, ensure_ascii=False)
         except (TypeError, ValueError):
@@ -363,19 +366,232 @@ class LMStudioSDKClient(LLMClient):
         tools: list[ToolDefinition] | None = None,
         session_id: str | None = None,
     ) -> LLMResponse:
-        """Not implemented in issue 0111 — the SDK tool-calling path lands in 0113.
+        """SDK-transport tool-calling ``complete`` (PRD 0017 / M4, issue 0113).
 
-        The ``sdk`` transport is a ``chat()``-only POC at this slice. Raising a
-        clear :class:`LLMClientError` (rather than silently degrading) makes a
-        premature ``complete`` under ``LLM_LMSTUDIO_TRANSPORT=sdk`` fail loudly;
-        the flag defaults to ``openai`` so no production path reaches here.
+        The SDK-transport counterpart of
+        :meth:`bob.llm_client.LMStudioClient.complete`. Same validator-role fold +
+        standard-role assertion, then converts ``tools`` to the SDK-native low-
+        level tool pair (:func:`bob.llm.lmstudio_sdk.tools.tool_definitions_to_sdk`,
+        deterministic order preserved) and drives the private
+        :class:`lmstudio.json_api.ChatResponseEndpoint` to CAPTURE the model's
+        tool-calls WITHOUT executing them (Bob dispatches tool-calls through the
+        orchestrator, never the SDK's agentic ``act()`` loop). Captured
+        :class:`ToolCallRequest`s map to :class:`bob.llm.types.ToolCall`s; a turn
+        with no tool-call returns ``LLMResponse(text=content)`` with the same
+        empty-content guard as the OpenAI path.
+
+        ``LLM_TOOL_MODE`` policy (PRD 0017 decision Q5): ``guided`` / ``hermes``
+        are rejected with a clear :class:`LLMClientError` for this transport (the
+        SDK has only one tool surface — its native tool defs); ``auto`` /
+        ``native`` use the SDK-native tools. ``supports_guided_json()`` stays
+        ``True`` (that gates ``chat(schema=…)``, a separate mechanism).
+
+        Observability matches the OpenAI ``complete`` exactly: paired
+        ``llm_call_start`` / ``llm_call_end`` debug events, :func:`log_llm_call`,
+        and the same ``is_tool_call`` / ``tool_calls`` payload shape.
         """
 
-        raise LLMClientError(
-            "LMStudioSDKClient.complete() is not implemented yet — the SDK "
-            "tool-calling transport arrives in issue 0113. Use "
-            "LLM_LMSTUDIO_TRANSPORT=openai for tool-calling until then."
+        messages = _normalise_validator_role(messages, allow_arbitrary_roles=False)
+        _assert_standard_roles(messages)
+
+        # Tool-mode policy: the SDK has a single native tool surface, so the
+        # guided / hermes wire formats are not expressible here. Reject loudly
+        # rather than silently fall back (parity with the codec's "loud
+        # misconfiguration" contract).
+        tool_mode = self._settings.LLM_TOOL_MODE
+        if tools and tool_mode in ("guided", "hermes"):
+            raise LLMClientError(
+                f"LLM_TOOL_MODE={tool_mode!r} is not supported on the LM Studio "
+                "SDK transport — the SDK exposes only native tool definitions. "
+                "Use LLM_TOOL_MODE=auto or native (or LLM_LMSTUDIO_TRANSPORT=openai "
+                f"for {tool_mode} tool-calling)."
+            )
+
+        chat = messages_to_chat(messages)
+        config = self._build_config()
+
+        llm_tools = None
+        client_tool_map = None
+        if tools:
+            llm_tools, client_tool_map = tool_definitions_to_sdk(tools)
+
+        correlation_id = uuid4().hex
+        token_estimate = _estimate_tokens(messages)
+        emit_debug(
+            category="llm",
+            severity="info",
+            source="bob.llm.lmstudio_sdk.complete",
+            summary=(f"LLM call démarré ({token_estimate} tokens prompt, model={self._model})"),
+            payload={
+                "messages": messages,
+                "model": self._model,
+                "reasoning": self._reasoning,
+                "tokens_prompt_estimate": token_estimate,
+                "has_tools": bool(tools),
+                "session_id": session_id,
+            },
+            correlation_id=correlation_id,
         )
+
+        started = time.perf_counter()
+        try:
+            result, tool_requests = await self._capture_tool_calls(
+                chat,
+                llm_tools=llm_tools,
+                client_tool_map=client_tool_map,
+                config=config,
+            )
+        except lmstudio.LMStudioError as exc:
+            latency_ms = (time.perf_counter() - started) * 1000.0
+            emit_debug(
+                category="llm",
+                severity="error",
+                source="bob.llm.lmstudio_sdk.complete",
+                summary=f"LLM call échoué en {latency_ms:.0f}ms: {exc}",
+                payload={
+                    "model": self._model,
+                    "latency_ms": latency_ms,
+                    "exception": str(exc),
+                    "exception_type": exc.__class__.__name__,
+                    "traceback": traceback.format_exc(),
+                    "session_id": session_id,
+                },
+                correlation_id=correlation_id,
+            )
+            raise LLMClientError(f"LM Studio SDK call failed: {exc}") from exc
+        latency_ms = (time.perf_counter() - started) * 1000.0
+
+        # Map the captured (NOT executed) tool-call requests onto Bob ToolCalls.
+        # A malformed-arguments request raises ``LLMClientError`` here — same
+        # error surface as the OpenAI native path (golden parity).
+        tool_calls = [tool_call_request_to_tool_call(req) for req in tool_requests]
+
+        text: str | None
+        if tool_calls:
+            text = None
+            raw_for_log = json.dumps(
+                [{"id": tc.id, "name": tc.name, "arguments": tc.arguments} for tc in tool_calls],
+                ensure_ascii=False,
+            )
+        else:
+            content = self._read_content(result)
+            if not content.strip():
+                emit_debug(
+                    category="llm",
+                    severity="error",
+                    source="bob.llm.lmstudio_sdk.complete",
+                    summary=f"LLM call empty response ({latency_ms:.0f}ms)",
+                    payload={
+                        "model": self._model,
+                        "host": self._host,
+                        "latency_ms": latency_ms,
+                        "session_id": session_id,
+                    },
+                    correlation_id=correlation_id,
+                )
+                raise LLMClientError("LM Studio SDK returned empty response")
+            text = content
+            raw_for_log = content
+
+        tokens_in, tokens_out = self._read_tokens(result)
+
+        log_llm_call(
+            session_id=session_id,
+            messages=messages,
+            raw_response=raw_for_log,
+            latency_ms=latency_ms,
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+        )
+
+        emit_debug(
+            category="llm",
+            severity="info",
+            source="bob.llm.lmstudio_sdk.complete",
+            summary=(
+                f"LLM call terminé en {latency_ms:.0f}ms "
+                f"({tokens_out if tokens_out is not None else '?'} tokens response)"
+            ),
+            payload={
+                "response": raw_for_log,
+                "is_tool_call": bool(tool_calls),
+                "tool_calls": [
+                    {"id": tc.id, "name": tc.name, "arguments": tc.arguments} for tc in tool_calls
+                ],
+                "latency_ms": latency_ms,
+                "tokens_in": tokens_in,
+                "tokens_out": tokens_out,
+                "model": self._model,
+                "session_id": session_id,
+            },
+            correlation_id=correlation_id,
+        )
+
+        return LLMResponse(text=text, tool_calls=tool_calls)
+
+    async def _capture_tool_calls(
+        self,
+        chat: Any,
+        *,
+        llm_tools: Any,
+        client_tool_map: Any,
+        config: LlmPredictionConfigDict,
+    ) -> tuple[Any, list[Any]]:
+        """Drive the low-level prediction and CAPTURE tool-calls (no execution).
+
+        This is the one place that touches the SDK's PRIVATE tool surface, so the
+        fragile API is isolated and 0114's streaming arg-fragment override (M6)
+        builds on the SAME endpoint. The surface used (lmstudio 1.5.0):
+
+        - :class:`lmstudio.json_api.ChatResponseEndpoint` constructed directly
+          with ``llm_tools`` (a ``LlmToolUseSettingToolArray``) + the matching
+          ``client_tool_map`` — i.e. NOT via ``parse_tools`` (Bob already carries
+          JSON-Schema tool params and must not derive a callable; see
+          :mod:`bob.llm.lmstudio_sdk.tools`);
+        - :class:`lmstudio.async_api.AsyncPredictionStream` over the channel from
+          ``model._session._create_channel(endpoint)``;
+        - :meth:`AsyncPredictionStream._iter_events` yielding
+          :class:`lmstudio.json_api.PredictionToolCallEvent` (``.arg`` is a
+          :class:`ToolCallRequest`).
+
+        The no-execution guarantee: we only *collect* ``PredictionToolCallEvent``
+        args. We never call ``endpoint.request_tool_call_async()`` (the only thing
+        that runs a tool impl) and never enter the ``act()`` loop. The sentinel
+        ``client_tool_map`` impls are unreachable (and raise if ever called).
+
+        Returns ``(PredictionResult, [ToolCallRequest, …])``. A no-tools call
+        (``llm_tools is None``) drives a plain chat prediction with no tools
+        advertised and yields an empty request list.
+        """
+
+        from lmstudio.async_api import AsyncPredictionStream
+        from lmstudio.json_api import ChatResponseEndpoint, PredictionToolCallEvent
+
+        async with self._client_factory(self._host) as client:
+            model = await client.llm.model(self._model)
+            endpoint = ChatResponseEndpoint(
+                model.identifier,
+                chat,
+                None,  # response_format — tool-calling does not gate via JSON schema
+                config,
+                None,  # preset_config
+                None,  # on_message
+                None,  # on_first_token
+                None,  # on_prediction_fragment
+                None,  # on_prompt_processing_progress
+                None,  # handle_invalid_tool_request — unused (no act() loop)
+                llm_tools,
+                client_tool_map,
+            )
+            channel_cm = model._session._create_channel(endpoint)
+            stream = AsyncPredictionStream(channel_cm, endpoint)
+            tool_requests: list[Any] = []
+            async for event in stream._iter_events():
+                if isinstance(event, PredictionToolCallEvent):
+                    # Collect WITHOUT executing: no request_tool_call_async(),
+                    # no act() loop. The orchestrator dispatches these instead.
+                    tool_requests.append(event.arg)
+            return stream.result(), tool_requests
 
     async def stream_chat(
         self,

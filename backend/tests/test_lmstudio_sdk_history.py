@@ -9,6 +9,7 @@ round-trips arrive in issue 0113.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import pytest
@@ -104,5 +105,96 @@ def test_missing_content_becomes_empty() -> None:
 
 
 def test_unknown_role_raises() -> None:
+    # ``tool`` is now a supported role (issue 0113); a genuinely unknown role
+    # still raises loudly.
     with pytest.raises(HistoryConversionError):
-        messages_to_chat([{"role": "tool", "content": "result"}])
+        messages_to_chat([{"role": "function", "content": "result"}])
+
+
+# --- tool-turn round-trips (issue 0113 / M3) ---------------------------------
+
+
+def _tool_parts(chat_history: Any) -> list[dict[str, Any]]:
+    """Return the flat list of content parts across all messages, each tagged
+    with its message role, for asserting tool-call / tool-result shapes."""
+
+    parts: list[dict[str, Any]] = []
+    for entry in chat_history["messages"]:
+        for part in entry.get("content", []):
+            if isinstance(part, dict):
+                parts.append({"role": entry["role"], **part})
+    return parts
+
+
+def test_assistant_tool_calls_round_trip() -> None:
+    """An assistant turn with OpenAI-style ``tool_calls`` becomes an SDK
+    assistant response carrying ``toolCallRequest`` parts (args JSON-decoded)."""
+
+    messages: list[dict[str, Any]] = [
+        {"role": "user", "content": "search bitcoin"},
+        {
+            "role": "assistant",
+            "content": "on it",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "web_search",
+                        "arguments": json.dumps({"q": "bitcoin"}),
+                    },
+                }
+            ],
+        },
+    ]
+    history = messages_to_chat(messages)._get_history()
+    parts = _tool_parts(history)
+    request_parts = [p for p in parts if p["type"] == "toolCallRequest"]
+    assert len(request_parts) == 1
+    req = request_parts[0]["toolCallRequest"]
+    assert req["name"] == "web_search"
+    assert req["id"] == "call_1"
+    # The OpenAI ``arguments`` JSON string is decoded back to a mapping.
+    assert req["arguments"] == {"q": "bitcoin"}
+    # The assistant text is preserved alongside the request.
+    assert ("assistant", "on it") in _texts(history)
+
+
+def test_tool_result_round_trip() -> None:
+    """A ``tool`` result turn becomes an SDK ``toolCallResult`` part keyed by id."""
+
+    messages: list[dict[str, Any]] = [
+        {"role": "user", "content": "search bitcoin"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "web_search", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "price is high"},
+        {"role": "assistant", "content": "It is high."},
+    ]
+    history = messages_to_chat(messages)._get_history()
+    roles = [entry["role"] for entry in history["messages"]]
+    assert roles == ["user", "assistant", "tool", "assistant"]
+    result_parts = [p for p in _tool_parts(history) if p["type"] == "toolCallResult"]
+    assert len(result_parts) == 1
+    assert result_parts[0]["content"] == "price is high"
+    assert result_parts[0]["toolCallId"] == "call_1"
+
+
+def test_assistant_without_tool_calls_unchanged() -> None:
+    """An assistant turn with no ``tool_calls`` stays a plain text response
+    (the base-layer arm is untouched)."""
+
+    history = messages_to_chat(
+        [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]
+    )._get_history()
+    parts = _tool_parts(history)
+    assert all(p["type"] == "text" for p in parts)
+    assert _texts(history) == [("user", "hi"), ("assistant", "hello")]

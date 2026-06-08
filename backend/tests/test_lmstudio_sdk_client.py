@@ -27,6 +27,7 @@ from bob.config import Settings
 from bob.llm.factory import _build_for_backend, _build_role_client
 from bob.llm.lmstudio_sdk import LMStudioSDKClient
 from bob.llm.lmstudio_sdk.client import schema_to_response_format
+from bob.llm.types import ToolDefinition
 from bob.llm_client import LLMClient, LLMClientError, LMStudioClient
 from bob.llm_selection_store import LLMSelection, RoleSelection
 
@@ -68,12 +69,32 @@ class _FakeResult:
 
 
 class _FakeModel:
-    """Stand-in for the SDK ``AsyncLLM`` handle. Records the ``respond`` call."""
+    """Stand-in for the SDK ``AsyncLLM`` handle. Records the ``respond`` call.
+
+    For the low-level ``complete`` capture path it also exposes ``identifier`` +
+    a ``_session`` whose ``_create_channel`` returns a fake channel driven by a
+    scripted list of wire-event dicts — so the REAL ``ChatResponseEndpoint`` /
+    ``AsyncPredictionStream`` parse them (faithful, no re-implementation of the
+    SDK parser). ``executed`` records any tool-impl invocation (must stay empty:
+    the no-execution guarantee).
+    """
+
+    identifier = "fake-model"
 
     def __init__(self, result: _FakeResult | None, error: Exception | None) -> None:
         self._result = result
         self._error = error
         self.respond_calls: list[dict[str, Any]] = []
+        # Low-level (complete) capture seam.
+        self._wire_events: list[dict[str, Any]] = []
+        self.last_endpoint: Any = None
+        self.executed: list[Any] = []
+        self._session = _FakeSession(self)
+
+    def script_events(self, events: list[dict[str, Any]]) -> None:
+        """Set the wire-event dicts the fake channel will stream for ``complete``."""
+
+        self._wire_events = events
 
     async def respond(
         self,
@@ -89,6 +110,43 @@ class _FakeModel:
             raise self._error
         assert self._result is not None
         return self._result
+
+
+class _FakeChannel:
+    """Stand-in for the SDK ``AsyncChannel`` consumed by ``_iter_events``."""
+
+    def __init__(self, events: list[dict[str, Any]]) -> None:
+        self._events = events
+
+    async def rx_stream(self) -> Any:
+        for event in self._events:
+            yield event
+
+
+class _FakeChannelCM:
+    """Async context manager yielding a :class:`_FakeChannel` (channel_cm seam)."""
+
+    def __init__(self, events: list[dict[str, Any]]) -> None:
+        self._channel = _FakeChannel(events)
+
+    async def __aenter__(self) -> _FakeChannel:
+        return self._channel
+
+    async def __aexit__(self, *exc: object) -> None:
+        return None
+
+
+class _FakeSession:
+    """Stand-in for ``AsyncLLM._session`` — only ``_create_channel`` is used."""
+
+    def __init__(self, model: _FakeModel) -> None:
+        self._model = model
+
+    def _create_channel(self, endpoint: Any) -> _FakeChannelCM:
+        # If a tool impl is ever invoked, record it so the test can assert the
+        # SDK executed NOTHING (the capture-only contract).
+        self._model.last_endpoint = endpoint
+        return _FakeChannelCM(self._model._wire_events)
 
 
 class _FakeLlmNamespace:
@@ -131,6 +189,82 @@ def _factory_for(
         return client
 
     return factory
+
+
+# --- scripted wire events for the low-level complete() capture path ----------
+
+
+def _success_event(*, content_fragments: tuple[str, ...] = ()) -> list[dict[str, Any]]:
+    """Build the wire-event dicts for a finished prediction (fragments + success).
+
+    Minimal but real shapes the SDK's ``ChatResponseEndpoint.iter_message_events``
+    parses; the REAL parser turns these into the events ``complete`` consumes.
+    """
+
+    events: list[dict[str, Any]] = []
+    for frag in content_fragments:
+        events.append(
+            {
+                "type": "fragment",
+                "fragment": {
+                    "content": frag,
+                    "tokensCount": 1,
+                    "containsDrafted": False,
+                    "reasoningType": "none",
+                },
+            }
+        )
+    events.append(
+        {
+            "type": "success",
+            "stats": {
+                "stopReason": "eosFound",
+                "tokensPerSecond": 1.0,
+                "numGpuLayers": 0,
+                "timeToFirstTokenSec": 0.1,
+                "promptTokensCount": 5,
+                "predictedTokensCount": 3,
+                "totalTokensCount": 8,
+            },
+            "modelInfo": {
+                "identifier": "m",
+                "instanceReference": "r",
+                "modelKey": "m",
+                "format": "gguf",
+                "displayName": "m",
+                "path": "m",
+                "sizeBytes": 1,
+                "paramsString": "1B",
+                "architecture": "x",
+                "maxContextLength": 4096,
+                "trainedForToolUse": True,
+                "vision": False,
+            },
+            "loadModelConfig": {"fields": []},
+            "predictionConfig": {"fields": []},
+        }
+    )
+    return events
+
+
+def _tool_call_event(name: str, call_id: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "type": "toolCallGenerationEnd",
+        "toolCallRequest": {
+            "type": "function",
+            "name": name,
+            "id": call_id,
+            "arguments": arguments,
+        },
+    }
+
+
+def _tool(name: str = "web_search") -> ToolDefinition:
+    return ToolDefinition(
+        name=name,
+        description=f"desc {name}",
+        parameters={"type": "object", "properties": {"q": {"type": "string"}}, "required": ["q"]},
+    )
 
 
 # --- schema mapping ----------------------------------------------------------
@@ -336,14 +470,145 @@ async def test_chat_falls_back_to_parsed() -> None:
     assert out == '{"ok": true}'
 
 
-# --- POC seams (downstream issues replace these) -----------------------------
+# --- complete() tool-calling (issue 0113) ------------------------------------
+
+
+def _complete_client(captured: dict[str, Any], events: list[dict[str, Any]], **kw: Any) -> Any:
+    """Build an SDK client whose fake model streams ``events`` for ``complete``."""
+
+    def factory(host: str) -> Any:
+        model = _FakeModel(_FakeResult("unused"), None)
+        model.script_events(events)
+        client = _FakeAsyncClient(model)
+        captured["host"] = host
+        captured["client"] = client
+        captured["model"] = model
+        return client
+
+    return LMStudioSDKClient(
+        _settings(LLM_LMSTUDIO_TRANSPORT="sdk", **kw),
+        client_factory=factory,
+    )
 
 
 @pytest.mark.asyncio
-async def test_complete_not_implemented() -> None:
-    client = LMStudioSDKClient(_settings(LLM_LMSTUDIO_TRANSPORT="sdk"))
-    with pytest.raises(LLMClientError, match="issue 0113"):
-        await client.complete([{"role": "user", "content": "go"}])
+async def test_complete_captures_tool_calls_without_executing() -> None:
+    captured: dict[str, Any] = {}
+    events = [
+        _tool_call_event("web_search", "call_1", {"q": "bitcoin"}),
+        *_success_event(),
+    ]
+    client = _complete_client(captured, events)
+    resp = await client.complete([{"role": "user", "content": "search"}], tools=[_tool()])
+
+    assert resp.is_tool_call
+    assert resp.text is None
+    (call,) = resp.tool_calls
+    assert call.name == "web_search"
+    assert call.id == "call_1"
+    assert call.arguments == {"q": "bitcoin"}
+    # The SDK executed NOTHING — no tool impl was invoked.
+    assert captured["model"].executed == []
+    # The websocket was closed.
+    assert captured["client"].closed is True
+
+
+@pytest.mark.asyncio
+async def test_complete_multiple_tool_calls() -> None:
+    captured: dict[str, Any] = {}
+    events = [
+        _tool_call_event("web_search", "c1", {"q": "a"}),
+        _tool_call_event("web_search", "c2", {"q": "b"}),
+        *_success_event(),
+    ]
+    client = _complete_client(captured, events)
+    resp = await client.complete([{"role": "user", "content": "go"}], tools=[_tool()])
+    assert [c.id for c in resp.tool_calls] == ["c1", "c2"]
+
+
+@pytest.mark.asyncio
+async def test_complete_no_tool_call_returns_text() -> None:
+    captured: dict[str, Any] = {}
+    events = _success_event(content_fragments=("hello ", "world"))
+    client = _complete_client(captured, events)
+    resp = await client.complete([{"role": "user", "content": "hi"}], tools=[_tool()])
+    assert resp.tool_calls == []
+    assert resp.text == "hello world"
+
+
+@pytest.mark.asyncio
+async def test_complete_empty_content_raises() -> None:
+    captured: dict[str, Any] = {}
+    events = _success_event(content_fragments=("   ",))
+    client = _complete_client(captured, events)
+    with pytest.raises(LLMClientError, match="empty response"):
+        await client.complete([{"role": "user", "content": "hi"}], tools=[_tool()])
+
+
+@pytest.mark.asyncio
+async def test_complete_no_tools_drives_plain_prediction() -> None:
+    """``complete`` with no tools advertises none and returns the model text."""
+
+    captured: dict[str, Any] = {}
+    events = _success_event(content_fragments=("plain answer",))
+    client = _complete_client(captured, events)
+    resp = await client.complete([{"role": "user", "content": "hi"}])
+    assert resp.text == "plain answer"
+    assert resp.tool_calls == []
+
+
+@pytest.mark.asyncio
+async def test_complete_advertises_tools_to_endpoint() -> None:
+    """The converted SDK tools reach the low-level endpoint's config (rawTools)."""
+
+    captured: dict[str, Any] = {}
+    events = _success_event(content_fragments=("ok",))
+    client = _complete_client(captured, events)
+    await client.complete([{"role": "user", "content": "hi"}], tools=[_tool("alpha")])
+    endpoint = captured["model"].last_endpoint
+    # The endpoint folds llm_tools into its config stack; the advertised tool
+    # name is reachable on the channel creation params (rawTools).
+    blob = str(endpoint.creation_params)
+    assert "alpha" in blob
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["guided", "hermes"])
+async def test_complete_rejects_guided_and_hermes_modes(mode: str) -> None:
+    captured: dict[str, Any] = {}
+    events = _success_event(content_fragments=("ok",))
+    client = _complete_client(captured, events, LLM_TOOL_MODE=mode)
+    with pytest.raises(LLMClientError, match="not supported on the LM Studio"):
+        await client.complete([{"role": "user", "content": "hi"}], tools=[_tool()])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["auto", "native"])
+async def test_complete_accepts_auto_and_native_modes(mode: str) -> None:
+    captured: dict[str, Any] = {}
+    events = [_tool_call_event("web_search", "c1", {"q": "x"}), *_success_event()]
+    client = _complete_client(captured, events, LLM_TOOL_MODE=mode)
+    resp = await client.complete([{"role": "user", "content": "hi"}], tools=[_tool()])
+    assert resp.is_tool_call
+
+
+@pytest.mark.asyncio
+async def test_complete_sdk_error_maps_to_llm_client_error() -> None:
+    captured: dict[str, Any] = {}
+
+    def factory(host: str) -> Any:
+        model = _FakeModel(_FakeResult("x"), None)
+
+        def boom(_endpoint: Any) -> Any:
+            raise lmstudio.LMStudioServerError("boom")
+
+        model._session._create_channel = boom  # type: ignore[assignment]
+        captured["model"] = model
+        return _FakeAsyncClient(model)
+
+    client = LMStudioSDKClient(_settings(LLM_LMSTUDIO_TRANSPORT="sdk"), client_factory=factory)
+    with pytest.raises(LLMClientError, match="SDK call failed"):
+        await client.complete([{"role": "user", "content": "hi"}], tools=[_tool()])
 
 
 def test_is_llm_client_subclass() -> None:
