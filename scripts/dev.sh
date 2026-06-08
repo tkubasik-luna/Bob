@@ -58,7 +58,7 @@ for _ in {1..30}; do
   sleep 0.5
 done
 
-echo "[bob] frontend (Tauri — 2 fenêtres : legacy + new)"
+echo "[bob] frontend (Tauri — fenêtre HUD ; debug en Cmd+Shift+D)"
 (
   cd "$ROOT/frontend"
   pnpm install --silent

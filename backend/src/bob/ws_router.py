@@ -1,7 +1,8 @@
 """WebSocket router for the chat endpoint.
 
-Wires the ``/ws/chat`` endpoint to :class:`bob.chat_service.ChatService` and
-streams Kokoro TTS audio back to the client as **binary** WS frames.
+Wires the ``/ws/chat`` endpoint to :class:`bob.orchestrator.Orchestrator`
+(via :func:`bob.orchestrator.get_default_orchestrator`) and streams Kokoro TTS
+audio back to the client as **binary** WS frames.
 
 Per-turn streamed text protocol (PRD 0006 / issue 0049)
 -------------------------------------------------------

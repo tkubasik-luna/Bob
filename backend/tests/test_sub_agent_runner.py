@@ -14,7 +14,7 @@ from bob.event_bus import EventBus
 from bob.llm.types import LLMResponse, ToolDefinition
 from bob.llm_client import LLMClient
 from bob.sub_agent.policy import SubAgentPolicy
-from bob.sub_agent_runner import SubAgentRunner
+from bob.sub_agent.runner import SubAgentRunner
 from bob.task_store import TaskStore
 
 

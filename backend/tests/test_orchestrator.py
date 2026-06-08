@@ -20,7 +20,7 @@ from bob.orchestrator import (
     _SPAWN_CONFIRMATION,
     Orchestrator,
 )
-from bob.sub_agent_runner import SubAgentRunner
+from bob.sub_agent.runner import SubAgentRunner
 from bob.task_scheduler import TaskScheduler
 from bob.task_store import TaskStore
 
