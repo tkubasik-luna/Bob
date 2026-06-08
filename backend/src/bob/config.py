@@ -110,6 +110,21 @@ class Settings(BaseSettings):
     # this is a capability override, not an on/off switch.
     LLM_TOOL_MODE: Literal["auto", "native", "guided", "hermes"] = "auto"
 
+    # LM Studio inference transport selection (PRD 0017 / issue 0111).
+    #
+    # ``openai`` (default) routes LM Studio inference through the
+    # OpenAI-compatible HTTP endpoint via :class:`bob.llm_client.LMStudioClient`
+    # — the shipped behaviour, byte-for-byte unchanged. ``sdk`` routes it
+    # through the official ``lmstudio`` Python SDK
+    # (:class:`bob.llm.lmstudio_sdk.LMStudioSDKClient`) over the native
+    # websocket transport (host derived from ``LLM_BASE_URL`` via
+    # :func:`bob.lm_studio_manager.host_from_base_url`). The flag gates BOTH the
+    # global and the per-role (PRD 0016) factory paths so the whole LM Studio
+    # backend swaps atomically. Defaults to ``openai`` so nothing changes until
+    # the SDK transport is validated end-to-end on a real server; flipping it
+    # back is an instant rollback (no code change). Claude CLI is unaffected.
+    LLM_LMSTUDIO_TRANSPORT: Literal["sdk", "openai"] = "openai"
+
     # Implicit cap on concurrent running sub-tasks. The real cap + queue land
     # in slice #0020; this field exists now so callers can reference it
     # without breaking the config contract when the cap is wired up.

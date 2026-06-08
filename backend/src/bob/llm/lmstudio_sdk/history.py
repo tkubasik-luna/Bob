@@ -1,0 +1,121 @@
+"""Bob message history → ``lmstudio`` SDK :class:`Chat` converter (PRD 0017 / M3).
+
+A deep, PURE, separately-testable function: Bob's wire history (a list of
+``{"role", "content"}`` dicts) is rebuilt into the SDK's :class:`lmstudio.Chat`
+object the inference calls consume. This is the single place that knows how a
+Bob role maps onto a ``Chat`` entry.
+
+Scope of issue 0111 — base roles only:
+
+- ``system`` → :meth:`Chat.add_system_prompt`
+- ``user`` → :meth:`Chat.add_user_message`
+- ``assistant`` → :meth:`Chat.add_assistant_response`
+
+The ``system_validator`` role fold (issue 0048) is applied by the CALLER
+(:class:`bob.llm.lmstudio_sdk.client.LMStudioSDKClient`) *before* conversion,
+exactly like the OpenAI client folds it before dispatch — so by the time a
+message reaches this converter every role is already one of the standard four.
+
+Assistant-with-tool_calls turns and ``tool``-result turns round-trip through
+:meth:`Chat.add_assistant_response` (with tool-call requests) and
+:meth:`Chat.add_tool_result` respectively. Those are EXTENDED in issue 0113
+(tool-calling). To keep that extension a pure addition rather than a rewrite,
+the dispatch is already structured as a per-role branch keyed on ``role`` — 0113
+adds the ``tool`` branch and the tool-call arm of the ``assistant`` branch
+without touching the existing arms.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from lmstudio import Chat
+
+#: The roles this converter understands at the issue-0111 base layer. Tool-call
+#: round-trips (``tool`` results, assistant tool-call requests) arrive in 0113;
+#: an unexpected role here is a contract bug surfaced loudly rather than dropped.
+_BASE_ROLES = frozenset({"system", "user", "assistant"})
+
+
+class HistoryConversionError(ValueError):
+    """A Bob message could not be mapped onto an SDK :class:`Chat` entry.
+
+    Raised for an unknown / non-standard role reaching the converter (the
+    validator fold + standard-role assertion run upstream, so this only fires on
+    a genuine programming error or a role the base layer does not yet support).
+    """
+
+
+def _content_str(message: dict[str, Any]) -> str:
+    """Read a message's textual content as a plain string.
+
+    Bob's base-role messages carry a string ``content``. A non-string (or
+    missing) value is coerced via ``str`` so a malformed row never crashes the
+    converter — mirrors :func:`bob.llm_client._estimate_tokens`'s tolerance.
+    """
+
+    content = message.get("content")
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    return str(content)
+
+
+#: Separator used to coalesce consecutive ``system`` messages into one SDK
+#: system prompt. Matches :meth:`bob.llm_client.ClaudeCliClient._split_messages`'s
+#: ``"\n\n".join`` of system parts so the merged prompt reads identically across
+#: transports.
+_SYSTEM_JOIN = "\n\n"
+
+
+def messages_to_chat(messages: list[dict[str, Any]]) -> Chat:
+    """Convert Bob's wire ``messages`` into an SDK :class:`Chat`.
+
+    ``messages`` is the validator-folded, standard-role history (see module
+    docstring). Returns a fresh :class:`Chat` with one entry per message, in
+    order. Raises :class:`HistoryConversionError` on a role the base layer does
+    not handle.
+
+    DEVIATION from the OpenAI transport (robustness): the SDK :class:`Chat`
+    REJECTS multi-part / consecutive system prompts
+    (``LMStudioRuntimeError: Multi-part or consecutive system prompts are not
+    supported``), whereas the OpenAI-compatible endpoint accepts any number of
+    ``system`` rows. Bob routinely emits several (a base system prompt + the
+    issue-0048 folded ``system_validator`` row). To preserve behaviour we
+    coalesce a RUN of consecutive ``system`` messages into a single system prompt
+    joined with :data:`_SYSTEM_JOIN` (the same join the Claude CLI client uses),
+    rather than letting the SDK raise.
+    """
+
+    chat = Chat()
+    pending_system: list[str] = []
+
+    def flush_system() -> None:
+        if pending_system:
+            chat.add_system_prompt(_SYSTEM_JOIN.join(pending_system))
+            pending_system.clear()
+
+    for index, message in enumerate(messages):
+        role = message.get("role")
+        if role not in _BASE_ROLES:
+            raise HistoryConversionError(
+                f"Cannot convert role {role!r} at messages[{index}] to an SDK Chat "
+                f"entry. Base layer supports {sorted(_BASE_ROLES)}; tool-call "
+                f"round-trips arrive in issue 0113."
+            )
+        content = _content_str(message)
+        if role == "system":
+            pending_system.append(content)
+            continue
+        # A non-system message closes any open run of system prompts first.
+        flush_system()
+        if role == "user":
+            chat.add_user_message(content)
+        else:  # role == "assistant"
+            chat.add_assistant_response(content)
+    flush_system()
+    return chat
+
+
+__all__ = ["HistoryConversionError", "messages_to_chat"]

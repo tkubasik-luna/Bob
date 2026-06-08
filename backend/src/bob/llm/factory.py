@@ -24,11 +24,35 @@ from bob.llm_selection_store import LLMSelection, RoleSelection
 RoleClientBuilder = Callable[[RoleSelection, Settings], LLMClient]
 
 
+def _build_lm_studio_client(
+    settings: Settings, *, model: str | None = None, reasoning: str | None = None
+) -> LLMClient:
+    """Build the LM Studio inference client, gated on ``LLM_LMSTUDIO_TRANSPORT``.
+
+    PRD 0017 / issue 0111 — the transport flag selects the inference path for the
+    LM Studio backend WITHOUT touching any call site: ``openai`` (default) keeps
+    the shipped :class:`bob.llm_client.LMStudioClient` (OpenAI-compatible HTTP),
+    ``sdk`` swaps in :class:`bob.llm.lmstudio_sdk.LMStudioSDKClient` (native
+    ``lmstudio`` SDK websocket). Both honour the per-role ``model`` / ``reasoning``
+    overrides identically so the swap is transparent to the per-role builders.
+
+    The SDK client is imported lazily so the default ``openai`` path never pays
+    the SDK import cost on builders that don't need it, and so a future SDK-import
+    issue cannot break the shipped transport.
+    """
+
+    if settings.LLM_LMSTUDIO_TRANSPORT == "sdk":
+        from bob.llm.lmstudio_sdk import LMStudioSDKClient
+
+        return LMStudioSDKClient(settings, model=model, reasoning=reasoning)
+    return LMStudioClient(settings, model=model, reasoning=reasoning)
+
+
 def _build_for_backend(backend: str, settings: Settings, *, role: str | None = None) -> LLMClient:
     if backend == "claude_cli":
         return ClaudeCliClient(settings)
     if backend == "lm_studio":
-        return LMStudioClient(settings)
+        return _build_lm_studio_client(settings)
     if backend == "fake":
         # PRD 0016 / issue 0098 — the attestation harness provider. Built lazily
         # so production paths never import the attest package. ``role`` is
@@ -140,8 +164,12 @@ def _build_role_client(role_selection: RoleSelection, role: str, settings: Setti
         # the same LM Studio host still route each request to their own model.
         # base_url is already per-role via the folded ``LLM_BASE_URL``. The
         # per-role ``reasoning`` level rides on the client so every request from
-        # this role carries it (``None`` omits it → model's auto setting).
-        return LMStudioClient(effective, model=selection.lm_model, reasoning=selection.reasoning)
+        # this role carries it (``None`` omits it → model's auto setting). The
+        # transport flag (PRD 0017 / issue 0111) gates OpenAI vs SDK here too, so
+        # the per-role path swaps atomically with the global one.
+        return _build_lm_studio_client(
+            effective, model=selection.lm_model, reasoning=selection.reasoning
+        )
     if selection.provider == "fake":
         # PRD 0016 / issue 0098 — the attestation harness provider, at the
         # per-role granularity (the seeded role map inherits ``LLM_PROVIDER=fake``

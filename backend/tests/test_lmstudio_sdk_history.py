@@ -1,0 +1,108 @@
+"""Pure tests for the Bob history → SDK :class:`Chat` converter (PRD 0017 / M3).
+
+The converter (:func:`bob.llm.lmstudio_sdk.history.messages_to_chat`) is pure —
+no SDK server, no network — so these assert directly on the resulting ``Chat``'s
+serialised history (``Chat._get_history()``), the deterministic dict the SDK
+itself builds from the entries. Base roles only at issue 0111; tool-call
+round-trips arrive in issue 0113.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import pytest
+
+from bob.llm.lmstudio_sdk.history import HistoryConversionError, messages_to_chat
+from bob.llm_client import _normalise_validator_role
+from bob.validation.system_validator import (
+    FALLBACK_VALIDATOR_PREFIX,
+    SYSTEM_VALIDATOR_ROLE,
+)
+
+
+def _texts(chat_history: Any) -> list[tuple[str, str]]:
+    """Flatten a ``Chat._get_history()`` dict into ``(role, joined_text)`` pairs."""
+
+    pairs: list[tuple[str, str]] = []
+    messages = chat_history["messages"]
+    assert isinstance(messages, list)
+    for entry in messages:
+        assert isinstance(entry, dict)
+        role = entry["role"]
+        parts = entry.get("content", [])
+        text = "".join(part.get("text", "") for part in parts if isinstance(part, dict))
+        pairs.append((str(role), text))
+    return pairs
+
+
+def test_system_only() -> None:
+    chat = messages_to_chat([{"role": "system", "content": "You are Bob."}])
+    assert _texts(chat._get_history()) == [("system", "You are Bob.")]
+
+
+def test_multi_turn_user_assistant() -> None:
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "bonjour"},
+        {"role": "assistant", "content": "salut"},
+        {"role": "user", "content": "ça va ?"},
+    ]
+    chat = messages_to_chat(messages)
+    assert _texts(chat._get_history()) == [
+        ("system", "sys"),
+        ("user", "bonjour"),
+        ("assistant", "salut"),
+        ("user", "ça va ?"),
+    ]
+
+
+def test_validator_fold_applied_before_conversion() -> None:
+    """The caller folds ``system_validator`` → prefixed ``system`` first.
+
+    The converter only sees standard roles; this test wires the same fold the
+    client applies (``_normalise_validator_role``) and asserts the validator row
+    becomes a prefixed ``system`` segment. The SDK rejects consecutive system
+    prompts, so the base + validator rows are coalesced into ONE system prompt
+    (joined with a blank line) — the validator prefix stays distinguishable.
+    """
+
+    raw = [
+        {"role": "system", "content": "base"},
+        {"role": SYSTEM_VALIDATOR_ROLE, "content": "obey the schema"},
+        {"role": "user", "content": "go"},
+    ]
+    folded = _normalise_validator_role(raw, allow_arbitrary_roles=False)
+    chat = messages_to_chat(folded)
+    assert _texts(chat._get_history()) == [
+        ("system", "base\n\n" + FALLBACK_VALIDATOR_PREFIX + "obey the schema"),
+        ("user", "go"),
+    ]
+
+
+def test_consecutive_system_messages_coalesced() -> None:
+    """Consecutive system rows merge into one prompt (SDK rejects multiple)."""
+
+    chat = messages_to_chat(
+        [
+            {"role": "system", "content": "a"},
+            {"role": "system", "content": "b"},
+            {"role": "user", "content": "hi"},
+        ]
+    )
+    assert _texts(chat._get_history()) == [("system", "a\n\nb"), ("user", "hi")]
+
+
+def test_non_string_content_coerced() -> None:
+    chat = messages_to_chat([{"role": "user", "content": 42}])
+    assert _texts(chat._get_history()) == [("user", "42")]
+
+
+def test_missing_content_becomes_empty() -> None:
+    chat = messages_to_chat([{"role": "user"}])
+    assert _texts(chat._get_history()) == [("user", "")]
+
+
+def test_unknown_role_raises() -> None:
+    with pytest.raises(HistoryConversionError):
+        messages_to_chat([{"role": "tool", "content": "result"}])
