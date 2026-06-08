@@ -74,6 +74,16 @@ DEFAULT_LM_STUDIO_HOST = "localhost:1234"
 DEFAULT_MODEL_FOOTPRINT_GIB = 5.0
 
 
+#: Loopback host spellings that all denote "this machine". Collapsed to a single
+#: canonical host so two URL spellings of the same local server (the UI's
+#: ``localhost`` default vs a ``127.0.0.1`` / ``::1`` `.env`) don't spawn two
+#: managers — each with its own empty ref-count — and reload the same model.
+_LOOPBACK_HOSTS: frozenset[str] = frozenset(
+    {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
+)
+_CANONICAL_LOOPBACK = "localhost"
+
+
 def host_from_base_url(base_url: str | None) -> str:
     """Derive the ``lmstudio`` SDK ``host:port`` from the inference ``LLM_BASE_URL``.
 
@@ -83,12 +93,29 @@ def host_from_base_url(base_url: str | None) -> str:
     so the manager host is derived from the same setting rather than configured
     twice. Falls back to :data:`DEFAULT_LM_STUDIO_HOST` when the URL is absent or
     has no network location.
+
+    Canonicalises the result so equivalent spellings map to one key: the host is
+    lower-cased and every loopback alias (``localhost`` / ``127.0.0.1`` / ``::1``
+    / ``0.0.0.0``, and any ``127.0.0.0/8`` address) collapses to ``localhost``.
+    Without this the same local server reached as ``localhost:1234`` and
+    ``127.0.0.1:1234`` got two managers and the model loaded twice (bug:
+    duplicate model loads). Remote hosts are preserved verbatim (lower-cased) —
+    we never assume two distinct IPs are the same machine.
     """
 
     if not base_url:
         return DEFAULT_LM_STUDIO_HOST
     parsed = urlsplit(base_url if "//" in base_url else f"//{base_url}")
-    return parsed.netloc or DEFAULT_LM_STUDIO_HOST
+    netloc = parsed.netloc
+    if not netloc:
+        return DEFAULT_LM_STUDIO_HOST
+    host = (parsed.hostname or "").lower()
+    if host in _LOOPBACK_HOSTS or host.startswith("127."):
+        host = _CANONICAL_LOOPBACK
+    if not host:
+        return netloc.lower()
+    port = parsed.port
+    return f"{host}:{port}" if port is not None else host
 
 
 #: ``LlmInfo.type`` values we treat as chat-capable. ``vlm`` (vision LLM) is a
@@ -471,6 +498,27 @@ class LMStudioManager:
             self._role_model[role] = model_id
             self._budget_add(model_id, context_length)
             return
+
+        if not reload:
+            # The in-process ref map starts EMPTY at boot, but LM Studio may have
+            # already JIT-loaded this exact model on the first inference (or it
+            # was loaded out-of-band). Reloading it would be a wasteful duplicate
+            # load with a visible reload blip — the "model loaded twice" bug.
+            # Reconcile against the server's live loaded set and adopt an
+            # already-resident model into the ref map instead of reloading it.
+            # Best-effort: if the server can't be listed, fall through to the
+            # normal load path (which surfaces its own error).
+            try:
+                server_loaded = model_id in self.loaded_model_ids()
+            except LMStudioUnavailableError:
+                server_loaded = False
+            if server_loaded:
+                self._refs.setdefault(model_id, set()).add(role)
+                self._role_model[role] = model_id
+                # The model physically fits (it is already loaded) — book its
+                # footprint to reflect reality without a redundant budget gate.
+                self._budget_set(model_id, self._footprint_for(model_id, context_length))
+                return
 
         # A NEW load (or a forced reload): budget-check FIRST. On a forced
         # reload of an already-resident model its own footprint is already

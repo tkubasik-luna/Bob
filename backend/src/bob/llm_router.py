@@ -574,12 +574,22 @@ def _role_map_payload(selection: object) -> RoleMapResponse:
     # :class:`bob.llm_selection_store.RoleSelection`.
     settings = _settings_provider()
     claude_model = settings.CLAUDE_CLI_MODEL or DEFAULT_CLAUDE_MODEL_LABEL
+    fallback_base_url = settings.LLM_BASE_URL or None
     roles: dict[str, RoleSelectionBody] = {}
     for role in ROLES:
         sel = selection.roles[role]  # type: ignore[attr-defined]
+        # Report the EFFECTIVE base URL for LM Studio roles: the picker must show
+        # the server actually in use. A role with no pinned base_url (default
+        # seed / migrated flat file) falls back to the active LLM_BASE_URL rather
+        # than letting the UI substitute a hardcoded localhost placeholder — that
+        # mismatch was the "wrong URL shown" bug. Claude roles have no base_url,
+        # so the fallback only applies to lm_studio (mirrors GET /selection).
+        role_base_url = sel.base_url
+        if sel.provider == "lm_studio" and not role_base_url:
+            role_base_url = fallback_base_url
         roles[role] = RoleSelectionBody(
             provider=sel.provider,
-            base_url=sel.base_url,
+            base_url=role_base_url,
             lm_model=sel.lm_model,
             context_length=sel.context_length,
             reasoning=sel.reasoning,

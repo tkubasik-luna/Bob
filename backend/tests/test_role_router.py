@@ -103,6 +103,34 @@ def test_get_roles_returns_full_map(tmp_path: Path) -> None:
     assert body["claude_model"] == "claude-opus-4"
 
 
+def test_get_roles_lm_role_without_base_url_falls_back_to_effective(tmp_path: Path) -> None:
+    """A LM Studio role with no pinned base_url reports the effective LLM_BASE_URL.
+
+    Regression for the "wrong URL shown in settings" bug: the picker must show the
+    server actually in use, not a hardcoded localhost placeholder. The seeded
+    thinker/draft roles carry no base_url; the response fills them from
+    LLM_BASE_URL. The claude_cli subagent role keeps base_url=None (no fallback).
+    """
+
+    store = _seeded_store(tmp_path)
+    llm_router.set_role_store_provider(lambda: store)
+    llm_router.set_settings_provider(lambda: _settings(LLM_BASE_URL="http://192.168.86.21:1234/v1"))
+    try:
+        client = TestClient(app)
+        body = client.get("/api/llm/roles").json()
+    finally:
+        llm_router.reset_role_store_provider()
+        llm_router.reset_settings_provider()
+
+    # jarvis pinned its own URL → unchanged.
+    assert body["roles"]["jarvis"]["base_url"] == "http://localhost:1234/v1"
+    # thinker/draft (lm_studio, no base_url) → effective LLM_BASE_URL, not localhost.
+    assert body["roles"]["thinker"]["base_url"] == "http://192.168.86.21:1234/v1"
+    assert body["roles"]["draft"]["base_url"] == "http://192.168.86.21:1234/v1"
+    # claude_cli role has no base_url concept → stays null.
+    assert body["roles"]["subagent"]["base_url"] is None
+
+
 def test_put_role_dispatches_and_returns_updated_map(tmp_path: Path) -> None:
     result = RoleSelection(
         roles={

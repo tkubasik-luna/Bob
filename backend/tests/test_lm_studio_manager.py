@@ -190,6 +190,19 @@ def test_host_from_base_url_falls_back_when_absent() -> None:
     assert host_from_base_url("") == DEFAULT_LM_STUDIO_HOST
 
 
+def test_host_from_base_url_canonicalises_loopback_aliases() -> None:
+    # Every loopback spelling collapses to one key so the same local server
+    # reached two ways doesn't get two managers (→ duplicate model loads).
+    assert host_from_base_url("http://127.0.0.1:1234/v1") == "localhost:1234"
+    assert host_from_base_url("http://[::1]:1234/v1") == "localhost:1234"
+    assert host_from_base_url("http://0.0.0.0:1234") == "localhost:1234"
+    assert host_from_base_url("http://127.0.1.1:1234") == "localhost:1234"
+    # Host is lower-cased; a remote host is preserved verbatim (never assumed
+    # equal to another distinct host).
+    assert host_from_base_url("http://LocalHost:1234/v1") == "localhost:1234"
+    assert host_from_base_url("http://192.168.86.21:1234/v1") == "192.168.86.21:1234"
+
+
 def test_list_models_filters_embeddings_and_exposes_metadata() -> None:
     client = _FakeClient(_catalogue(), loaded=[_FakeLoaded("qwen2.5-7b-instruct")])
 
@@ -464,6 +477,38 @@ def test_reassigning_role_releases_old_model_when_unreferenced() -> None:
     assert manager.resident_model_ids() == frozenset({"modelB"})
     assert llm.unloaded == ["modelA"]  # old model freed (no other ref)
     assert [m for m, _ in llm.loaded] == ["modelA", "modelB"]
+
+
+def test_assign_role_adopts_server_loaded_model_without_reloading() -> None:
+    # The in-process ref map starts empty at boot, but LM Studio may already have
+    # JIT-loaded the model. assign_role must ADOPT the resident model (record the
+    # ref) rather than issuing a duplicate load — the "model loaded twice" bug.
+    llm = _FakeLlmNamespace()
+    client = _FakeClient(
+        _catalogue(),
+        loaded=[_FakeLoaded("qwen2.5-7b-instruct")],  # already resident server-side
+        llm=llm,
+    )
+    manager = LMStudioManager(host="localhost:1234", client_factory=lambda _h: client)
+
+    manager.assign_role("jarvis", "qwen2.5-7b-instruct", context_length=8192)
+
+    assert llm.loaded == []  # NO duplicate SDK load
+    assert llm.unloaded == []
+    assert manager.ref_count("qwen2.5-7b-instruct") == 1
+    assert manager.model_for_role("jarvis") == "qwen2.5-7b-instruct"
+
+
+def test_assign_role_loads_when_not_resident_anywhere() -> None:
+    # The model is neither ref-counted nor loaded server-side → a real load fires.
+    llm = _FakeLlmNamespace()
+    client = _FakeClient(_catalogue(), loaded=[], llm=llm)
+    manager = LMStudioManager(host="localhost:1234", client_factory=lambda _h: client)
+
+    manager.assign_role("jarvis", "qwen2.5-7b-instruct")
+
+    assert [m for m, _ in llm.loaded] == ["qwen2.5-7b-instruct"]
+    assert manager.ref_count("qwen2.5-7b-instruct") == 1
 
 
 def test_assign_role_refuses_third_model_over_budget() -> None:
