@@ -383,19 +383,170 @@ class LMStudioSDKClient(LLMClient):
         schema: dict[str, Any] | None = None,
         session_id: str | None = None,
     ) -> AsyncIterator[StreamChunk]:
-        """Not implemented in issue 0111 — SDK streaming chat lands in 0112.
+        """Streaming guided-JSON ``chat`` over the SDK transport (PRD 0017 / M5).
 
-        Overrides the base fallback (which would call :meth:`chat` and replay it
-        as one chunk) to fail loudly instead: the ``sdk`` transport's real
-        streaming path is issue 0112, and a silent single-chunk replay here
-        would mask that the streaming reasoning feed is not wired yet.
+        The SDK-transport counterpart of
+        :meth:`bob.llm_client.LMStudioClient.stream_chat`: same validator-role
+        fold, same ``messages_to_chat`` conversion, same ``response_format`` when
+        ``schema`` is set and the same ``config.raw`` reasoning passthrough as
+        :meth:`chat`, then drives ``model.respond_stream(...)`` and adapts the
+        SDK fragment stream into Bob :class:`StreamChunk`s via module M5
+        (:func:`bob.llm.lmstudio_sdk.streaming.adapt_prediction_stream`).
+
+        Yields ``text`` + ``reasoning`` chunks tick by tick, then one terminal
+        ``perf`` chunk built from the SDK's :class:`lmstudio.LlmPredictionStats`.
+        Concatenating the ``text`` deltas reconstructs BYTE-IDENTICALLY what
+        :meth:`chat` returns for the same input (the sub-agent action parse is
+        unchanged); ``reasoning`` deltas are cosmetic and never feed parsing
+        (issue 0069). ``log_llm_call`` + the end debug event (aggregated text,
+        tokens) are emitted in a ``finally``, exactly like the OpenAI transport's
+        :meth:`bob.llm_client.LMStudioClient._consume_chat_stream`.
+
+        This is an async generator: opening the (per-call) ``AsyncClient`` and
+        driving ``respond_stream`` happen inside the body so the websocket stays
+        open across iteration and is always closed via ``async with`` when the
+        consumer drains (or abandons) the stream.
         """
 
-        raise LLMClientError(
-            "LMStudioSDKClient.stream_chat() is not implemented yet — SDK "
-            "streaming chat arrives in issue 0112. Use "
-            "LLM_LMSTUDIO_TRANSPORT=openai for streaming until then."
+        messages = _normalise_validator_role(messages, allow_arbitrary_roles=False)
+        _assert_standard_roles(messages)
+
+        chat = messages_to_chat(messages)
+        response_format = schema_to_response_format(schema) if schema is not None else None
+        config = self._build_config()
+
+        correlation_id = uuid4().hex
+        token_estimate = _estimate_tokens(messages)
+        emit_debug(
+            category="llm",
+            severity="info",
+            source="bob.llm.lmstudio_sdk.stream_chat",
+            summary=(
+                f"LLM chat stream démarré ({token_estimate} tokens prompt, model={self._model})"
+            ),
+            payload={
+                "messages": messages,
+                "model": self._model,
+                "reasoning": self._reasoning,
+                "tokens_prompt_estimate": token_estimate,
+                "has_schema": schema is not None,
+                "session_id": session_id,
+                "streaming": True,
+            },
+            correlation_id=correlation_id,
         )
+
+        return self._consume_chat_stream(
+            chat,
+            response_format=response_format,
+            config=config,
+            session_id=session_id,
+            correlation_id=correlation_id,
+            messages=messages,
+        )
+
+    async def _consume_chat_stream(
+        self,
+        chat: Any,
+        *,
+        response_format: dict[str, Any] | None,
+        config: LlmPredictionConfigDict,
+        session_id: str | None,
+        correlation_id: str,
+        messages: list[dict[str, Any]],
+    ) -> AsyncIterator[StreamChunk]:
+        """Open the SDK stream and adapt it to ``StreamChunk``s (M5 driver).
+
+        Mirrors :meth:`bob.llm_client.LMStudioClient._consume_chat_stream`: walk
+        the stream yielding ``text`` / ``reasoning`` chunks (accumulating the text
+        for the post-stream log), end with a terminal ``perf`` chunk, and always
+        run ``log_llm_call`` + the end debug event in a ``finally``. SDK
+        ``LMStudioError`` failures map to :class:`LLMClientError` (a start-failure
+        debug event mirrors the ``chat()`` error arm).
+
+        The per-call ``AsyncClient`` lifecycle (``async with``) wraps the whole
+        iteration so the websocket is closed when the consumer finishes; the
+        long-lived per-role client lands in issue 0115.
+        """
+
+        from bob.llm.lmstudio_sdk.streaming import adapt_prediction_stream
+
+        text_buffer = ""
+        tokens_in: int | None = None
+        tokens_out: int | None = None
+        started = time.perf_counter()
+
+        def _accumulate(delta: str) -> None:
+            nonlocal text_buffer
+            text_buffer += delta
+
+        try:
+            async with self._client_factory(self._host) as client:
+                model = await client.llm.model(self._model)
+                try:
+                    stream = await model.respond_stream(
+                        chat,
+                        response_format=response_format,
+                        config=config,
+                    )
+                except lmstudio.LMStudioError as exc:
+                    latency_ms = (time.perf_counter() - started) * 1000.0
+                    emit_debug(
+                        category="llm",
+                        severity="error",
+                        source="bob.llm.lmstudio_sdk.stream_chat",
+                        summary=f"LLM chat stream échoué en {latency_ms:.0f}ms: {exc}",
+                        payload={
+                            "model": self._model,
+                            "latency_ms": latency_ms,
+                            "exception": str(exc),
+                            "exception_type": exc.__class__.__name__,
+                            "traceback": traceback.format_exc(),
+                            "session_id": session_id,
+                        },
+                        correlation_id=correlation_id,
+                    )
+                    raise LLMClientError(f"LM Studio SDK stream failed: {exc}") from exc
+
+                async for chunk in adapt_prediction_stream(
+                    aiter(stream),
+                    stats_getter=lambda: getattr(stream, "stats", None),
+                    started=started,
+                    on_text=_accumulate,
+                ):
+                    if chunk.kind == "perf":
+                        tokens_in = chunk.tokens_in
+                        tokens_out = chunk.tokens_out
+                    yield chunk
+        finally:
+            latency_ms = (time.perf_counter() - started) * 1000.0
+            log_llm_call(
+                session_id=session_id,
+                messages=messages,
+                raw_response=text_buffer,
+                latency_ms=latency_ms,
+                tokens_in=tokens_in,
+                tokens_out=tokens_out,
+            )
+            emit_debug(
+                category="llm",
+                severity="info",
+                source="bob.llm.lmstudio_sdk.stream_chat",
+                summary=(
+                    f"LLM chat stream terminé en {latency_ms:.0f}ms "
+                    f"({tokens_out if tokens_out is not None else '?'} tokens response)"
+                ),
+                payload={
+                    "response": text_buffer,
+                    "latency_ms": latency_ms,
+                    "tokens_in": tokens_in,
+                    "tokens_out": tokens_out,
+                    "model": self._model,
+                    "session_id": session_id,
+                    "streaming": True,
+                },
+                correlation_id=correlation_id,
+            )
 
     async def stream_complete(
         self,
