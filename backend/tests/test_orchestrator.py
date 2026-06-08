@@ -573,7 +573,6 @@ async def test_end_to_end_spawn_and_complete() -> None:
     assert any(m.action == "done" for m in messages)
 
 
-
 # ---------------------------------------------------------------------------
 # generate_proactive_message (slices #0021/#0025)
 #
@@ -861,9 +860,7 @@ async def test_proactive_loop_buffers_while_thinking_then_flushes_when_idle() ->
             # ``assistant_msg`` (sphere/TTS) frame: issue 0072 also lands a
             # Jarvis-lane "synthèse" chip + answer-text frame on the bus.
             orchestrator._jarvis_state = "idle"
-            flushed = await _wait_until(
-                lambda: any(e["type"] == "assistant_msg" for e in received)
-            )
+            flushed = await _wait_until(lambda: any(e["type"] == "assistant_msg" for e in received))
             assert flushed
             answer = next(e for e in received if e["type"] == "assistant_msg")
             assert answer["proactive"] is True
@@ -901,9 +898,7 @@ async def test_proactive_loop_respects_user_typing_then_flushes_on_reset() -> No
             # Stop typing → flush within a couple of poll cycles. Filter to the
             # ``assistant_msg`` frame (issue 0072 also emits Jarvis-lane frames).
             orchestrator.set_user_typing(False)
-            flushed = await _wait_until(
-                lambda: any(e["type"] == "assistant_msg" for e in received)
-            )
+            flushed = await _wait_until(lambda: any(e["type"] == "assistant_msg" for e in received))
             assert flushed
             answer = next(e for e in received if e["type"] == "assistant_msg")
             assert answer["speech"] == "Synthèse OK."
@@ -1231,9 +1226,7 @@ async def test_spawn_subtask_emits_decision_debug_event() -> None:
     assert response.spawned_task_ids
 
     spawn_events = [
-        e
-        for e in debug_log.snapshot()
-        if e.category == "decision" and "lance task v2" in e.summary
+        e for e in debug_log.snapshot() if e.category == "decision" and "lance task v2" in e.summary
     ]
     assert len(spawn_events) == 1
     assert "Drafts" in spawn_events[0].summary

@@ -123,18 +123,14 @@ def test_ensure_non_empty_falls_back_on_junk_goal() -> None:
     surfaced (top-k by score → here all-zero → first k by ascending name).
     """
 
-    tools = select_tools(
-        _registry(), "azerty qwerty zzz", k=8, min_score=1, ensure_non_empty=True
-    )
+    tools = select_tools(_registry(), "azerty qwerty zzz", k=8, min_score=1, ensure_non_empty=True)
     assert _names(tools) == ["gmail_search", "web_fetch", "web_search"]
 
 
 def test_ensure_non_empty_respects_k_cap_on_fallback() -> None:
     """The fallback honours ``k`` — it surfaces the best guesses, not everything."""
 
-    tools = select_tools(
-        _registry(), "azerty qwerty zzz", k=2, min_score=1, ensure_non_empty=True
-    )
+    tools = select_tools(_registry(), "azerty qwerty zzz", k=2, min_score=1, ensure_non_empty=True)
     assert len(tools) == 2
 
 
