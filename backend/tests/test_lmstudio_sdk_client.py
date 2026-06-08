@@ -22,6 +22,7 @@ from typing import Any
 
 import lmstudio
 import pytest
+from lmstudio.json_api import LMStudioWebsocketError
 
 from bob.config import Settings
 from bob.llm.factory import _build_for_backend, _build_role_client
@@ -160,17 +161,30 @@ class _FakeLlmNamespace:
 
 
 class _FakeAsyncClient:
-    """Stand-in for the SDK ``AsyncClient`` (async context manager)."""
+    """Stand-in for the SDK ``AsyncClient``.
+
+    Long-lived lifecycle (issue 0115): the SDK client drives ``__aenter__`` to
+    connect and ``aclose`` to tear down (NOT a per-call ``async with``). The fake
+    counts both so tests can assert the websocket is connected ONCE per client
+    and closed only on supersede.
+    """
 
     def __init__(self, model: _FakeModel) -> None:
         self.llm = _FakeLlmNamespace(model)
         self.closed = False
+        self.connect_count = 0
+        self.aclose_count = 0
 
     async def __aenter__(self) -> _FakeAsyncClient:
+        self.connect_count += 1
         return self
 
     async def __aexit__(self, *exc: object) -> None:
+        await self.aclose()
+
+    async def aclose(self) -> None:
         self.closed = True
+        self.aclose_count += 1
 
 
 def _factory_for(
@@ -340,7 +354,9 @@ async def test_chat_returns_content() -> None:
     # Host derived from LLM_BASE_URL; model handle resolved from the pinned model.
     assert captured["host"] == "localhost:1234"
     assert captured["model"].respond_calls[0]["response_format"] is None
-    assert captured["client"].closed is True
+    # Long-lived (issue 0115): connected once, NOT closed after the call.
+    assert captured["client"].connect_count == 1
+    assert captured["client"].closed is False
 
 
 @pytest.mark.asyncio
@@ -509,8 +525,9 @@ async def test_complete_captures_tool_calls_without_executing() -> None:
     assert call.arguments == {"q": "bitcoin"}
     # The SDK executed NOTHING — no tool impl was invoked.
     assert captured["model"].executed == []
-    # The websocket was closed.
-    assert captured["client"].closed is True
+    # Long-lived (issue 0115): the websocket stays open across calls.
+    assert captured["client"].connect_count == 1
+    assert captured["client"].closed is False
 
 
 @pytest.mark.asyncio
@@ -609,6 +626,116 @@ async def test_complete_sdk_error_maps_to_llm_client_error() -> None:
     client = LMStudioSDKClient(_settings(LLM_LMSTUDIO_TRANSPORT="sdk"), client_factory=factory)
     with pytest.raises(LLMClientError, match="SDK call failed"):
         await client.complete([{"role": "user", "content": "hi"}], tools=[_tool()])
+
+
+# --- long-lived client lifecycle + reconnect (issue 0115 / M7) ---------------
+
+
+class _WsDropModel(_FakeModel):
+    """A fake model whose ``respond`` raises a websocket drop the first N times.
+
+    Drives the reconnect+retry-once path: ``drops`` counts how many initial
+    ``respond`` calls (across the whole client's lifetime) raise
+    :class:`LMStudioWebsocketError` before one succeeds.
+    """
+
+    def __init__(self, drops: int, result: _FakeResult) -> None:
+        super().__init__(result, None)
+        self._drops = drops
+
+    async def respond(
+        self, history: Any, *, response_format: Any = None, config: Any = None
+    ) -> Any:
+        if self._drops > 0:
+            self._drops -= 1
+            raise LMStudioWebsocketError("websocket dropped")
+        return await super().respond(history, response_format=response_format, config=config)
+
+
+def _lifecycle_factory(clients: list[_FakeAsyncClient], model: _FakeModel) -> Any:
+    """A factory recording every built client into ``clients`` (one per connect).
+
+    Each ``_connect`` builds a NEW fake client wrapping the SAME shared ``model``
+    (so a ``drops`` counter survives across reconnects), so the list length is the
+    number of (re)connections — exactly what the lifecycle assertions read.
+    """
+
+    def factory(host: str) -> _FakeAsyncClient:
+        client = _FakeAsyncClient(model)
+        clients.append(client)
+        return client
+
+    return factory
+
+
+@pytest.mark.asyncio
+async def test_long_lived_client_connects_once_across_calls() -> None:
+    """N calls reuse ONE connection: the factory connects once, never per call."""
+
+    clients: list[_FakeAsyncClient] = []
+    factory = _lifecycle_factory(clients, _FakeModel(_FakeResult("ok"), None))
+    client = LMStudioSDKClient(_settings(LLM_LMSTUDIO_TRANSPORT="sdk"), client_factory=factory)
+
+    for _ in range(3):
+        assert await client.chat([{"role": "user", "content": "hi"}]) == "ok"
+
+    # Exactly one client built + connected; never closed mid-life.
+    assert len(clients) == 1
+    assert clients[0].connect_count == 1
+    assert clients[0].aclose_count == 0
+    assert clients[0].closed is False
+
+
+@pytest.mark.asyncio
+async def test_websocket_drop_reconnects_and_retries_once() -> None:
+    """A websocket drop mid-call → ONE reconnect, then the retry succeeds."""
+
+    clients: list[_FakeAsyncClient] = []
+    factory = _lifecycle_factory(clients, _WsDropModel(drops=1, result=_FakeResult("recovered")))
+    client = LMStudioSDKClient(_settings(LLM_LMSTUDIO_TRANSPORT="sdk"), client_factory=factory)
+
+    out = await client.chat([{"role": "user", "content": "hi"}])
+    assert out == "recovered"
+    # First client connected then closed on reconnect; a second client connected.
+    assert len(clients) == 2
+    assert clients[0].aclose_count == 1
+    assert clients[1].connect_count == 1
+    assert clients[1].closed is False
+
+
+@pytest.mark.asyncio
+async def test_persistent_websocket_drop_raises_llm_client_error() -> None:
+    """Two consecutive drops (reconnect + retry both fail) → ``LLMClientError``."""
+
+    clients: list[_FakeAsyncClient] = []
+    factory = _lifecycle_factory(clients, _WsDropModel(drops=2, result=_FakeResult("never")))
+    client = LMStudioSDKClient(_settings(LLM_LMSTUDIO_TRANSPORT="sdk"), client_factory=factory)
+
+    with pytest.raises(LLMClientError, match="SDK call failed"):
+        await client.chat([{"role": "user", "content": "hi"}])
+    # Initial connect + exactly one reconnect (retry-once, not a retry loop).
+    assert len(clients) == 2
+
+
+@pytest.mark.asyncio
+async def test_aclose_closes_the_long_lived_client() -> None:
+    """``aclose`` tears down the connected websocket; idempotent + safe unused."""
+
+    clients: list[_FakeAsyncClient] = []
+    factory = _lifecycle_factory(clients, _FakeModel(_FakeResult("ok"), None))
+    client = LMStudioSDKClient(_settings(LLM_LMSTUDIO_TRANSPORT="sdk"), client_factory=factory)
+
+    # aclose before any use is a no-op (lazy: never connected).
+    await client.aclose()
+    assert clients == []
+
+    await client.chat([{"role": "user", "content": "hi"}])
+    assert len(clients) == 1
+    await client.aclose()
+    assert clients[0].aclose_count == 1
+    # Idempotent: a second aclose does not double-close.
+    await client.aclose()
+    assert clients[0].aclose_count == 1
 
 
 def test_is_llm_client_subclass() -> None:

@@ -107,12 +107,19 @@ class _FakeAsyncClient:
     def __init__(self, model: _FakeModel) -> None:
         self.llm = _FakeLlmNamespace(model)
         self.closed = False
+        self.connect_count = 0
+        self.aclose_count = 0
 
     async def __aenter__(self) -> _FakeAsyncClient:
+        self.connect_count += 1
         return self
 
     async def __aexit__(self, *exc: object) -> None:
+        await self.aclose()
+
+    async def aclose(self) -> None:
         self.closed = True
+        self.aclose_count += 1
 
 
 def _stream_client(captured: dict[str, Any], events: list[dict[str, Any]], **kw: Any) -> Any:
@@ -352,9 +359,11 @@ async def test_stream_complete_tool_call_lifecycle() -> None:
     end = next(c for c in chunks if c.kind == "tool_call_end")
     assert end.final_arguments == {"speech": "Hello world"}
 
-    # No tool was executed (capture-only contract); websocket closed.
+    # No tool was executed (capture-only contract). Long-lived (issue 0115):
+    # the websocket is connected once and stays open after the stream drains.
     assert captured["model"].executed == []
-    assert captured["client"].closed is True
+    assert captured["client"].connect_count == 1
+    assert captured["client"].closed is False
 
 
 @pytest.mark.asyncio

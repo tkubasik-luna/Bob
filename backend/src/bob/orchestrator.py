@@ -1048,6 +1048,17 @@ class Orchestrator:
 
     # --- PRD 0006 / issue 0050 — completion batching + delivery -----------
 
+    @property
+    def jarvis_client(self) -> LLMClient:
+        """The current Jarvis :class:`LLMClient` (read by the swap coordinator).
+
+        Exposed so :class:`bob.llm_swap.LLMSwitcher` can grab the SUPERSEDED
+        client before replacing it and tear down its async resource (the SDK
+        transport's long-lived websocket, issue 0115) after the swap.
+        """
+
+        return self._jarvis_client
+
     def set_jarvis_client(self, client: LLMClient) -> None:
         """Replace the Jarvis :class:`LLMClient` reference (live model swap, 0080).
 

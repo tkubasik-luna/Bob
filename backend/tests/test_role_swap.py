@@ -313,3 +313,87 @@ async def test_set_reasoning_never_touches_load_policy(tmp_path: Path) -> None:
     # No AssertionError → the load policy was never invoked.
     updated = await switcher.set_reasoning("jarvis", "medium")
     assert updated.role("jarvis").reasoning == "medium"
+
+
+# --- close-on-supersede for the SDK transport (issue 0115) -------------------
+
+
+class _AcloseSpyClient(FakeLLMClient):
+    """A fake client exposing ``aclose`` — stands in for the SDK transport.
+
+    The swap coordinator must ``aclose`` the SUPERSEDED client when a role's
+    client is rebuilt (so the SDK's long-lived websocket is not leaked). Counts
+    the close so a test can assert it happened EXACTLY once.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.aclose_count = 0
+
+    async def aclose(self) -> None:
+        self.aclose_count += 1
+
+
+def _switcher_with_spies(
+    tmp_path: Path,
+) -> tuple[RoleLLMSwitcher, RoleClientRegistry, dict[str, _AcloseSpyClient]]:
+    """A switcher whose registry is seeded with an ``aclose`` spy per role."""
+
+    store = RoleSelectionStore(tmp_path / "llm_selection.json")
+    _seed(store)
+    spies: dict[str, _AcloseSpyClient] = {role: _AcloseSpyClient() for role in ROLES}
+    registry = RoleClientRegistry(cast("dict[str, LLMClient]", dict(spies)))
+    switcher = RoleLLMSwitcher(
+        settings=_settings(),
+        selection_store=store,
+        registry=registry,
+    )
+    return switcher, registry, spies
+
+
+@pytest.mark.asyncio
+async def test_swap_role_closes_superseded_sdk_client(tmp_path: Path) -> None:
+    switcher, _registry, spies = _switcher_with_spies(tmp_path)
+
+    await switcher.swap_role(
+        "jarvis",
+        LLMSelection(provider="lm_studio", lm_model="new-jarvis", context_length={}),
+    )
+
+    # The superseded jarvis client is closed exactly once; others untouched.
+    assert spies["jarvis"].aclose_count == 1
+    for role in ("thinker", "draft", "subagent"):
+        assert spies[role].aclose_count == 0
+
+
+@pytest.mark.asyncio
+async def test_set_reasoning_closes_superseded_sdk_client(tmp_path: Path) -> None:
+    switcher, _registry, spies = _switcher_with_spies(tmp_path)
+
+    await switcher.set_reasoning("thinker", "high")
+
+    assert spies["thinker"].aclose_count == 1
+    for role in ("jarvis", "draft", "subagent"):
+        assert spies[role].aclose_count == 0
+
+
+@pytest.mark.asyncio
+async def test_swap_role_close_is_noop_for_non_sdk_client(tmp_path: Path) -> None:
+    """A superseded client with no ``aclose`` (OpenAI / Claude) is left alone."""
+
+    store = RoleSelectionStore(tmp_path / "llm_selection.json")
+    _seed(store)
+    # Seed plain FakeLLMClients (no ``aclose``) — the OpenAI/Claude case.
+    registry = RoleClientRegistry({role: FakeLLMClient() for role in ROLES})
+    switcher = RoleLLMSwitcher(
+        settings=_settings(),
+        selection_store=store,
+        registry=registry,
+    )
+
+    # Must not raise (close is a duck-typed no-op for non-SDK clients).
+    await switcher.swap_role(
+        "subagent",
+        LLMSelection(provider="claude_cli", lm_model=None, context_length={}),
+    )
+    assert isinstance(registry.get("subagent"), ClaudeCliClient)

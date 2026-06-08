@@ -142,6 +142,47 @@ async def test_swap_loads_rebuilds_both_clients_and_writes_json(tmp_path: Path) 
     assert persisted.context_length == {"target-model": 16384}
 
 
+class _AcloseSpyClient(FakeLLMClient):
+    """A fake client exposing ``aclose`` — stands in for the SDK transport."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.aclose_count = 0
+
+    async def aclose(self) -> None:
+        self.aclose_count += 1
+
+
+@pytest.mark.asyncio
+async def test_swap_closes_superseded_sdk_clients(tmp_path: Path) -> None:
+    """Both superseded role clients (SDK transport) are ``aclose``-d after swap."""
+
+    manager = _FakeManager()
+    initial = LLMSelection(provider="lm_studio", lm_model="boot-model", context_length={})
+    store = LLMSelectionStore(tmp_path / "llm_selection.json")
+    store.write(initial)
+    old_jarvis = _AcloseSpyClient()
+    old_subagent = _AcloseSpyClient()
+    orch = _OrchestratorSpy(old_jarvis)
+    holder = SubAgentClientHolder(old_subagent)
+    switcher = LLMSwitcher(
+        settings=_settings(),
+        manager=cast(Any, manager),
+        selection_store=store,
+        orchestrator=cast(Orchestrator, orch),
+        subagent_holder=holder,
+    )
+
+    await switcher.swap_lm_model("target-model")
+
+    # Both superseded clients were torn down exactly once; the replacements are
+    # in place (and are NOT the spies).
+    assert old_jarvis.aclose_count == 1
+    assert old_subagent.aclose_count == 1
+    assert orch.jarvis_client is not old_jarvis
+    assert holder.client is not old_subagent
+
+
 @pytest.mark.asyncio
 async def test_swap_load_failure_keeps_previous_clients_and_does_not_write(
     tmp_path: Path,

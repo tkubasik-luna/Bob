@@ -8,12 +8,14 @@ LM Studio through the native websocket SDK
 of the OpenAI HTTP shim. The two are selected by ``LLM_LMSTUDIO_TRANSPORT`` in
 :mod:`bob.llm.factory` (default ``openai`` — nothing changes until flipped).
 
-Issue 0111 is the foundational tracer-bullet slice: only :meth:`chat` (+ the
-guided-JSON structured-output mapping) goes through the SDK. ``complete`` /
-``stream_chat`` / ``stream_complete`` and the long-lived per-role lifecycle land
-in issues 0112-0115; until then this client raises a clear error for those
-methods so the only supported ``sdk`` path is the POC ``chat()``. The flag
-defaults to ``openai`` so production is never built on this partial client.
+Issue 0115 (M7) makes the SDK ``AsyncClient`` **long-lived per role**: the
+client lazy-connects on first use and the persistent websocket is reused across
+every subsequent call (amortising the handshake → low TTFT for voice), instead
+of the earlier per-call open/close. A websocket drop mid-call
+(:class:`lmstudio.json_api.LMStudioWebsocketError`) triggers ONE transparent
+reconnect + retry before surfacing :class:`LLMClientError`. The connection is
+torn down via :meth:`aclose` when the swap coordinator supersedes this client
+(model / host / provider / reasoning swap) — see :mod:`bob.llm_swap`.
 
 Observability is preserved EXACTLY like :class:`LMStudioClient.chat`: paired
 ``llm_call_start`` / ``llm_call_end`` debug events (same category / source style
@@ -30,15 +32,18 @@ without a running LM Studio server. Downstream issues reuse this same seam.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import time
 import traceback
-from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from collections.abc import Awaitable, Callable
+from typing import TYPE_CHECKING, Any, TypeVar
 from uuid import uuid4
 
 import lmstudio
 from lmstudio import AsyncClient, LlmPredictionConfigDict
+from lmstudio.json_api import LMStudioWebsocketError
 
 from bob.config import Settings
 from bob.debug_log import emit_debug
@@ -70,6 +75,10 @@ _MAX_TOKENS = 4096
 #: ``lmstudio.AsyncClient``; tests inject a fake to stay offline (mirrors
 #: :data:`bob.lm_studio_manager.ClientFactory`).
 AsyncClientFactory = Callable[[str], AsyncClient]
+
+
+#: Return type for the reconnect-wrapped operation helper.
+_T = TypeVar("_T")
 
 
 def _default_async_client_factory(host: str) -> AsyncClient:
@@ -126,6 +135,12 @@ class LMStudioSDKClient(LLMClient):
         self._reasoning = reasoning
         # DI seam: tests inject a fake ``AsyncClient`` factory to stay offline.
         self._client_factory = client_factory or _default_async_client_factory
+        # Long-lived per-role client state (issue 0115 / M7). The connected
+        # ``AsyncClient`` is built lazily on first use and reused across calls;
+        # the lock serialises connect / reconnect / aclose so a concurrent
+        # caller never sees a half-built (or half-torn-down) connection.
+        self._client: AsyncClient | None = None
+        self._client_lock = asyncio.Lock()
 
     @property
     def _model(self) -> str | None:
@@ -166,6 +181,105 @@ class LMStudioSDKClient(LLMClient):
         if self._reasoning is not None:
             config["raw"] = {"fields": [{"key": "reasoning", "value": self._reasoning}]}
         return config
+
+    # ------------------------------------------------------------------ #
+    # Long-lived client lifecycle (issue 0115 / M7)
+    # ------------------------------------------------------------------ #
+
+    async def _connect(self) -> AsyncClient:
+        """Build + connect a fresh ``AsyncClient`` for this role's host.
+
+        The factory returns an UN-connected client; entering its async context
+        (``__aenter__``) is what opens the websocket sessions for the real SDK
+        ``AsyncClient`` (and flips the fake's connected flag in tests). We drive
+        ``__aenter__`` / ``aclose`` explicitly rather than ``async with`` because
+        the connection outlives a single call — it is closed by :meth:`aclose`
+        when the swap coordinator supersedes this client.
+        """
+
+        client = self._client_factory(self._host)
+        await client.__aenter__()
+        return client
+
+    async def _ensure_client(self) -> AsyncClient:
+        """Return the connected long-lived client, lazy-connecting on first use."""
+
+        async with self._client_lock:
+            if self._client is None:
+                self._client = await self._connect()
+            return self._client
+
+    async def _reconnect(self) -> AsyncClient:
+        """Tear down the current (dropped) client and connect a fresh one.
+
+        Used by :meth:`_run_with_reconnect` after a websocket drop. Closing the
+        stale client is best-effort: the websocket is already gone, so an error
+        from ``aclose`` is swallowed (we are about to replace it anyway).
+        """
+
+        async with self._client_lock:
+            stale = self._client
+            self._client = None
+            if stale is not None:
+                # The websocket is already gone; a close error is unsalvageable.
+                with contextlib.suppress(Exception):
+                    await stale.aclose()
+            self._client = await self._connect()
+            return self._client
+
+    async def aclose(self) -> None:
+        """Close the long-lived websocket — called when this client is superseded.
+
+        Invoked by the swap coordinator (:mod:`bob.llm_swap`) AFTER the
+        replacement client is in place, so the role is never left with no usable
+        client (Annexe G "jamais 0 modèle pour un rôle actif"). Idempotent and
+        safe to call when never connected (lazy clients that were built but never
+        used). Non-SDK clients (OpenAI / Claude) have no ``aclose`` — the
+        coordinator guards on ``hasattr`` so closing them is a no-op.
+        """
+
+        async with self._client_lock:
+            client = self._client
+            self._client = None
+        if client is not None:
+            await client.aclose()
+
+    async def _run_with_reconnect(
+        self,
+        op: Callable[[AsyncClient], Awaitable[_T]],
+        *,
+        source: str,
+    ) -> _T:
+        """Run ``op`` against the long-lived client with reconnect + retry-once.
+
+        ``op`` receives the connected :class:`AsyncClient` and performs ONE
+        operation (resolve a model handle + drive a prediction). On a websocket
+        drop (:class:`lmstudio.json_api.LMStudioWebsocketError`) we reconnect the
+        client ONCE and re-run ``op``; a second drop (or any other SDK error)
+        propagates to the caller (which maps it to :class:`LLMClientError`).
+
+        Factored here so the four inference methods share ONE reconnect policy
+        rather than copy-pasting it. ``source`` tags the reconnect debug event.
+        """
+
+        client = await self._ensure_client()
+        try:
+            return await op(client)
+        except LMStudioWebsocketError as exc:
+            emit_debug(
+                category="llm",
+                severity="warn",
+                source=source,
+                summary=f"LM Studio SDK websocket dropped — reconnecting + retry once: {exc}",
+                payload={
+                    "model": self._model,
+                    "host": self._host,
+                    "exception": str(exc),
+                    "exception_type": exc.__class__.__name__,
+                },
+            )
+            client = await self._reconnect()
+            return await op(client)
 
     def supports_guided_json(self) -> bool:
         """LM Studio SDK gates ``chat(schema=…)`` via native structured output.
@@ -301,23 +415,23 @@ class LMStudioSDKClient(LLMClient):
         response_format: dict[str, Any] | None,
         config: LlmPredictionConfigDict,
     ) -> Any:
-        """Obtain a model handle and run one ``respond`` against ``chat``.
+        """Resolve a model handle and run one ``respond`` against ``chat``.
 
-        Builds a short-lived :class:`AsyncClient` for the role's host, resolves
-        the model handle (``client.llm.model(key)``) and calls ``model.respond``.
-        The long-lived per-role client lifecycle (PRD 0017 / M7, issue 0115)
-        replaces this per-call open; for the POC a per-call client is correct
-        and keeps the seam trivially fakeable. The whole body runs inside the
-        ``async with`` so the websocket is always closed.
+        Uses the long-lived per-role :class:`AsyncClient` (issue 0115 / M7):
+        resolves the model handle (``client.llm.model(key)``) over the persistent
+        websocket and calls ``model.respond``. A websocket drop reconnects +
+        retries the whole operation ONCE (:meth:`_run_with_reconnect`).
         """
 
-        async with self._client_factory(self._host) as client:
+        async def _op(client: AsyncClient) -> Any:
             model = await client.llm.model(self._model)
             return await model.respond(
                 chat,
                 response_format=response_format,
                 config=config,
             )
+
+        return await self._run_with_reconnect(_op, source="bob.llm.lmstudio_sdk.chat")
 
     @staticmethod
     def _read_content(result: Any) -> str:
@@ -565,7 +679,7 @@ class LMStudioSDKClient(LLMClient):
         from lmstudio.async_api import AsyncPredictionStream
         from lmstudio.json_api import ChatResponseEndpoint, PredictionToolCallEvent
 
-        async with self._client_factory(self._host) as client:
+        async def _op(client: AsyncClient) -> tuple[Any, list[Any]]:
             model = await client.llm.model(self._model)
             endpoint = ChatResponseEndpoint(
                 model.identifier,
@@ -590,6 +704,8 @@ class LMStudioSDKClient(LLMClient):
                     # no act() loop. The orchestrator dispatches these instead.
                     tool_requests.append(event.arg)
             return stream.result(), tool_requests
+
+        return await self._run_with_reconnect(_op, source="bob.llm.lmstudio_sdk.complete")
 
     async def stream_chat(
         self,
@@ -616,10 +732,10 @@ class LMStudioSDKClient(LLMClient):
         tokens) are emitted in a ``finally``, exactly like the OpenAI transport's
         :meth:`bob.llm_client.LMStudioClient._consume_chat_stream`.
 
-        This is an async generator: opening the (per-call) ``AsyncClient`` and
-        driving ``respond_stream`` happen inside the body so the websocket stays
-        open across iteration and is always closed via ``async with`` when the
-        consumer drains (or abandons) the stream.
+        This is an async generator: it drives ``respond_stream`` over the
+        long-lived per-role ``AsyncClient`` (issue 0115 / M7), which persists
+        across calls and is closed only when the swap coordinator supersedes this
+        client (:meth:`aclose`).
         """
 
         messages = _normalise_validator_role(messages, allow_arbitrary_roles=False)
@@ -678,9 +794,10 @@ class LMStudioSDKClient(LLMClient):
         ``LMStudioError`` failures map to :class:`LLMClientError` (a start-failure
         debug event mirrors the ``chat()`` error arm).
 
-        The per-call ``AsyncClient`` lifecycle (``async with``) wraps the whole
-        iteration so the websocket is closed when the consumer finishes; the
-        long-lived per-role client lands in issue 0115.
+        The long-lived per-role ``AsyncClient`` (issue 0115 / M7) is reused across
+        calls — no per-call open/close. The reconnect + retry-once policy wraps
+        the stream SETUP (resolve model + open ``respond_stream``); once fragments
+        flow a drop is surfaced as :class:`LLMClientError` rather than replayed.
         """
 
         from bob.llm.lmstudio_sdk.streaming import adapt_prediction_stream
@@ -695,43 +812,48 @@ class LMStudioSDKClient(LLMClient):
             text_buffer += delta
 
         try:
-            async with self._client_factory(self._host) as client:
-                model = await client.llm.model(self._model)
-                try:
-                    stream = await model.respond_stream(
+            try:
+
+                async def _open(client: AsyncClient) -> Any:
+                    model = await client.llm.model(self._model)
+                    return await model.respond_stream(
                         chat,
                         response_format=response_format,
                         config=config,
                     )
-                except lmstudio.LMStudioError as exc:
-                    latency_ms = (time.perf_counter() - started) * 1000.0
-                    emit_debug(
-                        category="llm",
-                        severity="error",
-                        source="bob.llm.lmstudio_sdk.stream_chat",
-                        summary=f"LLM chat stream échoué en {latency_ms:.0f}ms: {exc}",
-                        payload={
-                            "model": self._model,
-                            "latency_ms": latency_ms,
-                            "exception": str(exc),
-                            "exception_type": exc.__class__.__name__,
-                            "traceback": traceback.format_exc(),
-                            "session_id": session_id,
-                        },
-                        correlation_id=correlation_id,
-                    )
-                    raise LLMClientError(f"LM Studio SDK stream failed: {exc}") from exc
 
-                async for chunk in adapt_prediction_stream(
-                    aiter(stream),
-                    stats_getter=lambda: getattr(stream, "stats", None),
-                    started=started,
-                    on_text=_accumulate,
-                ):
-                    if chunk.kind == "perf":
-                        tokens_in = chunk.tokens_in
-                        tokens_out = chunk.tokens_out
-                    yield chunk
+                stream = await self._run_with_reconnect(
+                    _open, source="bob.llm.lmstudio_sdk.stream_chat"
+                )
+            except lmstudio.LMStudioError as exc:
+                latency_ms = (time.perf_counter() - started) * 1000.0
+                emit_debug(
+                    category="llm",
+                    severity="error",
+                    source="bob.llm.lmstudio_sdk.stream_chat",
+                    summary=f"LLM chat stream échoué en {latency_ms:.0f}ms: {exc}",
+                    payload={
+                        "model": self._model,
+                        "latency_ms": latency_ms,
+                        "exception": str(exc),
+                        "exception_type": exc.__class__.__name__,
+                        "traceback": traceback.format_exc(),
+                        "session_id": session_id,
+                    },
+                    correlation_id=correlation_id,
+                )
+                raise LLMClientError(f"LM Studio SDK stream failed: {exc}") from exc
+
+            async for chunk in adapt_prediction_stream(
+                aiter(stream),
+                stats_getter=lambda: getattr(stream, "stats", None),
+                started=started,
+                on_text=_accumulate,
+            ):
+                if chunk.kind == "perf":
+                    tokens_in = chunk.tokens_in
+                    tokens_out = chunk.tokens_out
+                yield chunk
         finally:
             latency_ms = (time.perf_counter() - started) * 1000.0
             log_llm_call(
@@ -797,10 +919,10 @@ class LMStudioSDKClient(LLMClient):
         dispatches captured calls). ``log_llm_call`` + the end debug event run in a
         ``finally``, exactly like the OpenAI transport.
 
-        This is an async generator: the per-call ``AsyncClient`` (``async with``)
-        wraps the whole iteration so the websocket is closed when the consumer
-        drains (or abandons) the stream; the long-lived per-role client lands in
-        issue 0115.
+        This is an async generator: it drives the M6 endpoint over the long-lived
+        per-role ``AsyncClient`` (issue 0115 / M7), which persists across calls
+        and is closed only when the swap coordinator supersedes this client
+        (:meth:`aclose`).
         """
 
         messages = _normalise_validator_role(messages, allow_arbitrary_roles=False)
@@ -917,116 +1039,121 @@ class LMStudioSDKClient(LLMClient):
             return raw_id or name or f"call_{index}"
 
         try:
-            async with self._client_factory(self._host) as client:
-                model = await client.llm.model(self._model)
-                endpoint = BobChatResponseEndpoint(
-                    model.identifier,
-                    chat,
-                    None,  # response_format — tool-calling does not gate via JSON schema
-                    config,
-                    None,  # preset_config
-                    None,  # on_message
-                    None,  # on_first_token
-                    None,  # on_prediction_fragment
-                    None,  # on_prompt_processing_progress
-                    None,  # handle_invalid_tool_request — unused (no act() loop)
-                    llm_tools,
-                    client_tool_map,
-                )
-                try:
-                    channel_cm = model._session._create_channel(endpoint)
-                except lmstudio.LMStudioError as exc:
-                    latency_ms = (time.perf_counter() - started) * 1000.0
-                    emit_debug(
-                        category="llm",
-                        severity="error",
-                        source="bob.llm.lmstudio_sdk.stream_complete",
-                        summary=f"LLM stream échoué en {latency_ms:.0f}ms: {exc}",
-                        payload={
-                            "model": self._model,
-                            "latency_ms": latency_ms,
-                            "exception": str(exc),
-                            "exception_type": exc.__class__.__name__,
-                            "traceback": traceback.format_exc(),
-                            "session_id": session_id,
-                        },
-                        correlation_id=correlation_id,
-                    )
-                    raise LLMClientError(f"LM Studio SDK stream failed: {exc}") from exc
+            try:
 
-                stream = AsyncPredictionStream(channel_cm, endpoint)
-                async for event in stream._iter_events():
-                    if isinstance(event, PredictionFragmentEvent):
-                        chunk = fragment_to_chunk(event.arg)
-                        if chunk is None:
-                            continue
-                        if first_token_at is None:
-                            first_token_at = time.perf_counter()
-                        if chunk.kind == "text":
-                            text_buffer += chunk.text_delta
-                        yield chunk
-                    elif isinstance(event, PredictionToolCallArgFragmentEvent):
-                        if first_token_at is None:
-                            first_token_at = time.perf_counter()
-                        call_id = started_calls.get(event.index)
-                        if call_id is None:
-                            # First fragment for this call → emit ``tool_call_start``.
-                            call_id = _resolve_call_id(event.index, event.id, event.name)
-                            started_calls[event.index] = call_id
-                            yield StreamChunk(
-                                kind="tool_call_start",
-                                tool_call_id=call_id,
-                                name=event.name,
-                            )
+                async def _open(client: AsyncClient) -> Any:
+                    model = await client.llm.model(self._model)
+                    endpoint = BobChatResponseEndpoint(
+                        model.identifier,
+                        chat,
+                        None,  # response_format — tool-calling does not gate via JSON schema
+                        config,
+                        None,  # preset_config
+                        None,  # on_message
+                        None,  # on_first_token
+                        None,  # on_prediction_fragment
+                        None,  # on_prompt_processing_progress
+                        None,  # handle_invalid_tool_request — unused (no act() loop)
+                        llm_tools,
+                        client_tool_map,
+                    )
+                    channel_cm = model._session._create_channel(endpoint)
+                    return AsyncPredictionStream(channel_cm, endpoint)
+
+                stream = await self._run_with_reconnect(
+                    _open, source="bob.llm.lmstudio_sdk.stream_complete"
+                )
+            except lmstudio.LMStudioError as exc:
+                latency_ms = (time.perf_counter() - started) * 1000.0
+                emit_debug(
+                    category="llm",
+                    severity="error",
+                    source="bob.llm.lmstudio_sdk.stream_complete",
+                    summary=f"LLM stream échoué en {latency_ms:.0f}ms: {exc}",
+                    payload={
+                        "model": self._model,
+                        "latency_ms": latency_ms,
+                        "exception": str(exc),
+                        "exception_type": exc.__class__.__name__,
+                        "traceback": traceback.format_exc(),
+                        "session_id": session_id,
+                    },
+                    correlation_id=correlation_id,
+                )
+                raise LLMClientError(f"LM Studio SDK stream failed: {exc}") from exc
+
+            async for event in stream._iter_events():
+                if isinstance(event, PredictionFragmentEvent):
+                    chunk = fragment_to_chunk(event.arg)
+                    if chunk is None:
+                        continue
+                    if first_token_at is None:
+                        first_token_at = time.perf_counter()
+                    if chunk.kind == "text":
+                        text_buffer += chunk.text_delta
+                    yield chunk
+                elif isinstance(event, PredictionToolCallArgFragmentEvent):
+                    if first_token_at is None:
+                        first_token_at = time.perf_counter()
+                    call_id = started_calls.get(event.index)
+                    if call_id is None:
+                        # First fragment for this call → emit ``tool_call_start``.
+                        call_id = _resolve_call_id(event.index, event.id, event.name)
+                        started_calls[event.index] = call_id
                         yield StreamChunk(
-                            kind="tool_call_args_delta",
+                            kind="tool_call_start",
                             tool_call_id=call_id,
-                            args_delta=event.fragment,
+                            name=event.name,
                         )
-                    elif isinstance(event, PredictionToolCallEvent):
-                        # Terminal whole-call: final parse → ``tool_call_end``.
-                        # Malformed args raise ``LLMClientError`` (parity).
-                        tool_call = tool_call_request_to_tool_call(event.arg)
-                        if first_token_at is None:
-                            first_token_at = time.perf_counter()
-                        # Find the index this end corresponds to. The wire gives
-                        # no index on the end event, so match by call id, else
-                        # fall back to the next unstarted index.
-                        index = next(
-                            (i for i, cid in started_calls.items() if cid == tool_call.id),
-                            len(started_calls),
-                        )
-                        if index not in started_calls:
-                            # No fragment streamed for this call (whole-call only,
-                            # uncommon) — still emit a well-formed ``tool_call_start``.
-                            started_calls[index] = tool_call.id
-                            yield StreamChunk(
-                                kind="tool_call_start",
-                                tool_call_id=tool_call.id,
-                                name=tool_call.name,
-                            )
-                        log_calls.append(
-                            {
-                                "id": tool_call.id,
-                                "name": tool_call.name,
-                                "arguments": tool_call.arguments,
-                            }
-                        )
+                    yield StreamChunk(
+                        kind="tool_call_args_delta",
+                        tool_call_id=call_id,
+                        args_delta=event.fragment,
+                    )
+                elif isinstance(event, PredictionToolCallEvent):
+                    # Terminal whole-call: final parse → ``tool_call_end``.
+                    # Malformed args raise ``LLMClientError`` (parity).
+                    tool_call = tool_call_request_to_tool_call(event.arg)
+                    if first_token_at is None:
+                        first_token_at = time.perf_counter()
+                    # Find the index this end corresponds to. The wire gives
+                    # no index on the end event, so match by call id, else
+                    # fall back to the next unstarted index.
+                    index = next(
+                        (i for i, cid in started_calls.items() if cid == tool_call.id),
+                        len(started_calls),
+                    )
+                    if index not in started_calls:
+                        # No fragment streamed for this call (whole-call only,
+                        # uncommon) — still emit a well-formed ``tool_call_start``.
+                        started_calls[index] = tool_call.id
                         yield StreamChunk(
-                            kind="tool_call_end",
+                            kind="tool_call_start",
                             tool_call_id=tool_call.id,
                             name=tool_call.name,
-                            final_arguments=tool_call.arguments,
                         )
+                    log_calls.append(
+                        {
+                            "id": tool_call.id,
+                            "name": tool_call.name,
+                            "arguments": tool_call.arguments,
+                        }
+                    )
+                    yield StreamChunk(
+                        kind="tool_call_end",
+                        tool_call_id=tool_call.id,
+                        name=tool_call.name,
+                        final_arguments=tool_call.arguments,
+                    )
 
-                perf = build_perf_chunk(
-                    getattr(stream, "stats", None),
-                    started=started,
-                    first_token_at=first_token_at,
-                )
-                tokens_in = perf.tokens_in
-                tokens_out = perf.tokens_out
-                yield perf
+            perf = build_perf_chunk(
+                getattr(stream, "stats", None),
+                started=started,
+                first_token_at=first_token_at,
+            )
+            tokens_in = perf.tokens_in
+            tokens_out = perf.tokens_out
+            yield perf
         finally:
             latency_ms = (time.perf_counter() - started) * 1000.0
             raw_for_log = json.dumps(log_calls, ensure_ascii=False) if log_calls else text_buffer

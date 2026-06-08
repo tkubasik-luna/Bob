@@ -157,12 +157,19 @@ class _FakeAsyncClient:
     def __init__(self, model: _FakeStreamModel) -> None:
         self.llm = _FakeLlmNamespace(model)
         self.closed = False
+        self.connect_count = 0
+        self.aclose_count = 0
 
     async def __aenter__(self) -> _FakeAsyncClient:
+        self.connect_count += 1
         return self
 
     async def __aexit__(self, *exc: object) -> None:
+        await self.aclose()
+
+    async def aclose(self) -> None:
         self.closed = True
+        self.aclose_count += 1
 
 
 def _factory_for(
@@ -297,9 +304,10 @@ async def test_stream_chat_yields_text_reasoning_then_perf() -> None:
     perf = chunks[-1]
     assert perf.tokens_in == 11
     assert perf.tokens_out == 7
-    # Client opened + closed, model resolved from the pinned model.
+    # Long-lived (issue 0115): connected once, NOT closed after the stream drains.
     assert captured["host"] == "localhost:1234"
-    assert captured["client"].closed is True
+    assert captured["client"].connect_count == 1
+    assert captured["client"].closed is False
 
 
 @pytest.mark.asyncio

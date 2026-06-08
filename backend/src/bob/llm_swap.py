@@ -60,6 +60,36 @@ from bob.orchestrator import Orchestrator
 _VALID_PROVIDERS = frozenset({"lm_studio", "claude_cli"})
 
 
+async def aclose_client(client: LLMClient | None) -> None:
+    """Close a superseded client's async resource — a no-op for non-SDK clients.
+
+    The LM Studio SDK transport (issue 0115) holds a long-lived websocket via
+    :meth:`bob.llm.lmstudio_sdk.client.LMStudioSDKClient.aclose`; when a swap
+    rebuilds a role's client the OLD one must be torn down or its socket leaks.
+    The OpenAI :class:`bob.llm_client.LMStudioClient` and
+    :class:`bob.llm_client.ClaudeCliClient` hold no async resource and expose no
+    ``aclose`` — duck-typed here so closing them is a safe no-op (the swap path
+    is identical for every transport). Failures are swallowed: a failed close of
+    a superseded client must never abort a successful swap.
+    """
+
+    if client is None:
+        return
+    aclose = getattr(client, "aclose", None)
+    if aclose is None:
+        return
+    try:
+        await aclose()
+    except Exception:  # superseded client; a close failure is non-fatal
+        emit_debug(
+            category="llm",
+            severity="warn",
+            source="bob.llm_swap.aclose_client",
+            summary="Failed to close superseded LLM client (ignored)",
+            payload={"client_type": client.__class__.__name__},
+        )
+
+
 class ClaudeCliUnavailableError(RuntimeError):
     """The ``claude`` CLI binary could not be found on ``PATH``.
 
@@ -187,7 +217,13 @@ class LLMSwitcher:
             #    pin an explicit ctx override for this model when supplied).
             new_selection = self._next_selection(current, model_id, context_length)
 
-            # 3. Rebuild + swap both role clients from the NEW selection.
+            # 3. Rebuild + swap both role clients from the NEW selection. Grab
+            #    the superseded clients FIRST so the SDK transport's long-lived
+            #    websockets (issue 0115) are torn down after the swap; closing
+            #    happens AFTER both replacements are in place so no role is ever
+            #    left clientless (Annexe G). No-op for OpenAI/Claude.
+            old_jarvis = self._orchestrator.jarvis_client
+            old_subagent = self._subagent_holder.client
             self._orchestrator.set_jarvis_client(build_jarvis_client(self._settings, new_selection))
             self._subagent_holder.set(build_subagent_client(self._settings, new_selection))
 
@@ -196,6 +232,7 @@ class LLMSwitcher:
 
             # 5. Persist only after a fully successful swap.
             self._selection_store.write(new_selection)
+            await self._aclose_superseded(old_jarvis, old_subagent)
             return SwapResult(selection=new_selection)
 
     async def swap_provider(self, provider: str) -> SwapResult:
@@ -244,6 +281,10 @@ class LLMSwitcher:
 
             # 3. Rebuild + swap both role clients from the NEW selection. The
             #    factory dispatches the backend off ``new_selection.provider``.
+            #    Capture the superseded clients to close their SDK websockets
+            #    (issue 0115) after the swap.
+            old_jarvis = self._orchestrator.jarvis_client
+            old_subagent = self._subagent_holder.client
             self._orchestrator.set_jarvis_client(build_jarvis_client(self._settings, new_selection))
             self._subagent_holder.set(build_subagent_client(self._settings, new_selection))
 
@@ -262,6 +303,7 @@ class LLMSwitcher:
 
             # 5. Persist only after a fully successful swap.
             self._selection_store.write(new_selection)
+            await self._aclose_superseded(old_jarvis, old_subagent)
             return SwapResult(selection=new_selection)
 
     async def swap_base_url(self, base_url: str) -> SwapResult:
@@ -290,11 +332,32 @@ class LLMSwitcher:
             self._manager.set_host(new_host)
             new_selection = self._next_base_url_selection(current, url)
 
+            # A base_url change moves the SDK websocket host → the old clients'
+            # long-lived connections (issue 0115) must be torn down after the swap.
+            old_jarvis = self._orchestrator.jarvis_client
+            old_subagent = self._subagent_holder.client
             self._orchestrator.set_jarvis_client(build_jarvis_client(self._settings, new_selection))
             self._subagent_holder.set(build_subagent_client(self._settings, new_selection))
 
             self._selection_store.write(new_selection)
+            await self._aclose_superseded(old_jarvis, old_subagent)
             return SwapResult(selection=new_selection)
+
+    @staticmethod
+    async def _aclose_superseded(*clients: LLMClient | None) -> None:
+        """Close every superseded client (no-op for non-SDK transports).
+
+        Called AFTER both replacement clients are in place so neither role is
+        ever momentarily without a client (Annexe G). Distinct objects only — if
+        the same object backs both roles it is closed once.
+        """
+
+        seen: set[int] = set()
+        for client in clients:
+            if client is None or id(client) in seen:
+                continue
+            seen.add(id(client))
+            await aclose_client(client)
 
     @staticmethod
     def _next_base_url_selection(current: LLMSelection | None, base_url: str) -> LLMSelection:
@@ -451,15 +514,25 @@ class RoleClientRegistry:
 
         return self._clients[role]
 
-    def set(self, role: str, client: LLMClient) -> None:
-        """Replace ``role``'s client and fire its sink (if any)."""
+    def set(self, role: str, client: LLMClient) -> LLMClient | None:
+        """Replace ``role``'s client, fire its sink, and return the OLD client.
+
+        The superseded client is returned (``None`` if the role had none) so the
+        async caller can :func:`aclose_client` it AFTER the replacement is in
+        place — the SDK transport's long-lived websocket (issue 0115) must be
+        torn down on supersede, while the role is never momentarily left without
+        a usable client (Annexe G "jamais 0 modèle pour un rôle actif"). Closing
+        is a no-op for the OpenAI / Claude clients (they hold no async resource).
+        """
 
         if role not in ROLES:
             raise KeyError(f"Unknown LLM role: {role!r}")
+        previous = self._clients.get(role)
         self._clients[role] = client
         sink = self._sinks.get(role)
         if sink is not None:
             sink(client)
+        return previous
 
 
 class RoleManagerRegistry:
@@ -573,10 +646,15 @@ class RoleLLMSwitcher:
             next_map = current.with_role(role, selection)
 
             # Rebuild ONLY the changed role's client; the others are untouched.
+            # ``set`` returns the superseded client; close it AFTER the
+            # replacement is registered so the role is never momentarily without
+            # a client (Annexe G), and the SDK transport's long-lived websocket
+            # (issue 0115) is torn down instead of leaked. No-op for OpenAI/Claude.
             rebuilt = build_role_client(next_map, role, self._settings)
-            self._registry.set(role, rebuilt)
+            previous = self._registry.set(role, rebuilt)
 
             self._selection_store.write(next_map)
+            await aclose_client(previous)
             return next_map
 
     async def set_reasoning(self, role: str, reasoning: str | None) -> RoleSelection:
@@ -612,10 +690,14 @@ class RoleLLMSwitcher:
 
             # Rebuild ONLY this role's client so the new level rides on the next
             # request. No manager / load policy — reasoning is request-scoped.
+            # Close the superseded client AFTER the rebuild is registered (the
+            # SDK transport bakes ``reasoning`` into the client, so a level change
+            # rebuilds + supersedes the long-lived websocket client; issue 0115).
             rebuilt = build_role_client(next_map, role, self._settings)
-            self._registry.set(role, rebuilt)
+            previous = self._registry.set(role, rebuilt)
 
             self._selection_store.write(next_map)
+            await aclose_client(previous)
 
             # Instrumentation (Debug View): make it explicit that a reasoning
             # change persists + refreshes the client only — it issues NO LM
