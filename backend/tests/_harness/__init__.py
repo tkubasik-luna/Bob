@@ -11,4 +11,8 @@ Two utilities are exposed for cross-test reuse:
   alongside the test code.
 
 Both are introduced at issue 0043 and re-used by every later slice.
+
+Issue 0122 adds :mod:`virtual_clock` — a virtual-time asyncio event loop
+(:class:`~virtual_clock.VirtualTimePolicy`) so timeout behavior can be
+asserted with zero real waiting.
 """

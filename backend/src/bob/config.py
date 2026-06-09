@@ -130,6 +130,15 @@ class Settings(BaseSettings):
     # without breaking the config contract when the cap is wired up.
     MAX_RUNNING_TASKS: int = 3
 
+    # WS fan-out hardening (PRD 0018 / issue 0122). Every per-emitter forward
+    # in :func:`bob.event_bus_v2.emit_event` is bounded by this timeout. An
+    # emitter that exceeds it — a zombie HUD window, a wedged debug socket —
+    # is evicted from the registry on the spot: it receives nothing further
+    # and can never freeze the orchestrator again. The window re-registers a
+    # fresh forwarder on reconnect, so eviction is never fatal to a healthy
+    # client.
+    WS_EMITTER_TIMEOUT_SECONDS: float = 1.5
+
     @model_validator(mode="after")
     def _validate_provider_requirements(self) -> Settings:
         if self.LLM_PROVIDER == "lm_studio":

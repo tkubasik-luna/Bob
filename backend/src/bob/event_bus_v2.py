@@ -50,17 +50,22 @@ Concurrency contract: every public function in this module is safe to
 call without holding any lock. The producer side uses :func:`emit_debug`
 which already handles the bounded-queue / drop-oldest contract for slow
 subscribers. The forwarder side wraps the legacy WS emitter, which is
-``async`` and may itself block on a slow socket — but the WS layer owns
-that emitter and only registers it for the session lifetime.
+``async`` and may itself block on a slow socket — every per-emitter
+forward is therefore bounded by ``WS_EMITTER_TIMEOUT_SECONDS`` and an
+emitter that times out or raises is evicted from the registry on first
+failure (issue 0122), so a zombie window can never freeze the
+orchestrator.
 """
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from typing import Any
 
 import structlog
 
+from bob.config import get_settings
 from bob.debug_log import (
     DebugCategory,
     DebugEvent,
@@ -168,9 +173,11 @@ async def emit_event(
     WS. When ``None`` (the default) the same ``payload`` is used for both, so
     every existing call site is unchanged.
 
-    Concurrency: the debug emit is synchronous; the WS forward is awaited
-    so a slow socket can be back-pressured by the caller (matches the
-    legacy :func:`bob.ws_events.emit` contract).
+    Concurrency: the debug emit is synchronous; the WS forwards are awaited
+    (concurrently, one task per emitter) so the caller observes completion —
+    but each forward is capped at ``WS_EMITTER_TIMEOUT_SECONDS`` and a
+    timed-out / raising emitter is evicted from the registry (issue 0122),
+    so back-pressure from a dead socket is bounded instead of unbounded.
     """
 
     captured_payload = debug_payload if debug_payload is not None else payload
@@ -210,19 +217,61 @@ async def emit_event(
         # task id (the ContextVar produced ``None`` for it).
         _patch_last_event_task_id(resolved_task_id)
 
-    if not _ws_emitters:
+    emitters = list(_ws_emitters)
+    if not emitters:
         return
     # Snapshot the set: a forwarder may disconnect (and remove itself) while we
-    # await a slow sibling. Each forward is isolated so one dead/slow socket
-    # cannot starve the other windows.
-    for emitter in list(_ws_emitters):
-        try:
-            await emitter(payload)
-        except Exception:
-            _logger.exception(
-                "event_bus_v2.ws_forward_failed",
-                event_type=payload.get("type"),
-            )
+    # await a slow sibling. Forwards run concurrently and each one is bounded
+    # by ``WS_EMITTER_TIMEOUT_SECONDS``; a hung or crashing socket is evicted
+    # from the registry on first failure (issue 0122) so it receives nothing
+    # further and can never block the other windows or the producer.
+    timeout = get_settings().WS_EMITTER_TIMEOUT_SECONDS
+    if len(emitters) == 1:
+        # Fast path: a direct await adds no extra task hop, so a
+        # single-window session keeps the exact pre-0122 loop-turn cadence
+        # (producers and tests that yield a fixed number of turns after an
+        # emit keep observing the event on time).
+        await _forward_to_emitter(emitters[0], payload, timeout)
+        return
+    await asyncio.gather(*(_forward_to_emitter(emitter, payload, timeout) for emitter in emitters))
+
+
+async def _forward_to_emitter(emitter: WsEmitter, payload: WsTaskEvent, timeout: float) -> None:
+    """Forward ``payload`` to one emitter, bounded by ``timeout``. Evict on failure.
+
+    Eviction contract (issue 0122): an emitter that times out or raises is
+    removed from the registry immediately — it receives nothing further and
+    can no longer block the fan-out, and the set keeps no dead references.
+    The WS layer registers a fresh forwarder when the window reconnects, so
+    eviction is never fatal to a healthy client. Never raises: a failing
+    emitter must not poison its siblings inside the same :func:`asyncio.gather`.
+    """
+
+    try:
+        await asyncio.wait_for(emitter(payload), timeout=timeout)
+    except TimeoutError:
+        remove_ws_emitter(emitter)
+        _logger.warning(
+            "event_bus_v2.ws_emitter_evicted",
+            reason="timeout",
+            timeout_seconds=timeout,
+            emitter=_emitter_name(emitter),
+            event_type=payload.get("type"),
+        )
+    except Exception:
+        remove_ws_emitter(emitter)
+        _logger.exception(
+            "event_bus_v2.ws_emitter_evicted",
+            reason="raised",
+            emitter=_emitter_name(emitter),
+            event_type=payload.get("type"),
+        )
+
+
+def _emitter_name(emitter: WsEmitter) -> str:
+    """Loggable identity for an emitter callable (eviction context)."""
+
+    return getattr(emitter, "__qualname__", None) or repr(emitter)
 
 
 def _default_summary(payload: WsTaskEvent) -> str:
