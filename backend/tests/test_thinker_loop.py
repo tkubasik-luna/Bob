@@ -218,6 +218,108 @@ async def test_debounce_window_elapsed_fires_again() -> None:
     assert client.calls == ["quel", "quel temps fait-il"]
 
 
+# --- semantic-endpoint fast path (PRD 0018 / issue 0120) ----------------------
+
+
+def _complete_reply(text: str, *, complete: bool) -> str:
+    return json.dumps({"corrected_text": text, "user_turn_complete": complete})
+
+
+async def test_turn_complete_bit_pushed_at_pass_conclusion() -> None:
+    """The bit reaches the endpoint hook the instant the pass concludes.
+
+    Timestamps under the fake clock: the push lands at the trigger instant (the
+    clock never advanced during the pass), i.e. strictly INSIDE the still-open
+    250 ms debounce window — the signal did not wait for the window.
+    """
+
+    client = _FakeThinkerClient(replies=[_complete_reply("c'est fini", complete=True)])
+    state = LiveTranscriptState()
+    clock = _Clock()
+    loop = _loop(client, state, clock, debounce_ms=250)
+    received: list[tuple[float, bool]] = []
+    loop.on_turn_complete = lambda complete: received.append((clock.now, complete))
+
+    loop.start("t1")
+    trigger_ts = clock.now
+    await loop.feed_partial("c'est fini")
+    await loop.join()
+
+    # Delivered exactly once, at the pass-conclusion timestamp — well before
+    # the debounce window (trigger_ts + 0.250) would have elapsed.
+    assert received == [(trigger_ts, True)]
+
+
+async def test_turn_complete_push_keeps_pass_debounce_for_rest_of_payload() -> None:
+    """Only the bit escapes the debounce — the NEXT inference stays debounced."""
+
+    client = _FakeThinkerClient(replies=[_complete_reply("fin", complete=True)])
+    state = LiveTranscriptState()
+    clock = _Clock()
+    loop = _loop(client, state, clock, debounce_ms=250)
+    received: list[bool] = []
+    loop.on_turn_complete = received.append
+
+    loop.start("t1")
+    await loop.feed_partial("fin")
+    await loop.join()
+    assert received == [True]
+
+    # A partial INSIDE the window coalesces exactly as before (no second model
+    # call, hence no second push) even though the bit already propagated.
+    clock.advance(0.1)
+    await loop.feed_partial("fin du tour")
+    await loop.join()
+    assert client.calls == ["fin"]
+    assert received == [True]
+
+
+async def test_turn_complete_withdrawal_pushed_immediately_too() -> None:
+    """A later pass that withdraws the bit pushes ``False`` at its conclusion."""
+
+    client = _FakeThinkerClient(
+        replies=[
+            _complete_reply("fin", complete=True),
+            _complete_reply("fin mais en fait", complete=False),
+        ]
+    )
+    state = LiveTranscriptState()
+    clock = _Clock()
+    loop = _loop(client, state, clock, debounce_ms=250)
+    received: list[bool] = []
+    loop.on_turn_complete = received.append
+
+    loop.start("t1")
+    await loop.feed_partial("fin")
+    await loop.join()
+    clock.advance(0.3)  # past the window — a fresh pass is accepted
+    await loop.feed_partial("fin mais en fait")
+    await loop.join()
+
+    assert received == [True, False]
+
+
+async def test_turn_complete_push_failure_keeps_snapshot_and_event() -> None:
+    """A failing hook is logged and dropped — the pass still lands its snapshot."""
+
+    client = _FakeThinkerClient(replies=[_complete_reply("fin", complete=True)])
+    state = LiveTranscriptState()
+    loop = _loop(client, state, _Clock())
+
+    def _boom(complete: bool) -> None:
+        raise RuntimeError("hook down")
+
+    loop.on_turn_complete = _boom
+    loop.start("t1")
+    await loop.feed_partial("fin")
+    await loop.join()
+
+    snap = state.latest()
+    assert snap is not None
+    assert snap.user_turn_complete is True
+    assert len(_snapshots()) == 1
+
+
 # --- ≤1 inference in flight (Annexe H) ---------------------------------------
 
 

@@ -90,7 +90,9 @@ class TurnLatency:
     #: window. ``None`` until a pause is observed during ``user_speaking``.
     t_backchannel_pause: float | None = None
     #: Backchannel (issue 0105): when Bob's (first) acknowledgement token was
-    #: produced (synthesised + played) in that pause — the end of the window.
+    #: dispatched in that pause — the end of the window. Since issue 0120 the
+    #: synthesis is fire-and-forget, so this marks the dispatch (decision →
+    #: synthesis spawned), not the synthesis end.
     #: ``None`` until a backchannel actually fired (a turn with no backchannel
     #: leaves both marks unset, so ``backchannel_ms`` stays ``None``).
     t_backchannel: float | None = None

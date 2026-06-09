@@ -79,9 +79,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import Any, Protocol
 
 import structlog
 
@@ -236,8 +236,10 @@ class FullDuplexLoop:
     #: Receives the (interrupted) ``turn_id`` + the brief token; synthesises it via
     #: Kokoro (fake TTS under attest) and streams it out WITHOUT touching the FSM
     #: floor. Wired by ws_router; ``None`` skips the audio (the decision + event
-    #: still fire so the gate is attestable in narrow test setups). A failure is
-    #: swallowed — a backchannel hiccup must never perturb the live user turn.
+    #: still fire so the gate is attestable in narrow test setups). Dispatched as
+    #: a supervised fire-and-forget task (PRD 0018 / issue 0120): the frame loop
+    #: never awaits the synthesis, and a failure is logged — a backchannel hiccup
+    #: must never perturb the live user turn.
     backchannel_tts: Callable[[str, str], Awaitable[None]] | None = None
     #: SpeculativeDraft hooks (PRD 0016 / issue 0104 — the anticipation capstone).
     #: They MIRROR the Thinker hooks: ``on_draft_start`` arms the drafter for a
@@ -291,6 +293,12 @@ class FullDuplexLoop:
     #: did inline + adds ``t_first_partial`` / ``t_tts_end``.
     _latency: TurnLatency = field(default_factory=TurnLatency)
     _say_task: asyncio.Task[None] | None = None
+    #: The in-flight fire-and-forget backchannel synthesis task (PRD 0018 /
+    #: issue 0120). Spawned supervised by ``_maybe_backchannel`` (never awaited
+    #: in the frame loop); ``stop`` cancels it so no synthesis outlives the
+    #: session. Only the latest is tracked — the refractory window makes an
+    #: overlap rare, and an orphaned earlier task is still supervised (logged).
+    _backchannel_task: asyncio.Task[None] | None = None
     #: Cumulative cleaned text Bob has actually played in the active say-path
     #: (updated by the say-path's ``on_spoken_progress``); the basis for
     #: ``committed_spoken_text`` on a barge-in cut.
@@ -474,6 +482,25 @@ class FullDuplexLoop:
         ):
             await self._on_endpoint()
 
+    def note_thinker_complete(self, complete: bool) -> None:
+        """Out-of-band semantic-endpoint push (PRD 0018 / issue 0120).
+
+        Wired by ws_router to the ThinkerLoop's ``on_turn_complete`` hook: the
+        instant a Thinker pass concludes, its ``user_turn_complete`` bit lands
+        here — WITHOUT waiting for the inference-cadence debounce or the next
+        frame's ``thinker_complete`` poll. The bit only ARMS (or withdraws) the
+        pending semantic endpoint; the actual fire still happens on the next
+        frame's :meth:`bob.endpointer.Endpointer.observe` under the Annexe H
+        stable-prefix confirmation, so the anti-false-positive rule is intact.
+        Sync + pure (a note on the endpointer) so the Thinker's pass never
+        blocks on the voice loop. Dropped outside ``user_speaking`` — a late
+        push from a pass that outlived its turn must not arm the next one.
+        """
+
+        if self._stopped or self._fsm.state is not TurnState.USER_SPEAKING:
+            return
+        self._endpointer.note_user_turn_complete(complete)
+
     async def join(self) -> None:
         """Await the in-flight say-path task, if any (test / shutdown helper).
 
@@ -501,6 +528,9 @@ class FullDuplexLoop:
             return
         self._stopped = True
         await self._cancel_say_task()
+        # A fire-and-forget backchannel synthesis (issue 0120) must not outlive
+        # the session — cancel it here (the only place it is ever awaited).
+        await self._cancel_backchannel_task()
         # Annexe H — ``voice_stop`` tears the loop down: cooperatively cancel any
         # in-flight Thinker pass too (no-op when unwired / already stopped).
         if self.on_thinker_stop is not None:
@@ -968,10 +998,12 @@ class FullDuplexLoop:
         silence-decay refractory window to have elapsed since the last
         acknowledgement. A pause the Thinker did not flag, or one inside the
         refractory window, is silently skipped (logged with the reason). When the
-        gate says emit: stamp the pause→ack latency window, synthesise the short
-        token (Kokoro / fake TTS) WITHOUT a floor change, emit the ``backchannel``
-        voice event (Annexe A.2), and arm the refractory window. A trigger source
-        / TTS that is unwired (bare loop) makes this a no-op.
+        gate says emit: stamp the pause→ack latency window, dispatch the short
+        token's synthesis (Kokoro / fake TTS) as a supervised FIRE-AND-FORGET
+        task WITHOUT a floor change (PRD 0018 / issue 0120 — the frame loop never
+        awaits it; a failure is logged and never touches the turn), emit the
+        ``backchannel`` voice event (Annexe A.2), and arm the refractory window.
+        A trigger source / TTS that is unwired (bare loop) makes this a no-op.
         """
 
         if self.backchannel_trigger is None:
@@ -999,14 +1031,26 @@ class FullDuplexLoop:
         if self._latency.t_backchannel_pause is None:
             self._latency.t_backchannel_pause = now
 
-        # Synthesise + play the short token WITHOUT touching the FSM floor. A
-        # failure is swallowed: a backchannel hiccup must never perturb the live
-        # user turn (the user keeps the floor regardless).
-        if self.backchannel_tts is not None:
-            with contextlib.suppress(Exception):
-                await self.backchannel_tts(turn_id, decision.token)
+        # Synthesise + play the short token WITHOUT touching the FSM floor — as
+        # a supervised FIRE-AND-FORGET task (PRD 0018 / issue 0120): the frame
+        # loop never awaits the synthesis again, so the next mic frame is
+        # processed while Kokoro renders the token. A synthesis failure is
+        # logged by the supervisor and never perturbs the live user turn (the
+        # user keeps the floor regardless).
+        backchannel_tts = self.backchannel_tts
+        if backchannel_tts is not None:
+            token = decision.token
 
-        # The token has been produced (end of the ``backchannel_ms`` window).
+            async def _synthesise() -> None:
+                await backchannel_tts(turn_id, token)
+
+            self._backchannel_task = self._spawn_supervised(
+                _synthesise(), what="backchannel_tts", turn_id=turn_id
+            )
+
+        # The token has been DISPATCHED (end of the ``backchannel_ms`` window —
+        # since issue 0120 the synthesis is fire-and-forget, so the mark measures
+        # pause→dispatch, not pause→synthesis-done).
         if self._latency.t_backchannel is None:
             self._latency.t_backchannel = self._now()
 
@@ -1114,6 +1158,46 @@ class FullDuplexLoop:
     async def _cancel_say_task(self) -> None:
         task = self._say_task
         self._say_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+
+    def _spawn_supervised(
+        self, coro: Coroutine[Any, Any, None], *, what: str, turn_id: str
+    ) -> asyncio.Task[None]:
+        """Spawn a fire-and-forget background task whose failure is logged.
+
+        Minimal local supervision (PRD 0018 / issue 0120): a done-callback reads
+        the task's exception so it is never silently dropped by the event loop,
+        and a failure never propagates into the frame loop / the live turn.
+        Deliberately tiny (create_task + done-callback) so the generic
+        TaskSupervisor (issue 0124) can swap in later.
+        """
+
+        task = asyncio.create_task(coro)
+
+        def _log_failure(done: asyncio.Task[None]) -> None:
+            if done.cancelled():
+                return
+            exc = done.exception()
+            if exc is not None:
+                _logger.warning(
+                    "voice_loop.background_task_failed",
+                    session_id=self.session_id,
+                    turn_id=turn_id,
+                    what=what,
+                    error=repr(exc),
+                )
+
+        task.add_done_callback(_log_failure)
+        return task
+
+    async def _cancel_backchannel_task(self) -> None:
+        """Cancel the in-flight fire-and-forget backchannel synthesis, if any."""
+
+        task = self._backchannel_task
+        self._backchannel_task = None
         if task is not None and not task.done():
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):

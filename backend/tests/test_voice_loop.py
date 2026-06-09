@@ -418,6 +418,90 @@ async def test_withdrawn_signal_holds_until_silence_floor() -> None:
     assert say.transcripts == ["bonjour le monde"]
 
 
+# --- semantic bit push (PRD 0018 / issue 0120) --------------------------------
+
+
+def _push_loop(say: _RecordingSayPath) -> FullDuplexLoop:
+    # NO ``thinker_complete`` poll wired: the out-of-band ``note_thinker_complete``
+    # push is the ONLY semantic channel, and the 100-frame silence floor the only
+    # other way the turn could end. ~1 word revealed per 480-sample frame so the
+    # stable prefix keeps advancing across frames (the Annexe H confirmation).
+    settings = _semantic_settings()
+    return FullDuplexLoop(
+        voice_turn_factory=lambda: VoiceTurn(
+            engine=FakeSttEngine(
+                transcript="bonjour le monde entier mes amis", samples_per_word=480
+            ),
+            session_id="s1",
+            settings=settings,
+        ),
+        say_path=say,
+        settings=settings,
+        session_id="s1",
+    )
+
+
+async def test_pushed_thinker_complete_fires_endpoint_without_poll() -> None:
+    """A pass-conclusion push alone arms the semantic endpoint (issue 0120).
+
+    The Thinker's ``user_turn_complete`` lands BETWEEN frames via
+    ``note_thinker_complete`` (no per-frame ``thinker_complete`` poll, no
+    inference-cadence debounce); the advancing stable prefix confirms it
+    (Annexe H) and ONE silence frame fires the endpoint — far before the
+    100-frame silence floor, the only other way this turn could end.
+    """
+
+    say = _RecordingSayPath(produce_audio=True)
+    loop = _push_loop(say)
+    assert await loop.start() is True
+
+    # Voiced frames open the turn; the fake STT reveals ~1 word per frame.
+    for _ in range(3):
+        await loop.feed_raw_frame(_LOUD)
+    assert loop.state is TurnState.USER_SPEAKING
+
+    # A Thinker pass concludes BETWEEN frames → the bit is pushed immediately.
+    loop.note_thinker_complete(True)
+
+    # Two more voiced frames advance the stable prefix past the arm-time
+    # watermark (the anti-false-positive confirmation) ...
+    for _ in range(2):
+        await loop.feed_raw_frame(_LOUD)
+    # ... and a single silence frame fires the CONFIRMED semantic endpoint.
+    await loop.feed_raw_frame(_QUIET)
+    await loop.join()
+
+    assert say.transcripts == ["bonjour le monde entier mes amis"]
+    tos = [t["to"] for t in _turn_states()]
+    assert "thinking" in tos
+    latencies = _latency_events()
+    assert latencies and "t_endpoint" in latencies[-1]["marks"]
+
+
+async def test_pushed_bit_outside_user_speaking_is_dropped() -> None:
+    """A push while the user does not hold the floor must not arm anything.
+
+    A late pass can outlive its turn (the push fires after ``endpoint`` /
+    before any speech); it must never pre-arm the NEXT turn's endpoint.
+    """
+
+    say = _RecordingSayPath(produce_audio=True)
+    loop = _push_loop(say)
+    await loop.start()
+
+    loop.note_thinker_complete(True)  # idle — dropped
+
+    for _ in range(5):
+        await loop.feed_raw_frame(_LOUD)
+    # The stable prefix advanced plenty, but nothing was armed: a short trailing
+    # silence (far under the 100-frame floor) must NOT end the turn early.
+    for _ in range(10):
+        await loop.feed_raw_frame(_QUIET)
+    assert say.transcripts == []
+    assert loop.state is TurnState.USER_SPEAKING
+    await loop.stop()
+
+
 async def test_frames_after_stop_are_dropped() -> None:
     say = _RecordingSayPath()
     loop = _loop(say)
@@ -919,6 +1003,9 @@ async def test_pause_with_trigger_emits_backchannel_without_floor_change() -> No
     # but NOT the endpoint (4 frames). The backchannel fires in that pause.
     for _ in range(2):
         await loop.feed_raw_frame(_QUIET)
+    # The synthesis is fire-and-forget (issue 0120): yield once so the spawned
+    # task runs the (instant) fake TTS.
+    await asyncio.sleep(0)
 
     # The acknowledgement was synthesised + the event emitted...
     assert tts.calls and tts.calls[0][1] == "mm"
@@ -991,6 +1078,102 @@ async def test_backchannel_stamps_backchannel_ms_in_turn_latency() -> None:
     derived = latencies[-1]["derived"]
     assert derived["backchannel_ms"] is not None
     assert derived["backchannel_ms"] >= 0
+
+
+class _GatedBackchannelTts:
+    """A SLOW fake backchannel TTS: parks on a gate until released."""
+
+    def __init__(self) -> None:
+        self.release = asyncio.Event()
+        self.calls: list[tuple[str, str]] = []
+        self.finished = 0
+
+    async def __call__(self, turn_id: str, token: str) -> None:
+        self.calls.append((turn_id, token))
+        await self.release.wait()
+        self.finished += 1
+
+
+async def test_slow_backchannel_synthesis_does_not_block_frame_loop() -> None:
+    """The frame loop keeps processing while a backchannel synthesises (0120).
+
+    Before issue 0120 the loop AWAITED the synthesis inside the frame handler —
+    a parked TTS froze the pump on the pause frame. Now the synthesis is
+    fire-and-forget: the ``backchannel`` event fires at dispatch, subsequent
+    frames are processed, and the whole turn completes normally while the TTS
+    is STILL parked.
+    """
+
+    say = _RecordingSayPath(produce_audio=True)
+    tts = _GatedBackchannelTts()
+    # One-shot trigger so the later pre-endpoint pause does not dispatch a
+    # second backchannel (the refractory is 0 in these settings).
+    triggers = iter(["mm"])
+    loop = _loop(
+        say,
+        transcript="bonjour le monde",
+        backchannel_trigger=lambda: next(triggers, None),
+        backchannel_tts=tts,
+    )
+    await _open_turn(loop)
+
+    # The pause trips the backchannel; the synthesis parks on the gate.
+    for _ in range(2):
+        await loop.feed_raw_frame(_QUIET)
+    await asyncio.sleep(0)  # let the spawned task reach the gate
+    assert [token for _turn, token in tts.calls] == ["mm"]
+    assert tts.finished == 0  # parked — and the frame handler already returned
+    # The dispatch already emitted the event (not gated on synthesis end).
+    assert len(_backchannel_events()) == 1
+
+    # The frame loop is NOT blocked: the user resumes and finishes the turn
+    # while the synthesis is still parked; the endpoint fires, the reply runs.
+    for _ in range(4):
+        await loop.feed_raw_frame(_LOUD)
+    assert loop.state is TurnState.USER_SPEAKING
+    for _ in range(6):
+        await loop.feed_raw_frame(_QUIET)
+    await loop.join()
+    assert say.transcripts == ["bonjour le monde"]
+    assert tts.finished == 0  # the whole turn completed while the TTS was parked
+    assert len(_backchannel_events()) == 1
+
+    # Teardown cancels the parked fire-and-forget task (no leak).
+    await loop.stop()
+
+
+async def test_backchannel_synthesis_failure_never_affects_the_turn() -> None:
+    """An exception in the fire-and-forget synthesis is contained (issue 0120).
+
+    The local supervisor logs it (never re-raises into the frame loop); the
+    user keeps the floor and the turn runs to a normal completion exactly as if
+    the backchannel had succeeded.
+    """
+
+    async def _boom(turn_id: str, token: str) -> None:
+        raise RuntimeError("kokoro down")
+
+    say = _RecordingSayPath(produce_audio=True)
+    loop = _loop(
+        say,
+        transcript="bonjour le monde",
+        backchannel_trigger=lambda: "mm",
+        backchannel_tts=_boom,
+    )
+    await _open_turn(loop)
+    for _ in range(2):
+        await loop.feed_raw_frame(_QUIET)
+    await asyncio.sleep(0)  # the spawned synthesis raises (and is supervised)
+
+    # The failure never touched the turn: the user still holds the floor...
+    assert loop.state is TurnState.USER_SPEAKING
+    # ...and the turn runs to a normal completion (endpoint → reply).
+    for _ in range(4):
+        await loop.feed_raw_frame(_LOUD)
+    for _ in range(6):
+        await loop.feed_raw_frame(_QUIET)
+    await loop.join()
+    assert say.transcripts == ["bonjour le monde"]
 
 
 async def test_no_backchannel_hooks_is_inert() -> None:

@@ -674,6 +674,13 @@ async def _handle_voice_start(
         draft_commit_gate=(drafter.commit_gate if drafter is not None else None),
         draft_emit_decision=(drafter.emit_decision if drafter is not None else None),
     )
+    # PRD 0018 / issue 0120 — semantic-endpoint fast path: each concluding
+    # Thinker pass PUSHES its ``user_turn_complete`` bit straight into the
+    # loop's endpoint logic, bypassing the inference-cadence debounce. The
+    # ``thinker_complete`` per-frame poll above stays as the net (it re-arms a
+    # pending endpoint a speech frame disarmed, and covers an unwired push).
+    if thinker is not None:
+        thinker.loop.on_turn_complete = loop.note_thinker_complete
     session["thinker_loop"] = thinker.loop if thinker is not None else None
     session["speculative_draft"] = drafter
     started = await loop.start()

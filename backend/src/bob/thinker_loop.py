@@ -23,6 +23,12 @@ Cadence (Annexe H, normative)
   default 250 ms): a partial that arrives within the window of the last accepted
   trigger only updates the "latest partial" — the loop does not start a fresh
   inference per partial.
+- The ``user_turn_complete`` bit BYPASSES that cadence (PRD 0018 / issue 0120):
+  the instant a pass concludes (snapshot accepted), the bit is PUSHED through the
+  optional ``on_turn_complete`` hook — straight into the endpoint logic, without
+  riding the debounce or the voice loop's per-frame poll. Only the bit takes the
+  fast path; the rest of the payload (corrected text / variables / plan) keeps
+  the debounced cadence above.
 - **At most ONE inference in flight per turn.** A partial that arrives while a
   pass is running sets a "rerun pending" flag with the newest text; the loop
   re-evaluates exactly once when the current pass finishes (so the model always
@@ -134,6 +140,15 @@ class ThinkerLoop:
     inject ``spawn`` (defaults to :func:`asyncio.create_task`) so the WS layer
     can route the inference onto the scheduler's shared TaskGroup, and a ``clock``
     for deterministic debounce tests.
+
+    ``on_turn_complete`` (PRD 0018 / issue 0120) is the semantic-endpoint fast
+    path: a sync hook the loop invokes with the snapshot's ``user_turn_complete``
+    the INSTANT an accepted pass concludes — bypassing the inference-cadence
+    debounce entirely (the next pass stays debounced; only the bit escapes).
+    ws_router wires it to :meth:`bob.voice_loop.FullDuplexLoop.note_thinker_complete`
+    AFTER both objects exist, so it is a public assignable attribute. ``None``
+    (bare loop / tests) keeps the store-then-poll path as the only channel. A
+    hook failure is logged and never takes the pass down.
     """
 
     def __init__(
@@ -145,11 +160,15 @@ class ThinkerLoop:
         session_id: str,
         spawn: SpawnTask | None = None,
         clock: Callable[[], float] | None = None,
+        on_turn_complete: Callable[[bool], None] | None = None,
     ) -> None:
         self._client = client
         self._live_state = live_state
         self._settings = settings
         self._session_id = session_id
+        #: Semantic-endpoint push (issue 0120). Public so ws_router can wire the
+        #: FullDuplexLoop's ``note_thinker_complete`` after construction.
+        self.on_turn_complete = on_turn_complete
         # ``asyncio.create_task`` is generic over the coroutine result; pin it to
         # the loop's ``Coroutine[..., None]`` signature so the attribute type is
         # exactly :data:`SpawnTask` (mypy: a bare assignment would widen it).
@@ -301,6 +320,13 @@ class ThinkerLoop:
                 return
             accepted = self._live_state.update(snapshot)
             if accepted:
+                # Semantic-endpoint fast path (PRD 0018 / issue 0120): push the
+                # ``user_turn_complete`` bit the instant the pass concludes —
+                # BEFORE the (awaiting) event emission — so the endpoint logic
+                # receives it without waiting for the debounce cadence or the
+                # voice loop's next-frame poll. Both values propagate: ``True``
+                # arms the pending semantic endpoint, ``False`` withdraws it.
+                self._push_turn_complete(snapshot.user_turn_complete)
                 await self._emit_snapshot(snapshot)
         except asyncio.CancelledError:
             raise
@@ -310,6 +336,26 @@ class ThinkerLoop:
             )
         finally:
             await self._maybe_rerun()
+
+    def _push_turn_complete(self, complete: bool) -> None:
+        """Push the semantic bit to the ``on_turn_complete`` hook (issue 0120).
+
+        Sync + cheap by contract (the consumer is the FullDuplexLoop's pure
+        endpointer note). A failing hook is logged and dropped — the snapshot
+        already landed in the store, so the per-frame poll remains the net.
+        """
+
+        hook = self.on_turn_complete
+        if hook is None:
+            return
+        try:
+            hook(complete)
+        except Exception:
+            _logger.exception(
+                "thinker_loop.turn_complete_push_failed",
+                session_id=self._session_id,
+                turn_id=self._turn_id,
+            )
 
     async def _maybe_rerun(self) -> None:
         """Re-evaluate once if a partial arrived mid-pass (the ≤1 rerun, Annexe H)."""
