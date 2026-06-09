@@ -72,6 +72,36 @@ describe("SetupScreen", () => {
     expect(window.localStorage.getItem(SETUP_COMPLETE_KEY)).toBe("1");
   });
 
+  test("a late seed does not clobber a URL the user already typed", async () => {
+    // Race: fetchLlmSelection resolves AFTER the user edits the URL. The stale
+    // stored URL must NOT overwrite the typed one (which made the ping keep
+    // probing the old server).
+    let resolveSeed!: (sel: unknown) => void;
+    apiMock.fetchLlmSelection.mockReturnValue(
+      new Promise((res) => {
+        resolveSeed = res;
+      }),
+    );
+    render(<SetupScreen onReady={vi.fn()} />);
+
+    const input = await screen.findByPlaceholderText("http://localhost:1234/v1");
+    fireEvent.change(input, { target: { value: "http://192.168.4.94:1234/v1" } });
+
+    // Seed resolves late with a DIFFERENT (stale) URL.
+    resolveSeed({
+      provider: "lm_studio",
+      lm_model: "old",
+      context_length: {},
+      claude_model: "claude-opus-4",
+      base_url: "http://10.0.0.1:1234/v1",
+    });
+
+    // The user's typed URL survives.
+    await waitFor(() =>
+      expect((input as HTMLInputElement).value).toBe("http://192.168.4.94:1234/v1"),
+    );
+  });
+
   test("Claude CLI provider needs no model load to start", async () => {
     const onReady = vi.fn();
     render(<SetupScreen onReady={onReady} />);

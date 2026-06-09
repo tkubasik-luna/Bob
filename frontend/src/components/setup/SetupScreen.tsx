@@ -15,7 +15,7 @@
 // null base_url (the "wrong URL shown" bug) and the model is explicitly loaded
 // once — never the JIT/duplicate-load surprise.
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   type LlmModel,
   LlmModelsUnavailableError,
@@ -52,6 +52,12 @@ export function SetupScreen({ onReady }: Props) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [loadingModels, setLoadingModels] = useState(false);
+  // The seed (fetchLlmSelection) is async; if the user starts typing a new URL
+  // before it resolves, its setBaseUrl must NOT clobber the typed value back to
+  // the stored one (the race that made an edited URL "revert" and the ping keep
+  // probing the stale server). Any user interaction flips this and the seed is
+  // ignored from then on.
+  const userTouchedRef = useRef(false);
 
   // Seed the form from the backend's CURRENT (effective) selection so the URL
   // shown is the one really in use — never a hardcoded localhost placeholder.
@@ -59,7 +65,7 @@ export function SetupScreen({ onReady }: Props) {
     let cancelled = false;
     fetchLlmSelection()
       .then((sel: LlmSelection) => {
-        if (cancelled) return;
+        if (cancelled || userTouchedRef.current) return;
         setProvider(sel.provider === "claude_cli" ? "claude_cli" : "lm_studio");
         setBaseUrl(sel.base_url ?? "");
         setClaudeModel(sel.claude_model || "Claude CLI");
@@ -162,7 +168,10 @@ export function SetupScreen({ onReady }: Props) {
             type="button"
             className={`setup-provider ${provider === "lm_studio" ? "is-active" : ""}`}
             aria-pressed={provider === "lm_studio"}
-            onClick={() => setProvider("lm_studio")}
+            onClick={() => {
+              userTouchedRef.current = true;
+              setProvider("lm_studio");
+            }}
           >
             LM Studio
           </button>
@@ -170,7 +179,10 @@ export function SetupScreen({ onReady }: Props) {
             type="button"
             className={`setup-provider ${provider === "claude_cli" ? "is-active" : ""}`}
             aria-pressed={provider === "claude_cli"}
-            onClick={() => setProvider("claude_cli")}
+            onClick={() => {
+              userTouchedRef.current = true;
+              setProvider("claude_cli");
+            }}
           >
             Claude CLI
           </button>
@@ -186,7 +198,10 @@ export function SetupScreen({ onReady }: Props) {
                   type="text"
                   value={baseUrl}
                   placeholder="http://localhost:1234/v1"
-                  onChange={(e) => setBaseUrl(e.target.value)}
+                  onChange={(e) => {
+                    userTouchedRef.current = true;
+                    setBaseUrl(e.target.value);
+                  }}
                   spellCheck={false}
                 />
                 <span
@@ -215,7 +230,10 @@ export function SetupScreen({ onReady }: Props) {
                         type="button"
                         className={`setup-model ${selectedModel === m.id ? "is-active" : ""}`}
                         aria-pressed={selectedModel === m.id}
-                        onClick={() => setSelectedModel(m.id)}
+                        onClick={() => {
+                          userTouchedRef.current = true;
+                          setSelectedModel(m.id);
+                        }}
                       >
                         <span className="setup-model-id">{m.id}</span>
                         {m.loaded ? <span className="setup-model-loaded">chargé</span> : null}
