@@ -99,21 +99,26 @@ def _is_say(event: CapturedEvent) -> bool:
     return isinstance(speech, str) and bool(speech.strip())
 
 
-def _voice_subtype_matcher(subtype: str) -> EventMatcher:
+def _voice_subtype_matcher(*subtypes: str) -> EventMatcher:
     """Build a matcher for a ``category="voice"`` event with ``payload.type``.
 
     The « Listen » pipeline (issue 0099) emits its events via
     :func:`bob.event_bus_v2.emit_event`, which nests the wire payload under
     ``payload.ws_event`` in the captured debug frame; the concrete kind is
     ``payload.ws_event.type`` (``stt_partial`` / ``stt_final`` — Annexe A.2).
-    This lets ``wait_event`` synchronise on a transcript landing.
+    This lets ``wait_event`` synchronise on a transcript landing. Several
+    subtypes may map to one logical name (e.g. ``audio_chunk`` covers both the
+    backchannel per-chunk event and the say-path's batched
+    ``audio_chunk_batch`` — PRD 0018 / issue 0121).
     """
+
+    accepted = frozenset(subtypes)
 
     def _match(event: CapturedEvent) -> bool:
         if event.get("category") != "voice":
             return False
         ws_event = (event.get("payload") or {}).get("ws_event") or {}
-        return ws_event.get("type") == subtype
+        return ws_event.get("type") in accepted
 
     return _match
 
@@ -129,7 +134,11 @@ LOGICAL_EVENT_MATCHERS: dict[str, EventMatcher] = {
     # transition event + the outbound TTS chunk marker. ``wait_event`` /
     # ``wait_state`` synchronise on these.
     "turn_state": _voice_subtype_matcher("turn_state"),
-    "audio_chunk": _voice_subtype_matcher("audio_chunk"),
+    # ``audio_chunk`` is the logical "Bob emitted audio" event. The say-path
+    # emits it BATCHED since issue 0121 (``audio_chunk_batch``, one per window);
+    # backchannels (issue 0105) still emit the per-chunk form. A
+    # ``wait_event`` on ``audio_chunk`` matches either.
+    "audio_chunk": _voice_subtype_matcher("audio_chunk", "audio_chunk_batch"),
     # PRD 0016 / issue 0101 (Annexe A.2 + B): the confirmed barge-in cut.
     # ``wait_event type: bargein`` blocks until Bob was interrupted.
     "bargein": _voice_subtype_matcher("bargein"),
@@ -569,13 +578,15 @@ def check_fsm_not_reached(spec: dict[str, Any], ctx: AssertionContext) -> Assert
 
 
 def check_audio_chunks_gte(spec: dict[str, Any], ctx: AssertionContext) -> AssertionResult:
-    """PASS iff at least ``spec['min']`` outbound ``audio_chunk`` events were seen.
+    """PASS iff at least ``spec['min']`` outbound PCM chunks were observed.
 
-    Spec: ``{kind: audio_chunks_gte, min: 1}`` (Annexe C). Counts the
-    ``audio_chunk`` voice events the say-path emits per outbound PCM block (the
-    raw PCM rides the chat socket, so the count is the debug-observable proxy for
-    "Bob actually spoke"). Covers the bare-loop audio-out criterion; a later
-    barge-in slice asserts a *cut* count against the same events.
+    Spec: ``{kind: audio_chunks_gte, min: 1}`` (Annexe C). The raw PCM rides
+    the chat socket, so the debug-observable proxy for "Bob actually spoke" is
+    the voice event stream: each per-chunk ``audio_chunk`` event (backchannels,
+    issue 0105) counts 1, and each batched ``audio_chunk_batch`` summary the
+    say-path emits per window (PRD 0018 / issue 0121) contributes its
+    ``count``. Covers the bare-loop audio-out criterion; the barge-in slice
+    asserts a *cut* count against the same events.
     """
 
     raw_min = spec.get("min", 1)
@@ -587,8 +598,18 @@ def check_audio_chunks_gte(spec: dict[str, Any], ctx: AssertionContext) -> Asser
             ok=False,
             detail={"error": "audio_chunks_gte 'min' must be an integer", "min": raw_min},
         )
-    matcher = _voice_subtype_matcher("audio_chunk")
-    count = sum(1 for event in ctx.events if matcher(event))
+    single = _voice_subtype_matcher("audio_chunk")
+    batched = _voice_subtype_matcher("audio_chunk_batch")
+    count = 0
+    for event in ctx.events:
+        if single(event):
+            count += 1
+        elif batched(event):
+            ws_event = (event.get("payload") or {}).get("ws_event") or {}
+            try:
+                count += max(0, int(ws_event.get("count", 0)))
+            except (TypeError, ValueError):
+                continue
     return AssertionResult(
         kind="audio_chunks_gte",
         ok=count >= minimum,

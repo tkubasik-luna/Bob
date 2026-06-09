@@ -475,6 +475,18 @@ class Settings(BaseSettings):
     TURN_METRICS_MAX_TURNS: int = 64
     TURN_METRICS_WINDOW: int = 256
 
+    # Speech stream pipeline (PRD 0018 / issue 0121, Module 3). The say-path's
+    # :class:`bob.speech_pipeline.SpeechStreamPipeline` overlaps Kokoro
+    # synthesis with the WebSocket drain through a BOUNDED producer/consumer
+    # queue. ``SPEECH_PIPELINE_QUEUE_MAX_CHUNKS`` is that bound, in PCM chunks
+    # (~250 ms / ~12 KiB each at 24 kHz): a slow client parks the synthesizer
+    # at the limit instead of growing memory. ``SPEECH_PIPELINE_BATCH_WINDOW_MS``
+    # is the batched audio-out observability window: instead of one debug event
+    # per chunk, the pipeline emits at most one ``audio_chunk_batch`` summary
+    # (count + bytes) per window while chunks flow.
+    SPEECH_PIPELINE_QUEUE_MAX_CHUNKS: int = 16
+    SPEECH_PIPELINE_BATCH_WINDOW_MS: int = 1000
+
     def voice_retention_policy(self) -> VoiceRetentionPolicy:
         """Build the :class:`VoiceRetentionPolicy` from the settings dials.
 

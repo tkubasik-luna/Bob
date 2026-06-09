@@ -88,18 +88,19 @@ from bob import task_scheduler as task_scheduler_module
 from bob import task_store as task_store_module
 from bob import text_segmenter, turn_metrics, voice_retention_policy, ws_events
 from bob import voice_store as voice_store_module
-from bob.config import Settings
+from bob.config import Settings, get_settings
 from bob.debug_log import emit_debug
 from bob.event_bus_v2 import emit_event, get_snapshot_for_task, subscribe_for_task
 from bob.live_transcript_state import LiveTranscriptState
 from bob.orchestrator import Orchestrator, get_default_orchestrator
 from bob.speculative_draft import SpeculativeDraft
+from bob.speech_pipeline import ChunkBatchSummary, SpeechStreamPipeline
 from bob.spoken_text_cleaner import clean_for_speech
 from bob.stt_engine import SttEngine, get_default_stt_engine
 from bob.task_store import TaskStoreError
 from bob.task_supervisor import create_supervised_task
 from bob.thinker_loop import ThinkerLoop
-from bob.tts_service import KokoroTtsService, get_default_tts_service
+from bob.tts_service import KokoroTtsService, SynthesisChunk, get_default_tts_service
 from bob.voice_loop import FullDuplexLoop, PersistedTurn, SayPathDriver
 from bob.voice_turn import VoiceTurn
 
@@ -590,8 +591,6 @@ async def _handle_voice_start(
     armed tears the previous one down first (defensive — the client should pair
     start/stop, but a dropped ``voice_stop`` must not wedge the session).
     """
-
-    from bob.config import get_settings
 
     settings = get_settings()
     if not settings.STT_ENABLED:
@@ -1589,13 +1588,21 @@ async def _synthesize_and_stream(
     on_spoken_progress: Callable[[str], Awaitable[None]] | None = None,
     on_audio_chunk: Callable[[bytes, int], Awaitable[None]] | None = None,
 ) -> None:
-    """Segment ``text``, stream PCM chunks straight from KPipeline to the WS.
+    """Segment ``text``, stream PCM chunks to the WS via the speech pipeline.
 
-    Pipeline (sequential, by design — KPipeline is not thread-safe):
+    PRD 0018 / issue 0121: the path is owned by
+    :class:`bob.speech_pipeline.SpeechStreamPipeline` —
 
-        clean_for_speech(text) → text_segmenter.segment → for each sentence:
-            tts.synthesize_stream(sentence) → for each PCM chunk:
-                websocket.send_bytes(pcm)
+        clean_for_speech(text) → text_segmenter.segment → pipeline.run:
+            producer: tts.synthesize_stream(sentence N+1) overlaps
+            consumer: websocket.send_bytes(sentence N's chunks)
+
+    with a bounded queue between the two (a slow client parks synthesis at the
+    bound, never unbounded memory). The pipeline places ``tts_first_chunk``
+    (0117) at the first synthesized block; this function places
+    ``audio_first_byte`` after the first ``send_bytes``. Per-chunk debug events
+    are replaced by one batched ``audio_chunk_batch`` voice event per window
+    (``SPEECH_PIPELINE_BATCH_WINDOW_MS``).
 
     First chunk of the whole turn triggers a single ``audio_start`` JSON
     header so the client knows the sample rate. ``first_audio_ms`` is
@@ -1609,7 +1616,8 @@ async def _synthesize_and_stream(
 
     Cancellation: this coroutine runs as a background task and may be
     cancelled by :func:`_cancel_active_tts` when a new user message
-    arrives, OR by the full-duplex loop on a confirmed barge-in. The cancelling
+    arrives, OR by the full-duplex loop on a confirmed barge-in (issue 0119
+    additionally cuts via the pipeline's single ``cancel()``). The cancelling
     path emits the final ``audio_end``; we bubble :class:`asyncio.CancelledError`
     here and do not emit it ourselves. Because the cut lands between/within
     sentences, the last ``on_spoken_progress`` value is exactly the played
@@ -1666,129 +1674,146 @@ async def _synthesize_and_stream(
             payload={"session_id": session_id, "msg_id": msg_id},
         )
 
+    settings = get_settings()
     started_at = time.perf_counter()
     started_audio = False
     error_emitted = False
-    audio_chunks = 0
+    chunks_sent = 0
 
+    async def _send_chunk(chunk: SynthesisChunk) -> None:
+        """The pipeline's sink: one PCM block → the chat WebSocket."""
+
+        nonlocal started_audio, chunks_sent, on_first_audio
+        if not started_audio:
+            await websocket.send_json(
+                {
+                    "type": "audio_start",
+                    "msg_id": msg_id,
+                    "sample_rate": chunk.sample_rate,
+                }
+            )
+            first_audio_ms = (time.perf_counter() - started_at) * 1000.0
+            _logger.info(
+                "ws_chat.tts_first_audio",
+                session_id=session_id,
+                msg_id=msg_id,
+                first_audio_ms=round(first_audio_ms, 1),
+            )
+            emit_debug(
+                category="voice",
+                severity="debug",
+                source="bob.ws_router._synthesize_and_stream",
+                summary=f"Audio stream démarré (msg={msg_id})",
+                payload={
+                    "session_id": session_id,
+                    "msg_id": msg_id,
+                    "sample_rate": chunk.sample_rate,
+                    "first_audio_ms": round(first_audio_ms, 1),
+                },
+            )
+            started_audio = True
+            # Full-duplex loop hook (issue 0100): mark ``t_first_audio_chunk``
+            # + flip the turn FSM into ``bob_speaking`` exactly once, just
+            # before the very first outbound chunk. ``None`` on the text path.
+            if on_first_audio is not None:
+                await on_first_audio()
+                on_first_audio = None
+        await websocket.send_bytes(chunk.pcm16)
+        if chunks_sent == 0:
+            # PRD 0018 / issue 0117 — ``audio_first_byte``: the turn's first
+            # PCM bytes actually LEFT the socket (vs ``tts_first_chunk`` =
+            # synthesis ready, placed by the pipeline's producer). The gap
+            # between the two is the network/write cost.
+            turn_metrics.mark_current("audio_first_byte")
+        chunks_sent += 1
+        # PRD 0016 / issue 0109 — hand the raw PCM block to the full-duplex
+        # loop so it accumulates Bob's ``tts_out`` recording for persistence.
+        # ``None`` on the text path (no voice turn is persisted there).
+        if on_audio_chunk is not None:
+            await on_audio_chunk(chunk.pcm16, chunk.sample_rate)
+
+    async def _on_sentence_drained(index: int) -> None:
+        # This sentence's chunks have all left the socket — report the
+        # cumulative text Bob has actually played (issue 0101). A barge-in
+        # cancel between sentences lands here with the last fully-played
+        # prefix already reported. Reconstructed from the cleaned sentences so
+        # it matches what TTS spoke (not the raw reply): the
+        # committed_spoken_text basis.
+        if on_spoken_progress is not None:
+            await on_spoken_progress(" ".join(sentences[: index + 1]))
+
+    async def _on_sentence_error(index: int, exc: Exception) -> None:
+        # One bad sentence (phonemizer hiccup) never kills the reply — the
+        # pipeline already skipped to the next one; surface the first failure
+        # to the client as a single ``audio_error``.
+        nonlocal error_emitted
+        _logger.error(
+            "ws_chat.tts_failed",
+            session_id=session_id,
+            msg_id=msg_id,
+            sentence_index=index,
+            exc_info=exc,
+        )
+        if error_emitted:
+            return
+        emit_debug(
+            category="voice",
+            severity="warn",
+            source="bob.ws_router._synthesize_and_stream",
+            summary=f"Audio erreur: {exc or exc.__class__.__name__}",
+            payload={
+                "session_id": session_id,
+                "msg_id": msg_id,
+                "sentence_index": index,
+                "exception": str(exc),
+                "exception_type": exc.__class__.__name__,
+            },
+        )
+        await websocket.send_json(
+            {
+                "type": "audio_error",
+                "msg_id": msg_id,
+                "reason": str(exc) or exc.__class__.__name__,
+            }
+        )
+        error_emitted = True
+
+    async def _on_chunk_batch(summary: ChunkBatchSummary) -> None:
+        # PRD 0018 / issue 0121 (supersedes the 0016 Annexe A.2 per-chunk
+        # event): surface the outbound PCM as ONE batched voice event per
+        # window so the attestation harness can still count audio-out on
+        # ``/ws/debug`` (``audio_chunks_gte`` sums ``count``) without one
+        # event per ~250 ms block. The raw PCM rides the chat socket and never
+        # lands in the ring buffer; no transcript text on this event.
+        await emit_event(
+            {
+                "type": "audio_chunk_batch",
+                "msg_id": msg_id,
+                "count": summary.count,
+                "bytes": summary.pcm_bytes,
+                "first_chunk_index": summary.first_chunk_index,
+                "sample_rate": summary.sample_rate,
+            },
+            category="voice",
+            severity="debug",
+            source="bob.ws_router.audio_chunk_batch",
+            summary=f"audio_chunk_batch x{summary.count} ({summary.pcm_bytes} B, msg={msg_id})",
+        )
+
+    # PRD 0018 / issue 0121 — the pipelined say-path: sentence N+1 synthesizes
+    # while sentence N drains; a bounded queue decouples the two; ONE
+    # ``cancel()`` (or cancelling this task) cuts everything at once.
+    pipeline = SpeechStreamPipeline(
+        synthesize=tts.synthesize_stream,
+        send_chunk=_send_chunk,
+        on_sentence_drained=_on_sentence_drained,
+        on_sentence_error=_on_sentence_error,
+        on_chunk_batch=_on_chunk_batch,
+        queue_max_chunks=settings.SPEECH_PIPELINE_QUEUE_MAX_CHUNKS,
+        batch_window_ms=settings.SPEECH_PIPELINE_BATCH_WINDOW_MS,
+    )
     try:
-        for idx, sentence in enumerate(sentences):
-            try:
-                async for chunk in tts.synthesize_stream(sentence):
-                    if not started_audio:
-                        # PRD 0018 / issue 0117 — ``tts_first_chunk``: the
-                        # synthesiser produced the turn's first PCM block
-                        # (before any network write). A no-op outside a
-                        # metered voice turn (text path / proactive TTS).
-                        turn_metrics.mark_current("tts_first_chunk")
-                        await websocket.send_json(
-                            {
-                                "type": "audio_start",
-                                "msg_id": msg_id,
-                                "sample_rate": chunk.sample_rate,
-                            }
-                        )
-                        first_audio_ms = (time.perf_counter() - started_at) * 1000.0
-                        _logger.info(
-                            "ws_chat.tts_first_audio",
-                            session_id=session_id,
-                            msg_id=msg_id,
-                            first_audio_ms=round(first_audio_ms, 1),
-                        )
-                        emit_debug(
-                            category="voice",
-                            severity="debug",
-                            source="bob.ws_router._synthesize_and_stream",
-                            summary=f"Audio stream démarré (msg={msg_id})",
-                            payload={
-                                "session_id": session_id,
-                                "msg_id": msg_id,
-                                "sample_rate": chunk.sample_rate,
-                                "first_audio_ms": round(first_audio_ms, 1),
-                            },
-                        )
-                        started_audio = True
-                        # Full-duplex loop hook (issue 0100): mark
-                        # ``t_first_audio_chunk`` + flip the turn FSM into
-                        # ``bob_speaking`` exactly once, just before the very
-                        # first outbound chunk. ``None`` on the text path.
-                        if on_first_audio is not None:
-                            await on_first_audio()
-                            on_first_audio = None
-                    await websocket.send_bytes(chunk.pcm16)
-                    if audio_chunks == 0:
-                        # PRD 0018 / issue 0117 — ``audio_first_byte``: the
-                        # turn's first PCM bytes actually LEFT the socket (vs
-                        # ``tts_first_chunk`` = synthesis ready). The gap
-                        # between the two is the network/write cost.
-                        turn_metrics.mark_current("audio_first_byte")
-                    # PRD 0016 / Annexe A.2 — surface each outbound PCM block as
-                    # an ``audio_chunk`` voice event so the attestation harness
-                    # can count audio-out on ``/ws/debug`` (the raw PCM rides the
-                    # chat socket and never lands in the ring buffer). The full
-                    # text/transcript stays off this event (just the index +
-                    # size) so no scrubbing is needed.
-                    audio_chunks += 1
-                    await emit_event(
-                        {
-                            "type": "audio_chunk",
-                            "msg_id": msg_id,
-                            "chunk_index": audio_chunks - 1,
-                            "bytes": len(chunk.pcm16),
-                            "sample_rate": chunk.sample_rate,
-                        },
-                        category="voice",
-                        severity="debug",
-                        source="bob.ws_router.audio_chunk",
-                        summary=f"audio_chunk #{audio_chunks - 1} (msg={msg_id})",
-                    )
-                    # PRD 0016 / issue 0109 — hand the raw PCM block to the
-                    # full-duplex loop so it accumulates Bob's ``tts_out``
-                    # recording for persistence. ``None`` on the text path (no
-                    # voice turn is persisted there).
-                    if on_audio_chunk is not None:
-                        await on_audio_chunk(chunk.pcm16, chunk.sample_rate)
-                # This sentence's chunks have all left the socket — report the
-                # cumulative text Bob has actually played (issue 0101). A
-                # barge-in cancel between sentences lands here with the last
-                # fully-played prefix already reported. Reconstructed from the
-                # cleaned sentences so it matches what TTS spoke (not the raw
-                # reply): the committed_spoken_text basis.
-                if on_spoken_progress is not None:
-                    await on_spoken_progress(" ".join(sentences[: idx + 1]))
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                _logger.exception(
-                    "ws_chat.tts_failed",
-                    session_id=session_id,
-                    msg_id=msg_id,
-                    sentence_index=idx,
-                )
-                if not error_emitted:
-                    emit_debug(
-                        category="voice",
-                        severity="warn",
-                        source="bob.ws_router._synthesize_and_stream",
-                        summary=f"Audio erreur: {exc or exc.__class__.__name__}",
-                        payload={
-                            "session_id": session_id,
-                            "msg_id": msg_id,
-                            "sentence_index": idx,
-                            "exception": str(exc),
-                            "exception_type": exc.__class__.__name__,
-                        },
-                    )
-                    await websocket.send_json(
-                        {
-                            "type": "audio_error",
-                            "msg_id": msg_id,
-                            "reason": str(exc) or exc.__class__.__name__,
-                        }
-                    )
-                    error_emitted = True
-                continue
-
+        await pipeline.run(sentences)
         await websocket.send_json({"type": "audio_end", "msg_id": msg_id})
         emit_debug(
             category="voice",
