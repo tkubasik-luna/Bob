@@ -55,12 +55,31 @@ forward is therefore bounded by ``WS_EMITTER_TIMEOUT_SECONDS`` and an
 emitter that times out or raises is evicted from the registry on first
 failure (issue 0122), so a zombie window can never freeze the
 orchestrator.
+
+Hot event batching (PRD 0018 / issue 0123)
+------------------------------------------
+
+The token-by-token streams — ``speech_delta`` (one frame per parser tick)
+and ``reasoning_delta`` (one frame per reasoning token) — used to pay the
+full pipeline (ring-buffer append + retention sweep + JSONL line + one WS
+frame per window) for EVERY token. :func:`emit_event` now coalesces them:
+a hot event is buffered per ``(type, key)`` — ``msg_id`` for speech,
+``agent_ref`` for reasoning — and at most one MERGED event per key is
+emitted per ``WS_HOT_EVENT_BATCH_WINDOW_MS`` window. The merged event
+keeps the exact same wire type and shape with the ``delta`` fields
+concatenated, so the frontend consumers (which already accumulate deltas
+per key) need no change. Everything else stays immediate; a cold event
+flushes any pending window FIRST, so the relative order "deltas precede
+their closing ``ui_payload`` / ``assistant_msg``" is preserved. Setting
+the window to ``0`` disables coalescing entirely.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextvars
 from collections.abc import AsyncGenerator, Awaitable, Callable
+from dataclasses import dataclass, field
 from typing import Any
 
 import structlog
@@ -72,6 +91,7 @@ from bob.debug_log import (
     DebugSeverity,
     current_task_id,
     emit_debug,
+    replace_last_event,
     snapshot,
     snapshot_for_task,
     subscribe_filtered,
@@ -139,6 +159,176 @@ def snapshot_ws_emitters() -> set[WsEmitter]:
     return set(_ws_emitters)
 
 
+# --- Hot event batching (PRD 0018 / issue 0123) -------------------------------
+#
+# High-frequency delta streams are coalesced per ``(type, key)`` over a short
+# window before they hit the (single, shared) emit pipeline. The merged event
+# keeps the same wire type with the ``delta`` fields concatenated — the
+# frontend consumers already accumulate deltas per key, so the wire contract
+# is unchanged, only the frame cadence drops from per-token to per-window.
+
+#: Hot wire types → the payload field that scopes one logical stream. Two
+#: streams (e.g. Jarvis + a sub-agent both reasoning) never merge into one
+#: frame because the key is part of the buffer slot.
+_HOT_EVENT_KEY_FIELDS: dict[str, str] = {
+    "speech_delta": "msg_id",
+    "reasoning_delta": "agent_ref",
+}
+
+
+@dataclass
+class _PendingHotEvent:
+    """One buffered (merging) hot stream awaiting its window flush."""
+
+    payload: WsTaskEvent
+    category: DebugCategory
+    severity: DebugSeverity
+    source: str
+    summary: str | None
+    #: Context snapshot of the FIRST buffered delta — the flush may run from
+    #: the timer task or a cold emit in a foreign context, and the ring-buffer
+    #: side must still inherit the producer's ``current_turn_id`` /
+    #: ``current_task_id`` ContextVars.
+    context: contextvars.Context = field(default_factory=contextvars.copy_context)
+
+
+class _HotEventBatcher:
+    """Per-(type, key) coalescing buffer with a trailing window timer.
+
+    Buffering is synchronous (no await — the producer returns immediately);
+    the flush is driven by a single timer task that fires once per window
+    while anything is pending, or eagerly by :func:`emit_event` when a cold
+    event must not overtake the buffered deltas. Memory stays bounded: one
+    slot per live ``(type, key)`` stream, each holding one growing string for
+    at most one window.
+    """
+
+    def __init__(self) -> None:
+        self._pending: dict[tuple[str, str], _PendingHotEvent] = {}
+        self._timer: asyncio.Task[None] | None = None
+        self._lock = asyncio.Lock()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._flushing = False
+
+    def ensure_loop(self) -> None:
+        """Bind (or re-bind) the batcher to the running event loop.
+
+        The module-level instance outlives test event loops; state buffered
+        on a dead loop (its lock, its timer) cannot be reused, so a loop
+        change drops everything and starts clean. In production there is one
+        loop for the process lifetime and this is a pointer comparison.
+        """
+
+        loop = asyncio.get_running_loop()
+        if self._loop is loop:
+            return
+        self._loop = loop
+        self._pending.clear()
+        self._timer = None
+        self._lock = asyncio.Lock()
+        self._flushing = False
+
+    def has_work(self) -> bool:
+        """True when buffered deltas exist or a flush is in flight."""
+
+        return bool(self._pending) or self._flushing or self._lock.locked()
+
+    def buffer(
+        self,
+        event_type: str,
+        key: str,
+        payload: WsTaskEvent,
+        *,
+        category: DebugCategory,
+        severity: DebugSeverity,
+        source: str,
+        summary: str | None,
+        window_seconds: float,
+    ) -> None:
+        """Merge ``payload`` into its stream slot; arm the window timer."""
+
+        slot = (event_type, key)
+        pending = self._pending.get(slot)
+        if pending is None:
+            self._pending[slot] = _PendingHotEvent(
+                payload=dict(payload),
+                category=category,
+                severity=severity,
+                source=source,
+                summary=summary,
+            )
+        else:
+            pending.payload["delta"] = str(pending.payload.get("delta", "")) + str(
+                payload.get("delta", "")
+            )
+        if self._timer is None or self._timer.done():
+            self._timer = asyncio.create_task(
+                self._run_timer(window_seconds), name="event_bus_v2.hot_event_flush"
+            )
+
+    async def flush(self) -> None:
+        """Drain every pending stream now (cold-event ordering + teardown)."""
+
+        async with self._lock:
+            await self._flush_locked()
+        self._cancel_timer_if_idle()
+
+    async def _run_timer(self, window_seconds: float) -> None:
+        """Fire one flush per window while anything is pending, then retire."""
+
+        try:
+            while True:
+                await asyncio.sleep(window_seconds)
+                async with self._lock:
+                    await self._flush_locked()
+                if not self._pending:
+                    return
+        except asyncio.CancelledError:
+            # An eager flush already drained us (or the loop is going down).
+            return
+
+    async def _flush_locked(self) -> None:
+        """Emit every buffered merged event, in first-arrival order."""
+
+        while self._pending:
+            entries = list(self._pending.values())
+            self._pending.clear()
+            self._flushing = True
+            try:
+                for entry in entries:
+                    await _emit_event_now(
+                        entry.payload,
+                        category=entry.category,
+                        severity=entry.severity,
+                        source=entry.source,
+                        summary=entry.summary,
+                        debug_payload=None,
+                        context=entry.context,
+                    )
+            finally:
+                self._flushing = False
+
+    def _cancel_timer_if_idle(self) -> None:
+        """Retire the window timer once nothing is pending (no task leak)."""
+
+        timer = self._timer
+        if timer is None or timer.done() or timer is asyncio.current_task():
+            return
+        if not self._pending:
+            timer.cancel()
+            self._timer = None
+
+
+_hot_batcher = _HotEventBatcher()
+
+
+async def flush_hot_events() -> None:
+    """Force-emit any buffered hot deltas now. Test / teardown hook."""
+
+    _hot_batcher.ensure_loop()
+    await _hot_batcher.flush()
+
+
 async def emit_event(
     payload: WsTaskEvent,
     *,
@@ -178,9 +368,105 @@ async def emit_event(
     but each forward is capped at ``WS_EMITTER_TIMEOUT_SECONDS`` and a
     timed-out / raising emitter is evicted from the registry (issue 0122),
     so back-pressure from a dead socket is bounded instead of unbounded.
+
+    Hot batching (PRD 0018 / issue 0123): a ``speech_delta`` /
+    ``reasoning_delta`` payload does not emit immediately — it merges into
+    its per-key buffer and the whole pipeline (ring buffer + JSONL + WS
+    fan-out) runs at most once per ``WS_HOT_EVENT_BATCH_WINDOW_MS`` window
+    per stream, on a merged event of the same wire shape. Every other event
+    type flushes the pending buffers FIRST and then emits with zero added
+    delay, so cross-type ordering on the wire matches the call order.
+    """
+
+    _hot_batcher.ensure_loop()
+
+    event_type = payload.get("type")
+    if isinstance(event_type, str) and event_type in _HOT_EVENT_KEY_FIELDS:
+        key = payload.get(_HOT_EVENT_KEY_FIELDS[event_type])
+        window_ms = get_settings().WS_HOT_EVENT_BATCH_WINDOW_MS
+        if isinstance(key, str) and key and window_ms > 0 and debug_payload is None:
+            _hot_batcher.buffer(
+                event_type,
+                key,
+                payload,
+                category=category,
+                severity=severity,
+                source=source,
+                summary=summary,
+                window_seconds=window_ms / 1000.0,
+            )
+            return
+
+    # Cold path: never delayed — but any buffered hot deltas must reach the
+    # wire first, or a closing ``assistant_msg`` / ``ui_payload`` would
+    # overtake the deltas it concludes.
+    if _hot_batcher.has_work():
+        await _hot_batcher.flush()
+    await _emit_event_now(
+        payload,
+        category=category,
+        severity=severity,
+        source=source,
+        summary=summary,
+        debug_payload=debug_payload,
+        context=None,
+    )
+
+
+async def _emit_event_now(
+    payload: WsTaskEvent,
+    *,
+    category: DebugCategory,
+    severity: DebugSeverity,
+    source: str,
+    summary: str | None,
+    debug_payload: WsTaskEvent | None,
+    context: contextvars.Context | None,
+) -> None:
+    """The actual emit pipeline: ring buffer append + WS fan-out.
+
+    ``context`` is non-``None`` only for merged hot events flushed outside
+    their producer's task (the window timer, or a sibling producer's cold
+    emit): the ring-buffer side runs inside that snapshot so the event still
+    inherits the producer's ``current_turn_id`` / ``current_task_id``.
     """
 
     captured_payload = debug_payload if debug_payload is not None else payload
+    if context is not None:
+        context.run(
+            _emit_to_ring_buffer, payload, captured_payload, category, severity, source, summary
+        )
+    else:
+        _emit_to_ring_buffer(payload, captured_payload, category, severity, source, summary)
+
+    emitters = list(_ws_emitters)
+    if not emitters:
+        return
+    # Snapshot the set: a forwarder may disconnect (and remove itself) while we
+    # await a slow sibling. Forwards run concurrently and each one is bounded
+    # by ``WS_EMITTER_TIMEOUT_SECONDS``; a hung or crashing socket is evicted
+    # from the registry on first failure (issue 0122) so it receives nothing
+    # further and can never block the other windows or the producer.
+    timeout = get_settings().WS_EMITTER_TIMEOUT_SECONDS
+    if len(emitters) == 1:
+        # Fast path: a direct await adds no extra task hop, so a
+        # single-window session keeps the exact pre-0122 loop-turn cadence
+        # (producers and tests that yield a fixed number of turns after an
+        # emit keep observing the event on time).
+        await _forward_to_emitter(emitters[0], payload, timeout)
+        return
+    await asyncio.gather(*(_forward_to_emitter(emitter, payload, timeout) for emitter in emitters))
+
+
+def _emit_to_ring_buffer(
+    payload: WsTaskEvent,
+    captured_payload: WsTaskEvent,
+    category: DebugCategory,
+    severity: DebugSeverity,
+    source: str,
+    summary: str | None,
+) -> None:
+    """Synchronous debug-side half of the emit: ring buffer + task-id patch."""
 
     # Resolve the task id: prefer the explicit ``payload["task_id"]``
     # (orchestrator/scheduler level) over the ContextVar (sub-agent
@@ -216,24 +502,6 @@ async def emit_event(
         # Patch the just-appended event so it carries the payload-derived
         # task id (the ContextVar produced ``None`` for it).
         _patch_last_event_task_id(resolved_task_id)
-
-    emitters = list(_ws_emitters)
-    if not emitters:
-        return
-    # Snapshot the set: a forwarder may disconnect (and remove itself) while we
-    # await a slow sibling. Forwards run concurrently and each one is bounded
-    # by ``WS_EMITTER_TIMEOUT_SECONDS``; a hung or crashing socket is evicted
-    # from the registry on first failure (issue 0122) so it receives nothing
-    # further and can never block the other windows or the producer.
-    timeout = get_settings().WS_EMITTER_TIMEOUT_SECONDS
-    if len(emitters) == 1:
-        # Fast path: a direct await adds no extra task hop, so a
-        # single-window session keeps the exact pre-0122 loop-turn cadence
-        # (producers and tests that yield a fixed number of turns after an
-        # emit keep observing the event on time).
-        await _forward_to_emitter(emitters[0], payload, timeout)
-        return
-    await asyncio.gather(*(_forward_to_emitter(emitter, payload, timeout) for emitter in emitters))
 
 
 async def _forward_to_emitter(emitter: WsEmitter, payload: WsTaskEvent, timeout: float) -> None:
@@ -288,10 +556,10 @@ def _patch_last_event_task_id(task_id: str) -> None:
     """Replace the last buffer entry with a copy carrying ``task_id``.
 
     Called by :func:`emit_event` when the ContextVar produced ``None``
-    for the task id but the WS payload carried one. The ring buffer is
-    a :class:`collections.deque`; we pop the last entry, build a copy
-    with the resolved id and re-append. The deque is bounded so this
-    is O(1).
+    for the task id but the WS payload carried one. The swap itself is
+    owned by :func:`bob.debug_log.replace_last_event` (issue 0123) so the
+    ring buffer's cached retention size stays in step with the patched
+    copy. The deque is bounded so this is O(1).
 
     This is a small wart compared to threading an explicit ``task_id=``
     parameter into :func:`emit_debug`; we chose this path because every
@@ -322,7 +590,7 @@ def _patch_last_event_task_id(task_id: str) -> None:
         task_id=task_id,
         replayed=last.replayed,
     )
-    _buffer[-1] = patched
+    replace_last_event(patched)
 
 
 def get_snapshot() -> list[DebugEvent]:
@@ -365,6 +633,7 @@ __all__ = [
     "WsTaskEvent",
     "add_ws_emitter",
     "emit_event",
+    "flush_hot_events",
     "get_snapshot",
     "get_snapshot_for_task",
     "remove_ws_emitter",

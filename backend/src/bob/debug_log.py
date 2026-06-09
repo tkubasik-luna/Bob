@@ -61,6 +61,7 @@ import json
 import logging
 import os
 import threading
+import time
 import uuid
 from collections import deque
 from collections.abc import AsyncGenerator, Callable
@@ -200,14 +201,34 @@ class DebugEvent:
 _buffer: deque[DebugEvent] = deque(maxlen=_RING_BUFFER_MAXLEN)
 _subscribers: list[asyncio.Queue[DebugEvent]] = []
 
+# Issue 0123 — per-event serialized size, measured ONCE at append time and
+# cached alongside the ring buffer (``_event_sizes[i]`` is the wire size of
+# ``_buffer[i]``; ``_buffer_bytes`` is the running total). Retention
+# enforcement reads the cache instead of re-dumping every buffered event's
+# JSON on every emit (the pre-0123 behaviour was O(buffer) serializations per
+# emit). The cache is rebuilt lazily if someone mutates ``_buffer`` directly
+# (tests do) — see :func:`_sync_size_cache`.
+_event_sizes: deque[int] = deque()
+_buffer_bytes: int = 0
+
+#: Fallback size charged to an event whose payload defeats serialization
+#: (circular refs, ...). Such an event writes no JSONL line either.
+_UNSERIALIZABLE_EVENT_SIZE = 512
+
 # Optional JSONL file sink (debugging aid). When installed via
 # :func:`install_file_sink`, every emitted event is also appended as a single
 # JSON line to a persistent file handle so the orchestration trace survives the
 # process and can be read / grepped offline — the WS feed only lives as long as
 # a client is connected and the ring buffer is bounded + in-memory. The handle
-# is opened once and flushed per line so a crash still leaves a complete log.
+# is opened once; lines are buffered in memory and written + flushed as one
+# block per flush window (issue 0123) instead of a write+flush per event.
 _file_sink: TextIO | None = None
 _file_sink_lock = threading.Lock()
+_pending_sink_lines: list[str] = []
+_sink_flush_interval_s: float = 1.0
+_sink_flush_max_lines: int = 200
+_sink_last_flush: float = 0.0
+_sink_clock: Callable[[], float] = time.monotonic
 
 
 def _now_iso() -> str:
@@ -312,7 +333,11 @@ def emit_debug(
         task_id=effective_task_id,
         replayed=False,
     )
-    _buffer.append(event)
+    # Issue 0123 — serialize ONCE: the line feeds the JSONL sink and its
+    # length is the cached retention size, so neither the sink nor the
+    # retention sweep ever re-dumps this event's JSON.
+    line = _serialize_event(event)
+    _append_event(event, len(line) if line is not None else _UNSERIALIZABLE_EVENT_SIZE)
     # Issue 0052: enforce byte + age retention bounds. The deque maxlen
     # still protects against the worst-case pathological producer; the
     # policy adds dimensions the deque cannot express on its own.
@@ -321,8 +346,9 @@ def emit_debug(
     # Persist to the optional JSONL file sink before fanning out to live
     # subscribers. Unlike the ring buffer (bounded, in-memory) and the WS
     # subscribers (drop-oldest under backpressure), the file sink keeps a
-    # complete, ordered trace on disk for offline debugging.
-    _write_to_file_sink(event)
+    # complete, ordered trace on disk for offline debugging. No sink
+    # installed (file log disabled) → no disk write at all (issue 0123).
+    _write_to_file_sink(line)
 
     # Drop strategy: drop the oldest queued event for the slow subscriber,
     # then place the new one. We iterate over a snapshot of the subscriber
@@ -339,6 +365,94 @@ def emit_debug(
                     # Race: queue drained between full check and get.
                     # Loop back, the next put_nowait will succeed.
                     continue
+
+
+# --- Ring-buffer append + cached sizes (issue 0123) ---------------------------
+
+
+def _serialize_event(event: DebugEvent) -> str | None:
+    """Dump ``event`` to its single JSONL wire line, or ``None`` on failure.
+
+    Called exactly once per emitted event. ``default=str`` guards payloads
+    carrying non-JSON-native values (datetimes, enums, ...); anything that
+    still defeats serialization (circular refs) yields ``None`` — the event
+    stays in the ring buffer but writes no JSONL line and is charged the
+    :data:`_UNSERIALIZABLE_EVENT_SIZE` fallback for retention purposes.
+    """
+
+    try:
+        return json.dumps(event.to_dict(), ensure_ascii=False, default=str)
+    except Exception:
+        return None
+
+
+def _sync_size_cache() -> None:
+    """Rebuild the size cache when it drifted from the ring buffer.
+
+    The cache is maintained by :func:`_append_event` / :func:`_popleft_event`,
+    but ``_buffer`` is module state and a few callers (tests injecting
+    synthetic events) append to it directly. A length mismatch is the drift
+    signal: re-measure everything once and move on — a one-off O(buffer) cost
+    paid only when someone bypassed the append helper, never on the steady
+    emit path.
+    """
+
+    global _buffer_bytes
+    if len(_event_sizes) == len(_buffer):
+        return
+    _event_sizes.clear()
+    for event in _buffer:
+        line = _serialize_event(event)
+        _event_sizes.append(len(line) if line is not None else _UNSERIALIZABLE_EVENT_SIZE)
+    _buffer_bytes = sum(_event_sizes)
+
+
+def _append_event(event: DebugEvent, size: int) -> None:
+    """Append ``event`` to the ring buffer, keeping the size cache in step.
+
+    Mirrors the deque ``maxlen`` auto-eviction: when the buffer is full the
+    oldest entry's cached size leaves the running total as the deque drops it.
+    """
+
+    global _buffer_bytes
+    _sync_size_cache()
+    if _buffer.maxlen is not None and len(_buffer) == _buffer.maxlen and _event_sizes:
+        _buffer_bytes -= _event_sizes.popleft()
+    _buffer.append(event)
+    _event_sizes.append(size)
+    _buffer_bytes += size
+
+
+def _popleft_event() -> None:
+    """Drop the oldest buffered event AND its cached size."""
+
+    global _buffer_bytes
+    _buffer.popleft()
+    if _event_sizes:
+        _buffer_bytes -= _event_sizes.popleft()
+
+
+def replace_last_event(patched: DebugEvent) -> None:
+    """Swap the newest ring-buffer entry for ``patched`` (issue 0052 task-id fix).
+
+    Owned here (rather than :mod:`bob.event_bus_v2` poking ``_buffer[-1]``
+    directly) so the cached retention size stays correct: the patched copy is
+    re-measured once. Only task-lifecycle events ever take this path — never
+    the hot delta stream — so the extra dump is rare and cheap. The JSONL
+    line already buffered for the pre-patch event is intentionally left
+    untouched (the sink always recorded the as-emitted shape, pre-0123 too).
+    """
+
+    global _buffer_bytes
+    if not _buffer:
+        return
+    _sync_size_cache()
+    line = _serialize_event(patched)
+    new_size = len(line) if line is not None else _UNSERIALIZABLE_EVENT_SIZE
+    _buffer[-1] = patched
+    if _event_sizes:
+        _buffer_bytes += new_size - _event_sizes[-1]
+        _event_sizes[-1] = new_size
 
 
 def snapshot() -> list[DebugEvent]:
@@ -370,7 +484,10 @@ def clear() -> None:
     seeing the events that were emitted during its lifetime.
     """
 
+    global _buffer_bytes
     _buffer.clear()
+    _event_sizes.clear()
+    _buffer_bytes = 0
 
 
 # --- JSONL file sink (offline debugging) -------------------------------------
@@ -382,25 +499,53 @@ def clear() -> None:
 # persistent handle, giving a complete, ordered, crash-durable trace that can
 # be read / grepped offline. Installed from the FastAPI lifespan; opt-out via
 # the ``ORCHESTRATION_LOG_ENABLED`` setting.
+#
+# Issue 0123 — write gating + batching. The sink is the only disk consumer of
+# the debug stream: no sink installed (file log disabled) means ``emit_debug``
+# touches the disk exactly zero times, whether or not a Debug View client is
+# connected (the WS feed reads the in-memory ring buffer, never this file).
+# With a sink installed, lines are buffered in memory and written + flushed as
+# ONE block per flush window (interval OR pending-line cap, both settings)
+# instead of a synchronous write+flush per event. Order is preserved — there
+# is a single appender and the pending list is FIFO.
 
 
-def install_file_sink(path: str | Path) -> None:
+def install_file_sink(
+    path: str | Path,
+    *,
+    flush_interval_seconds: float = 1.0,
+    flush_max_lines: int = 200,
+    clock: Callable[[], float] = time.monotonic,
+) -> None:
     """Open a JSONL file sink so every emitted event is also written to disk.
 
     Idempotent: a second call while a sink is already open keeps the existing
-    handle. The parent directory is created if missing; the file is opened in
-    append mode and accumulates across process restarts. A ``session_start``
-    marker line is written directly to the file (not via :func:`emit_debug`)
-    so each run is delimited on disk without polluting the live WS feed.
+    handle (and its thresholds). The parent directory is created if missing;
+    the file is opened in append mode and accumulates across process restarts.
+    A ``session_start`` marker line is written directly to the file (not via
+    :func:`emit_debug`) so each run is delimited on disk without polluting the
+    live WS feed.
+
+    ``flush_interval_seconds`` / ``flush_max_lines`` bound the write batching
+    (issue 0123): pending lines are written + flushed as one block when either
+    threshold is reached. The boot path feeds them from the
+    ``ORCHESTRATION_LOG_FLUSH_*`` settings; ``clock`` is injectable so tests
+    drive the interval without real waiting.
     """
 
-    global _file_sink
+    global _file_sink, _sink_flush_interval_s, _sink_flush_max_lines
+    global _sink_last_flush, _sink_clock
     with _file_sink_lock:
         if _file_sink is not None:
             return
         target = Path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
         _file_sink = target.open("a", encoding="utf-8")
+        _sink_flush_interval_s = max(0.0, flush_interval_seconds)
+        _sink_flush_max_lines = max(1, flush_max_lines)
+        _sink_clock = clock
+        _sink_last_flush = clock()
+        _pending_sink_lines.clear()
         marker = {
             "ts": _now_iso(),
             "category": "system",
@@ -420,42 +565,81 @@ def install_file_sink(path: str | Path) -> None:
 
 
 def uninstall_file_sink() -> None:
-    """Flush + close the JSONL file sink. Idempotent."""
+    """Drain pending lines, then flush + close the JSONL file sink. Idempotent."""
 
     global _file_sink
     with _file_sink_lock:
         if _file_sink is None:
             return
         with contextlib.suppress(Exception):
+            _drain_pending_locked(_file_sink)
             _file_sink.flush()
             _file_sink.close()
+        _pending_sink_lines.clear()
         _file_sink = None
 
 
-def _write_to_file_sink(event: DebugEvent) -> None:
-    """Append ``event`` to the JSONL file sink if one is installed.
+def flush_file_sink() -> None:
+    """Force-write any pending buffered lines to disk now. Idempotent.
 
-    Fire-and-forget: any serialisation / I/O error is swallowed so a broken
-    sink never propagates into the producer hot path. ``default=str`` guards
-    payloads carrying non-JSON-native values (datetimes, enums, ...). Flushed
-    per line so a crash still leaves a complete log.
+    The steady path flushes on the interval / line-cap thresholds; this hook
+    exists for orderly teardown points (and tests) that want the trace on
+    disk without waiting for the next event to trip a threshold.
     """
 
-    if _file_sink is None:
+    global _sink_last_flush
+    with _file_sink_lock:
+        sink = _file_sink
+        if sink is None:
+            return
+        with contextlib.suppress(Exception):
+            _drain_pending_locked(sink)
+            sink.flush()
+        _sink_last_flush = _sink_clock()
+
+
+def _drain_pending_locked(sink: TextIO) -> None:
+    """Write every pending line to ``sink``. Caller holds the lock."""
+
+    if not _pending_sink_lines:
         return
-    try:
-        line = json.dumps(event.to_dict(), ensure_ascii=False, default=str)
-    except Exception:
+    sink.write("".join(line + "\n" for line in _pending_sink_lines))
+    _pending_sink_lines.clear()
+
+
+def _write_to_file_sink(line: str | None) -> None:
+    """Buffer ``line`` for the JSONL sink; write + flush per window (issue 0123).
+
+    ``line`` is the event's single serialization done by :func:`emit_debug`
+    (``None`` when the payload defeated JSON — such an event is skipped).
+    No sink installed → no disk activity at all. With a sink, the line joins
+    the in-memory pending list and the whole list is written + flushed as one
+    block when the flush interval has elapsed or the pending cap is reached.
+    Fire-and-forget: any I/O error is swallowed so a broken sink never
+    propagates into the producer hot path.
+    """
+
+    global _sink_last_flush
+    if line is None or _file_sink is None:
         return
     with _file_sink_lock:
         sink = _file_sink
         if sink is None:
             return
+        _pending_sink_lines.append(line)
+        now = _sink_clock()
+        if (
+            len(_pending_sink_lines) < _sink_flush_max_lines
+            and now - _sink_last_flush < _sink_flush_interval_s
+        ):
+            return
         try:
-            sink.write(line + "\n")
+            _drain_pending_locked(sink)
             sink.flush()
         except Exception:
             return
+        finally:
+            _sink_last_flush = now
 
 
 # --- Retention policy hook (issue 0052) --------------------------------------
@@ -463,9 +647,9 @@ def _write_to_file_sink(event: DebugEvent) -> None:
 # The ring buffer is bounded by ``_RING_BUFFER_MAXLEN`` already — that's a
 # count cap. Issue 0052 adds two extra dimensions enforced on every emit:
 #
-# - ``max_bytes``: total estimated bytes of the buffered events. Estimated
-#   via :func:`len(json.dumps(event.to_dict()))` so the size accounts for
-#   wire-shape (which is what an overlay client actually streams).
+# - ``max_bytes``: total estimated bytes of the buffered events, read from
+#   the per-event size cache (measured once at append, issue 0123 — the
+#   pre-0123 sweep re-dumped every buffered event's JSON on every emit).
 # - ``max_age_seconds``: events older than this are dropped before the
 #   buffer is consulted. Wall-clock based; we re-parse the ``ts`` field
 #   via :func:`datetime.fromisoformat` (the ``Z`` suffix is normalised to
@@ -486,7 +670,9 @@ def _enforce_retention() -> None:
     if policy is None:
         return
 
-    # Age-based eviction first — cheaper than measuring bytes.
+    _sync_size_cache()
+
+    # Age-based eviction first — cheaper than the bytes check.
     now = datetime.now(UTC)
     if policy.max_age_seconds is not None:
         threshold = policy.max_age_seconds
@@ -499,23 +685,17 @@ def _enforce_retention() -> None:
                 age = (now - datetime.fromisoformat(ts)).total_seconds()
             except ValueError:
                 # Malformed timestamp — drop, can't reason about its age.
-                _buffer.popleft()
+                _popleft_event()
                 continue
             if age <= threshold:
                 break
-            _buffer.popleft()
+            _popleft_event()
 
-    # Bytes-based eviction. Recompute total each loop pass; the deque is
-    # bounded by ``_RING_BUFFER_MAXLEN`` so the iteration is short.
+    # Bytes-based eviction against the cached running total — no
+    # re-serialization of buffered events (issue 0123).
     if policy.max_bytes is not None:
-
-        def total_bytes() -> int:
-            import json
-
-            return sum(len(json.dumps(event.to_dict())) for event in _buffer)
-
-        while _buffer and total_bytes() > policy.max_bytes:
-            _buffer.popleft()
+        while _buffer and _buffer_bytes > policy.max_bytes:
+            _popleft_event()
 
 
 async def subscribe() -> AsyncGenerator[DebugEvent, None]:

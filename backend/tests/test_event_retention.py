@@ -191,3 +191,35 @@ def test_age_eviction_in_the_future_is_a_noop() -> None:
 
     summaries = [e.summary for e in snapshot()]
     assert "from-future" in summaries
+
+
+def test_retention_does_not_reserialize_buffered_events_on_every_emit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue 0123 — size is measured once at append; the sweep reads the cache.
+
+    Pre-0123 the bytes bound re-dumped EVERY buffered event's JSON on every
+    emit (O(buffer) serializations per emit, O(n²) for a burst). Now each
+    emitted event is serialized exactly once, at append time.
+    """
+
+    set_retention_policy(EventRetentionPolicy(max_bytes=10 * 1024 * 1024, max_age_seconds=3600.0))
+
+    real_dumps = json.dumps
+    calls = 0
+
+    def _counting_dumps(*args: object, **kwargs: object) -> str:
+        nonlocal calls
+        calls += 1
+        return real_dumps(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(json, "dumps", _counting_dumps)
+
+    n_events = 50
+    for i in range(n_events):
+        emit_debug(category="system", severity="info", source="t", summary=f"e{i}")
+
+    # One serialization per emitted event — not one per buffered event per
+    # emit. (The pre-0123 sweep would have made 1+2+...+50 = 1275 calls.)
+    assert calls == n_events
+    assert len(snapshot()) == n_events

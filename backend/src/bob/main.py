@@ -122,7 +122,11 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     # the ring buffer is bounded + in-memory). Installed early so boot-time
     # events are captured; torn down in the finally below.
     if settings.ORCHESTRATION_LOG_ENABLED:
-        install_file_sink("logs/orchestration.jsonl")
+        install_file_sink(
+            "logs/orchestration.jsonl",
+            flush_interval_seconds=settings.ORCHESTRATION_LOG_FLUSH_INTERVAL_SECONDS,
+            flush_max_lines=settings.ORCHESTRATION_LOG_FLUSH_MAX_LINES,
+        )
 
     db_path = data_dir / _DB_FILENAME
     if settings.BOB_CLEAR_ON_START and db_path.exists():

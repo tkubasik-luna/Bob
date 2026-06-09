@@ -225,13 +225,15 @@ async def test_action_parsed_only_from_content_despite_noisy_reasoning() -> None
     assert task.state == "done"
     assert task.result == "the answer is 42"
 
-    # A reasoning_delta event per reasoning chunk, in order, tagged by agent_ref.
+    # Every reasoning chunk reaches the wire in order, tagged by agent_ref.
+    # Issue 0123 coalesces the per-token frames into merged ``reasoning_delta``
+    # events (same wire type, deltas concatenated) per batching window — the
+    # full text and its order are the contract, not the frame cadence.
     reasoning_events = [e for e in emitted if e.get("type") == "reasoning_delta"]
-    assert [e["delta"] for e in reasoning_events] == [
-        "Hmm, I should ",
-        "emit a done action {fake json}",
-        " — yes.",
-    ]
+    assert (
+        "".join(e["delta"] for e in reasoning_events)
+        == "Hmm, I should emit a done action {fake json} — yes."
+    )
     assert all(e["agent_ref"] == task_id for e in reasoning_events)
 
 

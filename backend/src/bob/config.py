@@ -487,6 +487,30 @@ class Settings(BaseSettings):
     SPEECH_PIPELINE_QUEUE_MAX_CHUNKS: int = 16
     SPEECH_PIPELINE_BATCH_WINDOW_MS: int = 1000
 
+    # Hot event batching (PRD 0018 / issue 0123, Module 4). High-frequency WS
+    # events — ``speech_delta`` (one frame per parser tick) and
+    # ``reasoning_delta`` (one frame per reasoning token) — are coalesced
+    # backend-side in :func:`bob.event_bus_v2.emit_event` into ONE merged
+    # event of the same wire type (``delta`` fields concatenated, key fields
+    # preserved) per window before they reach the ring buffer + WS fan-out.
+    # Low-frequency events (``assistant_msg``, ``task_updated``,
+    # ``audio_start`` / ``audio_end``, ...) are never delayed — they flush any
+    # pending window first so global order is preserved. ``0`` disables
+    # coalescing entirely (every delta emits immediately, the pre-0123
+    # behaviour). The frontend rAF throttling (issue 0073) stays in place as
+    # the second line of defense.
+    WS_HOT_EVENT_BATCH_WINDOW_MS: int = 75
+
+    # JSONL debug-sink write batching (PRD 0018 / issue 0123). The
+    # ``logs/orchestration.jsonl`` sink used to ``write()+flush()`` once per
+    # emitted event — a synchronous disk round-trip on the hot path. Lines are
+    # now buffered in memory and written + flushed as ONE block whenever either
+    # threshold is reached: the flush interval (seconds since the last flush)
+    # or the pending-line cap. Order on disk is unchanged (single appender);
+    # the durability window on a crash is bounded by these two dials.
+    ORCHESTRATION_LOG_FLUSH_INTERVAL_SECONDS: float = 1.0
+    ORCHESTRATION_LOG_FLUSH_MAX_LINES: int = 200
+
     def voice_retention_policy(self) -> VoiceRetentionPolicy:
         """Build the :class:`VoiceRetentionPolicy` from the settings dials.
 
