@@ -463,7 +463,16 @@ async def test_progress_sequence_then_done_persists_messages_and_emits_events() 
                 '{"action": "done", "result": "all good"}',
             ]
         )
-        runner = SubAgentRunner(subagent_client=client, task_store=store, event_bus=EventBus())
+        # Issue 0127 — the default ``stall_force_threshold`` (3) would cut this
+        # deliberately chatty 3-progress script before its own ``done``; raise
+        # it so the test keeps exercising the message/event lifecycle it is
+        # about (the stall guard has its own suite in test_sub_agent_v2_runner).
+        runner = SubAgentRunner(
+            subagent_client=client,
+            task_store=store,
+            event_bus=EventBus(),
+            policy=SubAgentPolicy(stall_force_threshold=4),
+        )
         await runner.run(task_id)
     finally:
         ws_events.set_emitter(None)
@@ -533,9 +542,10 @@ async def test_progress_cap_exceeded_emits_done_degraded() -> None:
     ``done``; the cap is recorded on the structured event payload.
 
     Mail-tool-loop (Trou A, 2026-05-29): pure ``progress`` now ALSO trips the
-    stall guard (force at 4 consecutive). To exercise the ITERATION-CAP path
-    specifically, pin ``max_iterations`` below that threshold so the cap fires
-    first — the stall guard is covered separately in ``test_sub_agent_v2_runner``.
+    stall guard (force at ``stall_force_threshold`` consecutive, default 3 —
+    issue 0127). To exercise the ITERATION-CAP path specifically, pin
+    ``max_iterations`` below the force threshold so the cap fires first — the
+    stall guard is covered separately in ``test_sub_agent_v2_runner``.
     """
 
     store = _make_store()
@@ -551,14 +561,21 @@ async def test_progress_cap_exceeded_emits_done_degraded() -> None:
         client = _ScriptedClient(
             chat_values=[f'{{"action": "progress", "status": "step {i}"}}' for i in range(1, 7)]
         )
-        # Pin the iteration cap below the stall-force threshold (4) so the CAP is
+        # Pin the iteration cap below the stall-force threshold so the CAP is
         # what fires on pure progress: at the top of the 4th loop the iteration
-        # counter has reached 3 and trips before a 4th LLM call.
+        # counter has reached 3 and trips before a 4th LLM call. The force
+        # threshold must sit ABOVE the cap (issue 0127 default is 3 == cap,
+        # which would stall-force on the 3rd progress before the cap check).
         runner = SubAgentRunner(
             subagent_client=client,
             task_store=store,
             event_bus=EventBus(),
-            policy=SubAgentPolicy(max_iterations=3, wall_clock_seconds=999.0, token_cap=999_999),
+            policy=SubAgentPolicy(
+                max_iterations=3,
+                wall_clock_seconds=999.0,
+                token_cap=999_999,
+                stall_force_threshold=4,
+            ),
         )
         await runner.run(task_id)
     finally:

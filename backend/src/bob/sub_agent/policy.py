@@ -19,6 +19,15 @@ Three global caps are enforced by the runner:
   LLM call and exits with ``done(degraded, token_cap)`` once the cap
   is exceeded. Defaults to ``200_000``.
 
+One reactive guard rides alongside the caps (issue 0127):
+
+- ``stall_force_threshold``: after this many CONSECUTIVE no-progress
+  iterations (filler ``progress``, duplicate ``tool_call``, or a tool
+  dispatch failing with the SAME error code) the runner stops waiting
+  on the model and force-terminates with ``done(..., stalled)``.
+  Defaults to ``3`` so a tool failing in a loop is cut and reported in
+  seconds instead of running to the iteration cap.
+
 Per-task-type overrides
 -----------------------
 
@@ -68,6 +77,12 @@ class SubAgentPolicy:
     #: non-terminal and never trigger this. Set False to force the model-driven
     #: termination path (used by stall/cap tests that must reach those guards).
     converge_on_terminal_result: bool = True
+    #: Issue 0127 — consecutive no-progress iterations tolerated before the
+    #: runner force-terminates the run with ``done(..., stalled)``. The runner
+    #: resets the streak on a successful tool result AND on a tool error whose
+    #: error CODE differs from the previous attempt (a new error is genuine
+    #: diagnostic progress); only the same dead end repeating burns it down.
+    stall_force_threshold: int = 3
     per_task_type: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
 
     def for_task_type(self, task_type: str | None) -> SubAgentPolicy:
@@ -89,6 +104,7 @@ class SubAgentPolicy:
             "token_cap",
             "cancel_grace_seconds",
             "converge_on_terminal_result",
+            "stall_force_threshold",
         }
         return replace(
             self,

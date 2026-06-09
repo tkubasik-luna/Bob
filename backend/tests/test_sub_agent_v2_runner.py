@@ -26,6 +26,7 @@ from typing import Any
 
 import pytest
 
+from bob import ws_events
 from bob.db.migrations_runner import apply_migrations, default_migrations_dir
 from bob.debug_log import snapshot_for_task
 from bob.event_bus import EventBus
@@ -279,8 +280,15 @@ async def test_iteration_cap_emits_done_degraded() -> None:
     # 6 progress emits with cap=3 → the cap triggers BEFORE the 4th
     # progress is consumed: the runner's iteration counter has reached 3
     # at the top of the loop after 3 progress iterations were handled.
+    # The stall-force threshold (default 3, issue 0127) must sit ABOVE the
+    # cap so the CAP is the guard under test, not the stall force.
     client = _ScriptedClient(chat_values=[_progress_payload(f"step {i}") for i in range(1, 7)])
-    policy = SubAgentPolicy(max_iterations=3, wall_clock_seconds=999.0, token_cap=10_000)
+    policy = SubAgentPolicy(
+        max_iterations=3,
+        wall_clock_seconds=999.0,
+        token_cap=10_000,
+        stall_force_threshold=4,
+    )
     runner = SubAgentRunner(
         subagent_client=client,
         task_store=store,
@@ -1731,7 +1739,7 @@ def test_envelope_salvages_tool_call_before_hallucinated_function_results() -> N
         '"destination": "Puygros, 73190, Savoie, France", "mode": "driving"}}\n\n'
         "<function_calls>\n"
         '<invoke name="maps_directions">\n'
-        "<parameter name=\"origin\">Chambéry, Savoie, France</parameter>\n"
+        '<parameter name="origin">Chambéry, Savoie, France</parameter>\n'
         "</invoke>\n"
         "</function_calls>\n"
         "<function_results>\n"
@@ -2016,8 +2024,8 @@ async def test_guided_path_avoids_fenced_envelope_failure_mode() -> None:
     # Prose BEFORE the JSON defeats the non-guided parse: the leading span is not
     # JSON, so ``raw_decode`` fails at column 1 (locked by the path-3
     # ``envelope/prose-prefix`` fixture).
-    prose_prefixed = (
-        "Here is my next action:\n" + json.dumps({"action": "progress", "thought": "x"})
+    prose_prefixed = "Here is my next action:\n" + json.dumps(
+        {"action": "progress", "thought": "x"}
     )
     # Non-guided normaliser still raises on it (unchanged fallback behaviour).
     with pytest.raises(SubAgentActionParseError):
@@ -2110,7 +2118,9 @@ async def test_duplicate_tool_call_not_redispatched_and_forces_salvaged_done() -
     bus = EventBus()
     state_changes = await _collect_state_changes(bus)
     registry, handler_calls = _make_echo_registry()
-    # 5 identical calls: #1 dispatches, #2..#5 are dups → stall 1,2,3,4 → force.
+    # Identical calls: #1 dispatches, the rest are dups → stall 1,2,3 → force
+    # at the default ``stall_force_threshold`` (3, issue 0127). Extra scripted
+    # entries past the force are simply never consumed.
     client = _ScriptedClient(chat_values=[_tool_call_payload("echo", {"q": "x"}) for _ in range(5)])
     runner = SubAgentRunner(
         subagent_client=client,
@@ -2452,9 +2462,10 @@ async def test_progress_spam_without_any_tool_forces_failed_stalled() -> None:
 
     The original RC1 guard only counted progress AFTER a successful tool result,
     so a pure-progress spin (a weak model "thinking" forever) ran free until a
-    hard cap / external kill. Now EVERY progress counts: nudge at 2, force at 4 —
-    far below the (deliberately high) iteration cap, proving the stall guard, not
-    the cap, is what terminates it."""
+    hard cap / external kill. Now EVERY progress counts: nudge at 2, force at 3
+    (the issue-0127 default ``stall_force_threshold``) — far below the
+    (deliberately high) iteration cap, proving the stall guard, not the cap, is
+    what terminates it."""
 
     store = _make_store()
     task_id = _make_running_task(store)
@@ -2474,8 +2485,8 @@ async def test_progress_spam_without_any_tool_forces_failed_stalled() -> None:
     for _ in range(5):
         await asyncio.sleep(0)
 
-    # Forced at the 4th consecutive progress (stall 1,2,3,4) — not the 99 cap.
-    assert len(client.calls) == 4
+    # Forced at the 3rd consecutive progress (stall 1,2,3) — not the 99 cap.
+    assert len(client.calls) == 3
     task = store.get_task(task_id)
     assert task.state == "failed"
     assert state_changes[-1]["status"] == "failed"
@@ -2508,8 +2519,7 @@ async def test_tool_error_then_progress_spam_forces_failed_naming_the_error() ->
         chat_values=[
             _tool_call_payload("boomtool", {"q": "x"}),  # errors → stall 1
             _progress_payload("j'ai appelé l'outil"),  # stall 2 → nudge
-            _progress_payload("je relance la recherche"),  # stall 3
-            _progress_payload("toujours en cours"),  # stall 4 → force
+            _progress_payload("je relance la recherche"),  # stall 3 → force
         ]
     )
     runner = SubAgentRunner(
@@ -2525,8 +2535,8 @@ async def test_tool_error_then_progress_spam_forces_failed_naming_the_error() ->
     for _ in range(5):
         await asyncio.sleep(0)
 
-    # Forced at stall 4 (1 error + 3 progress), not the 99-iteration cap.
-    assert len(client.calls) == 4
+    # Forced at stall 3 (1 error + 2 progress), not the 99-iteration cap.
+    assert len(client.calls) == 3
     task = store.get_task(task_id)
     assert task.state == "failed"
     assert state_changes[-1]["status"] == "failed"
@@ -2583,6 +2593,235 @@ async def test_tool_error_then_successful_retry_resets_stall() -> None:
     assert task.result == "done cleanly"
     # The single error (stall 1, below the nudge threshold of 2) injected no nudge.
     assert not any(m["role"] == "system_validator" for c in client.calls for m in c["messages"])
+
+
+# ---------------------------------------------------------------------------
+# Issue 0127 — reactive stall guard: error-code-aware streak + settable force
+# threshold (default 3). A tool failing in a loop with the SAME error code is
+# cut at the threshold; a CHANGED error code is genuine diagnostic progress and
+# resets the streak. Verified via emitted events / terminal results only.
+# ---------------------------------------------------------------------------
+
+
+def _make_coded_error_registry() -> SubAgentToolRegistry:
+    """A ``coder`` tool that ALWAYS errors, with the error CODE taken from its
+    ``code`` arg — lets a test script the exact error-code sequence the stall
+    guard sees across attempts. The ``attempt`` arg varies the call signature so
+    repeated codes still DISPATCH instead of hitting the RC4 dedup guard."""
+
+    from pydantic import BaseModel
+
+    class _Args(BaseModel):
+        code: str
+        attempt: int
+
+    async def _handler(_ctx: Any, args: BaseModel) -> SubAgentToolHandlerOutcome:
+        code = getattr(args, "code", "unknown")
+        return SubAgentToolHandlerOutcome(
+            status="error",
+            error_code=code,
+            error_message=f"failure {code}",
+        )
+
+    return SubAgentToolRegistry(
+        [
+            SubAgentToolDefinition(
+                name="coder",
+                version="v1",
+                description="always errors with the requested code",
+                args_model=_Args,
+                handler=_handler,
+            )
+        ]
+    )
+
+
+def _coder_call(code: str, attempt: int) -> str:
+    return _tool_call_payload("coder", {"code": code, "attempt": attempt})
+
+
+@pytest.mark.asyncio
+async def test_same_error_code_loop_forces_failed_at_default_threshold() -> None:
+    """Issue 0127 — a tool failing in a loop with the SAME error code cannot
+    evade the guard by varying its arguments: the run is cut at the default
+    ``stall_force_threshold`` (3) — far below the iteration cap — with a clean
+    ``done(failed, stalled)`` naming the error, and the forced stall chip is
+    emitted so the user gets feedback instead of silence."""
+
+    store = _make_store()
+    task_id = _make_running_task(store)
+    bus = EventBus()
+    state_changes = await _collect_state_changes(bus)
+    registry = _make_coded_error_registry()
+
+    received_ws: list[dict[str, Any]] = []
+
+    async def _emitter(event: dict[str, Any]) -> None:
+        received_ws.append(event)
+
+    ws_events.set_emitter(_emitter)
+    try:
+        # Different args each time → every call DISPATCHES (no dedup); every
+        # dispatch fails with the same code → stall 1, 2, 3 → force at the 3rd.
+        client = _ScriptedClient(chat_values=[_coder_call("invalid_query", i) for i in range(1, 6)])
+        runner = SubAgentRunner(
+            subagent_client=client,
+            task_store=store,
+            event_bus=bus,
+            policy=SubAgentPolicy(
+                max_iterations=99, wall_clock_seconds=999.0, token_cap=10_000_000
+            ),
+            tool_registry=registry,
+            clock=_ControllableClock(),
+        )
+        await runner.run(task_id)
+    finally:
+        ws_events.set_emitter(None)
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    # Terminated at the 3rd same-code attempt — NOT the 99-iteration cap.
+    assert len(client.calls) == 3
+    task = store.get_task(task_id)
+    assert task.state == "failed"
+    assert state_changes[-1]["status"] == "failed"
+    assert state_changes[-1]["reason_code"] == REASON_STALLED
+    # The terminal summary names the failing tool + error for the user.
+    assert task.result is not None
+    assert "coder" in task.result
+    assert "failure invalid_query" in task.result
+    # The forced stall chip reached the activity feed (projected, ``warn``).
+    stall_chips = [
+        e for e in received_ws if e.get("type") == "agent_activity" and e.get("kind") == "stall"
+    ]
+    assert stall_chips
+    assert stall_chips[-1]["label"] == "Boucle détectée — terminaison forcée"
+
+
+@pytest.mark.asyncio
+async def test_error_code_change_resets_stall_so_model_can_recover() -> None:
+    """Issue 0127 — an error-code CHANGE between attempts is real diagnostic
+    progress (the model tried something genuinely different) and resets the
+    streak: A, A, B then ``done`` reaches the model's OWN done. Under the old
+    fixed counter the 3rd errored attempt would have force-terminated the run
+    before the ``done`` was ever consumed."""
+
+    store = _make_store()
+    task_id = _make_running_task(store)
+    bus = EventBus()
+    state_changes = await _collect_state_changes(bus)
+    registry = _make_coded_error_registry()
+    client = _ScriptedClient(
+        chat_values=[
+            _coder_call("alpha", 1),  # stall 1
+            _coder_call("alpha", 2),  # same code → stall 2 (nudge)
+            _coder_call("beta", 1),  # NEW code → reset → stall 1
+            _done_v2_payload(
+                result_summary="conclu proprement", status="complete", reason_code="ok"
+            ),
+        ]
+    )
+    runner = SubAgentRunner(
+        subagent_client=client,
+        task_store=store,
+        event_bus=bus,
+        policy=SubAgentPolicy(max_iterations=99, wall_clock_seconds=999.0, token_cap=10_000_000),
+        tool_registry=registry,
+        clock=_ControllableClock(),
+    )
+
+    await runner.run(task_id)
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    # All 4 scripted turns ran: the code change kept the run alive long enough
+    # for the model's own terminal done — never a forced stall.
+    assert len(client.calls) == 4
+    task = store.get_task(task_id)
+    assert task.state == "done"
+    assert state_changes[-1]["status"] == "complete"
+    assert state_changes[-1]["reason_code"] == "ok"
+    assert task.result == "conclu proprement"
+
+
+@pytest.mark.asyncio
+async def test_error_code_change_then_same_code_loop_still_forces() -> None:
+    """Issue 0127 — the reset is not an evasion loophole: after switching to a
+    new error code, that code repeating burns the streak down again and the run
+    is still cut at the threshold (A, B, B, B → force at the 4th attempt),
+    naming the LAST error."""
+
+    store = _make_store()
+    task_id = _make_running_task(store)
+    bus = EventBus()
+    state_changes = await _collect_state_changes(bus)
+    registry = _make_coded_error_registry()
+    client = _ScriptedClient(
+        chat_values=[
+            _coder_call("alpha", 1),  # stall 1
+            _coder_call("beta", 1),  # NEW code → reset → stall 1
+            _coder_call("beta", 2),  # same code → stall 2 (nudge)
+            _coder_call("beta", 3),  # same code → stall 3 → force
+            _coder_call("beta", 4),  # never consumed
+        ]
+    )
+    runner = SubAgentRunner(
+        subagent_client=client,
+        task_store=store,
+        event_bus=bus,
+        policy=SubAgentPolicy(max_iterations=99, wall_clock_seconds=999.0, token_cap=10_000_000),
+        tool_registry=registry,
+        clock=_ControllableClock(),
+    )
+
+    await runner.run(task_id)
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    assert len(client.calls) == 4
+    task = store.get_task(task_id)
+    assert task.state == "failed"
+    assert state_changes[-1]["status"] == "failed"
+    assert state_changes[-1]["reason_code"] == REASON_STALLED
+    assert task.result is not None
+    assert "failure beta" in task.result
+
+
+@pytest.mark.asyncio
+async def test_stall_force_threshold_is_a_policy_setting() -> None:
+    """Issue 0127 — the force ceiling is a ``SubAgentPolicy`` dial: with
+    ``stall_force_threshold=2`` the same-code error loop is cut at the 2nd
+    attempt instead of the default 3rd."""
+
+    store = _make_store()
+    task_id = _make_running_task(store)
+    bus = EventBus()
+    state_changes = await _collect_state_changes(bus)
+    registry = _make_coded_error_registry()
+    client = _ScriptedClient(chat_values=[_coder_call("invalid_query", i) for i in range(1, 6)])
+    runner = SubAgentRunner(
+        subagent_client=client,
+        task_store=store,
+        event_bus=bus,
+        policy=SubAgentPolicy(
+            max_iterations=99,
+            wall_clock_seconds=999.0,
+            token_cap=10_000_000,
+            stall_force_threshold=2,
+        ),
+        tool_registry=registry,
+        clock=_ControllableClock(),
+    )
+
+    await runner.run(task_id)
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    assert len(client.calls) == 2
+    task = store.get_task(task_id)
+    assert task.state == "failed"
+    assert state_changes[-1]["status"] == "failed"
+    assert state_changes[-1]["reason_code"] == REASON_STALLED
 
 
 # ---------------------------------------------------------------------------

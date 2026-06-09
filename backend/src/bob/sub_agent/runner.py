@@ -211,11 +211,15 @@ Clock = Callable[[], float]
 #     external hard-kill with an empty result.
 #
 # So a "stall" iteration is now ANY non-advancing step: a ``progress``, a
-# duplicate ``tool_call``, OR a ``tool_call`` whose dispatch ERRORED. Only a
-# fresh SUCCESSFUL tool result (or a ``done``) is forward progress and resets the
-# streak. Empirically (logs 2026-05-21..29) no task that ever reached a terminal
-# ``done`` emitted more than 3 consecutive ``progress`` — every run with ≥4 was a
-# loop — so the force threshold below never truncates a legitimate task.
+# duplicate ``tool_call``, OR a ``tool_call`` whose dispatch ERRORED. A fresh
+# SUCCESSFUL tool result (or a ``done``) is forward progress and resets the
+# streak — and so does a tool error whose ERROR CODE differs from the previous
+# attempt (issue 0127): a NEW error means the model genuinely changed its
+# approach and surfaced a different diagnostic, while the SAME code repeating
+# is the dead-end shape the guard exists to cut. Empirically (logs
+# 2026-05-21..29) no task that ever reached a terminal ``done`` needed more
+# than the force threshold of consecutive no-progress steps once error-code
+# changes stopped counting against it.
 
 #: After this many consecutive stall iterations, re-inject a forcing nudge under
 #: the ``system_validator`` role. The message is context-aware (see
@@ -225,12 +229,13 @@ Clock = Callable[[], float]
 #: "lecture du mail" reflection between a tool result and the terminal ``done``.
 _STALL_NUDGE_THRESHOLD = 2
 
-#: Hard ceiling: after this many consecutive stall iterations the runner stops
-#: waiting on the model and force-terminates via
-#: :meth:`SubAgentRunner._force_stalled_done` — salvaging the last successful
-#: tool result (``done(degraded, stalled)``) or, failing that, naming the last
-#: tool error (``done(failed, stalled)``), so the exit is never an empty mystery.
-_STALL_FORCE_THRESHOLD = 4
+# The hard force ceiling is a policy setting (issue 0127):
+# :attr:`bob.sub_agent.policy.SubAgentPolicy.stall_force_threshold`, default 3.
+# After that many consecutive stall iterations the runner stops waiting on the
+# model and force-terminates via :meth:`SubAgentRunner._force_stalled_done` —
+# salvaging the last successful tool result (``done(degraded, stalled)``) or,
+# failing that, naming the last tool error (``done(failed, stalled)``), so the
+# exit is never an empty mystery.
 
 #: Max chars of a salvaged tool-result body folded into a degraded ``done``'s
 #: ``result_summary`` so Jarvis' done-synthesis still has the data to answer
@@ -981,7 +986,9 @@ class SubAgentRunner:
         # error instead of failing silently. ``stall_count`` is the run of
         # non-advancing iterations — a ``progress``, a duplicate ``tool_call``, or
         # an ERRORED ``tool_call`` (Trou A/B) — driving the forcing function
-        # (RC1); it resets to 0 ONLY on a new successful tool result.
+        # (RC1); it resets to 0 on a new successful tool result OR on a tool
+        # error whose error CODE differs from the previous attempt (issue 0127:
+        # a new error is genuine diagnostic progress).
         seen_tool_calls: dict[str, int] = {}
         last_tool_result: dict[str, Any] | None = None
         last_tool_name: str | None = None
@@ -1612,9 +1619,26 @@ class SubAgentRunner:
                     # past the threshold, then force-terminates. Without this a tool
                     # that only ever errors leaves ``last_tool_result`` None and the
                     # loop is unbounded until a hard cap / external kill.
+                    #
+                    # Issue 0127 — a DIFFERENT error code than the previous attempt
+                    # is genuine diagnostic progress (the model changed its approach
+                    # and hit a new wall), so the streak restarts at this attempt.
+                    # The SAME code repeating is the dead-end loop the guard cuts.
+                    if (
+                        last_tool_error is not None
+                        and step.dispatched.error_code != last_tool_error.error_code
+                    ):
+                        stall_count = 0
                     last_tool_error = step.dispatched
                     stall_count += 1
                     decision = self._stall_decision(stall_count)
+                    if decision != "none":
+                        # Issue 0127 — an error-loop stall is as salient as the
+                        # progress / duplicate-call shapes: surface the same
+                        # ``warn`` chip so the user sees the run being cut.
+                        await self._emit_activity(
+                            StallNudge(agent_ref=task_id, forced=decision == "force")
+                        )
                     if decision == "force":
                         await self._force_stalled_done(
                             task_id,
@@ -2600,20 +2624,20 @@ class SubAgentRunner:
             },
         )
 
-    @staticmethod
-    def _stall_decision(stall_count: int) -> str:
+    def _stall_decision(self, stall_count: int) -> str:
         """Map a stall streak to ``"force"`` / ``"nudge"`` / ``"none"`` (RC1).
 
         ``stall_count`` is the run of non-advancing iterations since the last
-        successful tool result — a ``progress``, a duplicate ``tool_call``, or a
-        ``tool_call`` whose dispatch ERRORED (Trou A/B). At
-        :data:`_STALL_FORCE_THRESHOLD` the runner force-terminates via
-        :meth:`_force_stalled_done`; at :data:`_STALL_NUDGE_THRESHOLD` it injects
-        a ``system_validator`` nudge (:meth:`_stall_nudge_message`). Checked
-        force-first so the higher threshold wins.
+        reset — a ``progress``, a duplicate ``tool_call``, or a ``tool_call``
+        whose dispatch ERRORED with the same error code as the previous attempt
+        (Trou A/B + issue 0127). At the policy's ``stall_force_threshold``
+        (default 3) the runner force-terminates via :meth:`_force_stalled_done`;
+        at :data:`_STALL_NUDGE_THRESHOLD` it injects a ``system_validator``
+        nudge (:meth:`_stall_nudge_message`). Checked force-first so the higher
+        threshold wins.
         """
 
-        if stall_count >= _STALL_FORCE_THRESHOLD:
+        if stall_count >= self._policy.stall_force_threshold:
             return "force"
         if stall_count >= _STALL_NUDGE_THRESHOLD:
             return "nudge"
