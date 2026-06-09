@@ -44,7 +44,8 @@ Lifecycle + cooperative cancellation (Annexe H)
 :meth:`feed_partial` is the per-``stt_partial`` hook. On ``endpoint`` /
 ``bargein`` / ``voice_stop`` the full-duplex loop calls :meth:`stop`, which mirrors
 the sub-agent cancel ladder (:mod:`bob.task_scheduler`): set a cooperative stop
-flag, give the in-flight inference ``THINKER_CANCEL_GRACE_MS`` to unwind, then
+flag, give the in-flight inference ``THINKER_CANCEL_GRACE_MS`` — CAPPED at
+``THINKER_CANCEL_GRACE_CAP_MS`` (PRD 0018 / issue 0118) — to unwind, then
 escalate to :meth:`asyncio.Task.cancel`. The inference task is spawned through an
 injected ``spawn`` callable so the WS layer can route it onto the scheduler's
 shared :class:`asyncio.TaskGroup` (structured concurrency — no leaked
@@ -175,7 +176,14 @@ class ThinkerLoop:
         self._spawn: SpawnTask = spawn if spawn is not None else _default_spawn
         self._clock = clock or time.monotonic
         self._debounce_s = max(0.0, settings.THINKER_DEBOUNCE_MS / 1000.0)
-        self._grace_s = max(0.0, settings.THINKER_CANCEL_GRACE_MS / 1000.0)
+        # PRD 0018 / issue 0118: the cooperative grace is CAPPED. The endpoint
+        # freeze sits on the user-audible critical path, so a parked inference
+        # gets at most ``THINKER_CANCEL_GRACE_CAP_MS`` to unwind before the
+        # stop escalates to the hard :meth:`asyncio.Task.cancel`.
+        self._grace_s = min(
+            max(0.0, settings.THINKER_CANCEL_GRACE_MS / 1000.0),
+            max(0.0, settings.THINKER_CANCEL_GRACE_CAP_MS / 1000.0),
+        )
 
         # Per-turn state. ``_turn_id`` is the FSM turn the loop is armed for;
         # ``_seq`` is the monotonic snapshot counter (anti-stale watermark on the
@@ -257,8 +265,10 @@ class ThinkerLoop:
 
         Annexe H ladder, mirroring the sub-agent scheduler: latch the stop flag
         (so no new pass starts and the in-flight pass will not reschedule), give
-        the in-flight inference ``THINKER_CANCEL_GRACE_MS`` to unwind on its own,
-        then escalate to :meth:`asyncio.Task.cancel`. Idempotent. Does NOT clear
+        the in-flight inference the capped grace
+        (``min(THINKER_CANCEL_GRACE_MS, THINKER_CANCEL_GRACE_CAP_MS)`` — PRD
+        0018 / issue 0118) to unwind on its own, then escalate to
+        :meth:`asyncio.Task.cancel`. Idempotent. Does NOT clear
         the store — the snapshot the Speaker consults at the endpoint must survive
         the freeze (the next :meth:`start` clears it).
         """

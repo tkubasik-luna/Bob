@@ -79,10 +79,11 @@ class _FakeThinkerClient:
         raise NotImplementedError
 
 
-def _settings(*, debounce_ms: int = 250, grace_ms: int = 50) -> Settings:
+def _settings(*, debounce_ms: int = 250, grace_ms: int = 50, grace_cap_ms: int = 250) -> Settings:
     return Settings.model_construct(
         THINKER_DEBOUNCE_MS=debounce_ms,
         THINKER_CANCEL_GRACE_MS=grace_ms,
+        THINKER_CANCEL_GRACE_CAP_MS=grace_cap_ms,
         STT_DEBUG_TEXT_MAX_CHARS=64,
     )
 
@@ -94,11 +95,12 @@ def _loop(
     *,
     debounce_ms: int = 250,
     grace_ms: int = 50,
+    grace_cap_ms: int = 250,
 ) -> ThinkerLoop:
     return ThinkerLoop(
         client=client,  # type: ignore[arg-type]
         live_state=state,
-        settings=_settings(debounce_ms=debounce_ms, grace_ms=grace_ms),
+        settings=_settings(debounce_ms=debounce_ms, grace_ms=grace_ms, grace_cap_ms=grace_cap_ms),
         session_id="s1",
         clock=clock,
     )
@@ -377,6 +379,35 @@ async def test_stop_cancels_inflight_pass() -> None:
     await loop.stop()  # grace elapses (gate never set) → hard cancel
     assert loop.inflight is False
     # The cancelled pass produced no snapshot / event.
+    assert state.latest() is None
+    assert _snapshots() == []
+
+
+async def test_stop_grace_is_capped_by_setting() -> None:
+    """The configured 2 s grace is CAPPED (PRD 0018 / issue 0118).
+
+    A pass that would stall through the whole cooperative grace (the gate is
+    never set) is hard-cancelled at ``THINKER_CANCEL_GRACE_CAP_MS`` instead:
+    ``stop`` returns in the cap window, nowhere near the 2 s grace.
+    """
+
+    client = _FakeThinkerClient()
+    client.gate = asyncio.Event()  # never set — the pass would stall forever
+    state = LiveTranscriptState()
+    loop = _loop(client, state, _Clock(), grace_ms=2_000, grace_cap_ms=30)
+
+    loop.start("t1")
+    await loop.feed_partial("bloque")
+    await client.started.wait()
+    assert loop.inflight is True
+
+    started = asyncio.get_running_loop().time()
+    await loop.stop()  # the 30 ms cap elapses → hard cancel (not the 2 s grace)
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert loop.inflight is False
+    assert elapsed < 1.0, f"stop took {elapsed:.3f}s — the grace cap did not apply"
+    # The hard-cancelled pass produced no snapshot / event.
     assert state.latest() is None
     assert _snapshots() == []
 

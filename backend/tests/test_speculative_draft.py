@@ -78,10 +78,17 @@ class _FakeDraftClient:
         raise NotImplementedError
 
 
-def _settings(*, debounce_ms: int = 250, grace_ms: int = 50, similarity: float = 0.6) -> Settings:
+def _settings(
+    *,
+    debounce_ms: int = 250,
+    grace_ms: int = 50,
+    grace_cap_ms: int = 250,
+    similarity: float = 0.6,
+) -> Settings:
     return Settings.model_construct(
         THINKER_DEBOUNCE_MS=debounce_ms,
         THINKER_CANCEL_GRACE_MS=grace_ms,
+        THINKER_CANCEL_GRACE_CAP_MS=grace_cap_ms,
         DRAFT_COMMIT_SIMILARITY=similarity,
         STT_DEBUG_TEXT_MAX_CHARS=64,
     )
@@ -276,6 +283,38 @@ async def test_stop_cancels_a_parked_pass_then_keeps_held_draft() -> None:
     # A stopped loop accepts no further work.
     await drafter.feed_partial("more")
     assert client.calls == ["quel temps"]
+
+
+async def test_stop_grace_is_capped_by_setting() -> None:
+    """The configured 2 s grace is CAPPED (PRD 0018 / issue 0118).
+
+    A pass that would stall through the whole cooperative grace (the gate is
+    never set) is hard-cancelled at ``THINKER_CANCEL_GRACE_CAP_MS`` instead:
+    ``stop`` returns in the cap window, nowhere near the 2 s grace.
+    """
+
+    client = _FakeDraftClient()
+    client.gate = asyncio.Event()  # never set — the pass would stall forever
+    drafter = SpeculativeDraft(
+        client=client,  # type: ignore[arg-type]
+        settings=_settings(grace_ms=2_000, grace_cap_ms=30),
+        session_id="s1",
+        spawn=asyncio.create_task,
+        clock=_Clock(),
+    )
+    drafter.start("t1")
+    await drafter.feed_partial("bloque")
+    await asyncio.wait_for(client.started.wait(), timeout=1.0)
+    assert drafter.inflight
+
+    started = asyncio.get_running_loop().time()
+    await drafter.stop()  # the 30 ms cap elapses → hard cancel (not the 2 s grace)
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert not drafter.inflight
+    assert elapsed < 1.0, f"stop took {elapsed:.3f}s — the grace cap did not apply"
+    # The hard-cancelled pass landed no draft — the gate runs COLD on this turn.
+    assert drafter.draft_text is None
 
 
 async def test_start_clears_previous_turn_draft() -> None:

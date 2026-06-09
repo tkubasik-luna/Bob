@@ -654,6 +654,18 @@ class FullDuplexLoop:
         Issue 0103: ``t_endpoint`` is stamped here whichever source crossed — the
         silence-floor net or a confirmed semantic ``user_turn_complete`` — so a
         complete clause's earlier endpoint is measurable in the latency marks.
+
+        Issue 0118 (PRD 0018, Module 2 — EndpointCommit): the endpoint path is
+        CONCURRENT. The Thinker freeze and the Draft freeze FAN OUT (they start
+        at the same instant instead of running back-to-back), and the STT
+        finalization (the full-buffer whisper pass) runs IN PARALLEL with both.
+        Each freeze's cooperative grace is capped inside the hook
+        (``THINKER_CANCEL_GRACE_CAP_MS``, default 250 ms — past it, hard
+        cancel), so the endpoint → say-path latency is bounded by
+        ``max(grace cap, stt finalize)`` rather than the old
+        ``grace + grace + finalize`` sum. The say-path is spawned as soon as
+        the commit-gate decision is available — nothing later on this path
+        waits for any further cleanup.
         """
 
         self._latency.t_endpoint = self._now()
@@ -662,42 +674,52 @@ class FullDuplexLoop:
             return
         await self._emit_turn_state(transition)
         # Critical-path metrics (PRD 0018 / issue 0117): the ``endpoint`` mark
-        # opens the response path; the next marks below time each sequential
-        # step it crosses before the say-path launches.
+        # opens the response path; the marks below time each step it crosses
+        # before the say-path launches (``loops_frozen`` / ``stt_finalized``
+        # land in whichever order the parallel branches finish).
         metrics = turn_metrics.get_default_collector()
         metrics.mark(transition.turn_id, "endpoint")
 
-        # Annexe H — the endpoint FREEZES the turn: cooperatively cancel the
-        # in-flight Thinker pass (cancel + grace + hard-kill, inside the hook)
-        # BEFORE the say-path assembles, so the Speaker consults the snapshot the
-        # loop already produced rather than racing a late pass. The snapshot
-        # survives the cancel (the loop does not clear on stop) so the
-        # ThinkerStateProvider still reads it at assembly. No-op when unwired.
-        if self.on_thinker_stop is not None:
-            with contextlib.suppress(Exception):
-                await self.on_thinker_stop()
-        # SpeculativeDraft (PRD 0016 / issue 0104): freeze the drafter the SAME way
-        # — cancel the in-flight pass (cancel + grace + hard-kill) so the commit
-        # gate reads the latest LANDED draft rather than racing a late pass. The
-        # held draft survives the stop (the drafter clears only on the next
-        # ``start``). No-op when unwired (Annexe G — always cold).
-        if self.on_draft_stop is not None:
-            with contextlib.suppress(Exception):
-                await self.on_draft_stop()
-        # ``loops_frozen`` — both anticipation loops are cancelled (their
-        # cooperative grace is the dominant cost PRD 0018 Module 2 attacks).
-        metrics.mark(transition.turn_id, "loops_frozen")
-
-        # Freeze the transcript (0099 finalize → stt_final) and detach the turn.
+        # Detach the STT turn SYNCHRONOUSLY (before any await) so a frame racing
+        # the endpoint path can never feed a turn that is being finalized.
         turn = self._turn
         self._turn = None
-        transcript = ""
-        if turn is not None:
-            final = await turn.finalize()
-            if final is not None:
-                transcript = final.text
-        # ``stt_finalized`` — the frozen final transcript is available.
-        metrics.mark(transition.turn_id, "stt_finalized")
+
+        async def _freeze_loops() -> None:
+            # Annexe H — the endpoint FREEZES the turn: cooperatively cancel the
+            # in-flight Thinker pass AND the in-flight Draft pass (cancel +
+            # capped grace + hard-kill, inside each hook) so the Speaker
+            # consults the snapshot / the commit gate reads the latest LANDED
+            # draft rather than racing a late pass. Both survive the cancel
+            # (the loops clear only on the next ``start``). Issue 0118: the two
+            # stops fan out concurrently — each hook latches its stop flag the
+            # moment it starts executing, so a pass that concludes after the
+            # freeze began can no longer mutate what the gate/Speaker read.
+            stops = [
+                self._call_quietly(hook)
+                for hook in (self.on_thinker_stop, self.on_draft_stop)
+                if hook is not None
+            ]
+            if stops:
+                await asyncio.gather(*stops)
+            # ``loops_frozen`` — both anticipation loops are cancelled (their
+            # cooperative grace is the dominant cost PRD 0018 Module 2 attacks).
+            metrics.mark(transition.turn_id, "loops_frozen")
+
+        async def _finalize_stt() -> str:
+            # Freeze the transcript (0099 finalize → stt_final). Runs in
+            # parallel with the freezes (issue 0118) — the whisper full-buffer
+            # pass shares nothing with the loop cancellation.
+            transcript = ""
+            if turn is not None:
+                final = await turn.finalize()
+                if final is not None:
+                    transcript = final.text
+            # ``stt_finalized`` — the frozen final transcript is available.
+            metrics.mark(transition.turn_id, "stt_finalized")
+            return transcript
+
+        _, transcript = await asyncio.gather(_freeze_loops(), _finalize_stt())
         # Record the frozen transcript for this turn's persisted row (issue 0109);
         # the say-path's reply (spoken_text) + completion drive the actual write.
         self._final_transcript = transcript
@@ -1140,6 +1162,18 @@ class FullDuplexLoop:
             # Release the (potentially large) PCM buffers for this turn.
             self._mic_pcm = bytearray()
             self._tts_pcm = bytearray()
+
+    @staticmethod
+    async def _call_quietly(hook: Callable[[], Awaitable[None]]) -> None:
+        """Await ``hook()`` suppressing any exception (cancellation excepted).
+
+        The freeze fan-out helper (issue 0118): each stop hook keeps the same
+        never-takes-the-turn-down contract it had when awaited inline, while
+        :func:`asyncio.gather` runs them concurrently.
+        """
+
+        with contextlib.suppress(Exception):
+            await hook()
 
     @staticmethod
     async def _feed_stt(turn: VoiceTurn, pcm: bytes) -> bool:

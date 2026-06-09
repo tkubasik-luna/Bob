@@ -25,8 +25,10 @@ import pytest
 
 from bob import debug_log, event_bus_v2, turn_metrics
 from bob.config import Settings
+from bob.live_transcript_state import LiveTranscriptState
 from bob.speculative_draft import SpeculativeDraft
 from bob.stt_engine import MIC_FRAME_TAG, FakeSttEngine
+from bob.thinker_loop import ThinkerLoop
 from bob.turn_fsm import TurnState
 from bob.voice_loop import FullDuplexLoop, PersistedTurn
 from bob.voice_turn import VoiceTurn
@@ -1556,3 +1558,240 @@ async def test_persist_hook_failure_emits_voice_persist_failed() -> None:
     ]
     assert len(buffered) == 1
     assert buffered[0]["turn_id"] == say.turn_ids[0]
+
+
+# --- endpoint concurrency (PRD 0018 / issue 0118) -----------------------------
+
+
+def _stt_final_events() -> list[dict[str, Any]]:
+    """The ``stt_final`` ws_event bodies currently in the debug ring buffer."""
+
+    out: list[dict[str, Any]] = []
+    for event in debug_log.snapshot():
+        ws_event = (event.payload or {}).get("ws_event") or {}
+        if ws_event.get("type") == "stt_final":
+            out.append(ws_event)
+    return out
+
+
+async def _until(predicate: Callable[[], bool], *, what: str) -> None:
+    """Poll ``predicate`` until true (bounded) — awaits a parallel branch."""
+
+    for _ in range(200):
+        if predicate():
+            return
+        await asyncio.sleep(0.005)
+    raise AssertionError(f"condition never reached: {what}")
+
+
+class _ParkedStopHook:
+    """A freeze hook that records entry and parks until released."""
+
+    def __init__(self) -> None:
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.finished = False
+
+    async def __call__(self) -> None:
+        self.entered.set()
+        await self.release.wait()
+        self.finished = True
+
+
+class _ParkedRoleClient:
+    """A role client whose pass parks forever — the cooperative cancel never
+    unhooks it (only the post-cap hard :meth:`asyncio.Task.cancel` does)."""
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self._gate = asyncio.Event()  # never set
+
+    def supports_guided_json(self) -> bool:
+        return False
+
+    async def chat(self, messages: list[dict[str, Any]], **kwargs: Any) -> str:
+        self.started.set()
+        await self._gate.wait()
+        return ""
+
+    async def complete(self, *args: Any, **kwargs: Any) -> Any:  # pragma: no cover - unused
+        raise NotImplementedError
+
+
+async def test_endpoint_freezes_thinker_and_draft_concurrently() -> None:
+    """Both freezes start at the same instant; STT finalizes in parallel (0118).
+
+    Under the pre-0118 sequential path the Draft stop could only START after
+    the Thinker stop RETURNED, and the STT finalize only after both: with both
+    hooks parked, the draft hook would never be entered and no ``stt_final``
+    could exist. Here both hooks are entered while BOTH are still parked
+    (concurrent fan-out), and the full-buffer STT pass has already frozen the
+    final transcript while the freezes are still in flight.
+    """
+
+    say = _RecordingSayPath(produce_audio=True)
+    thinker_stop = _ParkedStopHook()
+    draft_stop = _ParkedStopHook()
+    settings = _settings()
+    loop = FullDuplexLoop(
+        voice_turn_factory=lambda: VoiceTurn(
+            engine=FakeSttEngine(transcript="bonjour le monde", samples_per_word=160),
+            session_id="s1",
+            settings=settings,
+        ),
+        say_path=say,
+        settings=settings,
+        session_id="s1",
+        on_thinker_stop=thinker_stop,
+        on_draft_stop=draft_stop,
+    )
+    await loop.start()
+    for _ in range(6):
+        await loop.feed_raw_frame(_LOUD)
+
+    # Drive the trailing silence from a background task: the endpoint frame
+    # parks inside the (gated) freeze fan-out, so it must not block the test.
+    async def _silence() -> None:
+        for _ in range(8):
+            await loop.feed_raw_frame(_QUIET)
+
+    pump = asyncio.create_task(_silence())
+    try:
+        # CONCURRENT fan-out: both freezes are entered while NEITHER finished.
+        await asyncio.wait_for(thinker_stop.entered.wait(), timeout=1.0)
+        await asyncio.wait_for(draft_stop.entered.wait(), timeout=1.0)
+        assert thinker_stop.finished is False
+        assert draft_stop.finished is False
+
+        # The STT finalization did NOT wait for the freezes: the final
+        # transcript is already frozen (``stt_final`` emitted) while both
+        # stops are still parked.
+        await _until(lambda: bool(_stt_final_events()), what="stt_final during freeze")
+        assert _stt_final_events()[-1]["text"] == "bonjour le monde"
+
+        # The say-path waits for the commit-gate decision (which follows the
+        # capped freeze) — it has not launched yet.
+        assert say.transcripts == []
+    finally:
+        thinker_stop.release.set()
+        draft_stop.release.set()
+        await pump
+    await loop.join()
+
+    # Released freezes → gate → say-path on the (already) finalized transcript.
+    assert say.transcripts == ["bonjour le monde"]
+    assert loop.state is TurnState.IDLE
+
+
+async def test_stalled_anticipation_is_hard_cancelled_within_grace_cap() -> None:
+    """Acceptance (0118): stalling fakes never hold the say-path past the cap.
+
+    A REAL ThinkerLoop + REAL SpeculativeDraft run with clients whose in-flight
+    pass parks forever (the cooperative cancel never unhooks it) under a 2 s
+    configured grace. The 40 ms cap hard-cancels both — CONCURRENTLY — so the
+    endpoint frame returns (say-path spawned) within the cap window, nowhere
+    near the 2 s + 2 s the sequential uncapped graces would have cost.
+    """
+
+    settings = _settings().model_copy(
+        update={
+            "THINKER_DEBOUNCE_MS": 0,
+            "THINKER_CANCEL_GRACE_MS": 2_000,
+            "THINKER_CANCEL_GRACE_CAP_MS": 40,
+            "DRAFT_COMMIT_SIMILARITY": 0.6,
+        }
+    )
+    thinker_client = _ParkedRoleClient()
+    draft_client = _ParkedRoleClient()
+    thinker = ThinkerLoop(
+        client=thinker_client,  # type: ignore[arg-type]
+        live_state=LiveTranscriptState(),
+        settings=settings,
+        session_id="s1",
+        spawn=asyncio.create_task,
+    )
+    drafter = SpeculativeDraft(
+        client=draft_client,  # type: ignore[arg-type]
+        settings=settings,
+        session_id="s1",
+        spawn=asyncio.create_task,
+    )
+    say = _RecordingSayPath(produce_audio=True)
+    loop = FullDuplexLoop(
+        voice_turn_factory=lambda: VoiceTurn(
+            engine=FakeSttEngine(transcript="bonjour le monde", samples_per_word=160),
+            session_id="s1",
+            settings=settings,
+        ),
+        say_path=say,
+        settings=settings,
+        session_id="s1",
+        on_thinker_start=thinker.start,
+        on_thinker_feed=thinker.feed_partial,
+        on_thinker_stop=thinker.stop,
+        on_draft_start=drafter.start,
+        on_draft_feed=drafter.feed_partial,
+        on_draft_stop=drafter.stop,
+        draft_commit_gate=drafter.commit_gate,
+        draft_emit_decision=drafter.emit_decision,
+    )
+    await loop.start()
+    for _ in range(6):
+        await loop.feed_raw_frame(_LOUD)
+    # Both anticipation passes are genuinely IN FLIGHT (parked on their gates).
+    await asyncio.wait_for(thinker_client.started.wait(), timeout=1.0)
+    await asyncio.wait_for(draft_client.started.wait(), timeout=1.0)
+    assert thinker.inflight is True
+    assert drafter.inflight is True
+
+    started = asyncio.get_running_loop().time()
+    for _ in range(8):
+        await loop.feed_raw_frame(_QUIET)
+    elapsed = asyncio.get_running_loop().time() - started
+    await loop.join()
+
+    # The endpoint path (freeze fan-out + finalize + gate + say spawn) fit in
+    # the cap window + epsilon — NOT the 4 s of sequential uncapped graces.
+    assert elapsed < 1.0, f"endpoint path took {elapsed:.3f}s — the grace cap did not apply"
+    assert say.transcripts == ["bonjour le monde"]
+    assert say.prepared_replies == [None]  # no draft ever landed → cold path
+    assert thinker.inflight is False
+    assert drafter.inflight is False
+
+    # The 0117 summary decomposes the concurrent endpoint stages.
+    body = _turn_metrics_events()[-1]
+    stages = body["stages_ms"]
+    for stage in ("endpoint", "loops_frozen", "stt_finalized", "gate_decided"):
+        assert stage in stages
+    # ``loops_frozen`` reflects the capped (40 ms) freeze, not the 2 s grace.
+    marks = body["marks"]
+    assert marks["loops_frozen"] - marks["endpoint"] < 1.5
+
+
+async def test_endpoint_without_inflight_pass_behaves_as_before() -> None:
+    """No-regression (0118): an idle freeze + instant finalize = the old path.
+
+    Real Thinker + Draft loops with INSTANT clients whose passes are long done
+    by the endpoint: the fan-out has nothing to cancel, the commit gate adopts
+    the landed draft, and the turn walks the exact 0100/0104 cycle.
+    """
+
+    say = _RecordingSayPath(produce_audio=True)
+    loop, drafter = _loop_with_draft(say, draft_reply="Il fait beau à Paris.")
+    await loop.start()
+    for _ in range(8):
+        await loop.feed_raw_frame(_LOUD)
+    # Let the (instant) draft pass land before the endpoint silence.
+    await drafter.join()
+    assert drafter.inflight is False
+    for _ in range(8):
+        await loop.feed_raw_frame(_QUIET)
+    await loop.join()
+
+    # The committed draft is still adopted into the say-path verbatim.
+    assert say.transcripts == ["quel temps fait il"]
+    assert say.prepared_replies == ["Il fait beau à Paris."]
+    assert loop.state is TurnState.IDLE
+    body = _turn_metrics_events()[-1]
+    for stage in ("endpoint", "loops_frozen", "stt_finalized", "gate_decided"):
+        assert stage in body["stages_ms"]

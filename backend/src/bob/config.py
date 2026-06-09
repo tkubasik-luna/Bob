@@ -403,8 +403,17 @@ class Settings(BaseSettings):
     # on ``endpoint`` / ``bargein`` / ``voice_stop`` the loop is asked to stop,
     # given this long to unwind a parked inference, then hard-killed via
     # :meth:`asyncio.Task.cancel`.
+    #
+    # ``THINKER_CANCEL_GRACE_CAP_MS`` (PRD 0018 / issue 0118, Module 2 —
+    # EndpointCommit) CAPS that grace: the effective wait before the hard
+    # cancel is ``min(THINKER_CANCEL_GRACE_MS, THINKER_CANCEL_GRACE_CAP_MS)``.
+    # The endpoint freeze sits on the user-audible critical path (endpoint →
+    # first audio), so a parked anticipation inference may stall the say-path
+    # by at most this cap — past it, hard cancel. Applies to BOTH « Penser en
+    # parallèle » loops (the Draft reuses the Thinker cadence knobs, Annexe H).
     THINKER_DEBOUNCE_MS: int = 250
     THINKER_CANCEL_GRACE_MS: int = 2000
+    THINKER_CANCEL_GRACE_CAP_MS: int = 250
 
     # Backchannels (PRD 0016 / issue 0105, Annexe B + A.2 + F). On a ``vad_pause``
     # during ``user_speaking`` Bob may place a brief acknowledgement ("mm", "ok je

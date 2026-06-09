@@ -228,9 +228,15 @@ class SpeculativeDraft:
         self._is_tool_intent = is_tool_intent
         self._clock = clock or time.monotonic
         # Reuse the Thinker cadence knobs (the two loops share the « Penser en
-        # parallèle » debounce/grace contract — Annexe H).
+        # parallèle » debounce/grace contract — Annexe H). The cooperative grace
+        # is CAPPED (PRD 0018 / issue 0118): the endpoint freeze sits on the
+        # user-audible critical path, so a parked inference gets at most
+        # ``THINKER_CANCEL_GRACE_CAP_MS`` before the hard cancel.
         self._debounce_s = max(0.0, settings.THINKER_DEBOUNCE_MS / 1000.0)
-        self._grace_s = max(0.0, settings.THINKER_CANCEL_GRACE_MS / 1000.0)
+        self._grace_s = min(
+            max(0.0, settings.THINKER_CANCEL_GRACE_MS / 1000.0),
+            max(0.0, settings.THINKER_CANCEL_GRACE_CAP_MS / 1000.0),
+        )
         self._similarity_threshold = max(0.0, min(1.0, settings.DRAFT_COMMIT_SIMILARITY))
 
         # Per-turn state (same shape as the Thinker loop's).
@@ -312,8 +318,9 @@ class SpeculativeDraft:
     async def stop(self) -> None:
         """Cooperatively cancel the loop (mirrors ThinkerLoop.stop).
 
-        Latch the stop flag, give the in-flight inference
-        ``THINKER_CANCEL_GRACE_MS`` to unwind, then escalate to
+        Latch the stop flag, give the in-flight inference the capped grace
+        (``min(THINKER_CANCEL_GRACE_MS, THINKER_CANCEL_GRACE_CAP_MS)`` — PRD
+        0018 / issue 0118) to unwind, then escalate to
         :meth:`asyncio.Task.cancel`. Idempotent. Does NOT clear the held draft —
         the endpoint gate must read the pre-written reply AFTER the freeze (the
         next :meth:`start` clears it).
