@@ -27,7 +27,10 @@ Topics and payloads
   later slices that need to react to message additions (e.g. progress UI).
 
 Subscribers' exceptions are logged and swallowed — a single broken handler
-must not poison the bus for the rest.
+must not poison the bus for the rest. Issue 0124: each subscriber task is
+supervised (:mod:`bob.task_supervisor`), so a crashing handler is logged with
+its topic AND emits a visible ``system`` debug event, and the task result is
+always consumed (no "Task exception was never retrieved").
 """
 
 from __future__ import annotations
@@ -36,10 +39,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-import structlog
-
-_logger = structlog.get_logger(__name__)
-
+from bob.task_supervisor import supervise
 
 Subscriber = Callable[[dict[str, Any]], Awaitable[None]]
 
@@ -76,29 +76,34 @@ class EventBus:
 
         Each subscriber is wrapped in its own :func:`asyncio.create_task` so a
         slow or failing handler does not block siblings or the producer.
-        Exceptions raised inside a handler are logged but not re-raised.
+        Exceptions raised inside a handler are reported by the supervisor
+        (log with the topic + ``system`` debug event) but never re-raised —
+        the other subscribers still receive the event.
         """
 
         subs = list(self._subs.get(topic, ()))
         for fn in subs:
-            task = asyncio.create_task(self._run_subscriber(topic, fn, payload))
+            task = supervise(
+                asyncio.create_task(self._invoke(fn, payload)),
+                name="event_bus.subscriber",
+                context={
+                    "topic": topic,
+                    "subscriber": getattr(fn, "__qualname__", repr(fn)),
+                },
+            )
             self._inflight.add(task)
             task.add_done_callback(self._inflight.discard)
 
-    async def _run_subscriber(
-        self,
-        topic: str,
-        fn: Subscriber,
-        payload: dict[str, Any],
-    ) -> None:
-        try:
-            await fn(payload)
-        except Exception:
-            _logger.exception(
-                "event_bus.subscriber_failed",
-                topic=topic,
-                subscriber=getattr(fn, "__qualname__", repr(fn)),
-            )
+    @staticmethod
+    async def _invoke(fn: Subscriber, payload: dict[str, Any]) -> None:
+        """Adapt the ``Awaitable``-returning subscriber to a real coroutine.
+
+        :func:`asyncio.create_task` requires a coroutine object; subscribers are
+        only typed as returning an :class:`~collections.abc.Awaitable`. No
+        error handling here — an exception propagates to the supervised task.
+        """
+
+        await fn(payload)
 
 
 # --- Singleton plumbing -------------------------------------------------------

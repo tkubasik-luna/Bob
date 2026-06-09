@@ -23,7 +23,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 import structlog
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from bob import jarvis_store as jarvis_store_module
@@ -228,12 +228,16 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         settings.mcp_server_configs(),
         call_timeout_seconds=settings.MCP_CALL_TIMEOUT_SECONDS,
     )
+    _app.state.mcp_startup_error = None
     try:
         await mcp_runtime.startup(subagent_registry)
-    except Exception:
+    except Exception as exc:
         # Defensive: registration already swallows per-server failures, but a
-        # truly unexpected error must never take the boot down.
+        # truly unexpected error must never take the boot down. Issue 0124 —
+        # record it in app state so /health exposes the degradation instead of
+        # the failure living only in the boot log.
         _logger.exception("mcp.runtime.startup_failed")
+        _app.state.mcp_startup_error = f"{type(exc).__name__}: {exc}"
 
     live_runners: dict[str, SubAgentRunner] = {}
 
@@ -444,5 +448,15 @@ app.include_router(llm_router)
 
 
 @app.get("/health")
-async def health() -> dict[str, str]:
+async def health(request: Request) -> dict[str, str]:
+    """Liveness probe — also surfaces a degraded MCP boot (issue 0124).
+
+    ``mcp_startup_error`` is recorded by the lifespan when the MCP runtime
+    startup raised unexpectedly; the process still serves traffic (the MCP
+    tools simply never registered), so the status is ``degraded``, not down.
+    """
+
+    error = getattr(request.app.state, "mcp_startup_error", None)
+    if error:
+        return {"status": "degraded", "mcp_startup_error": str(error)}
     return {"status": "ok"}

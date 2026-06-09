@@ -94,6 +94,7 @@ from bob.event_bus_v2 import emit_event
 from bob.latency import DerivedValue, TurnLatency
 from bob.speculative_draft import DraftDecision
 from bob.stt_engine import SttFrameError, decode_pcm_frame
+from bob.task_supervisor import create_supervised_task
 from bob.turn_fsm import Transition, TurnEvent, TurnFsm, TurnState
 from bob.vad import EnergyVad, VadEvent, rms_normalised
 from bob.voice_turn import VoiceTurn, _scrub_text
@@ -689,8 +690,14 @@ class FullDuplexLoop:
         # Launch the say-path as a background task so a long generation does not
         # block the frame pump. Frames keep feeding STT while Bob speaks; once a
         # confirmation window of user speech elapses the barge-in path cuts in.
-        self._say_task = asyncio.create_task(
-            self._run_say_path(transcript, transition.turn_id, prepared_reply=prepared_reply)
+        # Issue 0124 — supervised: ``_run_say_path`` catches driver errors, but
+        # an exception escaping its finalize would otherwise die unobserved on
+        # the task (Bob "spoke" and nobody heard / the FSM never recovered).
+        self._say_task = create_supervised_task(
+            self._run_say_path(transcript, transition.turn_id, prepared_reply=prepared_reply),
+            name="voice.say_path",
+            session_id=self.session_id,
+            turn_id=transition.turn_id,
         )
 
     async def _run_commit_gate(self, transcript: str, turn_id: str) -> str | None:
@@ -1064,10 +1071,27 @@ class FullDuplexLoop:
         )
         try:
             await self.persist_turn(snapshot)
-        except Exception:
+        except Exception as exc:
             _logger.exception(
                 "voice_loop.persist_failed", session_id=self.session_id, turn_id=turn_id
             )
+            # Issue 0124 — a lost voice turn must be client-visible, not a
+            # log-only swallow: the user (and the attest harness) can see that
+            # this turn's transcript/audio never landed. Best-effort: the emit
+            # itself must never take the voice loop down.
+            with contextlib.suppress(Exception):
+                await emit_event(
+                    {
+                        "type": "voice_persist_failed",
+                        "turn_id": turn_id,
+                        "end_reason": end_reason,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    },
+                    category="voice",
+                    severity="error",
+                    source="bob.voice_loop.voice_persist_failed",
+                    summary=f"voice_persist_failed (turn={turn_id})",
+                )
         finally:
             # Release the (potentially large) PCM buffers for this turn.
             self._mic_pcm = bytearray()

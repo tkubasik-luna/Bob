@@ -97,6 +97,7 @@ from bob.speculative_draft import SpeculativeDraft
 from bob.spoken_text_cleaner import clean_for_speech
 from bob.stt_engine import SttEngine, get_default_stt_engine
 from bob.task_store import TaskStoreError
+from bob.task_supervisor import create_supervised_task
 from bob.thinker_loop import ThinkerLoop
 from bob.tts_service import KokoroTtsService, get_default_tts_service
 from bob.voice_loop import FullDuplexLoop, PersistedTurn, SayPathDriver
@@ -228,8 +229,15 @@ async def chat_ws(websocket: WebSocket) -> None:
             return
         if not isinstance(msg_id, str) or not msg_id:
             return
-        task: asyncio.Task[None] = asyncio.create_task(
-            _synthesize_and_stream(websocket, session_id, msg_id, speech)
+        # Issue 0124 — supervised: a synthesis that dies before/around the
+        # streaming pipeline would otherwise be a "ghost audio" (the backend
+        # believes it spoke; the user heard nothing, and the task exception
+        # was never retrieved). The supervisor logs it + emits a debug event.
+        task: asyncio.Task[None] = create_supervised_task(
+            _synthesize_and_stream(websocket, session_id, msg_id, speech),
+            name="tts.proactive_synthesis",
+            session_id=session_id,
+            msg_id=msg_id,
         )
         session.setdefault("active_tts", []).append((msg_id, task))
 
@@ -1531,8 +1539,14 @@ async def _handle_client_message(
     await websocket.send_json({"type": "thinking", "state": "end"})
 
     if voice_requested and response.speech.strip():
-        task: asyncio.Task[None] = asyncio.create_task(
-            _synthesize_and_stream(websocket, session_id, msg_id, response.speech)
+        # Issue 0124 — supervised like the proactive spawn above: a failed
+        # main-turn synthesis must be observable (log + debug event), never a
+        # silently-dropped task exception.
+        task: asyncio.Task[None] = create_supervised_task(
+            _synthesize_and_stream(websocket, session_id, msg_id, response.speech),
+            name="tts.turn_synthesis",
+            session_id=session_id,
+            msg_id=msg_id,
         )
         session = _sessions.get(session_id)
         if session is not None:

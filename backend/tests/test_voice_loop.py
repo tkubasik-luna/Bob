@@ -23,7 +23,7 @@ from typing import Any
 
 import pytest
 
-from bob import debug_log, turn_metrics
+from bob import debug_log, event_bus_v2, turn_metrics
 from bob.config import Settings
 from bob.speculative_draft import SpeculativeDraft
 from bob.stt_engine import MIC_FRAME_TAG, FakeSttEngine
@@ -1327,3 +1327,49 @@ async def test_one_metrics_summary_per_turn_across_consecutive_turns() -> None:
     body = events[-1]
     assert body["aggregates"]["turns_measured"] == 2
     assert body["aggregates"]["stages"]["endpoint"]["count"] == 2
+
+
+async def test_persist_hook_failure_emits_voice_persist_failed() -> None:
+    """A lost voice turn is client-visible (issue 0124), not a log-only swallow.
+
+    The event must reach BOTH sinks: the debug ring buffer (``/ws/debug``) and
+    the registered chat WS emitter (the client).
+    """
+
+    forwarded: list[dict[str, Any]] = []
+
+    async def _collect(event: dict[str, Any]) -> None:
+        forwarded.append(event)
+
+    async def _boom(turn: PersistedTurn) -> None:
+        raise RuntimeError("disk full")
+
+    event_bus_v2.set_ws_emitter(_collect)
+    try:
+        say = _RecordingSayPath(produce_audio=True)
+        loop = _loop(say, transcript="bonjour", persist_turn=_boom)
+        await loop.start()
+        for _ in range(8):
+            await loop.feed_raw_frame(_LOUD)
+        for _ in range(8):
+            await loop.feed_raw_frame(_QUIET)
+        await loop.join()
+    finally:
+        event_bus_v2.set_ws_emitter(None)
+
+    # The loop survived (existing contract) AND the failure was surfaced.
+    assert loop.state is TurnState.IDLE
+    failed = [e for e in forwarded if e.get("type") == "voice_persist_failed"]
+    assert len(failed) == 1
+    assert failed[0]["turn_id"] == say.turn_ids[0]
+    assert failed[0]["end_reason"] == "completed"
+    assert failed[0]["error"] == "RuntimeError: disk full"
+
+    # Same body in the debug ring buffer (the /ws/debug surface).
+    buffered = [
+        (event.payload or {}).get("ws_event") or {}
+        for event in debug_log.snapshot()
+        if ((event.payload or {}).get("ws_event") or {}).get("type") == "voice_persist_failed"
+    ]
+    assert len(buffered) == 1
+    assert buffered[0]["turn_id"] == say.turn_ids[0]

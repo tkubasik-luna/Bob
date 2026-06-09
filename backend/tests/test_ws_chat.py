@@ -9,15 +9,16 @@ file under ``BOB_DATA_DIR``, set up in :mod:`conftest`).
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import AsyncIterator, Iterator
 from typing import cast
 
 import pytest
 from fastapi.testclient import TestClient
 
+from bob import debug_log, ws_events, ws_router
 from bob import jarvis_store as jarvis_store_module
 from bob import task_store as task_store_module
-from bob import ws_events, ws_router
 from bob.main import app
 from bob.orchestrator import Orchestrator, OrchestratorResponse
 from bob.tts_service import KokoroTtsService, SynthesisChunk
@@ -710,4 +711,85 @@ def test_ws_chat_voice_mode_accepted_silently(clear_jarvis_history: None) -> Non
             assert err["type"] == "error"
             assert err["code"] == "unknown_task"
     finally:
+        ws_router.reset_orchestrator_provider()
+
+
+# --- supervised TTS synthesis tasks (PRD 0018 / issue 0124) -------------------
+#
+# A synthesis task that dies outside its own error handling used to vanish with
+# its exception unretrieved ("ghost audio": the backend believes it spoke, the
+# user heard nothing). The spawn sites are now supervised: the failure surfaces
+# as a ``system`` debug event in the ring buffer (the same sink ``/ws/debug``
+# serves). The TestClient drives the app loop in a portal thread, so the tests
+# poll the ring buffer with a small deadline.
+
+
+def _wait_for_supervisor_event(task_name: str, *, timeout: float = 3.0) -> debug_log.DebugEvent:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        for event in debug_log.snapshot():
+            if (
+                event.source == "bob.task_supervisor"
+                and event.payload.get("task_name") == task_name
+            ):
+                return event
+        time.sleep(0.02)
+    raise AssertionError(f"no supervised-task failure event for {task_name!r}")
+
+
+def _broken_tts_provider() -> KokoroTtsService:
+    raise RuntimeError("kokoro indisponible")
+
+
+def test_ws_chat_failed_turn_tts_emits_supervised_event(
+    fake_chat_service: _FakeOrchestrator,
+) -> None:
+    """A main-turn synthesis that dies is observable, not a silent ghost audio."""
+
+    debug_log.clear()
+    ws_router.set_tts_service_provider(_broken_tts_provider)
+    try:
+        with TestClient(app) as client, client.websocket_connect("/ws/chat") as ws:
+            ws.receive_json()  # session
+            ws.send_json({"type": "user_msg", "content": "hi", "voice": True})
+            assert ws.receive_json()["type"] == "thinking"
+            assistant = ws.receive_json()
+            assert assistant["type"] == "assistant_msg"
+            assert ws.receive_json() == {"type": "thinking", "state": "end"}
+
+            event = _wait_for_supervisor_event("tts.turn_synthesis")
+            assert event.severity == "error"
+            assert event.payload["msg_id"] == assistant["msg_id"]
+            assert event.payload["error"] == "RuntimeError: kokoro indisponible"
+    finally:
+        ws_router.reset_tts_service_provider()
+
+
+def test_ws_chat_failed_proactive_tts_emits_supervised_event(
+    clear_jarvis_history: None,
+) -> None:
+    """A proactive synthesis that dies emits a visible event (no ghost audio)."""
+
+    debug_log.clear()
+    fake = _ProactiveOrchestrator()
+    ws_router.set_orchestrator_provider(lambda: cast(Orchestrator, fake))
+    ws_router.set_tts_service_provider(_broken_tts_provider)
+    try:
+        with TestClient(app) as client, client.websocket_connect("/ws/chat") as ws:
+            assert ws.receive_json()["type"] == "session"
+            # Voice mode ON → the proactive assistant_msg also kicks off TTS.
+            ws.send_json({"type": "voice_mode", "enabled": True})
+            ws.send_json({"type": "user_msg", "content": "Draft un email"})
+            assert ws.receive_json() == {"type": "thinking", "state": "start"}
+
+            proactive = ws.receive_json()
+            assert proactive["type"] == "assistant_msg"
+            assert proactive["proactive"] is True
+
+            event = _wait_for_supervisor_event("tts.proactive_synthesis")
+            assert event.severity == "error"
+            assert event.payload["msg_id"] == proactive["msg_id"]
+            assert event.payload["error"] == "RuntimeError: kokoro indisponible"
+    finally:
+        ws_router.reset_tts_service_provider()
         ws_router.reset_orchestrator_provider()

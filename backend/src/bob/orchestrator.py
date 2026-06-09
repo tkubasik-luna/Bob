@@ -132,6 +132,7 @@ from bob.task_completion_debouncer import (
     TaskCompletionDebouncer,
 )
 from bob.task_store import TaskStore, TaskStoreError
+from bob.task_supervisor import create_supervised_task
 from bob.tools import (
     DispatchResult,
     ToolDispatcher,
@@ -1247,7 +1248,13 @@ class Orchestrator:
 
         if self._flusher_task is not None and not self._flusher_task.done():
             return
-        self._flusher_task = asyncio.create_task(self._flush_proactive_loop())
+        # Issue 0124 — supervised: a crash escaping the flusher loop (a dead
+        # flusher means proactive announcements silently stop) is logged +
+        # surfaced as a debug event instead of rotting unobserved on the task.
+        self._flusher_task = create_supervised_task(
+            self._flush_proactive_loop(),
+            name="orchestrator.proactive_flusher",
+        )
 
     async def stop_proactive_loop(self) -> None:
         """Cancel the background flusher (and any pending typing reset)."""
@@ -1284,7 +1291,10 @@ class Orchestrator:
 
         if value:
             try:
-                self._typing_reset_task = asyncio.create_task(self._auto_reset_typing())
+                self._typing_reset_task = create_supervised_task(
+                    self._auto_reset_typing(),
+                    name="orchestrator.typing_reset",
+                )
             except RuntimeError:
                 # No running loop (sync call sites in narrow tests). The
                 # flag is still honoured for the next flusher pass; manual
