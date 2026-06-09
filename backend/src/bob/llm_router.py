@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+import httpx
 from fastapi import APIRouter, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -44,6 +45,8 @@ from bob.lm_studio_manager import (
     LMStudioUnavailableError,
     ModelBudgetExceededError,
     host_from_base_url,
+    list_models_via_openai,
+    openai_endpoint_reachable,
 )
 
 router = APIRouter(prefix="/api/llm", tags=["llm"])
@@ -253,11 +256,27 @@ def get_llm_models(base_url: str | None = None) -> JSONResponse:
     try:
         models = manager.list_models()
     except LMStudioUnavailableError as exc:
-        body = LLMModelsErrorResponse(error="lm_studio_unavailable", detail=str(exc))
-        return JSONResponse(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            content=body.model_dump(),
-        )
+        # The lmstudio SDK management channel is down. For a candidate URL (the
+        # picker / setup screen) fall back to the OpenAI HTTP list so an
+        # OpenAI-only / remote server still surfaces selectable models (ids only —
+        # no SDK metadata). Only the SDK can list when no base_url is given.
+        if base_url:
+            try:
+                models = list_models_via_openai(base_url)
+            except httpx.HTTPError as http_exc:
+                body = LLMModelsErrorResponse(
+                    error="lm_studio_unavailable", detail=f"{exc}; HTTP fallback: {http_exc}"
+                )
+                return JSONResponse(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    content=body.model_dump(),
+                )
+        else:
+            body = LLMModelsErrorResponse(error="lm_studio_unavailable", detail=str(exc))
+            return JSONResponse(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                content=body.model_dump(),
+            )
     payload = LLMModelsResponse(
         models=[
             LLMModel(
@@ -293,11 +312,16 @@ def ping_llm(base_url: str | None = None) -> JSONResponse:
 
     if base_url:
         host = host_from_base_url(base_url)
-        manager: LMStudioManager = LMStudioManager(host=host)
+        # Probe the OpenAI HTTP endpoint FIRST — it's the channel inference uses,
+        # and a remote server may serve it without the lmstudio SDK websocket the
+        # SDK probe needs (which otherwise falsely reads "injoignable"). Fall back
+        # to the SDK probe only when HTTP is unreachable, so a local LM Studio
+        # with the SDK up but HTTP momentarily blocked still reads online.
+        reachable = openai_endpoint_reachable(base_url) or LMStudioManager(host=host).probe()
     else:
         manager = _manager_provider()
         host = manager.host
-    reachable = manager.probe()
+        reachable = manager.probe()
     body = LLMPingResponse(reachable=reachable, host=host)
     return JSONResponse(status_code=status.HTTP_200_OK, content=body.model_dump())
 

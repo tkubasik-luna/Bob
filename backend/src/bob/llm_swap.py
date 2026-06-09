@@ -52,7 +52,12 @@ from bob.llm_selection_store import (
     RoleSelection,
     RoleSelectionStore,
 )
-from bob.lm_studio_manager import LMStudioManager, host_from_base_url
+from bob.lm_studio_manager import (
+    LMStudioManager,
+    LMStudioUnavailableError,
+    host_from_base_url,
+    model_served_over_http,
+)
 from bob.orchestrator import Orchestrator
 
 #: Providers the live switch (issue 0081) accepts. The selection model uses the
@@ -206,12 +211,35 @@ class LLMSwitcher:
             #    a plain re-select of an already-resident model is a no-op load
             #    (kept resident, just re-pinned) so we don't needlessly offload
             #    + reload a model that is already loaded.
-            await asyncio.to_thread(
-                self._manager.load,
-                model_id,
-                effective_ctx,
-                reload=context_length is not None,
-            )
+            try:
+                await asyncio.to_thread(
+                    self._manager.load,
+                    model_id,
+                    effective_ctx,
+                    reload=context_length is not None,
+                )
+            except LMStudioUnavailableError:
+                # The lmstudio SDK management channel is unreachable. The SDK
+                # pre-load is an OPTIMISATION — inference runs over the OpenAI
+                # client, which JIT-loads the model on first use. So if the
+                # OpenAI HTTP endpoint confirms the model is served (a remote /
+                # OpenAI-only server that serves HTTP but not the SDK websocket),
+                # proceed with the pin + client swap rather than hard-failing.
+                # Otherwise re-raise — the server is genuinely unreachable.
+                base_url = current.base_url if current is not None else None
+                base_url = base_url or self._settings.LLM_BASE_URL
+                if not (base_url and model_served_over_http(base_url, model_id)):
+                    raise
+                emit_debug(
+                    category="llm",
+                    severity="warn",
+                    source="bob.llm_swap.swap_lm_model",
+                    summary=(
+                        f"SDK load unreachable for {model_id!r}; the OpenAI endpoint "
+                        f"serves it, pinning for JIT inference (no pre-load)"
+                    ),
+                    payload={"model": model_id, "base_url": base_url},
+                )
 
             # 2. Build the next selection (preserve provider + the ctx map, and
             #    pin an explicit ctx override for this model when supplied).

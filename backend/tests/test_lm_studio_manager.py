@@ -21,6 +21,7 @@ from collections.abc import Callable
 from typing import Any, cast
 
 import lmstudio
+import pytest
 from fastapi.testclient import TestClient
 
 from bob.config import Settings
@@ -740,6 +741,66 @@ def test_ping_endpoint_unreachable_server_returns_false_not_error() -> None:
     # Always 200 — the picker reads `reachable`, never an error status.
     assert response.status_code == 200
     assert response.json() == {"reachable": False, "host": "localhost:1234"}
+
+
+def test_ping_with_base_url_uses_openai_http_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A candidate URL is probed over the OpenAI HTTP endpoint, not the SDK.
+
+    Regression: a remote server serving the OpenAI API over the LAN was reported
+    "injoignable" because the SDK websocket probe failed. The ping now probes the
+    HTTP channel inference actually uses, so an HTTP-reachable server reads online
+    without the SDK being up.
+    """
+
+    from bob import llm_router
+
+    # HTTP probe says reachable; the SDK is never consulted (would raise here).
+    monkeypatch.setattr(llm_router, "openai_endpoint_reachable", lambda _url: True)
+    api = TestClient(app)
+    response = api.get("/api/llm/ping", params={"base_url": "http://192.168.4.94:1234/v1"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["reachable"] is True
+    assert body["host"] == "192.168.4.94:1234"
+
+
+def test_models_with_base_url_falls_back_to_openai_http(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When the SDK management channel is down, list models over OpenAI HTTP."""
+
+    from bob import llm_router
+    from bob.lm_studio_manager import LMStudioModel
+
+    def _boom(_host: str) -> _SDKClient:
+        raise lmstudio.LMStudioWebsocketError("sdk down")
+
+    # The HTTP lister returns one model (stubbed offline).
+    monkeypatch.setattr(
+        llm_router,
+        "list_models_via_openai",
+        lambda _url: [
+            LMStudioModel(
+                id="remote-model",
+                quantisation=None,
+                architecture=None,
+                max_context_length=None,
+                loaded=False,
+            )
+        ],
+    )
+    # Force the candidate-URL SDK path to fail: the route builds the per-URL
+    # manager via llm_router.LMStudioManager, so point it at a booming factory
+    # → list_models raises LMStudioUnavailableError → the route falls back to HTTP.
+    monkeypatch.setattr(
+        llm_router,
+        "LMStudioManager",
+        lambda host: LMStudioManager(host=host, client_factory=_boom),
+    )
+    api = TestClient(app)
+    response = api.get("/api/llm/models", params={"base_url": "http://192.168.4.94:1234/v1"})
+
+    assert response.status_code == 200
+    assert [m["id"] for m in response.json()["models"]] == ["remote-model"]
 
 
 # --- PUT /api/llm/selection endpoint tests ----------------------------------

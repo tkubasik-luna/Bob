@@ -56,6 +56,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 from urllib.parse import urlsplit
 
+import httpx
 import lmstudio
 
 if TYPE_CHECKING:
@@ -78,9 +79,7 @@ DEFAULT_MODEL_FOOTPRINT_GIB = 5.0
 #: canonical host so two URL spellings of the same local server (the UI's
 #: ``localhost`` default vs a ``127.0.0.1`` / ``::1`` `.env`) don't spawn two
 #: managers — each with its own empty ref-count — and reload the same model.
-_LOOPBACK_HOSTS: frozenset[str] = frozenset(
-    {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
-)
+_LOOPBACK_HOSTS: frozenset[str] = frozenset({"localhost", "127.0.0.1", "::1", "0.0.0.0"})
 _CANONICAL_LOOPBACK = "localhost"
 
 
@@ -116,6 +115,89 @@ def host_from_base_url(base_url: str | None) -> str:
         return netloc.lower()
     port = parsed.port
     return f"{host}:{port}" if port is not None else host
+
+
+# --- OpenAI-compatible HTTP probe (the channel inference actually uses) ------
+#
+# The lmstudio SDK talks to a SEPARATE management surface (a websocket API) from
+# the OpenAI-compatible REST endpoint Bob runs inference against. A remote LM
+# Studio (or any OpenAI-compatible server) can serve the HTTP API over the LAN
+# while the SDK websocket is down / version-incompatible — so an SDK-only
+# reachability probe falsely reports such a server "injoignable" even though
+# inference would work. These helpers probe / list over the SAME HTTP endpoint
+# the ``openai`` client uses, so the picker's "online" verdict matches reality.
+
+_OPENAI_PROBE_TIMEOUT_S = 3.0
+_OPENAI_LIST_TIMEOUT_S = 6.0
+
+
+def _openai_models_url(base_url: str) -> str:
+    """``{base_url}/models`` — the OpenAI list-models endpoint (cheap GET)."""
+
+    return f"{base_url.rstrip('/')}/models"
+
+
+def openai_endpoint_reachable(base_url: str, *, timeout: float = _OPENAI_PROBE_TIMEOUT_S) -> bool:
+    """True when the OpenAI-compatible server answers ``GET {base_url}/models``.
+
+    The authoritative "can Bob talk to this URL" check — it probes the exact
+    channel inference uses, independent of the lmstudio SDK websocket. Never
+    raises (a transport error / non-2xx collapses to ``False``)."""
+
+    try:
+        response = httpx.get(_openai_models_url(base_url), timeout=timeout)
+    except httpx.HTTPError:
+        return False
+    return response.is_success
+
+
+def list_models_via_openai(
+    base_url: str, *, timeout: float = _OPENAI_LIST_TIMEOUT_S
+) -> list[LMStudioModel]:
+    """List models from the OpenAI ``GET {base_url}/models`` endpoint.
+
+    FALLBACK for when the lmstudio SDK management channel is unreachable: the
+    OpenAI shape carries only model ids (no quant / arch / ctx / loaded — that
+    metadata lives on the SDK), so those fields come back ``None`` / ``False``,
+    but the picker can still list + select a model for an OpenAI-only / remote
+    server. Raises on a transport / non-2xx error so the caller surfaces
+    "unavailable" rather than an empty list."""
+
+    response = httpx.get(_openai_models_url(base_url), timeout=timeout)
+    response.raise_for_status()
+    payload = response.json()
+    data = payload.get("data", []) if isinstance(payload, dict) else []
+    models: list[LMStudioModel] = []
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        model_id = entry.get("id")
+        if isinstance(model_id, str) and model_id:
+            models.append(
+                LMStudioModel(
+                    id=model_id,
+                    quantisation=None,
+                    architecture=None,
+                    max_context_length=None,
+                    loaded=False,
+                )
+            )
+    return models
+
+
+def model_served_over_http(
+    base_url: str, model_id: str, *, timeout: float = _OPENAI_PROBE_TIMEOUT_S
+) -> bool:
+    """True when ``{base_url}/models`` lists ``model_id`` (best-effort, never raises).
+
+    Used to decide whether a model is usable for inference over the OpenAI HTTP
+    channel even when the lmstudio SDK management load failed (remote / OpenAI-
+    only server). A transport / parse error collapses to ``False``."""
+
+    try:
+        return any(m.id == model_id for m in list_models_via_openai(base_url, timeout=timeout))
+    except (httpx.HTTPError, ValueError):
+        return False
 
 
 #: ``LlmInfo.type`` values we treat as chat-capable. ``vlm`` (vision LLM) is a

@@ -491,6 +491,56 @@ async def test_swap_provider_to_lm_studio_unreachable_still_swaps(tmp_path: Path
 
 
 @pytest.mark.asyncio
+async def test_swap_lm_model_sdk_unreachable_but_served_over_http_proceeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SDK pre-load down + model served over OpenAI HTTP → pin + swap (JIT inference).
+
+    For a remote / OpenAI-only server the lmstudio SDK websocket can be down even
+    though the HTTP API serves the model. The SDK pre-load is an optimisation, so
+    the swap proceeds (the openai client JIT-loads) instead of hard-failing.
+    """
+
+    manager = _FakeManager(load_error=LMStudioUnavailableError("sdk down"))
+    initial = LLMSelection(
+        provider="lm_studio",
+        lm_model="boot-model",
+        context_length={},
+        base_url="http://192.168.4.94:1234/v1",
+    )
+    switcher, orch, _holder, store = _switcher(tmp_path, manager=manager, initial=initial)
+    # The OpenAI endpoint confirms the model is served.
+    monkeypatch.setattr("bob.llm_swap.model_served_over_http", lambda _url, _model: True)
+
+    old_jarvis = orch.jarvis_client
+    result = await switcher.swap_lm_model("target-model")
+
+    assert orch.jarvis_client is not old_jarvis  # clients rebuilt despite no pre-load
+    assert result.selection.lm_model == "target-model"
+    assert store.read().lm_model == "target-model"  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_swap_lm_model_sdk_unreachable_and_not_served_reraises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SDK down AND the model isn't served over HTTP → genuinely unavailable, re-raise."""
+
+    manager = _FakeManager(load_error=LMStudioUnavailableError("sdk down"))
+    initial = LLMSelection(provider="lm_studio", lm_model="boot-model", context_length={})
+    switcher, orch, _holder, store = _switcher(tmp_path, manager=manager, initial=initial)
+    monkeypatch.setattr("bob.llm_swap.model_served_over_http", lambda _url, _model: False)
+
+    old_jarvis = orch.jarvis_client
+    with pytest.raises(LMStudioUnavailableError):
+        await switcher.swap_lm_model("target-model")
+
+    # Nothing mutated — previous selection kept, client untouched.
+    assert orch.jarvis_client is old_jarvis
+    assert store.read().lm_model == "boot-model"  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
 async def test_swap_provider_unknown_value_rejected_before_any_probe(tmp_path: Path) -> None:
     """An unknown provider id raises before any probe / rebuild / write."""
 
