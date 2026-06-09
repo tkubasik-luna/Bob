@@ -501,6 +501,44 @@ class Settings(BaseSettings):
     # the second line of defense.
     WS_HOT_EVENT_BATCH_WINDOW_MS: int = 75
 
+    # Turn watchdog (PRD 0018 / issue 0126, Module 6). Every user turn (text
+    # or voice) runs under :class:`bob.turn_watchdog.TurnWatchdog`, with TWO
+    # distinct wall-clock budgets:
+    #
+    # - ``*_TTFT_TIMEOUT_SECONDS`` — the short time-to-first-token window: the
+    #   provider must START answering (first streamed chunk / first outbound
+    #   audio) within it, else the turn is cut with phase ``ttft`` ("the
+    #   provider never started answering").
+    # - ``*_COMPLETION_TIMEOUT_SECONDS`` — the total turn budget, measured
+    #   from turn start: a provider that streams a first token and then
+    #   stalls is cut here (never at TTFT).
+    #
+    # Expiry emits a ``turn_timeout`` event, restores the turn machinery to a
+    # healthy state, and delivers a short fallback (verbal on the voice path,
+    # text otherwise) instead of eternal silence. The voice path has its own
+    # (tighter) pair — a spoken conversation cannot absorb the latency a text
+    # turn can. ``TURN_FALLBACK_TIMEOUT_SECONDS`` bounds the fallback delivery
+    # itself (the fallback TTS could hang on the same broken engine). Any
+    # budget ``<= 0`` disables that phase.
+    TURN_TTFT_TIMEOUT_SECONDS: float = 30.0
+    TURN_COMPLETION_TIMEOUT_SECONDS: float = 300.0
+    VOICE_TURN_TTFT_TIMEOUT_SECONDS: float = 20.0
+    VOICE_TURN_COMPLETION_TIMEOUT_SECONDS: float = 120.0
+    TURN_FALLBACK_TIMEOUT_SECONDS: float = 10.0
+
+    # Degrade-and-continue guards on the turn path's network awaits (PRD 0018
+    # / issue 0126). These were previously unbounded: a hung rolling-summary
+    # regeneration stalled the live turn before the LLM call even started, a
+    # hung proactive synthesis wedged the flusher, and a hung Kokoro preload /
+    # synthesis produced a ``tts_ready`` (or nothing at all) with no audio.
+    # Each guard degrades independently — continue the turn with the existing
+    # (incomplete) summary, skip the proactive announcement, surface
+    # ``audio_error`` + ``audio_end`` to the client. ``<= 0`` disables.
+    SUMMARY_REGEN_TIMEOUT_SECONDS: float = 60.0
+    PROACTIVE_SYNTHESIS_TIMEOUT_SECONDS: float = 60.0
+    TTS_PRELOAD_TIMEOUT_SECONDS: float = 600.0
+    TTS_STREAM_TIMEOUT_SECONDS: float = 120.0
+
     # JSONL debug-sink write batching (PRD 0018 / issue 0123). The
     # ``logs/orchestration.jsonl`` sink used to ``write()+flush()`` once per
     # emitted event — a synchronous disk round-trip on the hot path. Lines are

@@ -77,7 +77,7 @@ import structlog
 
 from bob import jarvis_store as jarvis_store_module
 from bob import prompts as prompts_module
-from bob import task_scheduler, turn_metrics, ws_events
+from bob import task_scheduler, turn_metrics, turn_watchdog, ws_events
 from bob import task_store as task_store_module
 from bob import ui_registry as ui_registry_module
 from bob.config import get_settings
@@ -804,6 +804,11 @@ class Orchestrator:
                 # stream never moves the mark (the retry shows up in the
                 # ``validation_retry`` counter instead).
                 turn_metrics.mark_current("llm_first_token")
+                # PRD 0018 / issue 0126 — disarm the TurnWatchdog's TTFT
+                # timer: the provider started answering, so only the
+                # completion budget applies from here. No-op when no
+                # watchdog is bound (unguarded paths, narrow tests).
+                turn_watchdog.note_first_token_current()
             if chunk.kind == "tool_call_start":
                 assert chunk.tool_call_id is not None
                 assert chunk.name is not None
@@ -1495,8 +1500,32 @@ class Orchestrator:
             },
             {"role": "user", "content": prompt},
         ]
+        # PRD 0018 / issue 0126 — a hung proactive synthesis used to wedge the
+        # flusher loop forever (every later proactive push starved behind it).
+        # Degrade-and-continue: past the budget we skip THIS announcement (the
+        # task result is still persisted; the next user turn sees it in
+        # context) and the flusher moves on.
+        proactive_timeout_s = get_settings().PROACTIVE_SYNTHESIS_TIMEOUT_SECONDS
         try:
-            raw = await self._jarvis_client.chat(messages, session_id=task_id)
+            async with asyncio.timeout(proactive_timeout_s if proactive_timeout_s > 0 else None):
+                raw = await self._jarvis_client.chat(messages, session_id=task_id)
+        except TimeoutError:
+            _logger.warning(
+                "orchestrator.proactive_llm_timeout",
+                task_id=task_id,
+                timeout_seconds=proactive_timeout_s,
+            )
+            emit_debug(
+                category="system",
+                severity="warn",
+                source="orchestrator._render_proactive_text",
+                summary=(
+                    f"Synthèse proactive > {proactive_timeout_s:g}s — "
+                    "annonce sautée (degrade-and-continue)"
+                ),
+                payload={"task_id": task_id, "timeout_seconds": proactive_timeout_s},
+            )
+            return None
         except Exception:
             _logger.exception(
                 "orchestrator.proactive_llm_failed",
@@ -1794,13 +1823,35 @@ class Orchestrator:
             return
         recent_window = self._context_policy.recent_turns_window or 3
         current_epoch_id = self._current_epoch_id_for_assembly()
+        # PRD 0018 / issue 0126 — the regeneration is an LLM call sitting on
+        # the live turn's critical path, previously unbounded: a hung
+        # summariser stalled the turn before the Jarvis call even started.
+        # Degrade-and-continue: past the budget we cancel the regeneration
+        # and the turn proceeds with the existing (incomplete) summary.
+        summary_timeout_s = get_settings().SUMMARY_REGEN_TIMEOUT_SECONDS
         try:
-            await maybe_regenerate_rolling_summary(
-                jarvis_store=self._jarvis_store,
-                summary_store=self._ensure_summary_store(),
-                summariser=self._summariser,
-                recent_window=recent_window,
-                current_epoch_id=current_epoch_id,
+            async with asyncio.timeout(summary_timeout_s if summary_timeout_s > 0 else None):
+                await maybe_regenerate_rolling_summary(
+                    jarvis_store=self._jarvis_store,
+                    summary_store=self._ensure_summary_store(),
+                    summariser=self._summariser,
+                    recent_window=recent_window,
+                    current_epoch_id=current_epoch_id,
+                )
+        except TimeoutError:
+            _logger.warning(
+                "orchestrator.rolling_summary_timeout",
+                timeout_seconds=summary_timeout_s,
+            )
+            emit_debug(
+                category="system",
+                severity="warn",
+                source="orchestrator._maybe_regenerate_summary",
+                summary=(
+                    f"Régénération du summary > {summary_timeout_s:g}s — "
+                    "le turn continue avec le summary existant"
+                ),
+                payload={"timeout_seconds": summary_timeout_s},
             )
         except Exception:
             _logger.exception("orchestrator.rolling_summary_failed")

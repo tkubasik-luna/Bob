@@ -96,6 +96,7 @@ from bob.speculative_draft import DraftDecision
 from bob.stt_engine import SttFrameError, decode_pcm_frame
 from bob.task_supervisor import create_supervised_task
 from bob.turn_fsm import Transition, TurnEvent, TurnFsm, TurnState
+from bob.turn_watchdog import TURN_TIMEOUT_FALLBACK_SPEECH, TurnTimeoutError, TurnWatchdog
 from bob.vad import EnergyVad, VadEvent, rms_normalised
 from bob.voice_turn import VoiceTurn, _scrub_text
 
@@ -822,9 +823,23 @@ class FullDuplexLoop:
         threads its text to the driver so it speaks the draft verbatim instead of
         cold-generating — the anticipation that lets ``endpoint_to_first_audio_ms``
         land under the committed target (Annexe F). ``None`` keeps the cold path.
+
+        TurnWatchdog (PRD 0018 / issue 0126): the whole driver call (LLM
+        generation + TTS streaming) runs under the voice-path TTFT +
+        completion budgets. The orchestrator disarms the TTFT timer on the
+        first provider chunk; the first outbound audio chunk disarms it too
+        (the committed-draft path never runs the LLM). On expiry the body is
+        cancelled, a ``turn_timeout`` voice event fires and a short VERBAL
+        fallback is spoken (:meth:`_on_turn_timeout`); the ``finally`` below
+        then restores the FSM to a healthy idle exactly like any other exit.
         """
 
         first_audio_seen = False
+        # Issue 0126 — distinct (tighter) budgets for the voice path.
+        watchdog = TurnWatchdog(
+            ttft_timeout_s=self.settings.VOICE_TURN_TTFT_TIMEOUT_SECONDS,
+            completion_timeout_s=self.settings.VOICE_TURN_COMPLETION_TIMEOUT_SECONDS,
+        )
 
         async def _on_first_audio() -> None:
             nonlocal first_audio_seen
@@ -832,6 +847,10 @@ class FullDuplexLoop:
                 return
             first_audio_seen = True
             self._latency.t_first_audio_chunk = self._now()
+            # Issue 0126 — audio is flowing, so the provider definitely
+            # started answering (covers the committed-draft path, which
+            # bypasses the orchestrator's first-chunk note).
+            watchdog.note_first_token()
             moved = self._fsm.on_event(TurnEvent.SPEAK_START, turn_id=turn_id)
             if moved is not None:
                 await self._emit_turn_state(moved)
@@ -861,21 +880,107 @@ class FullDuplexLoop:
         # pump and any concurrent text turn are unaffected.
         metrics_token = turn_metrics.current_metrics_turn_id.set(turn_id)
         try:
-            await self.say_path(
-                transcript,
+            await watchdog.guard(
+                self.say_path(
+                    transcript,
+                    turn_id=turn_id,
+                    on_first_audio=_on_first_audio,
+                    on_spoken_progress=_on_spoken_progress,
+                    on_audio_chunk=_on_audio_chunk,
+                    prepared_reply=prepared_reply,
+                ),
+                name="voice.turn_watchdog",
+                session_id=self.session_id,
                 turn_id=turn_id,
-                on_first_audio=_on_first_audio,
-                on_spoken_progress=_on_spoken_progress,
-                on_audio_chunk=_on_audio_chunk,
-                prepared_reply=prepared_reply,
             )
         except asyncio.CancelledError:
             raise
+        except TurnTimeoutError as exc:
+            # Issue 0126 — budget expired: turn_timeout event + verbal
+            # fallback. The finally below still runs ``_finalize_say`` so the
+            # FSM returns to a healthy idle and the turn's latency +
+            # turn_metrics summaries are emitted like any other exit.
+            await self._on_turn_timeout(
+                turn_id, exc, transcript=transcript, on_first_audio=_on_first_audio
+            )
         except Exception:
             _logger.exception("voice_loop.say_path_failed", session_id=self.session_id)
         finally:
             turn_metrics.current_metrics_turn_id.reset(metrics_token)
             await self._finalize_say(turn_id)
+
+    async def _on_turn_timeout(
+        self,
+        turn_id: str,
+        exc: TurnTimeoutError,
+        *,
+        transcript: str,
+        on_first_audio: Callable[[], Awaitable[None]],
+    ) -> None:
+        """Expired turn budget: ``turn_timeout`` event + short verbal fallback.
+
+        PRD 0018 / issue 0126. The watchdog already cancelled the in-flight
+        say-path body (LLM stream + TTS); here we make the loss OBSERVABLE
+        and AUDIBLE instead of leaving the user in eternal silence:
+
+        1. emit the ``turn_timeout`` voice event (phase + budget) on the
+           unified bus — the chat client and the debug feed both see it;
+        2. bump the per-turn ``turn_timeout`` counter so the issue-0117
+           ``turn_metrics`` summary (still emitted by ``_finalize_say``)
+           records the cut;
+        3. speak the short fallback via the SAME say-path driver with
+           ``prepared_reply`` (no LLM call — the provider just proved itself
+           unresponsive), itself bounded by ``TURN_FALLBACK_TIMEOUT_SECONDS``
+           since the fallback TTS could hang on the same broken engine.
+
+        Never raises (cancellation excepted): the caller's ``finally`` owns
+        the FSM teardown via ``_finalize_say`` whatever happens here.
+        """
+
+        _logger.error(
+            "voice_loop.turn_timeout",
+            session_id=self.session_id,
+            turn_id=turn_id,
+            phase=exc.phase,
+            budget_seconds=exc.budget_seconds,
+        )
+        turn_metrics.get_default_collector().count(turn_id, "turn_timeout")
+        await emit_event(
+            {
+                "type": "turn_timeout",
+                "turn_id": turn_id,
+                "path": "voice",
+                "phase": exc.phase,
+                "budget_seconds": exc.budget_seconds,
+                "ts": self._now(),
+            },
+            category="voice",
+            severity="error",
+            source="bob.voice_loop.turn_timeout",
+            summary=f"turn_timeout {exc.phase} ({exc.budget_seconds:g}s) (turn={turn_id})",
+        )
+        if not transcript.strip():
+            return
+        fallback_timeout_s = self.settings.TURN_FALLBACK_TIMEOUT_SECONDS
+        try:
+            async with asyncio.timeout(fallback_timeout_s if fallback_timeout_s > 0 else None):
+                await self.say_path(
+                    transcript,
+                    turn_id=turn_id,
+                    on_first_audio=on_first_audio,
+                    prepared_reply=TURN_TIMEOUT_FALLBACK_SPEECH,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Best-effort by design: the turn_timeout event above is the
+            # guaranteed client signal; a fallback that cannot be voiced
+            # (TTS down) is logged, never re-raised.
+            _logger.exception(
+                "voice_loop.turn_timeout_fallback_failed",
+                session_id=self.session_id,
+                turn_id=turn_id,
+            )
 
     async def _finalize_say(self, turn_id: str) -> None:
         """Return the FSM to idle at the end of the say-path + reopen STT.

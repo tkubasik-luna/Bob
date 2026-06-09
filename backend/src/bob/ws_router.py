@@ -92,7 +92,7 @@ from bob.config import Settings, get_settings
 from bob.debug_log import emit_debug
 from bob.event_bus_v2 import emit_event, get_snapshot_for_task, subscribe_for_task
 from bob.live_transcript_state import LiveTranscriptState
-from bob.orchestrator import Orchestrator, get_default_orchestrator
+from bob.orchestrator import Orchestrator, OrchestratorResponse, get_default_orchestrator
 from bob.speculative_draft import SpeculativeDraft
 from bob.speech_pipeline import ChunkBatchSummary, SpeechStreamPipeline
 from bob.spoken_text_cleaner import clean_for_speech
@@ -101,6 +101,7 @@ from bob.task_store import TaskStoreError
 from bob.task_supervisor import create_supervised_task
 from bob.thinker_loop import ThinkerLoop
 from bob.tts_service import KokoroTtsService, SynthesisChunk, get_default_tts_service
+from bob.turn_watchdog import TURN_TIMEOUT_FALLBACK_SPEECH, TurnTimeoutError, TurnWatchdog
 from bob.voice_loop import FullDuplexLoop, PersistedTurn, SayPathDriver
 from bob.voice_turn import VoiceTurn
 
@@ -1469,8 +1470,50 @@ async def _handle_client_message(
     await _cancel_active_tts(session_id, emit_audio_end=True, websocket=websocket)
 
     await websocket.send_json({"type": "thinking", "state": "start"})
+    # PRD 0018 / issue 0126 — TurnWatchdog: the text turn runs under a TTFT +
+    # completion wall-clock budget. The orchestrator's streaming loop disarms
+    # the TTFT timer on the first provider chunk; expiry cancels the turn and
+    # delivers the short text fallback below instead of eternal silence.
+    turn_settings = get_settings()
+    watchdog = TurnWatchdog(
+        ttft_timeout_s=turn_settings.TURN_TTFT_TIMEOUT_SECONDS,
+        completion_timeout_s=turn_settings.TURN_COMPLETION_TIMEOUT_SECONDS,
+    )
     try:
-        response = await orchestrator.process_user_message(session_id, content)
+        response = await watchdog.guard(
+            orchestrator.process_user_message(session_id, content),
+            name="turn.text",
+            session_id=session_id,
+        )
+    except TurnTimeoutError as exc:
+        # Issue 0126 — expiry: emit the ``turn_timeout`` event (debug feed +
+        # WS fan-out), persist the fallback so the conversation history stays
+        # coherent, then fall through to the NORMAL emission path with the
+        # fallback as the reply (so a voice-requested turn still voices it).
+        _logger.error(
+            "ws_chat.turn_timeout",
+            session_id=session_id,
+            phase=exc.phase,
+            budget_seconds=exc.budget_seconds,
+        )
+        await emit_event(
+            {
+                "type": "turn_timeout",
+                "path": "text",
+                "phase": exc.phase,
+                "budget_seconds": exc.budget_seconds,
+                "session_id": session_id,
+            },
+            category="system",
+            severity="error",
+            source="bob.ws_router.turn_timeout",
+            summary=(f"turn_timeout {exc.phase} ({exc.budget_seconds:g}s) — fallback texte"),
+        )
+        with contextlib.suppress(RuntimeError):
+            jarvis_store_module.get_default_store().append(
+                "assistant", TURN_TIMEOUT_FALLBACK_SPEECH
+            )
+        response = OrchestratorResponse(speech=TURN_TIMEOUT_FALLBACK_SPEECH)
     except (httpx.ConnectError, openai.APIConnectionError, ConnectionError) as exc:
         _logger.error("ws_chat.llm_unreachable", session_id=session_id)
         # Issue: structlog uses ``PrintLoggerFactory`` which bypasses stdlib
@@ -1631,6 +1674,7 @@ async def _synthesize_and_stream(
         return
 
     tts = _tts_service_provider()
+    settings = get_settings()
 
     preparing = not _kokoro_model_files_present(tts)
     if preparing:
@@ -1642,10 +1686,46 @@ async def _synthesize_and_stream(
             summary="Kokoro download...",
             payload={"session_id": session_id, "msg_id": msg_id},
         )
+        # PRD 0018 / issue 0126 — bounded preload: a hung snapshot download /
+        # model load degrades to an explicit ``audio_error`` + ``audio_end``
+        # instead of a ``tts_preparing`` toast that never resolves. (The
+        # worker thread itself cannot be killed — it is abandoned; the client
+        # signal is the point.)
+        preload_timeout_s = settings.TTS_PRELOAD_TIMEOUT_SECONDS
         try:
-            await asyncio.to_thread(tts.preload)
+            if preload_timeout_s > 0:
+                await asyncio.wait_for(asyncio.to_thread(tts.preload), preload_timeout_s)
+            else:
+                await asyncio.to_thread(tts.preload)
         except asyncio.CancelledError:
             raise
+        except TimeoutError:
+            _logger.error(
+                "ws_chat.tts_preload_timeout",
+                session_id=session_id,
+                msg_id=msg_id,
+                timeout_seconds=preload_timeout_s,
+            )
+            emit_debug(
+                category="voice",
+                severity="warn",
+                source="bob.ws_router._synthesize_and_stream",
+                summary=f"Audio erreur: préchargement TTS > {preload_timeout_s:g}s",
+                payload={
+                    "session_id": session_id,
+                    "msg_id": msg_id,
+                    "timeout_seconds": preload_timeout_s,
+                },
+            )
+            await websocket.send_json(
+                {
+                    "type": "audio_error",
+                    "msg_id": msg_id,
+                    "reason": f"préchargement modèle TTS > {preload_timeout_s:g}s",
+                }
+            )
+            await websocket.send_json({"type": "audio_end", "msg_id": msg_id})
+            return
         except Exception as exc:
             _logger.exception("ws_chat.tts_download_failed", session_id=session_id, msg_id=msg_id)
             emit_debug(
@@ -1674,7 +1754,6 @@ async def _synthesize_and_stream(
             payload={"session_id": session_id, "msg_id": msg_id},
         )
 
-    settings = get_settings()
     started_at = time.perf_counter()
     started_audio = False
     error_emitted = False
@@ -1812,8 +1891,14 @@ async def _synthesize_and_stream(
         queue_max_chunks=settings.SPEECH_PIPELINE_QUEUE_MAX_CHUNKS,
         batch_window_ms=settings.SPEECH_PIPELINE_BATCH_WINDOW_MS,
     )
+    # PRD 0018 / issue 0126 — bounded streaming: a synthesis (or drain) that
+    # hangs mid-stream is cut at the budget and surfaced to the client as an
+    # explicit ``audio_error`` + ``audio_end`` instead of an ``audio_start``
+    # whose audio never finishes (or never starts).
+    stream_timeout_s = settings.TTS_STREAM_TIMEOUT_SECONDS
     try:
-        await pipeline.run(sentences)
+        async with asyncio.timeout(stream_timeout_s if stream_timeout_s > 0 else None):
+            await pipeline.run(sentences)
         await websocket.send_json({"type": "audio_end", "msg_id": msg_id})
         emit_debug(
             category="voice",
@@ -1822,6 +1907,34 @@ async def _synthesize_and_stream(
             summary="Audio stream terminé",
             payload={"session_id": session_id, "msg_id": msg_id},
         )
+    except TimeoutError:
+        _logger.error(
+            "ws_chat.tts_stream_timeout",
+            session_id=session_id,
+            msg_id=msg_id,
+            timeout_seconds=stream_timeout_s,
+        )
+        emit_debug(
+            category="voice",
+            severity="warn",
+            source="bob.ws_router._synthesize_and_stream",
+            summary=f"Audio erreur: flux TTS > {stream_timeout_s:g}s — coupé",
+            payload={
+                "session_id": session_id,
+                "msg_id": msg_id,
+                "timeout_seconds": stream_timeout_s,
+                "chunks_sent": chunks_sent,
+            },
+        )
+        with contextlib.suppress(Exception):
+            await websocket.send_json(
+                {
+                    "type": "audio_error",
+                    "msg_id": msg_id,
+                    "reason": f"flux TTS interrompu après {stream_timeout_s:g}s",
+                }
+            )
+            await websocket.send_json({"type": "audio_end", "msg_id": msg_id})
     except asyncio.CancelledError:
         # The cancelling path emits the final audio_end. Bubble out.
         raise
