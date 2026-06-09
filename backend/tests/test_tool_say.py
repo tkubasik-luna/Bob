@@ -275,6 +275,15 @@ async def test_say_handler_tolerates_missing_jarvis_store() -> None:
         def mark_superseded(self, task_id: str) -> None:
             return None
 
+        def find_by_query(
+            self,
+            query: str,
+            *,
+            prefer_state: Any = None,
+            limit: int = 1,
+        ) -> Any:
+            return []
+
     async def _emit(event: dict[str, Any]) -> None:
         return None
 

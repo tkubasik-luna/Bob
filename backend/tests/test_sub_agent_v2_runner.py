@@ -3160,7 +3160,8 @@ async def test_p4_single_result_ref_expands_to_full_multi_mail_section_list() ->
     assert task.state == "done"
     assert task.result_payload is not None
     assert [s["component"] for s in task.result_payload] == ["Mail", "Mail", "Mail"]
-    assert [s["props"]["subject"] for s in task.result_payload] == ["mail A", "mail B", "mail C"]
+    props = [s["props"] for s in task.result_payload]
+    assert [p["subject"] for p in props if isinstance(p, dict)] == ["mail A", "mail B", "mail C"]
 
 
 @pytest.mark.asyncio

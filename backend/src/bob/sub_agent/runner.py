@@ -906,6 +906,16 @@ class SubAgentRunner:
         # per turn (mirrors the goal-stable nature of the gate).
         self._pending_tool_retrieval: ToolRetrieval | None = None
         self._last_advertised_signature: tuple[str, ...] | None = None
+        # PRD 0018 / issue 0128 — per-run prompt-prefix cache. The runner is
+        # single-shot (one instance per task) and the task goal is immutable,
+        # so the advertised-tools selection (``select_tools``), the rendered
+        # tool catalogue (~20 KB of JSON Schema) and the skill packs are
+        # computed ONCE on the first iteration and reused byte-identical on
+        # every subsequent one. Combined with the stable-first fragment
+        # ordering in :meth:`_build_messages` this keeps the system-prompt
+        # prefix byte-stable across iterations so a local backend (LM Studio
+        # KV-cache) avoids a full re-prefill per iteration.
+        self._stable_system_prefix: str | None = None
 
     @property
     def addendum_queue(self) -> AddendumQueue:
@@ -1764,27 +1774,56 @@ class SubAgentRunner:
         )
         return advertised
 
+    def _stable_prompt_prefix(self, task: Task) -> str:
+        """The per-run-immutable head of the system prompt (issue 0128).
+
+        Base contract (goal-rendered) + goal-matching skill packs + the
+        rendered tool catalogue. All three depend only on the immutable task
+        goal (and the registry frozen at construction), so the block is
+        computed ONCE on the first iteration — ``select_tools`` runs once per
+        run — and every later iteration reuses the byte-identical string.
+        The catalogue is therefore frozen for the life of the run: a registry
+        mutated mid-run does not perturb the advertised set (the prefix
+        stability IS the contract — LM Studio KV-cache reuse).
+        """
+
+        if self._stable_system_prefix is None:
+            advertised_tools = self._advertise_tools(task)
+            tool_catalogue = _render_tool_catalogue(advertised_tools)
+            prefix = SUB_AGENT_V2_SYSTEM_PROMPT.render(goal=task.goal)
+            # Issue 0063: append any goal-matching skill packs (the Gmail
+            # recipe today) so the base contract stays tool-agnostic and a
+            # non-matching goal never pays for an irrelevant recipe's tokens.
+            for pack in select_skill_packs(task.goal):
+                prefix += "\n\n" + pack.render()
+            if tool_catalogue:
+                prefix += "\n\nOutils disponibles :\n" + tool_catalogue
+            self._stable_system_prefix = prefix
+        return self._stable_system_prefix
+
     def _build_messages(
         self,
         task: Task,
         pending_addenda: list[AddendumEntry],
     ) -> list[dict[str, Any]]:
-        """Build the LLM message list including history + drained addenda."""
+        """Build the LLM message list including history + drained addenda.
 
-        advertised_tools = self._advertise_tools(task)
-        tool_catalogue = _render_tool_catalogue(advertised_tools)
-        system_prompt = SUB_AGENT_V2_SYSTEM_PROMPT.render(goal=task.goal)
-        # Inject the current date so date-typed tool args (e.g. gmail_search
-        # ``after`` / ``before``) get the right year — local models otherwise
-        # hallucinate a stale one and the query builder rejects it.
+        Issue 0128 — fragment order is STABLE-FIRST: the per-run-immutable
+        prefix (base contract + skill packs + tool catalogue, cached via
+        :meth:`_stable_prompt_prefix`) leads, and the variable temporal
+        context trails it, so the system-prompt prefix stays byte-identical
+        across iterations. Validator feedback is appended by the caller AFTER
+        the assembled messages, so it never perturbs the prefix either.
+        """
+
+        system_prompt = self._stable_prompt_prefix(task)
+        # Variable tail — inject the current date so date-typed tool args
+        # (e.g. gmail_search ``after`` / ``before``) get the right year;
+        # local models otherwise hallucinate a stale one and the query
+        # builder rejects it. Re-evaluated each iteration (a run may span
+        # midnight) but placed AFTER every stable fragment so it never
+        # invalidates the cached prefix above it.
         system_prompt += "\n\n" + temporal_context_fragment()
-        # Issue 0063: append any goal-matching skill packs (the Gmail recipe
-        # today) so the base contract stays tool-agnostic and a non-matching
-        # goal never pays for an irrelevant recipe's tokens.
-        for pack in select_skill_packs(task.goal):
-            system_prompt += "\n\n" + pack.render()
-        if tool_catalogue:
-            system_prompt += "\n\nOutils disponibles :\n" + tool_catalogue
 
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_prompt},

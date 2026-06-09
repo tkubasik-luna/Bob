@@ -85,6 +85,15 @@ class _StubTaskStore:
     def mark_superseded(self, task_id: str) -> None:
         return None
 
+    def find_by_query(
+        self,
+        query: str,
+        *,
+        prefer_state: object = None,
+        limit: int = 1,
+    ) -> list[object]:
+        return []
+
 
 class _StubScheduler:
     async def enqueue(self, _task_id: str) -> None:

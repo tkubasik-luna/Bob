@@ -458,9 +458,21 @@ class Orchestrator:
                 payload={"session_id": session_id},
             )
 
+            # Issue 0128 — stable-first fragment order. The byte-stable prefix
+            # (personality + UI components addendum + tools contract) leads;
+            # the variable fragments (temporal context, waiting-input list)
+            # trail it, so two consecutive turns of the same session share an
+            # identical system-prompt prefix and a local backend (LM Studio
+            # KV-cache) avoids a full re-prefill per turn.
             system_content = self._build_system_prompt()
             waiting_context = self._build_waiting_input_addendum()
-            complete_system = system_content + _TOOLS_SYSTEM_ADDENDUM + waiting_context
+            complete_system = (
+                system_content
+                + _TOOLS_SYSTEM_ADDENDUM
+                + "\n\n"
+                + temporal_context_fragment()
+                + waiting_context
+            )
 
             # PRD 0006 / issue 0046 — bounded policy needs the rolling
             # summary to reflect the latest persisted older turns. The
@@ -1530,11 +1542,20 @@ class Orchestrator:
         )
 
     def _build_system_prompt(self) -> str:
+        """The stable Jarvis system prefix — byte-identical across turns.
+
+        Issue 0128 — carries ONLY turn-invariant fragments (personality +
+        UI components addendum). The variable fragments (temporal context,
+        waiting-input addendum) are appended by the caller AFTER this prefix
+        and the static tools contract, so the system-prompt prefix stays
+        byte-stable across turns (LM Studio prefix-cache reuse).
+        """
+
         ui_addendum = self._prompts.render(
             "system_chat",
             components_description=self._ui_registry.get_components_description_for_prompt(),
         )
-        return f"{self._jarvis_prompt}\n\n{temporal_context_fragment()}\n\n{ui_addendum}"
+        return f"{self._jarvis_prompt}\n\n{ui_addendum}"
 
     def _build_waiting_input_addendum(self) -> str:
         """Render a system-prompt suffix listing tasks waiting for the user.

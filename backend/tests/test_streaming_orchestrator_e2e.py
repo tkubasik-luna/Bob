@@ -353,9 +353,7 @@ async def test_e2e_jarvis_lane_reasoning_chip_and_final_answer(
     # Jarvis-lane reasoning rides ``reasoning_delta`` (chain-of-thought ONLY —
     # the settled answer is now a distinct channel, not folded in here).
     jarvis_reasoning = [
-        e
-        for e in recorder
-        if e["type"] == "reasoning_delta" and e.get("agent_ref") == "jarvis"
+        e for e in recorder if e["type"] == "reasoning_delta" and e.get("agent_ref") == "jarvis"
     ]
     joined = "".join(d["delta"] for d in jarvis_reasoning)
     assert "L'utilisateur dit bonjour." in joined
@@ -387,9 +385,7 @@ async def test_e2e_jarvis_lane_degraded_no_reasoning_still_has_answer(
 
     # No reasoning channel → no Jarvis reasoning frames at all.
     jarvis_reasoning = [
-        e
-        for e in recorder
-        if e["type"] == "reasoning_delta" and e.get("agent_ref") == "jarvis"
+        e for e in recorder if e["type"] == "reasoning_delta" and e.get("agent_ref") == "jarvis"
     ]
     assert jarvis_reasoning == []
     # The answer still reaches the lane via ``agent_answer``.
@@ -417,17 +413,13 @@ async def test_e2e_jarvis_lane_delegate_emits_orchestration_chip(
         name="spawn_task",
         arguments={"title": "Exposé", "goal": "Rédige un long exposé"},
     )
-    client = FakeLLMClient(
-        complete_responses=[LLMResponse(text=None, tool_calls=[spawn_call])]
-    )
+    client = FakeLLMClient(complete_responses=[LLMResponse(text=None, tool_calls=[spawn_call])])
     orchestrator, _js = _build_orchestrator(client)
     response = await orchestrator.process_user_message("s1", "fais un exposé")
     assert len(response.spawned_task_ids) == 1
 
     jarvis_chips = [
-        e
-        for e in recorder
-        if e["type"] == "agent_activity" and e.get("agent_ref") == "jarvis"
+        e for e in recorder if e["type"] == "agent_activity" and e.get("agent_ref") == "jarvis"
     ]
     assert len(jarvis_chips) == 1
     chip = jarvis_chips[0]

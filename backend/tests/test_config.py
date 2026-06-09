@@ -37,7 +37,7 @@ def test_settings_loads_from_env(monkeypatch: pytest.MonkeyPatch, tmp_path: obje
     assert settings.LLM_BASE_URL == "http://localhost:1234/v1"
     assert settings.LLM_MODEL == "qwen2.5-7b-instruct"
     assert settings.LLM_API_KEY == "lm-studio"
-    assert settings.LLM_TIMEOUT_SECONDS == 60.0
+    assert settings.LLM_TIMEOUT_SECONDS == 3600.0
     assert settings.BACKEND_HOST == "127.0.0.1"
     assert settings.BACKEND_PORT == 8000
     assert settings.LOG_LEVEL == "INFO"

@@ -57,9 +57,7 @@ class _FakeSwitcher:
         assert self.provider_result is not None
         return self.provider_result
 
-    async def swap_lm_model(
-        self, model_id: str, context_length: int | None = None
-    ) -> SwapResult:
+    async def swap_lm_model(self, model_id: str, context_length: int | None = None) -> SwapResult:
         self.model_calls.append((model_id, context_length))
         assert self.provider_result is not None
         return self.provider_result
@@ -86,9 +84,7 @@ def _reset() -> None:
 def test_put_provider_success_returns_new_selection_with_claude_label() -> None:
     switcher = _FakeSwitcher(
         provider_result=SwapResult(
-            selection=LLMSelection(
-                provider="claude_cli", lm_model="boot-model", context_length={}
-            )
+            selection=LLMSelection(provider="claude_cli", lm_model="boot-model", context_length={})
         )
     )
     client = _client(switcher)
@@ -149,9 +145,7 @@ def test_put_rejects_body_with_both_fields() -> None:
     )
     client = _client(switcher)
     try:
-        response = client.put(
-            "/api/llm/selection", json={"provider": "lm_studio", "lm_model": "m"}
-        )
+        response = client.put("/api/llm/selection", json={"provider": "lm_studio", "lm_model": "m"})
     finally:
         _reset()
 
@@ -177,16 +171,12 @@ def test_put_rejects_empty_body() -> None:
 def test_put_model_with_context_length_threads_ctx_to_switcher() -> None:
     switcher = _FakeSwitcher(
         provider_result=SwapResult(
-            selection=LLMSelection(
-                provider="lm_studio", lm_model="m", context_length={"m": 32768}
-            )
+            selection=LLMSelection(provider="lm_studio", lm_model="m", context_length={"m": 32768})
         )
     )
     client = _client(switcher)
     try:
-        response = client.put(
-            "/api/llm/selection", json={"lm_model": "m", "context_length": 32768}
-        )
+        response = client.put("/api/llm/selection", json={"lm_model": "m", "context_length": 32768})
     finally:
         _reset()
 
@@ -239,9 +229,7 @@ def test_put_non_positive_context_length_rejected_422() -> None:
     )
     client = _client(switcher)
     try:
-        response = client.put(
-            "/api/llm/selection", json={"lm_model": "m", "context_length": 0}
-        )
+        response = client.put("/api/llm/selection", json={"lm_model": "m", "context_length": 0})
     finally:
         _reset()
 
