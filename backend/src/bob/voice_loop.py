@@ -85,6 +85,7 @@ from typing import Protocol
 
 import structlog
 
+from bob import turn_metrics
 from bob.backchannel import BackchannelDecider
 from bob.bargein import BargeInConfirmation, BargeInController
 from bob.config import Settings
@@ -533,6 +534,9 @@ class FullDuplexLoop:
         # turn aborted (Annexe G), else ``voice_stop``.
         if mid_turn and active_turn_id is not None:
             await self._persist_turn(active_turn_id, "error" if aborted else "voice_stop")
+            # Issue 0117 — a mid-turn teardown still produces a metrics summary
+            # (no-op when the cancelled say-path's finalize already emitted it).
+            await self._emit_turn_metrics(active_turn_id)
 
     # -- FSM-driven steps ----------------------------------------------------
 
@@ -568,6 +572,11 @@ class FullDuplexLoop:
             # Fresh latency accumulator for this turn (keep the first-mic-frame
             # stamp — it measures from when Bob started listening).
             self._latency = TurnLatency(t_first_mic_frame=self._latency.t_first_mic_frame)
+            # Register the turn with the critical-path metrics collector (PRD
+            # 0018 / issue 0117) — its time origin is speech start, so the
+            # ``endpoint`` stage measures the user's speaking time and every
+            # later stage a pipeline step. The summary is emitted at finalize.
+            turn_metrics.get_default_collector().begin_turn(transition.turn_id)
             # Fresh per-turn capture buffers (PRD 0016 / issue 0109). Reset HERE
             # at the open so the persisted ``mic_in`` is this utterance only; the
             # frame that just tripped speech-start is already in ``_mic_pcm`` from
@@ -600,6 +609,11 @@ class FullDuplexLoop:
         if self._fsm.state is TurnState.THINKING:
             await self._dispatch(TurnEvent.VAD_SPEECH_START, turn_id=self._fsm.turn_id)
             await self._cancel_say_task()
+            # The cancelled say-path's finalize closed the turn's metrics entry
+            # (issue 0117); the resumed utterance re-uses the SAME turn id, so
+            # re-register it with a fresh time origin.
+            if self._fsm.turn_id is not None:
+                turn_metrics.get_default_collector().begin_turn(self._fsm.turn_id)
             if self._turn is None:
                 await self._open_stt_turn()
 
@@ -616,6 +630,11 @@ class FullDuplexLoop:
         if transition is None:
             return
         await self._emit_turn_state(transition)
+        # Critical-path metrics (PRD 0018 / issue 0117): the ``endpoint`` mark
+        # opens the response path; the next marks below time each sequential
+        # step it crosses before the say-path launches.
+        metrics = turn_metrics.get_default_collector()
+        metrics.mark(transition.turn_id, "endpoint")
 
         # Annexe H — the endpoint FREEZES the turn: cooperatively cancel the
         # in-flight Thinker pass (cancel + grace + hard-kill, inside the hook)
@@ -634,6 +653,9 @@ class FullDuplexLoop:
         if self.on_draft_stop is not None:
             with contextlib.suppress(Exception):
                 await self.on_draft_stop()
+        # ``loops_frozen`` — both anticipation loops are cancelled (their
+        # cooperative grace is the dominant cost PRD 0018 Module 2 attacks).
+        metrics.mark(transition.turn_id, "loops_frozen")
 
         # Freeze the transcript (0099 finalize → stt_final) and detach the turn.
         turn = self._turn
@@ -643,6 +665,8 @@ class FullDuplexLoop:
             final = await turn.finalize()
             if final is not None:
                 transcript = final.text
+        # ``stt_finalized`` — the frozen final transcript is available.
+        metrics.mark(transition.turn_id, "stt_finalized")
         # Record the frozen transcript for this turn's persisted row (issue 0109);
         # the say-path's reply (spoken_text) + completion drive the actual write.
         self._final_transcript = transcript
@@ -658,6 +682,9 @@ class FullDuplexLoop:
         # Bob answers near-instantly; a discarded one (divergence / no draft / tool
         # turn) leaves ``prepared_reply`` None and the say-path regenerates COLD.
         prepared_reply = await self._run_commit_gate(transcript, transition.turn_id)
+        # ``gate_decided`` — the speculative-draft verdict is in; the say-path
+        # can launch (committed draft or cold regeneration).
+        metrics.mark(transition.turn_id, "gate_decided")
 
         # Launch the say-path as a background task so a long generation does not
         # block the frame pump. Frames keep feeding STT while Bob speaks; once a
@@ -702,6 +729,15 @@ class FullDuplexLoop:
         # ``t_commit_decision`` — the gate ran (whatever the verdict).
         self._latency.t_commit_decision = self._now()
         self._latency.draft_hit = decision.committed
+
+        # Draft hit-rate counters (PRD 0018 / issue 0117): adopted vs discarded
+        # only when a draft actually existed at the gate — a ``no_draft`` /
+        # ``tool_turn`` verdict judged nothing, so it must not dilute the
+        # adoption rate the aggregates derive.
+        if decision.committed:
+            turn_metrics.get_default_collector().count(turn_id, "draft_adopted")
+        elif decision.reason not in ("no_draft", "tool_turn"):
+            turn_metrics.get_default_collector().count(turn_id, "draft_discarded")
 
         if self.draft_emit_decision is not None:
             with contextlib.suppress(Exception):
@@ -757,6 +793,14 @@ class FullDuplexLoop:
                 self._tts_pcm.extend(pcm)
                 self._tts_sample_rate = sample_rate
 
+        # Bind the metrics turn id for the say-path task's duration (PRD 0018 /
+        # issue 0117): the downstream sites that stamp ``llm_first_token`` /
+        # ``tts_first_chunk`` / ``audio_first_byte`` and count validation
+        # retries (orchestrator + ws_router) never see the voice turn id — they
+        # resolve it from this ContextVar via ``mark_current`` / ``count_current``.
+        # The var is task-local (set inside this task's context), so the frame
+        # pump and any concurrent text turn are unaffected.
+        metrics_token = turn_metrics.current_metrics_turn_id.set(turn_id)
         try:
             await self.say_path(
                 transcript,
@@ -771,6 +815,7 @@ class FullDuplexLoop:
         except Exception:
             _logger.exception("voice_loop.say_path_failed", session_id=self.session_id)
         finally:
+            turn_metrics.current_metrics_turn_id.reset(metrics_token)
             await self._finalize_say(turn_id)
 
     async def _finalize_say(self, turn_id: str) -> None:
@@ -812,6 +857,7 @@ class FullDuplexLoop:
         if transition is not None:
             await self._emit_turn_state(transition)
         await self._emit_turn_latency(turn_id)
+        await self._emit_turn_metrics(turn_id)
         # Persist the finished turn (PRD 0016 / issue 0109). ``completed_normally``
         # is true only when THIS say-task drove the teardown (the say-path ran to
         # the end while still owning the floor). A barge-in re-points the FSM to
@@ -861,6 +907,11 @@ class FullDuplexLoop:
 
         # cancel_llm_stream + cancel_tts — tearing the say task down cancels both.
         await self._cancel_say_task()
+        # The cancelled say-path's finalize emitted the interrupted turn's
+        # metrics summary (issue 0117). The barge-in re-uses the SAME id for
+        # the resumed utterance (0101 FSM contract), so re-register it with a
+        # fresh time origin — its own endpoint path produces its own summary.
+        turn_metrics.get_default_collector().begin_turn(turn_id)
 
         # commit_spoken_partial — persist exactly what left the speaker.
         if committed_spoken_text.strip() and self.commit_spoken is not None:
@@ -1091,6 +1142,35 @@ class FullDuplexLoop:
             severity="debug",
             source="bob.voice_loop.turn_latency",
             summary=f"turn_latency (turn={turn_id})",
+        )
+
+    async def _emit_turn_metrics(self, turn_id: str) -> None:
+        """Emit the PRD 0018 ``turn_metrics`` summary for a finished turn.
+
+        Issue 0117 — the per-turn critical-path decomposition (stage durations
+        + draft/retry counters) from :class:`bob.turn_metrics.TurnLatencyMetrics`,
+        with the rolling P50/P95 aggregates attached so the Debug View shows
+        the baseline numbers on the existing debug-event channel (no new UI).
+        Closing the turn also EVICTS it from the collector (bounded retention);
+        a turn already closed by another exit path is a silent no-op, so every
+        finalize exit (completed, barge-in, ``voice_stop``) can call this.
+        """
+
+        collector = turn_metrics.get_default_collector()
+        summary = collector.finish_turn(turn_id)
+        if summary is None:
+            return
+        await emit_event(
+            {
+                "type": "turn_metrics",
+                **summary,
+                "aggregates": collector.aggregates(),
+                "ts": self._now(),
+            },
+            category="voice",
+            severity="debug",
+            source="bob.voice_loop.turn_metrics",
+            summary=f"turn_metrics (turn={turn_id})",
         )
 
     async def _emit_bargein(

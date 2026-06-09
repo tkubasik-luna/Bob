@@ -77,7 +77,7 @@ import structlog
 
 from bob import jarvis_store as jarvis_store_module
 from bob import prompts as prompts_module
-from bob import task_scheduler, ws_events
+from bob import task_scheduler, turn_metrics, ws_events
 from bob import task_store as task_store_module
 from bob import ui_registry as ui_registry_module
 from bob.config import get_settings
@@ -649,6 +649,9 @@ class Orchestrator:
                 )
                 envelope.record_feedback(feedback_messages[-1]["content"])
                 envelope.increment(error_code="no_tool_call")
+                # PRD 0018 / issue 0117 — feed the validation-retry distribution
+                # (no-op outside a metered voice turn).
+                turn_metrics.count_current("validation_retry")
                 continue
 
             # ---- Dispatch tool calls.
@@ -715,6 +718,9 @@ class Orchestrator:
             )
             envelope.record_feedback(feedback_messages[-1]["content"])
             envelope.increment(error_code=error_code)
+            # PRD 0018 / issue 0117 — feed the validation-retry distribution
+            # (no-op outside a metered voice turn).
+            turn_metrics.count_current("validation_retry")
             continue
 
     async def _stream_jarvis_call(
@@ -773,8 +779,18 @@ class Orchestrator:
         # uniqueness.
         active_say_id: str | None = None
         emitter_finalised = False
+        first_chunk_seen = False
 
         async for chunk in stream:
+            if not first_chunk_seen:
+                first_chunk_seen = True
+                # PRD 0018 / issue 0117 — ``llm_first_token``: the provider
+                # started answering. Resolved through the metrics ContextVar:
+                # a no-op on text turns (no voice turn bound), and first-write-
+                # wins inside the collector so a validation retry's second
+                # stream never moves the mark (the retry shows up in the
+                # ``validation_retry`` counter instead).
+                turn_metrics.mark_current("llm_first_token")
             if chunk.kind == "tool_call_start":
                 assert chunk.tool_call_id is not None
                 assert chunk.name is not None

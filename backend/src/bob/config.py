@@ -445,6 +445,18 @@ class Settings(BaseSettings):
     VOICE_RETENTION_MAX_AUDIO_BYTES: int = int(1.5 * 1024 * 1024 * 1024)
     VOICE_RETENTION_MAX_TURN_AGE_DAYS: float = 30.0
 
+    # Turn latency metrics (PRD 0018 / issue 0117, Module 1). The in-memory
+    # :class:`bob.turn_metrics.TurnLatencyMetrics` collector decomposes every
+    # voice turn's critical path (endpoint → … → audio_first_byte) and keeps
+    # rolling P50/P95 aggregates per stage — the BASELINE all later PRD 0018
+    # optimizations are measured against. ``TURN_METRICS_MAX_TURNS`` bounds the
+    # simultaneously-tracked (begun, unfinished) turns — the oldest is evicted
+    # past the cap so an abandoned turn can never leak. ``TURN_METRICS_WINDOW``
+    # bounds each stage's rolling percentile sample window. Both keep the
+    # collector strictly bounded on a long session (no persistence).
+    TURN_METRICS_MAX_TURNS: int = 64
+    TURN_METRICS_WINDOW: int = 256
+
     def voice_retention_policy(self) -> VoiceRetentionPolicy:
         """Build the :class:`VoiceRetentionPolicy` from the settings dials.
 

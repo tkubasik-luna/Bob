@@ -23,7 +23,7 @@ from typing import Any
 
 import pytest
 
-from bob import debug_log
+from bob import debug_log, turn_metrics
 from bob.config import Settings
 from bob.speculative_draft import SpeculativeDraft
 from bob.stt_engine import MIC_FRAME_TAG, FakeSttEngine
@@ -155,6 +155,9 @@ def _backchannel_events() -> list[dict[str, Any]]:
 @pytest.fixture(autouse=True)
 def _clear_buffer() -> None:
     debug_log.clear()
+    # Fresh per-test metrics collector (issue 0117) so rolling aggregates and
+    # in-flight turn entries never leak across tests.
+    turn_metrics.set_default_collector(None)
 
 
 # --- happy-path full cycle ---------------------------------------------------
@@ -1161,3 +1164,166 @@ async def test_no_drafter_keeps_cold_path_unchanged() -> None:
     assert latency["derived"]["draft_hit"] is False
     assert "t_draft_ready" not in latency["marks"]
     assert "t_commit_decision" not in latency["marks"]
+
+
+# --- turn metrics (PRD 0018 / issue 0117) ------------------------------------
+
+
+def _turn_metrics_events() -> list[dict[str, Any]]:
+    """The ``turn_metrics`` ws_event bodies currently in the debug ring buffer."""
+
+    out: list[dict[str, Any]] = []
+    for event in debug_log.snapshot():
+        ws_event = (event.payload or {}).get("ws_event") or {}
+        if ws_event.get("type") == "turn_metrics":
+            out.append(ws_event)
+    return out
+
+
+class _MarkingSayPath(_RecordingSayPath):
+    """A say-path that stamps the downstream marks like the real driver does.
+
+    The real say-path sites (orchestrator first LLM token, ws_router TTS
+    first-chunk/first-byte) resolve the turn through the metrics ContextVar the
+    loop binds for the say task — this fake exercises that exact seam.
+    """
+
+    async def __call__(
+        self,
+        transcript: str,
+        *,
+        turn_id: str,
+        on_first_audio: Callable[[], Awaitable[None]],
+        on_spoken_progress: Callable[[str], Awaitable[None]] | None = None,
+        on_audio_chunk: Callable[[bytes, int], Awaitable[None]] | None = None,
+        prepared_reply: str | None = None,
+    ) -> None:
+        turn_metrics.mark_current("llm_first_token")
+        turn_metrics.mark_current("tts_first_chunk")
+        turn_metrics.count_current("validation_retry")
+        await super().__call__(
+            transcript,
+            turn_id=turn_id,
+            on_first_audio=on_first_audio,
+            on_spoken_progress=on_spoken_progress,
+            on_audio_chunk=on_audio_chunk,
+            prepared_reply=prepared_reply,
+        )
+        turn_metrics.mark_current("audio_first_byte")
+
+
+async def test_completed_turn_emits_turn_metrics_summary() -> None:
+    say = _MarkingSayPath(produce_audio=True)
+    loop = _loop(say, transcript="bonjour le monde")
+    await loop.start()
+    for _ in range(8):
+        await loop.feed_raw_frame(_LOUD)
+    for _ in range(8):
+        await loop.feed_raw_frame(_QUIET)
+    await loop.join()
+
+    events = _turn_metrics_events()
+    assert len(events) == 1
+    body = events[0]
+    assert body["turn_id"] == say.turn_ids[0]
+
+    # The loop-owned endpoint-path stages are all timed...
+    stages = body["stages_ms"]
+    for stage in ("endpoint", "loops_frozen", "stt_finalized", "gate_decided"):
+        assert stage in stages
+    # ...and the say-path stages resolved through the bound ContextVar.
+    for stage in ("llm_first_token", "tts_first_chunk", "audio_first_byte"):
+        assert stage in stages
+    # The marks are chronological: each stage duration is >= 0 and the marks
+    # follow the pipeline order endpoint -> ... -> audio_first_byte.
+    assert all(duration >= 0 for duration in stages.values())
+    marks = body["marks"]
+    assert marks["endpoint"] <= marks["stt_finalized"] <= marks["gate_decided"]
+    assert marks["gate_decided"] <= marks["llm_first_token"] <= marks["audio_first_byte"]
+
+    # Counters carry the stable schema + the retry the say-path counted.
+    counters = body["counters"]
+    assert counters["validation_retry"] == 1
+    assert counters["draft_adopted"] == 0
+    assert counters["draft_discarded"] == 0
+
+    # The rolling aggregates ride the same event (consultable in the Debug
+    # View) and already include this turn's samples.
+    aggregates = body["aggregates"]
+    assert aggregates["turns_measured"] == 1
+    assert aggregates["stages"]["endpoint"]["count"] == 1
+    assert "p50_ms" in aggregates["stages"]["endpoint"]
+    assert "p95_ms" in aggregates["stages"]["endpoint"]
+
+
+async def test_committed_draft_turn_counts_draft_adopted() -> None:
+    say = _RecordingSayPath(produce_audio=True)
+    loop, _drafter = _loop_with_draft(say, draft_reply="Il fait beau à Paris.")
+    await loop.start()
+    for _ in range(8):
+        await loop.feed_raw_frame(_LOUD)
+    for _ in range(8):
+        await loop.feed_raw_frame(_QUIET)
+    await loop.join()
+
+    body = _turn_metrics_events()[-1]
+    assert body["counters"]["draft_adopted"] == 1
+    assert body["counters"]["draft_discarded"] == 0
+    assert body["aggregates"]["draft_adoption_rate"] == 1.0
+
+
+async def test_discarded_draft_turn_counts_draft_discarded() -> None:
+    say = _RecordingSayPath(produce_audio=True)
+    loop, _drafter = _loop_with_draft(
+        say,
+        draft_reply="Je réserve une table.",
+        transcript="reserve une table pour ce soir",
+        revise_to="annule tout finalement laisse tomber",
+    )
+    await loop.start()
+    for _ in range(10):
+        await loop.feed_raw_frame(_LOUD)
+    for _ in range(8):
+        await loop.feed_raw_frame(_QUIET)
+    await loop.join()
+
+    body = _turn_metrics_events()[-1]
+    assert body["counters"]["draft_adopted"] == 0
+    assert body["counters"]["draft_discarded"] == 1
+    assert body["aggregates"]["draft_adoption_rate"] == 0.0
+
+
+async def test_voice_stop_midturn_still_emits_turn_metrics() -> None:
+    say = _RecordingSayPath()
+    loop = _loop(say)
+    await loop.start()
+    for _ in range(5):
+        await loop.feed_raw_frame(_LOUD)
+    assert loop.state is TurnState.USER_SPEAKING
+
+    await loop.stop()
+    # The turn never reached the endpoint, but the teardown still closes its
+    # metrics entry with a (stage-less) summary — no silent leak.
+    events = _turn_metrics_events()
+    assert len(events) == 1
+    assert events[0]["stages_ms"] == {}
+
+
+async def test_one_metrics_summary_per_turn_across_consecutive_turns() -> None:
+    say = _RecordingSayPath(produce_audio=True)
+    loop = _loop(say, transcript="bonjour")
+    await loop.start()
+    for _ in range(2):
+        for _ in range(6):
+            await loop.feed_raw_frame(_LOUD)
+        for _ in range(8):
+            await loop.feed_raw_frame(_QUIET)
+        await loop.join()
+
+    events = _turn_metrics_events()
+    assert len(events) == 2
+    # Two distinct turns, each summarised exactly once.
+    assert len({e["turn_id"] for e in events}) == 2
+    body = events[-1]
+    assert body["aggregates"]["turns_measured"] == 2
+    assert body["aggregates"]["stages"]["endpoint"]["count"] == 2

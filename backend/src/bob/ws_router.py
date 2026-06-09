@@ -86,7 +86,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from bob import jarvis_store as jarvis_store_module
 from bob import task_scheduler as task_scheduler_module
 from bob import task_store as task_store_module
-from bob import text_segmenter, voice_retention_policy, ws_events
+from bob import text_segmenter, turn_metrics, voice_retention_policy, ws_events
 from bob import voice_store as voice_store_module
 from bob.config import Settings
 from bob.debug_log import emit_debug
@@ -1655,6 +1655,11 @@ async def _synthesize_and_stream(
             try:
                 async for chunk in tts.synthesize_stream(sentence):
                     if not started_audio:
+                        # PRD 0018 / issue 0117 — ``tts_first_chunk``: the
+                        # synthesiser produced the turn's first PCM block
+                        # (before any network write). A no-op outside a
+                        # metered voice turn (text path / proactive TTS).
+                        turn_metrics.mark_current("tts_first_chunk")
                         await websocket.send_json(
                             {
                                 "type": "audio_start",
@@ -1690,6 +1695,12 @@ async def _synthesize_and_stream(
                             await on_first_audio()
                             on_first_audio = None
                     await websocket.send_bytes(chunk.pcm16)
+                    if audio_chunks == 0:
+                        # PRD 0018 / issue 0117 — ``audio_first_byte``: the
+                        # turn's first PCM bytes actually LEFT the socket (vs
+                        # ``tts_first_chunk`` = synthesis ready). The gap
+                        # between the two is the network/write cost.
+                        turn_metrics.mark_current("audio_first_byte")
                     # PRD 0016 / Annexe A.2 — surface each outbound PCM block as
                     # an ``audio_chunk`` voice event so the attestation harness
                     # can count audio-out on ``/ws/debug`` (the raw PCM rides the

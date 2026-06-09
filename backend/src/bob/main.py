@@ -30,6 +30,7 @@ from bob import jarvis_store as jarvis_store_module
 from bob import orchestrator as orchestrator_module
 from bob import task_scheduler as task_scheduler_module
 from bob import task_store as task_store_module
+from bob import turn_metrics as turn_metrics_module
 from bob import voice_store as voice_store_module
 from bob.config import get_settings
 from bob.connectors.mcp import MCPRuntime
@@ -144,6 +145,17 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     voice_store = voice_store_module.VoiceStore(conn, data_dir)
     voice_store_module.set_default_store(voice_store)
     set_voice_retention_policy(settings.voice_retention_policy())
+
+    # Turn latency metrics (PRD 0018 / issue 0117). The bounded in-memory
+    # collector behind the per-turn ``turn_metrics`` debug event — sized from
+    # settings and installed process-wide so the voice loop / orchestrator /
+    # ws_router instrumentation all feed the same baseline numbers.
+    turn_metrics_module.set_default_collector(
+        turn_metrics_module.TurnLatencyMetrics(
+            max_turns=settings.TURN_METRICS_MAX_TURNS,
+            window=settings.TURN_METRICS_WINDOW,
+        )
+    )
 
     # LLM selection store (PRD 0012 / issue 0078). JSON file under BOB_DATA_DIR
     # owns the runtime selection: seed from .env on first boot, JSON wins after.
@@ -399,6 +411,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         task_store_module.set_default_store(None)
         jarvis_store_module.set_default_store(None)
         voice_store_module.set_default_store(None)
+        turn_metrics_module.set_default_collector(None)
         set_default_llm_selection_store(None)
         set_default_role_store(None)
         set_role_switcher(None)
