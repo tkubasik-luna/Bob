@@ -611,11 +611,26 @@ async def _handle_voice_start(
         return
 
     # Defensive: a lingering loop (missed voice_stop) is torn down before the
-    # new one arms so we never run two loops for one socket.
+    # new one arms so we never run two loops for one socket. Issue 0125 — the
+    # slot is cleared BEFORE the stop (a frame racing the teardown can never
+    # route to the dying loop) and the stop runs under exception suppression:
+    # a failing stop must never abort the handler and leave the slot pointing
+    # at a dead loop — two rapid ``voice_start``s always converge on exactly
+    # one live loop, the new one.
     existing = session.get("voice_loop")
+    session["voice_loop"] = None
     if isinstance(existing, FullDuplexLoop):
-        await existing.stop()
-        session["voice_loop"] = None
+        try:
+            await existing.stop()
+        except Exception:
+            _logger.exception("ws_chat.voice_start_stale_loop_stop_failed", session_id=session_id)
+            emit_debug(
+                category="voice",
+                severity="warn",
+                source="bob.ws_router._handle_voice_start",
+                summary=f"stale voice loop stop failed (session={session_id})",
+                payload={"session_id": session_id},
+            )
 
     # PRD 0016 / issue 0102 — the « Penser en parallèle » étage. Build the
     # per-session live-transcript store + ThinkerLoop (mini ``thinker`` role

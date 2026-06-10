@@ -943,11 +943,46 @@ class FullDuplexLoop:
             await self._on_turn_timeout(
                 turn_id, exc, transcript=transcript, on_first_audio=_on_first_audio
             )
-        except Exception:
-            _logger.exception("voice_loop.say_path_failed", session_id=self.session_id)
+        except Exception as exc:
+            # The driver itself failed (LLM / TTS / WS error). ``_finalize_say``
+            # in the ``finally`` below returns the FSM to idle through the legal
+            # edges; here we make the abnormal path observable on the wire too
+            # (PRD 0018 / issue 0125), not just in the logs — whatever stage the
+            # exception hit (before the first audio chunk or mid-streaming).
+            _logger.exception(
+                "voice_loop.say_path_failed", session_id=self.session_id, turn_id=turn_id
+            )
+            with contextlib.suppress(Exception):
+                await emit_event(
+                    {
+                        "type": "say_path_failed",
+                        "turn_id": turn_id,
+                        "error": f"{type(exc).__name__}: {exc}",
+                        "ts": self._now(),
+                    },
+                    category="voice",
+                    severity="error",
+                    source="bob.voice_loop.say_path_failed",
+                    summary=f"say_path_failed (turn={turn_id})",
+                )
         finally:
             turn_metrics.current_metrics_turn_id.reset(metrics_token)
-            await self._finalize_say(turn_id)
+            # Issue 0125 — DEFENSIVE force-reset. ``_finalize_say`` is the path
+            # that legally returns the FSM to idle at the end of a say-path; if
+            # IT raises (WS closed, event-bus hiccup) nothing else would, and
+            # the session would wedge in ``thinking`` / ``bob_speaking``
+            # forever. The hard reset restores the idle invariant; the
+            # exception is re-raised so the 0124 supervisor still logs the
+            # abnormal task exit. An external ``CancelledError`` keeps its
+            # existing owners (``stop`` / barge-in drive the FSM on those
+            # paths) and is never swallowed.
+            try:
+                await self._finalize_say(turn_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                await self._force_reset(turn_id, exc)
+                raise
 
     async def _on_turn_timeout(
         self,
@@ -1075,6 +1110,65 @@ class FullDuplexLoop:
         # resumed turn already opened one.
         if not self._stopped and self._turn is None:
             await self._open_stt_turn()
+
+    async def _force_reset(self, turn_id: str, error: BaseException) -> None:
+        """Hard-reset the FSM to idle after a FAILED finalize (PRD 0018 / issue 0125).
+
+        ``_finalize_say`` is the only path that legally returns the FSM to idle
+        when a say-path ends; when it fails part-way (WS closed mid-emit, the
+        event bus down) the session could otherwise wedge in ``thinking`` /
+        ``bob_speaking`` and never accept another turn — the « never two turns
+        in ``bob_speaking`` » invariant must survive even the recovery path
+        failing. Defensive + best-effort, in this order:
+
+        1. SYNCHRONOUS pure reset first (cannot fail): if this say-path still
+           owns the turn, :meth:`bob.turn_fsm.TurnFsm.reset` forces idle.
+        2. Log + emit the ``fsm_force_reset`` voice event (observability of the
+           abnormal path) — suppressed: the emit must never re-wedge anything.
+        3. Close + emit the turn's 0117 ``turn_metrics`` entry (the failed
+           finalize may have died before its own emit; closing evicts the entry
+           so the collector never leaks). Idempotent — a no-op when the
+           finalize already closed it.
+        4. Re-arm STT so the armed window stays usable for the next utterance.
+
+        The ownership guard mirrors ``_finalize_say``: a turn the FSM already
+        moved off (``stop`` / barge-in / a resumed turn) keeps its new owner —
+        the reset never clobbers a live successor turn (only the cleanup steps
+        2-4 run then).
+        """
+
+        from_state = self._fsm.state
+        fsm_reset = self._fsm.turn_id == turn_id and from_state is not TurnState.IDLE
+        if fsm_reset:
+            self._fsm.reset()
+        _logger.error(
+            "voice_loop.fsm_force_reset",
+            session_id=self.session_id,
+            turn_id=turn_id,
+            from_state=from_state.value,
+            fsm_reset=fsm_reset,
+            error=f"{type(error).__name__}: {error}",
+        )
+        with contextlib.suppress(Exception):
+            await emit_event(
+                {
+                    "type": "fsm_force_reset",
+                    "turn_id": turn_id,
+                    "from_state": from_state.value,
+                    "fsm_reset": fsm_reset,
+                    "error": f"{type(error).__name__}: {error}",
+                    "ts": self._now(),
+                },
+                category="voice",
+                severity="error",
+                source="bob.voice_loop.fsm_force_reset",
+                summary=f"fsm_force_reset {from_state.value}->idle (turn={turn_id})",
+            )
+        with contextlib.suppress(Exception):
+            await self._emit_turn_metrics(turn_id)
+        if not self._stopped and self._turn is None:
+            with contextlib.suppress(Exception):
+                await self._open_stt_turn()
 
     async def _on_bargein(self, confirmation: BargeInConfirmation) -> None:
         """Perform the Annexe B ``bargein_confirmed`` actions (issue 0101).

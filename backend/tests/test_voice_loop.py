@@ -2200,3 +2200,214 @@ async def test_bargein_endpoint_policy_keeps_capped_grace_stops() -> None:
 
     say.release.set()
     await loop.stop()
+
+
+# --- say-path exception force-reset (PRD 0018 / issue 0125) -------------------
+
+
+def _events_of(event_type: str) -> list[dict[str, Any]]:
+    """The ws_event bodies of ``event_type`` currently in the debug ring buffer."""
+
+    out: list[dict[str, Any]] = []
+    for event in debug_log.snapshot():
+        ws_event = (event.payload or {}).get("ws_event") or {}
+        if ws_event.get("type") == event_type:
+            out.append(ws_event)
+    return out
+
+
+class _FailingSayPath:
+    """A say-path that raises at a configurable stage — but only on call 1.
+
+    ``before_first_audio`` raises before ``on_first_audio`` (the FSM never
+    leaves ``thinking``); ``mid_streaming`` raises right after it (the FSM is
+    in ``bob_speaking``). Later calls succeed and behave like
+    :class:`_RecordingSayPath` so the same loop can prove the NEXT utterance
+    works after the failure.
+    """
+
+    def __init__(self, *, fail_stage: str) -> None:
+        self.calls = 0
+        self.transcripts: list[str] = []
+        self.turn_ids: list[str] = []
+        self._fail_stage = fail_stage
+
+    async def __call__(
+        self,
+        transcript: str,
+        *,
+        turn_id: str,
+        on_first_audio: Callable[[], Awaitable[None]],
+        on_spoken_progress: Callable[[str], Awaitable[None]] | None = None,
+        on_audio_chunk: Callable[[bytes, int], Awaitable[None]] | None = None,
+        prepared_reply: str | None = None,
+    ) -> None:
+        self.calls += 1
+        self.transcripts.append(transcript)
+        self.turn_ids.append(turn_id)
+        fail = self.calls == 1
+        if fail and self._fail_stage == "before_first_audio":
+            raise RuntimeError("llm exploded before any audio")
+        await on_first_audio()
+        if fail and self._fail_stage == "mid_streaming":
+            raise RuntimeError("tts exploded mid-stream")
+        if on_spoken_progress is not None:
+            await on_spoken_progress(transcript)
+
+
+def _loop_for(say_path: Any, transcript: str = "bonjour") -> FullDuplexLoop:
+    settings = _settings()
+    return FullDuplexLoop(
+        voice_turn_factory=lambda: VoiceTurn(
+            engine=FakeSttEngine(transcript=transcript, samples_per_word=160),
+            session_id="s1",
+            settings=settings,
+        ),
+        say_path=say_path,
+        settings=settings,
+        session_id="s1",
+    )
+
+
+async def _drive_turn(loop: FullDuplexLoop) -> None:
+    """One voiced burst + trailing silence (endpoint) + await the say-path."""
+
+    for _ in range(8):
+        await loop.feed_raw_frame(_LOUD)
+    for _ in range(8):
+        await loop.feed_raw_frame(_QUIET)
+    await loop.join()
+
+
+async def test_say_path_exception_before_first_audio_returns_to_idle() -> None:
+    """Driver raises BEFORE the first audio chunk → idle + observable event."""
+
+    say = _FailingSayPath(fail_stage="before_first_audio")
+    loop = _loop_for(say)
+    assert await loop.start() is True
+
+    await _drive_turn(loop)
+
+    assert loop.state is TurnState.IDLE
+    failed = _events_of("say_path_failed")
+    assert len(failed) == 1
+    assert failed[0]["turn_id"] == say.turn_ids[0]
+    assert "llm exploded" in failed[0]["error"]
+    # The FSM never reached bob_speaking on the failed turn.
+    assert "bob_speaking" not in [t["to"] for t in _turn_states(say.turn_ids[0])]
+    # No hard reset was needed: the legal finalize edges recovered.
+    assert _events_of("fsm_force_reset") == []
+
+    # The same armed window still works: the NEXT utterance runs normally.
+    await _drive_turn(loop)
+    assert say.calls == 2
+    assert loop.state is TurnState.IDLE
+    await loop.stop()
+
+
+async def test_say_path_exception_mid_streaming_returns_to_idle() -> None:
+    """Driver raises while Bob is speaking → idle + observable event."""
+
+    say = _FailingSayPath(fail_stage="mid_streaming")
+    loop = _loop_for(say)
+    assert await loop.start() is True
+
+    await _drive_turn(loop)
+
+    assert loop.state is TurnState.IDLE
+    failed = _events_of("say_path_failed")
+    assert len(failed) == 1
+    assert "tts exploded" in failed[0]["error"]
+    # The failed turn DID reach bob_speaking, and the finalize closed it.
+    tos = [t["to"] for t in _turn_states(say.turn_ids[0])]
+    assert "bob_speaking" in tos
+    assert tos[-1] == "idle"
+
+    # The same armed window still works afterwards.
+    await _drive_turn(loop)
+    assert say.calls == 2
+    assert loop.state is TurnState.IDLE
+    await loop.stop()
+
+
+async def test_finalize_failure_hard_resets_fsm(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Even ``_finalize_say`` failing wholesale cannot wedge the FSM (issue 0125).
+
+    The say-path completes (FSM in ``bob_speaking``) but the finalize itself
+    blows up (e.g. the WS closed under it). The defensive force-reset must
+    restore idle, emit the ``fsm_force_reset`` event, close the turn's 0117
+    metrics entry (no collector leak) and re-arm STT so the next utterance
+    works.
+    """
+
+    say = _RecordingSayPath(produce_audio=True)
+    loop = _loop_for(say)
+    assert await loop.start() is True
+
+    real_finalize = loop._finalize_say
+    armed = True
+
+    async def _broken_finalize(turn_id: str) -> None:
+        nonlocal armed
+        if armed:
+            armed = False
+            raise RuntimeError("ws closed during finalize")
+        await real_finalize(turn_id)
+
+    monkeypatch.setattr(loop, "_finalize_say", _broken_finalize)
+    await _drive_turn(loop)
+
+    # The FSM was stuck in bob_speaking when finalize blew up — force-reset
+    # restored idle anyway.
+    assert loop.state is TurnState.IDLE
+    resets = _events_of("fsm_force_reset")
+    assert len(resets) == 1
+    assert resets[0]["turn_id"] == say.turn_ids[0]
+    assert resets[0]["from_state"] == "bob_speaking"
+    assert resets[0]["fsm_reset"] is True
+    assert "ws closed during finalize" in resets[0]["error"]
+    # The 0117 metrics entry was closed + emitted by the force-reset (no leak).
+    metrics = [m for m in _events_of("turn_metrics") if m.get("turn_id") == say.turn_ids[0]]
+    assert len(metrics) == 1
+    assert turn_metrics.get_default_collector().finish_turn(say.turn_ids[0]) is None
+
+    # STT was re-armed: the next utterance runs end-to-end on the same loop.
+    await _drive_turn(loop)
+    assert say.transcripts == ["bonjour", "bonjour"]
+    assert loop.state is TurnState.IDLE
+    await loop.stop()
+
+
+async def test_finalize_partial_failure_still_emits_reset_and_closes_metrics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Finalize dies AFTER the FSM edge (mid-emit): cleanup still completes.
+
+    The ``tts_end`` transition already landed (FSM idle) when the latency emit
+    raises. The force-reset has nothing to reset (``fsm_reset`` false) but the
+    abnormal path is still observable and the metrics entry still closes.
+    """
+
+    say = _RecordingSayPath(produce_audio=True)
+    loop = _loop_for(say)
+    assert await loop.start() is True
+
+    async def _boom(turn_id: str) -> None:
+        raise RuntimeError("event bus down")
+
+    monkeypatch.setattr(loop, "_emit_turn_latency", _boom)
+    await _drive_turn(loop)
+
+    assert loop.state is TurnState.IDLE
+    resets = _events_of("fsm_force_reset")
+    assert len(resets) == 1
+    assert resets[0]["fsm_reset"] is False
+    # Metrics closed by the force-reset even though finalize died before its
+    # own emit (issue 0117 — no in-flight entry leaks).
+    assert turn_metrics.get_default_collector().finish_turn(say.turn_ids[0]) is None
+
+    # The armed window stays usable (STT re-armed by the force-reset).
+    await _drive_turn(loop)
+    assert say.transcripts == ["bonjour", "bonjour"]
+    assert loop.state is TurnState.IDLE
+    await loop.stop()

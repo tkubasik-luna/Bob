@@ -22,6 +22,7 @@ from starlette.testclient import WebSocketTestSession
 from bob import ws_router
 from bob.orchestrator import Orchestrator
 from bob.stt_engine import MIC_FRAME_TAG, FakeSttEngine
+from bob.voice_loop import FullDuplexLoop
 
 
 class _NoopOrchestrator:
@@ -132,6 +133,62 @@ def test_voice_stop_without_start_is_noop(voice_client: TestClient) -> None:
         # Socket still alive: a follow-up bad frame yields the usual error.
         ws.send_json({"type": "nope"})
         assert ws.receive_json()["type"] == "error"
+
+
+def test_rapid_voice_start_with_failing_stop_leaves_one_live_loop(
+    voice_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue 0125 — the ``voice_start`` slot swap is race-free.
+
+    A second ``voice_start`` clears the session's loop slot BEFORE stopping the
+    stale loop, and a stop that RAISES is suppressed: exactly one live loop
+    remains (the new one) and the binary frames route to it.
+    """
+
+    with voice_client.websocket_connect("/ws/chat") as ws:
+        session_frame = ws.receive_json()
+        assert session_frame["type"] == "session"
+        session_id = session_frame["session_id"]
+
+        ws.send_json({"type": "voice_start", "window": "new", "ts_client": 0})
+        # Synchronize: JSON frames are handled sequentially, so once the error
+        # for the bogus frame arrives the voice_start handler has completed.
+        ws.send_json({"type": "sync_marker_1"})
+        assert ws.receive_json()["code"] == "bad_type"
+
+        session = ws_router._sessions[session_id]
+        first_loop = session["voice_loop"]
+        assert isinstance(first_loop, FullDuplexLoop)
+
+        slot_at_stop: list[Any] = []
+
+        async def _failing_stop() -> None:
+            # Record what the slot held when the stop ran: the handler must
+            # have cleared it ALREADY (slot swap before teardown).
+            slot_at_stop.append(session["voice_loop"])
+            raise RuntimeError("teardown wedged")
+
+        monkeypatch.setattr(first_loop, "stop", _failing_stop)
+
+        ws.send_json({"type": "voice_start", "window": "new", "ts_client": 1})
+        ws.send_json({"type": "sync_marker_2"})
+        assert ws.receive_json()["code"] == "bad_type"
+
+        # The slot was cleared BEFORE the (failing) stop ran, and exactly one
+        # live loop remains — the new one.
+        assert slot_at_stop == [None]
+        second_loop = session["voice_loop"]
+        assert isinstance(second_loop, FullDuplexLoop)
+        assert second_loop is not first_loop
+
+        # Frames route to the live loop: the 0099 round trip still works.
+        for _ in range(8):
+            ws.send_bytes(_mic_frame(160))
+        ws.send_json({"type": "voice_stop", "ts_client": 2})
+        seen = _drain_until(ws, "stt_final")
+        finals = [f for f in seen if f.get("type") == "stt_final"]
+        assert len(finals) == 1
+        assert finals[0]["text"] == "quel temps à paris"
 
 
 def test_malformed_text_frame_keeps_socket_alive(voice_client: TestClient) -> None:
