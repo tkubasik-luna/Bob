@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { SphereUI } from "./components/SphereUI";
 import { DebugView } from "./components/debug/DebugView";
 import { SETUP_COMPLETE_KEY, SetupScreen } from "./components/setup/SetupScreen";
-import { fetchLlmSelection, pingLm } from "./lib/llmApi";
+import { LLM_ROLES, fetchLlmRoles, pingLm } from "./lib/llmApi";
 
 type UiMode = "new" | "debug";
 
@@ -20,19 +20,29 @@ function getUiMode(): UiMode {
 type Phase = "loading" | "setup" | "ready";
 
 /** Decide the initial phase: skip setup only when the user completed it before
- * AND the configured backend is actually usable now (Claude CLI, or a
+ * AND every role's configured backend is actually usable now (Claude CLI, or a
  * reachable LM Studio server with a pinned model). A previously-fine server
  * that is now down re-shows setup rather than booting into a dead HUD. */
 async function resolveInitialPhase(): Promise<Phase> {
   if (window.localStorage.getItem(SETUP_COMPLETE_KEY) !== "1") return "setup";
   try {
-    const sel = await fetchLlmSelection();
-    if (sel.provider === "claude_cli") return "ready";
-    if (!sel.lm_model) return "setup";
-    const ping = await pingLm(sel.base_url ?? undefined);
-    return ping.reachable ? "ready" : "setup";
+    const map = await fetchLlmRoles();
+    // Distinct LM Studio servers across roles — each pinged once below.
+    const lmUrls = new Set<string>();
+    for (const role of LLM_ROLES) {
+      const sel = map.roles[role];
+      if (!sel) return "setup";
+      if (sel.provider === "claude_cli") continue;
+      if (!sel.lm_model) return "setup";
+      lmUrls.add(sel.base_url ?? "");
+    }
+    for (const url of lmUrls) {
+      const ping = await pingLm(url || undefined);
+      if (!ping.reachable) return "setup";
+    }
+    return "ready";
   } catch {
-    // Backend unreachable / selection endpoint failing → let the user reconfigure.
+    // Backend unreachable / roles endpoint failing → let the user reconfigure.
     return "setup";
   }
 }

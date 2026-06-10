@@ -24,6 +24,10 @@
   backdrop-filter: blur(12px);
 }
 
+.setup-card--wide {
+  width: min(580px, 92vw);
+}
+
 .setup-title {
   margin: 0;
   font-size: 1.4rem;
@@ -35,33 +39,6 @@
   margin: 0.3rem 0 1.4rem;
   font-size: 0.85rem;
   color: rgba(231, 237, 245, 0.6);
-}
-
-.setup-providers {
-  display: flex;
-  gap: 0.5rem;
-  margin-bottom: 1.4rem;
-}
-
-.setup-provider {
-  flex: 1;
-  padding: 0.6rem;
-  border-radius: 10px;
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  background: transparent;
-  color: inherit;
-  font-size: 0.9rem;
-  cursor: pointer;
-  transition: background 0.15s, border-color 0.15s;
-}
-
-.setup-provider:hover {
-  background: rgba(255, 255, 255, 0.05);
-}
-
-.setup-provider.is-active {
-  background: rgba(140, 190, 255, 0.16);
-  border-color: rgba(140, 190, 255, 0.55);
 }
 
 .setup-field {
@@ -109,58 +86,153 @@
   color: #ff9090;
 }
 
-.setup-models {
-  min-height: 3rem;
-  margin-bottom: 1rem;
-}
+/* ---- step 2 — one row per role: identity | merged select | provider badge */
 
-.setup-model-list {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  max-height: 220px;
-  overflow-y: auto;
+.setup-roles {
   display: flex;
   flex-direction: column;
-  gap: 0.3rem;
+  margin: 1.2rem 0 1rem;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
 }
 
-.setup-model {
-  width: 100%;
-  display: flex;
+.setup-role-row {
+  display: grid;
+  grid-template-columns: 150px 1fr 84px;
+  gap: 0.8rem;
   align-items: center;
-  justify-content: space-between;
-  gap: 0.5rem;
-  padding: 0.5rem 0.65rem;
+  padding: 0.7rem 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.setup-role-id {
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+  min-width: 0;
+}
+
+.setup-role-label {
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+.setup-role-hint {
+  font-size: 0.68rem;
+  color: rgba(231, 237, 245, 0.5);
+}
+
+.setup-role-select {
+  width: 100%;
+  min-width: 0;
+  padding: 0.5rem 0.6rem;
   border-radius: 8px;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(0, 0, 0, 0.25);
   color: inherit;
   font-size: 0.82rem;
-  cursor: pointer;
-  text-align: left;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
 }
 
-.setup-model:hover {
-  background: rgba(255, 255, 255, 0.05);
+.setup-role-select option,
+.setup-role-select optgroup {
+  background: #131923;
+  color: #e7edf5;
 }
 
-.setup-model.is-active {
-  background: rgba(140, 190, 255, 0.16);
-  border-color: rgba(140, 190, 255, 0.55);
+.setup-role-badge {
+  font-size: 0.68rem;
+  text-align: center;
+  padding: 0.25rem 0.4rem;
+  border-radius: 999px;
+  white-space: nowrap;
 }
 
-.setup-model-id {
+.setup-role-badge.is-lm {
+  background: rgba(126, 224, 164, 0.14);
+  color: #7ee0a4;
+}
+
+.setup-role-badge.is-claude {
+  background: rgba(186, 167, 255, 0.16);
+  color: #c5b5ff;
+}
+
+/* ---- loading phase — per-role commit board */
+
+.setup-commit-list {
+  list-style: none;
+  margin: 1.2rem 0 1rem;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.setup-commit {
+  display: grid;
+  grid-template-columns: 1.2rem 130px 1fr auto;
+  gap: 0.6rem;
+  align-items: center;
+  padding: 0.65rem 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  font-size: 0.82rem;
+  color: rgba(231, 237, 245, 0.55);
+}
+
+.setup-commit--loading {
+  color: #e7edf5;
+}
+
+.setup-commit--done {
+  color: rgba(231, 237, 245, 0.85);
+}
+
+.setup-commit--error {
+  color: #ff9090;
+}
+
+.setup-commit-status {
+  text-align: center;
+}
+
+.setup-commit--done .setup-commit-status {
+  color: #7ee0a4;
+}
+
+.setup-commit-role {
+  font-weight: 600;
+}
+
+.setup-commit-model {
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.setup-model-loaded {
-  font-size: 0.68rem;
-  color: #7ee0a4;
-  flex-shrink: 0;
+.setup-commit-quant {
+  font-style: normal;
+  color: rgba(231, 237, 245, 0.45);
+}
+
+.setup-commit-detail {
+  font-size: 0.72rem;
+  white-space: nowrap;
+}
+
+.setup-spinner {
+  display: inline-block;
+  width: 0.8rem;
+  height: 0.8rem;
+  border: 2px solid rgba(156, 198, 255, 0.25);
+  border-top-color: #9cc6ff;
+  border-radius: 50%;
+  animation: setup-spin 0.8s linear infinite;
+}
+
+@keyframes setup-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .setup-hint {
