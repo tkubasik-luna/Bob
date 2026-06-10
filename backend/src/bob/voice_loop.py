@@ -33,6 +33,17 @@ re-arm STT for the resumed utterance. It emits a ``bargein`` voice event
 (Annexe A.2) + the ``t_bargein_detected`` / ``t_cut`` latency marks (Annexe F),
 whose derived ``bargein_cut_ms`` targets <300 ms.
 
+Issue 0119 (PRD 0018, Module 2) makes that cut ZERO-GRACE — a separate
+cancellation policy from the endpoint's capped-grace freeze (0118): on
+confirmation the loop synchronously (before any await) cuts the outbound TTS
+via the ``cancel_speech`` hook (the 0121 pipeline's single ``cancel()`` — no
+further audio chunk reaches the client), hard-cancels the say task, and
+hard-cancels the Thinker/Draft loops via ``on_thinker_cancel`` /
+``on_draft_cancel`` (straight ``Task.cancel``, no cooperative grace, never
+awaited — a stalling pass cannot delay the cut). The cut is stamped as the
+``bargein_cut`` stage in the issue-0117 ``turn_metrics`` summary of the
+interrupted turn.
+
 What it owns
 ------------
 
@@ -215,6 +226,14 @@ class FullDuplexLoop:
     on_thinker_start: Callable[[str], None] | None = None
     on_thinker_feed: Callable[[str], Awaitable[None]] | None = None
     on_thinker_stop: Callable[[], Awaitable[None]] | None = None
+    #: ZERO-GRACE Thinker cancel for the barge-in path (PRD 0018 / issue 0119).
+    #: SYNCHRONOUS by contract — wired by ws_router to
+    #: :meth:`bob.thinker_loop.ThinkerLoop.hard_cancel`, which latches the stop
+    #: flag and escalates straight to ``Task.cancel`` without the cooperative
+    #: grace ``on_thinker_stop`` grants (and without awaiting the task, so a
+    #: stalling pass can never delay the cut). ``None`` skips it (bare loop);
+    #: the endpoint / ``voice_stop`` paths keep the capped-grace ``stop`` (0118).
+    on_thinker_cancel: Callable[[], None] | None = None
     #: Semantic-endpoint signal source (PRD 0016 / issue 0103, Annexe B + H). A
     #: pure read of the Thinker's LATEST ``user_turn_complete`` from the shared
     #: :class:`bob.live_transcript_state.LiveTranscriptState` (wired by ws_router
@@ -254,6 +273,21 @@ class FullDuplexLoop:
     on_draft_start: Callable[[str], None] | None = None
     on_draft_feed: Callable[[str], Awaitable[None]] | None = None
     on_draft_stop: Callable[[], Awaitable[None]] | None = None
+    #: ZERO-GRACE Draft cancel for the barge-in path (PRD 0018 / issue 0119).
+    #: Mirrors ``on_thinker_cancel`` — synchronous, wired to
+    #: :meth:`bob.speculative_draft.SpeculativeDraft.hard_cancel`. ``None``
+    #: skips it; the endpoint / ``voice_stop`` paths keep the capped-grace
+    #: ``stop`` (0118).
+    on_draft_cancel: Callable[[], None] | None = None
+    #: ONE-CALL kill-switch of the active outbound TTS stream (PRD 0018 / issue
+    #: 0119). SYNCHRONOUS by contract — wired by ws_router to the in-flight
+    #: :meth:`bob.speech_pipeline.SpeechStreamPipeline.cancel` (issue 0121: a
+    #: single call cuts synthesis AND drain; no further audio chunk reaches the
+    #: client). The barge-in path invokes it BEFORE any await so the cut is
+    #: effective immediately, independent of how long the cancelled say-path
+    #: task takes to unwind. ``None`` (bare loop / tests) keeps the task-cancel
+    #: as the only cut.
+    cancel_speech: Callable[[], None] | None = None
     #: Commit gate (PRD 0016 / issue 0104, Annexe F). A PURE read run at the
     #: endpoint on the FINAL frozen transcript: it returns a
     #: :class:`bob.speculative_draft.DraftDecision` — ``committed`` (adopt the
@@ -639,6 +673,12 @@ class FullDuplexLoop:
         # the table's ``cancel_generation`` action, then re-open STT for the
         # resumed utterance.
         if self._fsm.state is TurnState.THINKING:
+            # ZERO-GRACE cut (PRD 0018 / issue 0119) — same synchronous policy
+            # as the confirmed barge-in: kill the pipeline (a reply whose first
+            # chunk has not flipped the FSM yet may already be streaming) and
+            # hard-cancel the say task BEFORE any await, so the user's resumed
+            # speech is never answered over.
+            self._hard_cut_say_path()
             await self._dispatch(TurnEvent.VAD_SPEECH_START, turn_id=self._fsm.turn_id)
             await self._cancel_say_task()
             # The cancelled say-path's finalize closed the turn's metrics entry
@@ -1048,11 +1088,17 @@ class FullDuplexLoop:
         3. Move the FSM ``bob_speaking`` → ``user_speaking`` FIRST, so the
            cancelled say task's ``_finalize_say`` ownership guard sees the FSM no
            longer in ``bob_speaking`` and does NOT drive a second transition.
-        4. Cancel the in-flight say-path (``cancel_llm_stream`` + ``cancel_tts``):
-           cancelling the task aborts both the orchestrator generation and the
-           TTS stream cooperatively (the say-path bubbles ``CancelledError``).
-        5. Commit the played text to history (``commit_spoken_partial``) and
-           restart the Thinker (``start_thinker`` — no-op hook until 0102).
+        4. ZERO-GRACE cut (PRD 0018 / issue 0119) — synchronous, before ANY
+           await: ``cancel_speech`` (the 0121 pipeline kill-switch — no further
+           audio chunk reaches the client) + hard ``Task.cancel`` of the
+           say-path + ``hard_cancel`` of the Thinker/Draft loops (no cooperative
+           grace on this path; the endpoint keeps its capped grace — 0118). The
+           ``bargein_cut`` stage is stamped into the 0117 collector here so the
+           interrupted turn's ``turn_metrics`` summary carries the cut time.
+        5. Await the (already hard-cancelled) say task's unwind so the
+           interrupted turn's latency/metrics summaries land before the resumed
+           turn re-registers, then commit the played text to history
+           (``commit_spoken_partial``) and restart the Thinker (``start_thinker``).
         6. Emit the ``bargein`` voice event (Annexe A.2) + re-arm STT for the
            resumed utterance.
         """
@@ -1067,9 +1113,22 @@ class FullDuplexLoop:
             # and here (e.g. tts_end raced). Nothing to cut.
             return
         turn_id = transition.turn_id
+
+        # ZERO-GRACE cut (issue 0119) — all synchronous, before the first await,
+        # so Bob is effectively silent NOW whatever the cancelled tasks' unwind
+        # cost: pipeline kill-switch + say-task hard cancel, then the
+        # anticipation loops without their cooperative grace.
+        self._hard_cut_say_path()
+        self._hard_cancel_anticipation()
+        # The cut time lands in the interrupted turn's 0117 summary (the entry
+        # is still open — the cancelled say task's finalize closes + emits it).
+        turn_metrics.get_default_collector().mark(turn_id, "bargein_cut")
+
         await self._emit_turn_state(transition)
 
-        # cancel_llm_stream + cancel_tts — tearing the say task down cancels both.
+        # cancel_llm_stream + cancel_tts — the task is already hard-cancelled
+        # above; this awaits its unwind so the interrupted turn's summaries are
+        # emitted before the resumed turn re-registers below.
         await self._cancel_say_task()
         # The cancelled say-path's finalize emitted the interrupted turn's
         # metrics summary (issue 0117). The barge-in re-uses the SAME id for
@@ -1293,6 +1352,46 @@ class FullDuplexLoop:
         before = turn.partial_count
         await turn.feed_frame(pcm)
         return turn.partial_count != before
+
+    def _hard_cut_say_path(self) -> None:
+        """ZERO-GRACE cut of the in-flight say-path (PRD 0018 / issue 0119).
+
+        Synchronous by design — called BEFORE any await on the interruption
+        paths so the cut takes effect immediately:
+
+        1. ``cancel_speech`` — the TTS pipeline's single kill-switch (issue
+           0121): cuts synthesis AND drain in one call, so no further audio
+           chunk reaches the client even if the cancelled task's unwind takes
+           time (or stalls).
+        2. ``Task.cancel`` on the say task — aborts the LLM generation; the
+           cancellation propagates through the TurnWatchdog as an EXTERNAL
+           ``CancelledError`` (issue 0126 contract, never a TurnTimeoutError).
+
+        Does NOT await the task — :meth:`_cancel_say_task` (called right after
+        on the barge-in path) owns the ordered unwind. Idempotent.
+        """
+
+        if self.cancel_speech is not None:
+            with contextlib.suppress(Exception):
+                self.cancel_speech()
+        task = self._say_task
+        if task is not None and not task.done():
+            task.cancel()
+
+    def _hard_cancel_anticipation(self) -> None:
+        """ZERO-GRACE cancel of the Thinker + Draft loops (PRD 0018 / issue 0119).
+
+        Synchronous: each hook latches its loop's stop flag and escalates
+        straight to ``Task.cancel`` without the cooperative grace window the
+        endpoint freeze grants (0118) — and without awaiting the task, so an
+        in-flight pass whose cooperative cancel would stall can never delay
+        the barge-in cut. No-op when unwired (bare loop).
+        """
+
+        for hook in (self.on_thinker_cancel, self.on_draft_cancel):
+            if hook is not None:
+                with contextlib.suppress(Exception):
+                    hook()
 
     async def _cancel_say_task(self) -> None:
         task = self._say_task

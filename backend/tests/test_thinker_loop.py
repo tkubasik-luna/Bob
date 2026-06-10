@@ -412,6 +412,80 @@ async def test_stop_grace_is_capped_by_setting() -> None:
     assert _snapshots() == []
 
 
+async def test_hard_cancel_is_zero_grace_even_when_the_pass_stalls() -> None:
+    """``hard_cancel`` (PRD 0018 / issue 0119) never awaits the in-flight pass.
+
+    The pass here SWALLOWS the cooperative cancel (worse than parked: even the
+    post-grace escalation of :meth:`stop` would hang in its final await). The
+    zero-grace ``hard_cancel`` is synchronous: it latches the stop flag,
+    requests the hard ``Task.cancel`` and returns — the loop reports idle while
+    the stubborn task is STILL parked.
+    """
+
+    client = _FakeThinkerClient()
+    escape = asyncio.Event()
+
+    async def _stubborn_chat(
+        messages: list[dict[str, Any]],
+        schema: dict[str, Any] | None = None,
+        session_id: str | None = None,
+    ) -> str:
+        client.started.set()
+        while not escape.is_set():
+            try:
+                await escape.wait()
+            except asyncio.CancelledError:
+                continue  # the cooperative cancel stalls — by design
+        return "{}"
+
+    client.chat = _stubborn_chat  # type: ignore[method-assign]
+    tasks: list[asyncio.Task[None]] = []
+
+    def _spawn(coro: Any) -> asyncio.Task[None]:
+        task: asyncio.Task[None] = asyncio.create_task(coro)
+        tasks.append(task)
+        return task
+
+    state = LiveTranscriptState()
+    loop = ThinkerLoop(
+        client=client,  # type: ignore[arg-type]
+        live_state=state,
+        settings=_settings(grace_ms=2_000, grace_cap_ms=250),
+        session_id="s1",
+        spawn=_spawn,
+        clock=_Clock(),
+    )
+    loop.start("t1")
+    await loop.feed_partial("bloque")
+    await asyncio.wait_for(client.started.wait(), timeout=1.0)
+    assert loop.inflight is True
+
+    loop.hard_cancel()  # synchronous — returns without ANY grace or await
+
+    assert loop.inflight is False
+    # The stubborn task is still parked: the cut never waited on its unwind.
+    assert tasks and all(not task.done() for task in tasks)
+    # The loop is latched stopped — further partials are dropped.
+    await loop.feed_partial("après hard_cancel")
+    assert loop.inflight is False
+    # No snapshot leaked from the cancelled pass.
+    assert state.latest() is None
+
+    escape.set()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def test_hard_cancel_without_inflight_pass_is_a_noop() -> None:
+    client = _FakeThinkerClient()
+    loop = _loop(client, LiveTranscriptState(), _Clock())
+    loop.hard_cancel()  # nothing armed / in flight — silent no-op
+    loop.start("t1")
+    loop.hard_cancel()
+    loop.hard_cancel()  # idempotent
+    await loop.feed_partial("après")
+    assert client.calls == []
+
+
 async def test_stopped_loop_ignores_further_partials() -> None:
     client = _FakeThinkerClient()
     state = LiveTranscriptState()

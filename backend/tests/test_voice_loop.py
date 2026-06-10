@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import struct
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
 import pytest
@@ -27,8 +27,10 @@ from bob import debug_log, event_bus_v2, turn_metrics
 from bob.config import Settings
 from bob.live_transcript_state import LiveTranscriptState
 from bob.speculative_draft import SpeculativeDraft
+from bob.speech_pipeline import SpeechStreamPipeline
 from bob.stt_engine import MIC_FRAME_TAG, FakeSttEngine
 from bob.thinker_loop import ThinkerLoop
+from bob.tts_service import SynthesisChunk
 from bob.turn_fsm import TurnState
 from bob.voice_loop import FullDuplexLoop, PersistedTurn
 from bob.voice_turn import VoiceTurn
@@ -1795,3 +1797,406 @@ async def test_endpoint_without_inflight_pass_behaves_as_before() -> None:
     body = _turn_metrics_events()[-1]
     for stage in ("endpoint", "loops_frozen", "stt_finalized", "gate_decided"):
         assert stage in body["stages_ms"]
+
+
+# --- barge-in zero-grace (PRD 0018 / issue 0119) ------------------------------
+
+
+class _StubbornRoleClient:
+    """A role client whose in-flight pass SWALLOWS the cooperative cancel.
+
+    Worse than :class:`_ParkedRoleClient`: even the post-grace hard
+    ``Task.cancel`` of the 0118 ladder would stall in its final await, because
+    the coroutine traps ``CancelledError`` and keeps waiting. Only the 0119
+    zero-grace ``hard_cancel`` (which never awaits the task) cuts past it.
+    ``escape`` unblocks the parked pass at test teardown.
+    """
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.escape = asyncio.Event()
+
+    def supports_guided_json(self) -> bool:
+        return False
+
+    async def chat(self, messages: list[dict[str, Any]], **kwargs: Any) -> str:
+        self.started.set()
+        while not self.escape.is_set():
+            try:
+                await self.escape.wait()
+            except asyncio.CancelledError:
+                continue  # the cooperative cancel stalls — by design
+        return "{}"
+
+    async def complete(self, *args: Any, **kwargs: Any) -> Any:  # pragma: no cover - unused
+        raise NotImplementedError
+
+
+class _PipelineSayPath:
+    """A say-path that streams through a REAL :class:`SpeechStreamPipeline`.
+
+    Mimics ws_router's ``_synthesize_and_stream`` (issue 0121): an endless fake
+    synthesizer keeps producing chunks, the sink stamps each accepted chunk
+    with the loop's fake clock, and the in-flight pipeline is exposed so the
+    test wires the loop's ``cancel_speech`` hook to its single ``cancel()`` —
+    the 0119 barge-in surface.
+    """
+
+    def __init__(self, clock: Callable[[], float]) -> None:
+        self._clock = clock
+        self.pipeline: SpeechStreamPipeline | None = None
+        self.first_chunk_sent = asyncio.Event()
+        self.sent_at: list[float] = []
+        self.unwound = False
+
+    def cancel_speech(self) -> None:
+        """The loop's ``cancel_speech`` hook — the pipeline's ONE kill-switch."""
+
+        if self.pipeline is not None:
+            self.pipeline.cancel()
+
+    async def __call__(
+        self,
+        transcript: str,
+        *,
+        turn_id: str,
+        on_first_audio: Callable[[], Awaitable[None]],
+        on_spoken_progress: Callable[[str], Awaitable[None]] | None = None,
+        on_audio_chunk: Callable[[bytes, int], Awaitable[None]] | None = None,
+        prepared_reply: str | None = None,
+    ) -> None:
+        async def _synthesize(sentence: str) -> AsyncIterator[SynthesisChunk]:
+            for _ in range(100_000):  # effectively endless — only the cut stops it
+                yield SynthesisChunk(pcm16=b"\x00\x00" * 8, sample_rate=24_000)
+
+        first = True
+
+        async def _send(chunk: SynthesisChunk) -> None:
+            nonlocal first
+            if first:
+                first = False
+                await on_first_audio()
+            self.sent_at.append(self._clock())
+            self.first_chunk_sent.set()
+
+        self.pipeline = SpeechStreamPipeline(synthesize=_synthesize, send_chunk=_send)
+        try:
+            await self.pipeline.run(["une phrase sans fin"])
+        except asyncio.CancelledError:
+            self.unwound = True
+            raise
+
+
+async def test_bargein_cuts_tts_pipeline_with_no_audio_after_cut() -> None:
+    """Acceptance (0119): after the confirmation, NO audio chunk leaves.
+
+    Real :class:`SpeechStreamPipeline` + fake TTS + the deterministic fake
+    clock: every chunk the sink accepts is stamped on the SAME strictly
+    increasing clock that stamps ``t_cut``, so "no audio after the cut" is
+    exact (stronger than the 300 ms budget — zero chunks past ``cut_ts``).
+    The cut happens via the loop's synchronous ``cancel_speech`` hook (the
+    pipeline's single ``cancel()``), before any await of the say task unwind.
+    """
+
+    clock = _fake_clock(step_ms=30.0)
+    say = _PipelineSayPath(clock)
+    settings = Settings.model_construct(
+        STT_ENGINE="fake",
+        STT_SAMPLE_RATE=16_000,
+        VAD_SPEECH_RMS=0.02,
+        VAD_PAUSE_MS=60,
+        ENDPOINT_SILENCE_MS=120,
+        STT_DEBUG_TEXT_MAX_CHARS=64,
+        BARGEIN_CONFIRM_MS=90,
+    )
+    loop = FullDuplexLoop(
+        voice_turn_factory=lambda: VoiceTurn(
+            engine=FakeSttEngine(transcript="bonjour", samples_per_word=160),
+            session_id="s1",
+            settings=settings,
+        ),
+        say_path=say,
+        settings=settings,
+        session_id="s1",
+        cancel_speech=say.cancel_speech,
+    )
+    loop._now = clock  # type: ignore[method-assign]
+    await loop.start()
+    for _ in range(6):
+        await loop.feed_raw_frame(_LOUD)
+    for _ in range(8):
+        await loop.feed_raw_frame(_QUIET)
+    await asyncio.wait_for(say.first_chunk_sent.wait(), timeout=2.0)
+    assert loop.state is TurnState.BOB_SPEAKING
+    turn_id = loop._fsm.turn_id
+
+    # Continuous user speech past the 90 ms window confirms the barge-in.
+    async def _interrupt() -> None:
+        for _ in range(6):
+            await loop.feed_raw_frame(_LOUD)
+
+    await asyncio.wait_for(_interrupt(), timeout=2.0)
+
+    assert loop.state.value == "user_speaking"
+    pipeline = say.pipeline
+    assert pipeline is not None
+    assert pipeline.cancelled is True
+    assert say.unwound is True  # the say task observed the cut and unwound
+
+    # The wire event carries the cut instant; nothing was sent past it.
+    bargeins = _bargein_events(turn_id)
+    assert len(bargeins) == 1
+    cut_ts = bargeins[0]["cut_ts"]
+    assert say.sent_at, "the say-path streamed before the cut"
+    assert max(say.sent_at) <= cut_ts, "an audio chunk left AFTER the barge-in cut"
+
+    # No further chunk ever lands (the sink count is frozen at the cut).
+    sent_at_cut = len(say.sent_at)
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert len(say.sent_at) == sent_at_cut
+
+    await loop.stop()
+
+
+async def test_bargein_hard_cancels_anticipation_with_no_grace() -> None:
+    """Acceptance (0119): the Thinker/Draft passes are cut with ZERO grace.
+
+    REAL ThinkerLoop + SpeculativeDraft with STUBBORN clients (their passes
+    swallow the cooperative cancel — even the 0118 capped ladder would hang in
+    its final await). No stop hooks are wired, so both passes are still in
+    flight while Bob speaks; the confirmed barge-in hard-cancels them via the
+    synchronous ``on_thinker_cancel`` / ``on_draft_cancel`` hooks: both loops
+    report idle immediately, while the stubborn tasks themselves are STILL
+    parked — proof the cut never waited on their unwind.
+    """
+
+    settings = _settings().model_copy(
+        update={
+            "THINKER_DEBOUNCE_MS": 0,
+            "THINKER_CANCEL_GRACE_MS": 2_000,
+            "THINKER_CANCEL_GRACE_CAP_MS": 250,
+            "BARGEIN_CONFIRM_MS": 90,
+            "DRAFT_COMMIT_SIMILARITY": 0.6,
+        }
+    )
+    thinker_client = _StubbornRoleClient()
+    draft_client = _StubbornRoleClient()
+    tasks: list[asyncio.Task[None]] = []
+
+    def _spawn(coro: Any) -> asyncio.Task[None]:
+        task: asyncio.Task[None] = asyncio.create_task(coro)
+        tasks.append(task)
+        return task
+
+    thinker = ThinkerLoop(
+        client=thinker_client,  # type: ignore[arg-type]
+        live_state=LiveTranscriptState(),
+        settings=settings,
+        session_id="s1",
+        spawn=_spawn,
+    )
+    drafter = SpeculativeDraft(
+        client=draft_client,  # type: ignore[arg-type]
+        settings=settings,
+        session_id="s1",
+        spawn=_spawn,
+    )
+    say = _SpeakingSayPath(played="Bonjour")
+    loop = FullDuplexLoop(
+        voice_turn_factory=lambda: VoiceTurn(
+            engine=FakeSttEngine(transcript="bonjour", samples_per_word=160),
+            session_id="s1",
+            settings=settings,
+        ),
+        say_path=say,
+        settings=settings,
+        session_id="s1",
+        on_thinker_start=thinker.start,
+        on_thinker_feed=thinker.feed_partial,
+        on_thinker_cancel=thinker.hard_cancel,
+        on_draft_start=drafter.start,
+        on_draft_feed=drafter.feed_partial,
+        on_draft_cancel=drafter.hard_cancel,
+    )
+    loop._now = _fake_clock(step_ms=30.0)  # type: ignore[method-assign]
+    try:
+        await loop.start()
+        for _ in range(6):
+            await loop.feed_raw_frame(_LOUD)
+        # Both anticipation passes are genuinely IN FLIGHT (parked, stubborn).
+        await asyncio.wait_for(thinker_client.started.wait(), timeout=1.0)
+        await asyncio.wait_for(draft_client.started.wait(), timeout=1.0)
+        # No stop hooks wired → the endpoint freeze leaves them in flight.
+        for _ in range(8):
+            await loop.feed_raw_frame(_QUIET)
+        await asyncio.wait_for(say.entered.wait(), timeout=2.0)
+        assert loop.state is TurnState.BOB_SPEAKING
+        assert thinker.inflight is True
+        assert drafter.inflight is True
+
+        # The confirmed barge-in must return promptly — bounded so a regression
+        # back to a grace/await ladder fails the test instead of hanging it.
+        # Stop feeding at the cut: a frame fed AFTER the floor returned would
+        # feed the RESUMED utterance to the re-armed drafter (a legitimate new
+        # pass that would muddy the inflight assertions below).
+        async def _interrupt() -> None:
+            for _ in range(6):
+                await loop.feed_raw_frame(_LOUD)
+                if loop.state is not TurnState.BOB_SPEAKING:
+                    return
+
+        await asyncio.wait_for(_interrupt(), timeout=2.0)
+
+        assert loop.state.value == "user_speaking"
+        # Both loops were hard-cancelled with no grace…
+        assert thinker.inflight is False
+        assert drafter.inflight is False
+        # …and the stubborn passes are STILL parked: the cut never awaited them.
+        assert tasks and all(not task.done() for task in tasks)
+    finally:
+        say.release.set()
+        thinker_client.escape.set()
+        draft_client.escape.set()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await loop.stop()
+
+
+async def test_user_resume_during_thinking_cuts_speech_pipeline_too() -> None:
+    """Barge-in during THINKING (0119): the resume edge applies the same cut.
+
+    The user resumes while the say-path is still generating (no audio yet —
+    or a stream whose first chunk has not flipped the FSM): the loop invokes
+    the synchronous ``cancel_speech`` kill-switch BEFORE awaiting the say task
+    unwind, exactly like the confirmed barge-in path.
+    """
+
+    cut_calls: list[str] = []
+    say = _BlockingSayPath()
+    settings = _settings()
+    loop = FullDuplexLoop(
+        voice_turn_factory=lambda: VoiceTurn(
+            engine=FakeSttEngine(transcript="bonjour", samples_per_word=160),
+            session_id="s1",
+            settings=settings,
+        ),
+        say_path=say,
+        settings=settings,
+        session_id="s1",
+        cancel_speech=lambda: cut_calls.append("cut"),
+    )
+    await loop.start()
+    for _ in range(6):
+        await loop.feed_raw_frame(_LOUD)
+    for _ in range(8):
+        await loop.feed_raw_frame(_QUIET)
+    await asyncio.wait_for(say.entered.wait(), timeout=2.0)
+    assert loop.state is TurnState.THINKING
+
+    # The user resumes: the say-path is cut (pipeline kill-switch + task
+    # cancel) and the floor returns to the user.
+    await asyncio.wait_for(loop.feed_raw_frame(_LOUD), timeout=2.0)
+    assert loop.state.value == "user_speaking"
+    assert cut_calls == ["cut"]
+
+    await loop.stop()
+
+
+async def test_bargein_cut_lands_in_interrupted_turn_metrics_summary() -> None:
+    """Acceptance (0119): the cut time appears in the 0117 summary.
+
+    The interrupted turn's ``turn_metrics`` summary (emitted by the cancelled
+    say-path's finalize) carries the ``bargein_cut`` stage; the RESUMED turn
+    (same id, fresh origin — the 0101 contract) does not inherit it.
+    """
+
+    say = _SpeakingSayPath(played="Bonjour le monde")
+    loop = _bargein_loop(say, confirm_ms=90)
+    await _drive_to_bob_speaking(loop, say)
+    turn_id = loop._fsm.turn_id
+    assert turn_id is not None
+
+    for _ in range(6):
+        await loop.feed_raw_frame(_LOUD)
+
+    interrupted = [b for b in _turn_metrics_events() if b["turn_id"] == turn_id]
+    assert len(interrupted) == 1
+    body = interrupted[0]
+    assert "bargein_cut" in body["marks"]
+    assert "bargein_cut" in body["stages_ms"]
+    assert body["marks"]["bargein_cut"] >= body["marks"]["endpoint"]
+
+    # The resumed utterance re-uses the id with a FRESH metrics origin: its own
+    # summary (the voice_stop teardown) carries no stale cut mark.
+    say.release.set()
+    await loop.stop()
+    summaries = [b for b in _turn_metrics_events() if b["turn_id"] == turn_id]
+    assert len(summaries) == 2
+    assert "bargein_cut" not in summaries[-1]["marks"]
+
+
+async def test_bargein_endpoint_policy_keeps_capped_grace_stops() -> None:
+    """The two cancellation policies stay DISTINCT (0118 vs 0119).
+
+    On the SAME loop: the endpoint path freezes the anticipation via the
+    cooperative ``stop`` hooks (capped grace — issue 0118), and the barge-in
+    path cuts via the zero-grace ``cancel`` hooks WITHOUT calling the stops
+    again — each path keeps its own ladder.
+    """
+
+    stop_calls: list[str] = []
+    cancel_calls: list[str] = []
+
+    async def _thinker_stop() -> None:
+        stop_calls.append("thinker")
+
+    async def _draft_stop() -> None:
+        stop_calls.append("draft")
+
+    say = _SpeakingSayPath(played="Bonjour")
+    settings = Settings.model_construct(
+        STT_ENGINE="fake",
+        STT_SAMPLE_RATE=16_000,
+        VAD_SPEECH_RMS=0.02,
+        VAD_PAUSE_MS=60,
+        ENDPOINT_SILENCE_MS=120,
+        STT_DEBUG_TEXT_MAX_CHARS=64,
+        BARGEIN_CONFIRM_MS=90,
+    )
+    loop = FullDuplexLoop(
+        voice_turn_factory=lambda: VoiceTurn(
+            engine=FakeSttEngine(transcript="bonjour", samples_per_word=160),
+            session_id="s1",
+            settings=settings,
+        ),
+        say_path=say,
+        settings=settings,
+        session_id="s1",
+        on_thinker_stop=_thinker_stop,
+        on_draft_stop=_draft_stop,
+        on_thinker_cancel=lambda: cancel_calls.append("thinker"),
+        on_draft_cancel=lambda: cancel_calls.append("draft"),
+    )
+    loop._now = _fake_clock(step_ms=30.0)  # type: ignore[method-assign]
+    await loop.start()
+    for _ in range(6):
+        await loop.feed_raw_frame(_LOUD)
+    for _ in range(8):
+        await loop.feed_raw_frame(_QUIET)
+    await say.entered.wait()
+    assert loop.state is TurnState.BOB_SPEAKING
+
+    # The ENDPOINT froze via the cooperative stops; no hard cancel fired.
+    assert sorted(stop_calls) == ["draft", "thinker"]
+    assert cancel_calls == []
+
+    for _ in range(6):
+        await loop.feed_raw_frame(_LOUD)
+
+    # The BARGE-IN cut via the zero-grace cancels; the stops were not re-run.
+    assert loop.state.value == "user_speaking"
+    assert sorted(cancel_calls) == ["draft", "thinker"]
+    assert sorted(stop_calls) == ["draft", "thinker"]
+
+    say.release.set()
+    await loop.stop()

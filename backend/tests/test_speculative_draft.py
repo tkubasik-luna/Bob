@@ -317,6 +317,85 @@ async def test_stop_grace_is_capped_by_setting() -> None:
     assert drafter.draft_text is None
 
 
+async def test_hard_cancel_is_zero_grace_even_when_the_pass_stalls() -> None:
+    """``hard_cancel`` (PRD 0018 / issue 0119) never awaits the in-flight pass.
+
+    Mirrors the ThinkerLoop contract: the pass SWALLOWS the cooperative cancel
+    (even the post-grace escalation of :meth:`stop` would hang in its final
+    await), and the zero-grace ``hard_cancel`` is synchronous — it latches the
+    stop flag, requests the hard ``Task.cancel`` and returns while the stubborn
+    task is STILL parked.
+    """
+
+    client = _FakeDraftClient()
+    escape = asyncio.Event()
+
+    async def _stubborn_chat(
+        messages: list[dict[str, Any]],
+        schema: dict[str, Any] | None = None,
+        session_id: str | None = None,
+    ) -> str:
+        client.started.set()
+        while not escape.is_set():
+            try:
+                await escape.wait()
+            except asyncio.CancelledError:
+                continue  # the cooperative cancel stalls — by design
+        return "late reply"
+
+    client.chat = _stubborn_chat  # type: ignore[method-assign]
+    tasks: list[asyncio.Task[None]] = []
+
+    def _spawn(coro: Any) -> asyncio.Task[None]:
+        task: asyncio.Task[None] = asyncio.create_task(coro)
+        tasks.append(task)
+        return task
+
+    drafter = SpeculativeDraft(
+        client=client,  # type: ignore[arg-type]
+        settings=_settings(grace_ms=2_000, grace_cap_ms=250),
+        session_id="s1",
+        spawn=_spawn,
+        clock=_Clock(),
+    )
+    drafter.start("t1")
+    await drafter.feed_partial("bloque")
+    await asyncio.wait_for(client.started.wait(), timeout=1.0)
+    assert drafter.inflight is True
+
+    drafter.hard_cancel()  # synchronous — returns without ANY grace or await
+
+    assert drafter.inflight is False
+    # The stubborn task is still parked: the cut never waited on its unwind.
+    assert tasks and all(not task.done() for task in tasks)
+    # The loop is latched stopped — further partials are dropped; no draft held.
+    await drafter.feed_partial("après hard_cancel")
+    assert drafter.inflight is False
+    assert drafter.draft_text is None
+
+    escape.set()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def test_hard_cancel_keeps_the_already_landed_draft() -> None:
+    """``hard_cancel`` shares :meth:`stop`'s draft contract: the held draft
+    survives the cut (the next :meth:`start` clears it — on a barge-in the
+    loop re-arms immediately, dropping the stale speculation)."""
+
+    client = _FakeDraftClient(replies=["déjà posé"])
+    drafter = _drafter(client)
+    drafter.start("t1")
+    await drafter.feed_partial("bonjour")
+    await drafter.join()
+    assert drafter.draft_text == "déjà posé"
+
+    drafter.hard_cancel()
+    assert drafter.draft_text == "déjà posé"
+    # The barge-in re-arm then drops the stale speculation.
+    drafter.start("t1")
+    assert drafter.draft_text is None
+
+
 async def test_start_clears_previous_turn_draft() -> None:
     client = _FakeDraftClient(replies=["turn-1 reply"])
     drafter = _drafter(client)

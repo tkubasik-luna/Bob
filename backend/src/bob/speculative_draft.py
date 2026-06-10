@@ -344,6 +344,26 @@ class SpeculativeDraft:
             task.cancel()
             await _swallow(task)
 
+    def hard_cancel(self) -> None:
+        """ZERO-GRACE cancel for the barge-in path (PRD 0018 / issue 0119).
+
+        Mirrors :meth:`bob.thinker_loop.ThinkerLoop.hard_cancel`: latch the stop
+        flag and escalate STRAIGHT to :meth:`asyncio.Task.cancel` without any
+        cooperative grace and without awaiting the task — a pass whose unwind
+        stalls can never delay the barge-in cut. Synchronous + idempotent. Same
+        draft contract as :meth:`stop`: the latest landed draft survives (the
+        next :meth:`start` clears it — on a barge-in the loop re-arms right
+        after, dropping the now-stale speculation).
+        """
+
+        self._stopped = True
+        self._rerun = False
+        self._pending_text = None
+        task = self._inflight
+        self._inflight = None
+        if task is not None and not task.done():
+            task.cancel()
+
     async def join(self) -> None:
         """Await the in-flight pass, if any (test / shutdown helper). No cancel."""
 

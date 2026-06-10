@@ -181,11 +181,17 @@ async def chat_ws(websocket: WebSocket) -> None:
     # when the client reports runtime AEC failure via ``voice_aec_degraded``.
     # The mic muting itself is client-side; the flag + the emitted warn event are
     # the observable backend half of the net.
+    # ``active_speech_pipeline`` (PRD 0018 / issue 0119): the in-flight
+    # :class:`bob.speech_pipeline.SpeechStreamPipeline` registered by
+    # ``_synthesize_and_stream`` for the duration of one outbound TTS stream —
+    # the barge-in zero-grace path cuts it with the single synchronous
+    # ``cancel()``. ``None`` when nothing is streaming.
     _sessions[session_id] = {
         "active_tts": [],
         "voice_mode": False,
         "voice_loop": None,
         "half_duplex_gate": False,
+        "active_speech_pipeline": None,
     }
     orchestrator = _orchestrator_provider()
 
@@ -650,6 +656,14 @@ async def _handle_voice_start(
         on_thinker_start=(thinker.loop.start if thinker is not None else None),
         on_thinker_feed=(thinker.loop.feed_partial if thinker is not None else None),
         on_thinker_stop=(thinker.loop.stop if thinker is not None else None),
+        # Barge-in zero-grace (PRD 0018 / issue 0119): the confirmed interrupt
+        # hard-cancels the in-flight Thinker pass SYNCHRONOUSLY (no cooperative
+        # grace — unlike the endpoint freeze's capped ``stop``, 0118).
+        on_thinker_cancel=(thinker.loop.hard_cancel if thinker is not None else None),
+        # Barge-in zero-grace (issue 0119): ONE synchronous call cuts the
+        # in-flight TTS pipeline (synthesis + drain — issue 0121) the instant
+        # the interruption is confirmed.
+        cancel_speech=_make_cancel_speech(session_id),
         # Semantic endpoint (issue 0103): a pure read of the Thinker's latest
         # ``user_turn_complete`` from the SAME live-transcript store the loop
         # writes. The Endpointer fires the endpoint early only once a stable
@@ -671,6 +685,8 @@ async def _handle_voice_start(
         on_draft_start=(drafter.start if drafter is not None else None),
         on_draft_feed=(drafter.feed_partial if drafter is not None else None),
         on_draft_stop=(drafter.stop if drafter is not None else None),
+        # Barge-in zero-grace (issue 0119): mirror of ``on_thinker_cancel``.
+        on_draft_cancel=(drafter.hard_cancel if drafter is not None else None),
         draft_commit_gate=(drafter.commit_gate if drafter is not None else None),
         draft_emit_decision=(drafter.emit_decision if drafter is not None else None),
     )
@@ -790,6 +806,30 @@ def _make_say_path_driver(
         )
 
     return _drive
+
+
+def _make_cancel_speech(session_id: str) -> Callable[[], None]:
+    """Build the barge-in TTS kill-switch hook (PRD 0018 / issue 0119).
+
+    Returns a SYNCHRONOUS callable the full-duplex loop invokes on a confirmed
+    interruption, BEFORE any await: it cuts the session's in-flight
+    :class:`bob.speech_pipeline.SpeechStreamPipeline` (registered by
+    ``_synthesize_and_stream`` for the duration of one outbound stream) with the
+    pipeline's single idempotent ``cancel()`` — synthesis AND drain stop
+    together, so no further audio chunk reaches the client even while the
+    cancelled say-path task is still unwinding. A session with nothing streaming
+    (or already torn down) is a silent no-op.
+    """
+
+    def _cancel() -> None:
+        session = _sessions.get(session_id)
+        if session is None:
+            return
+        pipeline = session.get("active_speech_pipeline")
+        if isinstance(pipeline, SpeechStreamPipeline):
+            pipeline.cancel()
+
+    return _cancel
 
 
 def _make_backchannel_tts(
@@ -1056,12 +1096,12 @@ class _ThinkerHandle:
         """Barge-in ``start_thinker`` — cancel the in-flight pass then re-arm.
 
         On a confirmed barge-in the resumed turn re-plans from the user's new
-        utterance: stop the current pass cooperatively (cancel + grace +
-        hard-kill) then arm the loop for the same ``turn_id`` so the next partial
-        triggers a fresh pass. The full-duplex loop already cancelled the
-        in-flight pass via ``on_thinker_stop`` is NOT guaranteed on the barge-in
-        edge (that edge fires ``start_thinker``, not ``endpoint``), so we stop
-        here defensively before re-arming.
+        utterance: stop the current pass then arm the loop for the same
+        ``turn_id`` so the next partial triggers a fresh pass. Since issue 0119
+        the loop has ALREADY hard-cancelled the in-flight pass synchronously via
+        ``on_thinker_cancel`` (zero grace) before this hook fires, so the
+        cooperative ``stop`` here is normally an instant no-op — kept as a
+        defensive net for a pass racing the cut.
         """
 
         await self.loop.stop()
@@ -1891,6 +1931,13 @@ async def _synthesize_and_stream(
         queue_max_chunks=settings.SPEECH_PIPELINE_QUEUE_MAX_CHUNKS,
         batch_window_ms=settings.SPEECH_PIPELINE_BATCH_WINDOW_MS,
     )
+    # PRD 0018 / issue 0119 — expose the in-flight pipeline so the barge-in
+    # zero-grace path can cut it with the single SYNCHRONOUS ``cancel()``
+    # (no further audio chunk reaches the client) the instant the
+    # interruption is confirmed, without waiting for this task's unwind.
+    session = _sessions.get(session_id)
+    if session is not None:
+        session["active_speech_pipeline"] = pipeline
     # PRD 0018 / issue 0126 — bounded streaming: a synthesis (or drain) that
     # hangs mid-stream is cut at the budget and surfaced to the client as an
     # explicit ``audio_error`` + ``audio_end`` instead of an ``audio_start``
@@ -1938,6 +1985,12 @@ async def _synthesize_and_stream(
     except asyncio.CancelledError:
         # The cancelling path emits the final audio_end. Bubble out.
         raise
+    finally:
+        # De-register only OUR pipeline — a newer stream for this session may
+        # already have replaced the slot (interruption + immediate next turn).
+        sess = _sessions.get(session_id)
+        if sess is not None and sess.get("active_speech_pipeline") is pipeline:
+            sess["active_speech_pipeline"] = None
 
 
 # --- Per-task overlay WS (issue 0052) ---------------------------------------

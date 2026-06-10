@@ -14,6 +14,7 @@ Two layers:
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator, Iterator
 from typing import Any, cast
@@ -27,6 +28,7 @@ from bob import debug_log, turn_metrics, ws_router
 from bob import jarvis_store as jarvis_store_module
 from bob.main import app
 from bob.orchestrator import Orchestrator, OrchestratorResponse
+from bob.speech_pipeline import SpeechStreamPipeline
 from bob.tts_service import KokoroTtsService, SynthesisChunk
 from bob.turn_metrics import TurnLatencyMetrics
 
@@ -178,6 +180,96 @@ async def test_say_path_sentence_error_degrades_to_audio_error_and_continues() -
     # and the stream still terminated cleanly.
     assert stub.json_types() == ["audio_start", "audio_error", "audio_end"]
     assert stub.binary_count() == 4
+
+
+class _ParkedTts:
+    """A TTS double that yields ONE chunk then parks forever on a gate.
+
+    Lets a test freeze a stream mid-flight so the barge-in kill-switch
+    (issue 0119) is exercised against a genuinely in-flight pipeline.
+    """
+
+    def __init__(self) -> None:
+        self.gate = asyncio.Event()  # never set — only the cut unhooks it
+        self.sentences: list[str] = []
+
+    def is_model_cached(self) -> bool:
+        return True
+
+    async def synthesize_stream(
+        self,
+        text: str,
+        *,
+        voice: str | None = None,
+        speed: float | None = None,
+    ) -> AsyncIterator[SynthesisChunk]:
+        if not text.strip():
+            return
+        self.sentences.append(text)
+        yield SynthesisChunk(pcm16=b"\x00\x00" * 32, sample_rate=_SAMPLE_RATE)
+        await self.gate.wait()
+
+
+async def test_cancel_speech_hook_cuts_the_registered_inflight_pipeline() -> None:
+    """The 0119 barge-in surface: ONE synchronous call cuts the live stream.
+
+    ``_synthesize_and_stream`` registers its pipeline in the session for the
+    duration of the stream; ``_make_cancel_speech(session_id)()`` cuts it
+    (synthesis + drain) without touching the say-path task — no further PCM
+    frame reaches the socket — and the unwind clears the registration slot.
+    """
+
+    stub = _StubWebSocket()
+    session_id = "sess-cut"
+    ws_router._sessions[session_id] = {
+        "active_tts": [],
+        "voice_mode": False,
+        "voice_loop": None,
+        "half_duplex_gate": False,
+        "active_speech_pipeline": None,
+    }
+    fake = _ParkedTts()
+    ws_router.set_tts_service_provider(lambda: cast(KokoroTtsService, fake))
+    debug_log.clear()
+    try:
+        task = asyncio.create_task(
+            ws_router._synthesize_and_stream(
+                cast(WebSocket, stub), session_id, "msg-cut", "Une phrase qui ne finit jamais"
+            )
+        )
+        # The first chunk left the socket and the pipeline is registered.
+        for _ in range(200):
+            if stub.binary_count() >= 1:
+                break
+            await asyncio.sleep(0.005)
+        assert stub.binary_count() == 1
+        pipeline = ws_router._sessions[session_id]["active_speech_pipeline"]
+        assert isinstance(pipeline, SpeechStreamPipeline)
+
+        sent_before_cut = stub.binary_count()
+        ws_router._make_cancel_speech(session_id)()  # the ONE synchronous cut
+        assert pipeline.cancelled is True
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        # No audio after the cut; the slot was cleared by the unwind.
+        assert stub.binary_count() == sent_before_cut
+        assert ws_router._sessions[session_id]["active_speech_pipeline"] is None
+    finally:
+        ws_router.reset_tts_service_provider()
+        ws_router._sessions.pop(session_id, None)
+
+
+async def test_cancel_speech_hook_without_session_or_stream_is_a_noop() -> None:
+    """The kill-switch degrades silently: no session / nothing streaming."""
+
+    ws_router._make_cancel_speech("no-such-session")()  # no session at all
+    session_id = "sess-idle"
+    ws_router._sessions[session_id] = {"active_speech_pipeline": None}
+    try:
+        ws_router._make_cancel_speech(session_id)()  # nothing streaming
+    finally:
+        ws_router._sessions.pop(session_id, None)
 
 
 async def test_say_path_empty_text_sends_only_audio_end(fake_tts: _ChunkedFakeTts) -> None:

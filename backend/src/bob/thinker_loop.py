@@ -291,6 +291,27 @@ class ThinkerLoop:
             task.cancel()
             await _swallow(task)
 
+    def hard_cancel(self) -> None:
+        """ZERO-GRACE cancel for the barge-in path (PRD 0018 / issue 0119).
+
+        Unlike :meth:`stop` (cancel + capped grace + escalate), this latches the
+        stop flag and goes STRAIGHT to :meth:`asyncio.Task.cancel` — and never
+        awaits the task at all, so the barge-in cut can never be held hostage by
+        a pass whose cooperative unwind stalls. Synchronous + idempotent. Same
+        store contract as :meth:`stop`: the latest landed snapshot survives (the
+        next :meth:`start` clears it). The detached task unwinds on its own on
+        the event loop (``_run_pass`` lets only ``CancelledError`` escape, which
+        is a task's normal cancelled end — nothing is ever left unretrieved).
+        """
+
+        self._stopped = True
+        self._rerun = False
+        self._pending_text = None
+        task = self._inflight
+        self._inflight = None
+        if task is not None and not task.done():
+            task.cancel()
+
     async def join(self) -> None:
         """Await the in-flight pass, if any (test / shutdown helper). No cancel."""
 
