@@ -28,7 +28,7 @@ from pydantic import BaseModel, Field
 
 from bob.debug_log import emit_debug
 from bob.scheduler_policy import SCHEDULER_QUEUE_FULL_ERROR_CODE, SchedulerQueueFull
-from bob.task_store import TaskStoreError
+from bob.task_store import DEFAULT_TASK_SCOPE, TaskScope, TaskStoreError
 from bob.tools.dispatcher import ToolHandlerContext
 from bob.tools.registry import ToolDefinition
 from bob.tools.types import ToolHandlerOutcome
@@ -48,6 +48,14 @@ class SpawnTaskArgs(BaseModel):
         ...,
         min_length=1,
         description="Goal précis et complet pour le sub-agent.",
+    )
+    scope: TaskScope = Field(
+        DEFAULT_TASK_SCOPE,
+        description=(
+            "Profondeur de réponse attendue : 'fact' (un fait précis, "
+            "oui/non, un chiffre), 'brief' (réponse courte, défaut), "
+            "'deep' (recherche complète demandée explicitement)."
+        ),
     )
 
 
@@ -71,6 +79,18 @@ _SPAWN_TASK_PARAMETERS = {
         "goal": {
             "type": "string",
             "description": "Goal précis et complet pour le sub-agent.",
+        },
+        "scope": {
+            "type": "string",
+            "enum": ["fact", "brief", "deep"],
+            "description": (
+                "Profondeur de réponse attendue. 'fact' : l'utilisateur veut "
+                "UN fait précis (oui/non, un chiffre, une date) — ex. « est-ce "
+                "que le bitcoin a baissé aujourd'hui ? ». 'brief' (défaut) : "
+                "réponse courte sans détail exhaustif. 'deep' : l'utilisateur "
+                "demande explicitement des infos complètes, un rapport ou un "
+                "briefing — ex. « donne-moi des infos sur le bitcoin »."
+            ),
         },
     },
     "required": ["title", "goal"],
@@ -96,7 +116,7 @@ async def _spawn_task_handler(ctx: ToolHandlerContext, args: BaseModel) -> ToolH
             error_message="goal is empty after strip",
         )
 
-    task_id = ctx.task_store.create_task(title=title, goal=goal)
+    task_id = ctx.task_store.create_task(title=title, goal=goal, scope=args.scope)
     # Move the freshly-created task from the legacy ``pending`` default
     # to the v2 ``spawned`` start node so the scheduler counts it under
     # the v2 queue cap. Both states are valid in the union; the v2
@@ -123,6 +143,7 @@ async def _spawn_task_handler(ctx: ToolHandlerContext, args: BaseModel) -> ToolH
             "title": created.title,
             "goal": created.goal,
             "state": created.state,
+            "scope": created.scope,
         },
     )
     await ctx.ws_emit(

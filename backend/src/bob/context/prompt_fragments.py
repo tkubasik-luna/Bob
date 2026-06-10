@@ -152,7 +152,7 @@ CANCEL_CONFIRMATION = PromptFragment(
 
 TOOLS_SYSTEM_ADDENDUM = PromptFragment(
     id="tools_system_addendum",
-    version=4,
+    version=5,
     template=(
         "\n\nTu disposes des outils suivants :\n"
         "- ``say`` : pour répondre directement à l'utilisateur. C'est ton "
@@ -163,7 +163,12 @@ TOOLS_SYSTEM_ADDENDUM = PromptFragment(
         "et ``query`` (mots-clés pour retrouver la tâche). Le backend "
         "affiche le Markdown stocké — NE RÉ-GÉNÈRE PAS le contenu.\n"
         "- ``spawn_task`` : pour déléguer une tâche longue ou autonome à "
-        "un sub-agent en arrière-plan (version v2 PRD 0006).\n"
+        "un sub-agent en arrière-plan (version v2 PRD 0006). Renseigne "
+        "``scope`` selon la profondeur de réponse attendue : ``fact`` si "
+        "l'utilisateur veut UN fait précis (oui/non, un chiffre — ex. "
+        "« est-ce que le bitcoin a baissé aujourd'hui ? ») ; ``deep`` s'il "
+        "demande explicitement des infos complètes ou un rapport (ex. "
+        "« donne-moi des infos sur le bitcoin ») ; ``brief`` sinon.\n"
         "- ``addendum_task`` : pour ajouter une info à une sous-tâche "
         "déjà en cours sans la redémarrer. Le bloc STATE en tête de "
         "prompt liste l'``id`` exact de chaque tâche active.\n"
@@ -204,7 +209,9 @@ TOOLS_SYSTEM_ADDENDUM = PromptFragment(
         "``addendum_task`` / ``replan_task`` / ``cancel_task``) and "
         "instructs the LLM to read the ``recency`` signal from the "
         "STATE block. The legacy v1 ``*_subtask`` tools remain in the "
-        "registry as deprecated aliases for the migration."
+        "registry as deprecated aliases for the migration. v5 instructs "
+        "Jarvis to classify the expected answer depth into the new "
+        "``spawn_task.scope`` enum (fact / brief / deep)."
     ),
 )
 
@@ -252,6 +259,31 @@ DONE_SYNTHESIS_TEMPLATE = PromptFragment(
     description=(
         "Prompt fed to Jarvis when a sub-task emits ``done`` and we want "
         "Jarvis to announce + frame the result in his tone."
+    ),
+)
+
+
+DONE_SYNTHESIS_FACT_TEMPLATE = PromptFragment(
+    id="done_synthesis_fact",
+    version=1,
+    template=(
+        "La sous-tâche '{task_title}' vient de terminer.\n"
+        "Résultat brut : '{result}'.\n"
+        "L'utilisateur attendait UN fait précis (oui/non, un chiffre, une "
+        "date). Ta réponse sera LUE À VOIX HAUTE (TTS).\n"
+        "Si le résultat est vide ou incohérent, dis-le franchement en une "
+        "phrase et arrête-toi là.\n"
+        "Sinon, réponds DIRECTEMENT à la question en UNE phrase courte "
+        "(~15 mots), comme on répond à l'oral — ex. « Oui, le bitcoin a "
+        "perdu trois pour cent aujourd'hui. » Interdits : formule "
+        "d'introduction (« Voilà ce que j'ai trouvé »), listes, markdown, "
+        "contexte supplémentaire, question de relance. Le fait, rien "
+        "d'autre."
+    ),
+    description=(
+        "Variant of DONE_SYNTHESIS_TEMPLATE for ``scope='fact'`` tasks "
+        "(migration 0012): the user asked for a single fact, so Jarvis "
+        "answers it directly — no framing, no follow-up question."
     ),
 )
 
@@ -412,6 +444,63 @@ SUB_AGENT_V2_SYSTEM_PROMPT = PromptFragment(
         "salvage in :func:`bob.sub_agent.runner._decode_leading_json`)."
     ),
 )
+
+
+# --- Sub-agent scope directives (migration 0012). ---
+#
+# ``Task.scope`` records the answer depth Jarvis classified at spawn time.
+# The runner appends the matching directive to the stable system-prompt
+# prefix (after the base contract, before skill packs). ``brief`` — the
+# default — appends nothing so the pre-0012 prompt bytes (and the LM Studio
+# KV-cache prefix) are untouched for the common path.
+
+SUB_AGENT_SCOPE_FACT_DIRECTIVE = PromptFragment(
+    id="sub_agent_scope_fact",
+    version=1,
+    template=(
+        "ANSWER SCOPE: the user wants ONE precise fact (yes/no, a number, a "
+        "date) — not a report. Make the FEWEST tool calls needed to "
+        "establish that fact (usually one), then finish. ``result_summary`` "
+        "is the fact itself in 1 short French sentence. Set ``ui_payload`` "
+        "to null and do NOT author a Markdown deliverable — a short factual "
+        "answer needs no document. Prefer ``result_ref`` only if a tool "
+        "result directly IS the answer."
+    ),
+    description=(
+        "Appended to the sub-agent system prompt when ``Task.scope`` is "
+        "``fact``: minimal tool use, one-sentence result, no deliverable."
+    ),
+)
+
+
+SUB_AGENT_SCOPE_DEEP_DIRECTIVE = PromptFragment(
+    id="sub_agent_scope_deep",
+    version=1,
+    template=(
+        "ANSWER SCOPE: the user explicitly asked for complete information "
+        "(a report / briefing). Research thoroughly and author a full, "
+        "well-structured Markdown deliverable in ``ui_payload``."
+    ),
+    description=(
+        "Appended to the sub-agent system prompt when ``Task.scope`` is "
+        "``deep``: full research + rich deliverable is the explicit ask."
+    ),
+)
+
+
+def scope_directive_fragment(scope: str) -> str:
+    """Return the sub-agent prompt directive for ``scope`` (``""`` for brief).
+
+    ``brief`` (and any unknown value, defensively) maps to the empty string
+    so the default path leaves the stable prompt prefix byte-identical to
+    its pre-0012 form.
+    """
+
+    if scope == "fact":
+        return SUB_AGENT_SCOPE_FACT_DIRECTIVE.template
+    if scope == "deep":
+        return SUB_AGENT_SCOPE_DEEP_DIRECTIVE.template
+    return ""
 
 
 # --- Sub-agent skill packs (PRD 0008 / issue 0063). ---

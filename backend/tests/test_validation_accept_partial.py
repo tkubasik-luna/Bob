@@ -42,6 +42,7 @@ class _StubTask:
         self.state = "pending"
         self.created_at = "2026-01-01T00:00:00Z"
         self.result = None
+        self.scope = "brief"
 
 
 class _StubTaskStore:

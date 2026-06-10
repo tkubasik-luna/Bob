@@ -128,6 +128,7 @@ async def _replan_handler(ctx: ToolHandlerContext, args: BaseModel) -> ToolHandl
         title=old_task.title,
         goal=new_goal,
         lineage=new_lineage,
+        scope=old_task.scope,
     )
     # The replacement starts in ``spawned`` so it counts under the v2
     # queue cap (same pattern as ``spawn_task``).

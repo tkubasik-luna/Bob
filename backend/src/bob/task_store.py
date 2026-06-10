@@ -48,6 +48,18 @@ TaskState = Literal[
 TaskRole = Literal["system", "user", "assistant", "tool"]
 TaskAction = Literal["done", "ask_user", "progress"]
 
+#: Expected answer depth classified by Jarvis at spawn time (migration 0012).
+#:
+#: ``fact`` — a single fact / yes-no / number; the sub-agent stays minimal
+#: and the done synthesis answers directly. ``brief`` — the default, pre-0012
+#: behaviour. ``deep`` — full research + rich deliverable explicitly asked.
+TaskScope = Literal["fact", "brief", "deep"]
+
+#: Runtime fallback when the column carries an unknown value (defensive read).
+DEFAULT_TASK_SCOPE: TaskScope = "brief"
+
+_VALID_SCOPES: frozenset[str] = frozenset({"fact", "brief", "deep"})
+
 
 @dataclass(frozen=True)
 class Task:
@@ -77,6 +89,9 @@ class Task:
     created_at: str
     updated_at: str
     dismissed: bool
+    #: Expected answer depth (migration 0012) — see :data:`TaskScope`.
+    #: Drives the sub-agent prompt directive and the done-synthesis template.
+    scope: TaskScope = DEFAULT_TASK_SCOPE
     #: Structured deliverable persisted alongside the spoken / markdown
     #: ``result`` text (PRD 0008 / issue 0064; PRD 0010 / issue 0066 made it a
     #: LIST). Holds a list of ``{"component": ..., "props": {...}}`` section
@@ -160,12 +175,14 @@ class TaskStore:
         goal: str,
         parent_task_id: str | None = None,
         lineage: Sequence[str] | None = None,
+        scope: TaskScope = DEFAULT_TASK_SCOPE,
     ) -> str:
         """Insert a new task in ``pending`` state and return its id.
 
         ``lineage`` (PRD 0006 / issue 0044) defaults to an empty list. A
         future ``replan_task`` tool will pass the previous task chain when
-        spawning the replacement.
+        spawning the replacement. ``scope`` (migration 0012) records the
+        expected answer depth classified by Jarvis at spawn time.
         """
 
         task_id = uuid.uuid4().hex
@@ -173,9 +190,9 @@ class TaskStore:
         with self._lock, self._conn:
             self._conn.execute(
                 "INSERT INTO tasks"
-                "(id, title, goal, state, needs_attention, parent_task_id, lineage)"
-                " VALUES (?, ?, ?, 'pending', 0, ?, ?)",
-                (task_id, title, goal, parent_task_id, lineage_json),
+                "(id, title, goal, state, needs_attention, parent_task_id, lineage, scope)"
+                " VALUES (?, ?, ?, 'pending', 0, ?, ?, ?)",
+                (task_id, title, goal, parent_task_id, lineage_json, scope),
             )
         return task_id
 
@@ -191,7 +208,7 @@ class TaskStore:
             cursor = self._conn.execute(
                 "SELECT id, title, goal, state, needs_attention, result, result_payload,"
                 " parent_task_id, created_at, updated_at, dismissed, lineage,"
-                " delivered_at_turn"
+                " delivered_at_turn, scope"
                 " FROM tasks WHERE id = ?",
                 (task_id,),
             )
@@ -217,7 +234,8 @@ class TaskStore:
 
         query = (
             "SELECT id, title, goal, state, needs_attention, result, result_payload,"
-            " parent_task_id, created_at, updated_at, dismissed, lineage, delivered_at_turn"
+            " parent_task_id, created_at, updated_at, dismissed, lineage, delivered_at_turn,"
+            " scope"
             " FROM tasks"
         )
         where: list[str] = []
@@ -291,7 +309,8 @@ class TaskStore:
 
         sql = (
             "SELECT id, title, goal, state, needs_attention, result, result_payload,"
-            " parent_task_id, created_at, updated_at, dismissed, lineage, delivered_at_turn"
+            " parent_task_id, created_at, updated_at, dismissed, lineage, delivered_at_turn,"
+            " scope"
             " FROM tasks"
             f" WHERE {' AND '.join(where_clauses)}"
             f" ORDER BY {', '.join(order_parts)}"
@@ -512,6 +531,7 @@ def _row_to_task(row: tuple[object, ...]) -> Task:
         dismissed,
         lineage_raw,
         delivered_at_turn,
+        scope_raw,
     ) = row
     assert isinstance(id_, str)
     assert isinstance(title, str)
@@ -526,8 +546,14 @@ def _row_to_task(row: tuple[object, ...]) -> Task:
     assert isinstance(dismissed, int)
     assert isinstance(lineage_raw, str)
     assert delivered_at_turn is None or isinstance(delivered_at_turn, int)
+    assert isinstance(scope_raw, str)
     lineage = _decode_lineage(lineage_raw)
     result_payload = _decode_result_payload(result_payload_raw)
+    # Defensive read: collapse any unknown / legacy value to the default —
+    # scope is a prompt-shaping hint, never load-bearing for execution.
+    scope: TaskScope = (
+        scope_raw if scope_raw in _VALID_SCOPES else DEFAULT_TASK_SCOPE  # type: ignore[assignment]
+    )
     # ``state`` is constrained by the SQL CHECK to the TaskState set — the
     # cast to the Literal alias is safe.
     return Task(
@@ -542,6 +568,7 @@ def _row_to_task(row: tuple[object, ...]) -> Task:
         created_at=created_at,
         updated_at=updated_at,
         dismissed=bool(dismissed),
+        scope=scope,
         lineage=lineage,
         delivered_at_turn=delivered_at_turn,
     )

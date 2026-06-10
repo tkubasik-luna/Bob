@@ -241,6 +241,7 @@ async def test_say_handler_tolerates_missing_jarvis_store() -> None:
             goal: str,
             parent_task_id: str | None = None,
             lineage: Any = None,
+            scope: Any = None,
         ) -> str:
             return "task-stub"
 

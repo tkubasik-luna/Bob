@@ -91,6 +91,7 @@ class _TaskStoreLike(Protocol):
         goal: str,
         parent_task_id: str | None = ...,
         lineage: Any = ...,
+        scope: Any = ...,
     ) -> str: ...
 
     def get_task(self, task_id: str) -> Any: ...

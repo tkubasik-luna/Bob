@@ -63,8 +63,8 @@ def _make_task_store() -> TaskStore:
     return TaskStore(conn)
 
 
-def _make_running_task(store: TaskStore, *, goal: str) -> str:
-    task_id = store.create_task(title="t", goal=goal)
+def _make_running_task(store: TaskStore, *, goal: str, scope: str = "brief") -> str:
+    task_id = store.create_task(title="t", goal=goal, scope=scope)  # type: ignore[arg-type]
     store.update_state(task_id, "running")
     return task_id
 
@@ -251,6 +251,35 @@ async def test_runner_catalogue_frozen_for_the_run_despite_registry_mutation(
     second = client.calls[1]["messages"][0]["content"]
     assert first == second
     assert "mail_extra_tool" not in second
+
+
+@pytest.mark.asyncio
+async def test_runner_scope_directive_in_stable_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``Task.scope`` renders its directive inside the stable prefix (0012).
+
+    ``fact`` and ``deep`` append their ANSWER SCOPE block; ``brief`` (the
+    default) appends nothing, keeping the pre-0012 prefix bytes intact.
+    """
+
+    monkeypatch.setattr(runner_mod, "temporal_context_fragment", lambda now=None: "TEMPOREL-FIXE")
+
+    prompts: dict[str, str] = {}
+    for scope in ("fact", "brief", "deep"):
+        client = _ScriptedClient(chat_values=[_DONE])
+        runner = _make_runner(client, SubAgentToolRegistry([_mail_tool()]))
+        task_id = _make_running_task(
+            runner._task_store,
+            goal="Trouve le dernier mail de Paul",
+            scope=scope,
+        )
+        await runner.run(task_id)
+        prompts[scope] = client.calls[0]["messages"][0]["content"]
+
+    assert "ANSWER SCOPE: the user wants ONE precise fact" in prompts["fact"]
+    assert "ANSWER SCOPE: the user explicitly asked for complete information" in prompts["deep"]
+    assert "ANSWER SCOPE" not in prompts["brief"]
 
 
 @pytest.mark.asyncio

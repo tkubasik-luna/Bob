@@ -103,6 +103,7 @@ from bob.config import get_settings
 from bob.context.prompt_fragments import (
     SUB_AGENT_V2_ADDENDUM_TEMPLATE,
     SUB_AGENT_V2_SYSTEM_PROMPT,
+    scope_directive_fragment,
     select_skill_packs,
     temporal_context_fragment,
 )
@@ -1791,6 +1792,13 @@ class SubAgentRunner:
             advertised_tools = self._advertise_tools(task)
             tool_catalogue = _render_tool_catalogue(advertised_tools)
             prefix = SUB_AGENT_V2_SYSTEM_PROMPT.render(goal=task.goal)
+            # Migration 0012: the spawn-time answer-depth classification.
+            # ``brief`` renders empty so the default prefix bytes are
+            # unchanged; ``fact``/``deep`` are immutable per run, so the
+            # prefix stability contract holds.
+            scope_directive = scope_directive_fragment(task.scope)
+            if scope_directive:
+                prefix += "\n\n" + scope_directive
             # Issue 0063: append any goal-matching skill packs (the Gmail
             # recipe today) so the base contract stays tool-agnostic and a
             # non-matching goal never pays for an irrelevant recipe's tokens.

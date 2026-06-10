@@ -61,6 +61,7 @@ class _StubTaskStore:
         goal: str,
         parent_task_id: str | None = None,
         lineage: Any = None,
+        scope: Any = None,
     ) -> str:
         return "task-stub"
 

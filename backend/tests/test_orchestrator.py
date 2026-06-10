@@ -678,10 +678,16 @@ async def test_generate_proactive_message_unknown_kind_does_not_enqueue() -> Non
 # ---------------------------------------------------------------------------
 
 
-def _seed_done_task(task_store: TaskStore, *, title: str, result: str) -> str:
+def _seed_done_task(
+    task_store: TaskStore,
+    *,
+    title: str,
+    result: str,
+    scope: str = "brief",
+) -> str:
     """Helper: create a task in ``done`` state with ``result`` set."""
 
-    task_id = task_store.create_task(title=title, goal="g")
+    task_id = task_store.create_task(title=title, goal="g", scope=scope)  # type: ignore[arg-type]
     task_store.update_state(task_id, "running")
     task_store.set_result(task_id, result)
     task_store.update_state(task_id, "done")
@@ -786,6 +792,45 @@ async def test_do_generate_done_synthesis_handles_empty_result() -> None:
     assistant_msgs = [e for e in received if e["type"] == "assistant_msg"]
     assert len(assistant_msgs) == 1
     assert assistant_msgs[0]["speech"] == "C'est terminé."
+
+
+@pytest.mark.asyncio
+async def test_do_generate_done_synthesis_fact_scope_uses_direct_template() -> None:
+    """A ``scope='fact'`` task renders the direct-answer template (migration 0012)."""
+
+    received: list[dict[str, Any]] = []
+
+    async def _emitter(event: dict[str, Any]) -> None:
+        received.append(event)
+
+    ws_events.set_emitter(_emitter)
+    try:
+        orchestrator, jarvis_client, _sub, _js, task_store, _scheduler = _make_orchestrator(
+            chat_responses=["Oui, le bitcoin a perdu trois pour cent aujourd'hui."],
+        )
+        task_id = _seed_done_task(
+            task_store,
+            title="Cours bitcoin",
+            result="BTC -3% sur 24h",
+            scope="fact",
+        )
+
+        await orchestrator._do_generate_done_synthesis(task_id)
+    finally:
+        ws_events.set_emitter(None)
+
+    assistant_msgs = [e for e in received if e["type"] == "assistant_msg"]
+    assert len(assistant_msgs) == 1
+
+    user_msg = jarvis_client.chat_calls[0]["messages"][-1]
+    assert user_msg["role"] == "user"
+    assert "Cours bitcoin" in user_msg["content"]
+    assert "BTC -3% sur 24h" in user_msg["content"]
+    # Fact variant: direct one-sentence answer, no framing / follow-up.
+    assert "UN fait précis" in user_msg["content"]
+    assert "UNE phrase courte" in user_msg["content"]
+    # The brief/deep framing line must NOT leak into the fact prompt.
+    assert "2 phrases" not in user_msg["content"]
 
 
 # ---------------------------------------------------------------------------

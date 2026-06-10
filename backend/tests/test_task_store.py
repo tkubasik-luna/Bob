@@ -66,6 +66,32 @@ def test_get_task_unknown_raises(fresh_task_store: TaskStore) -> None:
         fresh_task_store.get_task("missing-id")
 
 
+def test_create_task_default_scope_is_brief(fresh_task_store: TaskStore) -> None:
+    task_id = fresh_task_store.create_task(title="T", goal="g")
+    assert fresh_task_store.get_task(task_id).scope == "brief"
+
+
+def test_create_task_scope_round_trips(fresh_task_store: TaskStore) -> None:
+    fact_id = fresh_task_store.create_task(title="T", goal="g", scope="fact")
+    deep_id = fresh_task_store.create_task(title="T", goal="g", scope="deep")
+
+    assert fresh_task_store.get_task(fact_id).scope == "fact"
+    assert fresh_task_store.get_task(deep_id).scope == "deep"
+    by_list = {t.id: t.scope for t in fresh_task_store.list_tasks()}
+    assert by_list == {fact_id: "fact", deep_id: "deep"}
+
+
+def test_unknown_scope_value_reads_back_as_brief() -> None:
+    """Defensive read: a corrupted / future scope value collapses to default."""
+
+    store, conn = _make_store_in_memory()
+    task_id = store.create_task(title="T", goal="g")
+    conn.execute("UPDATE tasks SET scope = 'galaxy-brain' WHERE id = ?", (task_id,))
+    conn.commit()
+
+    assert store.get_task(task_id).scope == "brief"
+
+
 def test_list_tasks_returns_in_creation_order(fresh_task_store: TaskStore) -> None:
     a = fresh_task_store.create_task(title="A", goal="ga")
     b = fresh_task_store.create_task(title="B", goal="gb")

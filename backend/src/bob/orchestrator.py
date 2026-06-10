@@ -93,6 +93,7 @@ from bob.context.policy import (
 from bob.context.prompt_fragments import (
     ASK_USER_PARAPHRASE_TEMPLATE,
     CANCEL_CONFIRMATION,
+    DONE_SYNTHESIS_FACT_TEMPLATE,
     DONE_SYNTHESIS_TEMPLATE,
     FAILED_SYNTHESIS_TEMPLATE,
     FORWARD_CONFIRMATION,
@@ -185,6 +186,12 @@ _ASK_USER_PARAPHRASE_TEMPLATE = ASK_USER_PARAPHRASE_TEMPLATE.template
 # Slice #0025 + issue 0046: hard-coded template for ``generate_done_synthesis``.
 # Now sourced from :data:`prompt_fragments.DONE_SYNTHESIS_TEMPLATE`.
 _DONE_SYNTHESIS_TEMPLATE = DONE_SYNTHESIS_TEMPLATE.template
+
+
+# Migration 0012: variant used when the task was spawned with ``scope='fact'``
+# — the user asked for a single fact, so the synthesis answers it directly
+# (no framing, no follow-up question).
+_DONE_SYNTHESIS_FACT_TEMPLATE = DONE_SYNTHESIS_FACT_TEMPLATE.template
 
 
 # Template for the ``failed`` proactive synthesis. A sub-task that fails on
@@ -1401,7 +1408,10 @@ class Orchestrator:
             return
 
         result_text = task.result if task.result is not None else ""
-        prompt = _DONE_SYNTHESIS_TEMPLATE.format(
+        template = (
+            _DONE_SYNTHESIS_FACT_TEMPLATE if task.scope == "fact" else _DONE_SYNTHESIS_TEMPLATE
+        )
+        prompt = template.format(
             task_title=task.title,
             result=result_text,
         )

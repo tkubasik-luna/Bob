@@ -1,0 +1,27 @@
+-- 0012 — Add ``tasks.scope`` column (expected answer depth).
+--
+-- Background: ``spawn_task`` carried only ``title`` + ``goal``, so a yes/no
+-- factual question ("le bitcoin a-t-il baissé aujourd'hui ?") and an open
+-- research request ("donne-moi des infos sur le bitcoin") produced the same
+-- kind of sub-task: full research, big deliverable, framed synthesis. The
+-- ``scope`` column persists the depth Jarvis classified at spawn time:
+--
+--   'fact'  — a single fact / yes-no / number is expected. The sub-agent
+--             keeps tool use minimal and answers in 1-2 sentences; the done
+--             synthesis answers directly with no framing or follow-up.
+--   'brief' — default; the pre-0012 behaviour (bounded 2-sentence synthesis,
+--             normal deliverable).
+--   'deep'  — full research + rich deliverable explicitly requested.
+--
+-- DEFAULT 'brief' keeps every pre-0012 row valid without a back-fill UPDATE
+-- and is also the runtime fallback when a weak local model omits the enum.
+--
+-- Idempotency: gated by the runner (``bob.db.migrations_runner``) via the
+-- ``_migrations`` bookkeeping row.
+--
+-- Down migration (manual, documentation only):
+--   DELETE FROM _migrations WHERE filename = '0012_tasks_scope.sql';
+--   -- and rebuild ``tasks`` without ``scope`` via the standard sqlite
+--   -- CREATE/INSERT/DROP/RENAME dance. Leaving the column is free.
+
+ALTER TABLE tasks ADD COLUMN scope TEXT NOT NULL DEFAULT 'brief';
