@@ -1,4 +1,11 @@
-"""Tests for :mod:`bob.llm_selection_store` and the GET selection endpoint."""
+"""Tests for the GET /api/llm/selection flat view over the per-role store.
+
+The flat v1 ``LLMSelectionStore`` is gone: :class:`RoleSelectionStore` is the
+single owner of ``llm_selection.json`` and the global ``/selection`` surface is
+a VIEW over its ``jarvis`` role. These tests pin that projection (and the
+related clobber regressions); the store's own decode/migration behaviour is
+covered by ``test_role_selection_store.py``.
+"""
 
 from __future__ import annotations
 
@@ -10,8 +17,10 @@ from fastapi.testclient import TestClient
 from bob.config import Settings
 from bob.llm_selection_store import (
     LLM_SELECTION_FILENAME,
+    ROLES,
     LLMSelection,
-    LLMSelectionStore,
+    RoleSelection,
+    RoleSelectionStore,
 )
 from bob.main import app
 
@@ -27,98 +36,26 @@ def _settings(**overrides: object) -> Settings:
     return Settings(**base)  # type: ignore[arg-type]
 
 
-def test_first_boot_seeds_from_settings_and_persists(tmp_path: Path) -> None:
-    path = tmp_path / LLM_SELECTION_FILENAME
-    store = LLMSelectionStore(path)
-    assert store.read() is None  # nothing persisted yet
-
-    seeded = store.seed_from_settings(_settings())
-
-    assert seeded.provider == "lm_studio"
-    assert seeded.lm_model == "qwen2.5-7b-instruct"
-    assert seeded.context_length == {}
-
-    # The JSON file now exists with the seeded shape.
-    assert path.exists()
-    assert seeded.base_url == "http://localhost:1234/v1"
-    on_disk = json.loads(path.read_text(encoding="utf-8"))
-    assert on_disk == {
-        "provider": "lm_studio",
-        "lm_model": "qwen2.5-7b-instruct",
-        "context_length": {},
-        "base_url": "http://localhost:1234/v1",
-        "reasoning": None,
-    }
+def _store_with_jarvis(path: Path, jarvis: LLMSelection) -> RoleSelectionStore:
+    store = RoleSelectionStore(path)
+    store.write(RoleSelection(roles={role: jarvis for role in ROLES}))
+    return store
 
 
-def test_json_wins_over_env_on_later_boots(tmp_path: Path) -> None:
-    path = tmp_path / LLM_SELECTION_FILENAME
-    # Pre-existing JSON differs from what .env would seed.
-    path.write_text(
-        json.dumps(
-            {
-                "provider": "claude_cli",
-                "lm_model": "persisted-model",
-                "context_length": {"persisted-model": 200000},
-            }
-        ),
-        encoding="utf-8",
-    )
-    store = LLMSelectionStore(path)
-
-    # .env says lm_studio / qwen but the JSON must win.
-    selection = store.seed_from_settings(_settings(LLM_PROVIDER="lm_studio"))
-
-    assert selection.provider == "claude_cli"
-    assert selection.lm_model == "persisted-model"
-    assert selection.context_length == {"persisted-model": 200000}
-
-
-def test_context_length_map_round_trips(tmp_path: Path) -> None:
-    path = tmp_path / LLM_SELECTION_FILENAME
-    store = LLMSelectionStore(path)
-    store.write(
-        LLMSelection(
-            provider="lm_studio",
-            lm_model="model-a",
-            context_length={"model-a": 32768, "model-b": 8192},
-        )
-    )
-
-    reloaded = LLMSelectionStore(path).read()
-
-    assert reloaded is not None
-    assert reloaded.provider == "lm_studio"
-    assert reloaded.lm_model == "model-a"
-    assert reloaded.context_length == {"model-a": 32768, "model-b": 8192}
-
-
-def test_read_decodes_corrupt_file_to_defaults(tmp_path: Path) -> None:
-    path = tmp_path / LLM_SELECTION_FILENAME
-    path.write_text("{ not valid json", encoding="utf-8")
-
-    selection = LLMSelectionStore(path).read()
-
-    assert selection is not None
-    assert selection.provider == "lm_studio"
-    assert selection.lm_model is None
-    assert selection.context_length == {}
-
-
-def test_get_endpoint_returns_current_selection(tmp_path: Path) -> None:
+def test_get_endpoint_returns_jarvis_view(tmp_path: Path) -> None:
     from bob import llm_router
 
     path = tmp_path / LLM_SELECTION_FILENAME
-    store = LLMSelectionStore(path)
-    store.write(
+    store = _store_with_jarvis(
+        path,
         LLMSelection(
             provider="lm_studio",
             lm_model="endpoint-model",
             context_length={"endpoint-model": 16384},
-        )
+        ),
     )
 
-    llm_router.set_store_provider(lambda: store)
+    llm_router.set_role_store_provider(lambda: store)
     llm_router.set_settings_provider(lambda: _settings(CLAUDE_CLI_MODEL="claude-opus-4"))
     try:
         # TestClient without the ``with`` block does not run the lifespan, so
@@ -126,7 +63,7 @@ def test_get_endpoint_returns_current_selection(tmp_path: Path) -> None:
         client = TestClient(app)
         response = client.get("/api/llm/selection")
     finally:
-        llm_router.reset_store_provider()
+        llm_router.reset_role_store_provider()
         llm_router.reset_settings_provider()
 
     assert response.status_code == 200
@@ -143,22 +80,90 @@ def test_get_endpoint_returns_current_selection(tmp_path: Path) -> None:
     }
 
 
+def test_get_endpoint_projects_jarvis_not_other_roles(tmp_path: Path) -> None:
+    """The flat view is the JARVIS role — a differently-pinned thinker must not leak."""
+
+    from bob import llm_router
+
+    path = tmp_path / LLM_SELECTION_FILENAME
+    store = RoleSelectionStore(path)
+    jarvis = LLMSelection(
+        provider="lm_studio", lm_model="jarvis-model", base_url="http://jarvis:1234/v1"
+    )
+    thinker = LLMSelection(
+        provider="claude_cli", lm_model="thinker-model", base_url="http://thinker:1234/v1"
+    )
+    store.write(
+        RoleSelection(
+            roles={"jarvis": jarvis, "thinker": thinker, "draft": jarvis, "subagent": jarvis}
+        )
+    )
+
+    llm_router.set_role_store_provider(lambda: store)
+    llm_router.set_settings_provider(lambda: _settings())
+    try:
+        response = TestClient(app).get("/api/llm/selection")
+    finally:
+        llm_router.reset_role_store_provider()
+        llm_router.reset_settings_provider()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["lm_model"] == "jarvis-model"
+    assert body["provider"] == "lm_studio"
+    assert body["base_url"] == "http://jarvis:1234/v1"
+
+
+def test_get_endpoint_reads_flat_v1_file_via_migration(tmp_path: Path) -> None:
+    """A legacy flat v1 file still serves the GET (role decode migrates it)."""
+
+    from bob import llm_router
+
+    path = tmp_path / LLM_SELECTION_FILENAME
+    path.write_text(
+        json.dumps(
+            {
+                "provider": "claude_cli",
+                "lm_model": "persisted-model",
+                "context_length": {"persisted-model": 200000},
+            }
+        ),
+        encoding="utf-8",
+    )
+    store = RoleSelectionStore(path)
+
+    llm_router.set_role_store_provider(lambda: store)
+    llm_router.set_settings_provider(lambda: _settings())
+    try:
+        response = TestClient(app).get("/api/llm/selection")
+    finally:
+        llm_router.reset_role_store_provider()
+        llm_router.reset_settings_provider()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["provider"] == "claude_cli"
+    assert body["lm_model"] == "persisted-model"
+    assert body["context_length"] == {"persisted-model": 200000}
+
+
 def test_get_endpoint_claude_model_falls_back_to_default(tmp_path: Path) -> None:
     """With ``CLAUDE_CLI_MODEL`` unset, the picker still gets a non-empty label."""
 
     from bob import llm_router
 
     path = tmp_path / LLM_SELECTION_FILENAME
-    store = LLMSelectionStore(path)
-    store.write(LLMSelection(provider="lm_studio", lm_model="m", context_length={}))
+    store = _store_with_jarvis(
+        path, LLMSelection(provider="lm_studio", lm_model="m", context_length={})
+    )
 
-    llm_router.set_store_provider(lambda: store)
+    llm_router.set_role_store_provider(lambda: store)
     llm_router.set_settings_provider(lambda: _settings(CLAUDE_CLI_MODEL=None))
     try:
         client = TestClient(app)
         response = client.get("/api/llm/selection")
     finally:
-        llm_router.reset_store_provider()
+        llm_router.reset_role_store_provider()
         llm_router.reset_settings_provider()
 
     assert response.status_code == 200

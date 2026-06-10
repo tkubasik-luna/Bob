@@ -22,7 +22,7 @@ import pytest
 
 from bob.config import Settings
 from bob.llm_client import LLMClient
-from bob.llm_selection_store import LLMSelection, LLMSelectionStore
+from bob.llm_selection_store import ROLES, LLMSelection, RoleSelection, RoleSelectionStore
 from bob.llm_swap import (
     ClaudeCliUnavailableError,
     LLMSwitcher,
@@ -93,20 +93,45 @@ class _OrchestratorSpy:
         self.token_budget = token_budget
 
 
+class _FlatStore:
+    """Flat (jarvis-view) test adapter over the per-role store.
+
+    The switcher takes the RoleSelectionStore directly; these tests assert the
+    GLOBAL surface's contract, which is the jarvis projection — the adapter
+    keeps the assertions in flat terms.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.role_store = RoleSelectionStore(path)
+
+    def write(self, selection: LLMSelection) -> None:
+        current = self.role_store.read()
+        if current is None:
+            self.role_store.write(RoleSelection(roles={role: selection for role in ROLES}))
+        else:
+            self.role_store.write(
+                current.with_role("jarvis", selection).with_role("subagent", selection)
+            )
+
+    def read(self) -> LLMSelection | None:
+        role_selection = self.role_store.read()
+        return role_selection.role("jarvis") if role_selection is not None else None
+
+
 def _switcher(
     tmp_path: Path,
     *,
     manager: _FakeManager,
     initial: LLMSelection,
-) -> tuple[LLMSwitcher, _OrchestratorSpy, SubAgentClientHolder, LLMSelectionStore]:
-    store = LLMSelectionStore(tmp_path / "llm_selection.json")
+) -> tuple[LLMSwitcher, _OrchestratorSpy, SubAgentClientHolder, _FlatStore]:
+    store = _FlatStore(tmp_path / "llm_selection.json")
     store.write(initial)
     orch = _OrchestratorSpy(FakeLLMClient())
     holder = SubAgentClientHolder(FakeLLMClient())
     switcher = LLMSwitcher(
         settings=_settings(),
         manager=cast(Any, manager),
-        selection_store=store,
+        selection_store=store.role_store,
         orchestrator=cast(Orchestrator, orch),
         subagent_holder=holder,
     )
@@ -159,7 +184,7 @@ async def test_swap_closes_superseded_sdk_clients(tmp_path: Path) -> None:
 
     manager = _FakeManager()
     initial = LLMSelection(provider="lm_studio", lm_model="boot-model", context_length={})
-    store = LLMSelectionStore(tmp_path / "llm_selection.json")
+    store = _FlatStore(tmp_path / "llm_selection.json")
     store.write(initial)
     old_jarvis = _AcloseSpyClient()
     old_subagent = _AcloseSpyClient()
@@ -168,7 +193,7 @@ async def test_swap_closes_superseded_sdk_clients(tmp_path: Path) -> None:
     switcher = LLMSwitcher(
         settings=_settings(),
         manager=cast(Any, manager),
-        selection_store=store,
+        selection_store=store.role_store,
         orchestrator=cast(Orchestrator, orch),
         subagent_holder=holder,
     )
@@ -665,3 +690,39 @@ async def test_swap_base_url_unreachable_still_swaps(tmp_path: Path) -> None:
     assert persisted is not None
     assert persisted.base_url == "http://10.0.0.9:9999/v1"
     assert result.selection.base_url == "http://10.0.0.9:9999/v1"
+
+
+@pytest.mark.asyncio
+async def test_global_swap_preserves_other_roles_pins(tmp_path: Path) -> None:
+    """Clobber regression: a GLOBAL swap must not flatten the per-role map.
+
+    The global coordinator persists into jarvis + subagent only; a thinker /
+    draft pinned via the per-role picker survives byte-for-byte. (The old flat
+    v1 store rewrote the whole file flat and destroyed these pins.)
+    """
+
+    manager = _FakeManager()
+    initial = LLMSelection(provider="lm_studio", lm_model="boot-model", context_length={})
+    switcher, _orch, _holder, store = _switcher(tmp_path, manager=manager, initial=initial)
+
+    # User pins thinker + draft to their own selections via the per-role picker.
+    role_map = store.role_store.read()
+    assert role_map is not None
+    store.role_store.write(
+        role_map.with_role(
+            "thinker",
+            LLMSelection(provider="lm_studio", lm_model="thinker-model", context_length={}),
+        ).with_role(
+            "draft",
+            LLMSelection(provider="claude_cli", lm_model=None, context_length={}),
+        )
+    )
+
+    await switcher.swap_lm_model("target-model")
+
+    after = store.role_store.read()
+    assert after is not None
+    assert after.role("jarvis").lm_model == "target-model"
+    assert after.role("subagent").lm_model == "target-model"
+    assert after.role("thinker").lm_model == "thinker-model"
+    assert after.role("draft").provider == "claude_cli"

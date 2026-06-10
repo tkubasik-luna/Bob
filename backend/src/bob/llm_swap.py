@@ -48,7 +48,6 @@ from bob.llm_selection_store import (
     REASONING_LEVELS,
     ROLES,
     LLMSelection,
-    LLMSelectionStore,
     RoleSelection,
     RoleSelectionStore,
 )
@@ -154,6 +153,13 @@ class LLMSwitcher:
     references it must update: the orchestrator (Jarvis role) and the sub-agent
     client holder. The selection store and LM Studio manager are injected so
     tests can drive the whole path against fakes.
+
+    The store is the per-role :class:`RoleSelectionStore` (the SINGLE owner of
+    ``llm_selection.json``). This global coordinator reads the ``jarvis`` role
+    as its flat view and persists a swap into ``jarvis`` + ``subagent`` —
+    exactly the two clients it rebuilds — leaving thinker / draft / stt /
+    budget untouched. (The old flat v1 store wrote the whole file flat and
+    destroyed the per-role map on every global swap.)
     """
 
     def __init__(
@@ -161,7 +167,7 @@ class LLMSwitcher:
         *,
         settings: Settings,
         manager: LMStudioManager,
-        selection_store: LLMSelectionStore,
+        selection_store: RoleSelectionStore,
         orchestrator: Orchestrator,
         subagent_holder: SubAgentClientHolder,
     ) -> None:
@@ -171,6 +177,27 @@ class LLMSwitcher:
         self._orchestrator = orchestrator
         self._subagent_holder = subagent_holder
         self._lock = asyncio.Lock()
+
+    def _read_flat(self) -> LLMSelection | None:
+        """The global surface's flat view: the ``jarvis`` role's selection."""
+
+        role_selection = self._selection_store.read()
+        return role_selection.role("jarvis") if role_selection is not None else None
+
+    def _write_flat(self, selection: LLMSelection) -> None:
+        """Persist a global swap into the per-role map.
+
+        Updates ``jarvis`` + ``subagent`` and keeps the other roles + stt +
+        budget byte-for-byte. A missing file (never seeded — bare tests) fans
+        the selection out to all four roles, like the boot seed.
+        """
+
+        current = self._selection_store.read()
+        if current is None:
+            next_map = RoleSelection(roles={role: selection for role in ROLES})
+        else:
+            next_map = current.with_role("jarvis", selection).with_role("subagent", selection)
+        self._selection_store.write(next_map)
 
     async def swap_lm_model(self, model_id: str, context_length: int | None = None) -> SwapResult:
         """Validate-then-swap to ``model_id`` (LM Studio provider).
@@ -198,7 +225,7 @@ class LLMSwitcher:
         """
 
         async with self._lock:
-            current = self._selection_store.read()
+            current = self._read_flat()
             effective_ctx = (
                 context_length
                 if context_length is not None
@@ -259,7 +286,7 @@ class LLMSwitcher:
             self._orchestrator.set_token_budget(token_budget_for_context_length(effective_ctx))
 
             # 5. Persist only after a fully successful swap.
-            self._selection_store.write(new_selection)
+            self._write_flat(new_selection)
             await self._aclose_superseded(old_jarvis, old_subagent)
             return SwapResult(selection=new_selection)
 
@@ -293,7 +320,7 @@ class LLMSwitcher:
             raise UnknownProviderError(f"Unknown LLM provider: {provider!r}")
 
         async with self._lock:
-            current = self._selection_store.read()
+            current = self._read_flat()
 
             # 1. Validate the TARGET. lm_studio: no gate (user must be able
             #    to switch even when the current server is offline). claude_cli:
@@ -330,7 +357,7 @@ class LLMSwitcher:
                 self._orchestrator.set_token_budget(DEFAULT_TOKEN_BUDGET)
 
             # 5. Persist only after a fully successful swap.
-            self._selection_store.write(new_selection)
+            self._write_flat(new_selection)
             await self._aclose_superseded(old_jarvis, old_subagent)
             return SwapResult(selection=new_selection)
 
@@ -354,7 +381,7 @@ class LLMSwitcher:
             raise UnknownProviderError("base_url must be a non-empty string")
 
         async with self._lock:
-            current = self._selection_store.read()
+            current = self._read_flat()
             new_host = host_from_base_url(url)
 
             self._manager.set_host(new_host)
@@ -367,7 +394,7 @@ class LLMSwitcher:
             self._orchestrator.set_jarvis_client(build_jarvis_client(self._settings, new_selection))
             self._subagent_holder.set(build_subagent_client(self._settings, new_selection))
 
-            self._selection_store.write(new_selection)
+            self._write_flat(new_selection)
             await self._aclose_superseded(old_jarvis, old_subagent)
             return SwapResult(selection=new_selection)
 

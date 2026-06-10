@@ -1,7 +1,10 @@
 """Read-only REST endpoints for the LLM selection (PRD 0012).
 
-Issue 0078 exposed ``GET /api/llm/selection`` returning the current selection
-owned by :class:`bob.llm_selection_store.LLMSelectionStore`.
+Issue 0078 exposed ``GET /api/llm/selection`` returning the current selection.
+The per-role :class:`bob.llm_selection_store.RoleSelectionStore` is the single
+source of truth; the global ``/selection`` surface is a flat VIEW over its
+``jarvis`` role (a global PUT swaps jarvis + subagent via
+:class:`bob.llm_swap.LLMSwitcher`).
 
 Issue 0079 adds ``GET /api/llm/models`` returning the live list of locally
 downloaded, chat-capable LM Studio models (via
@@ -27,10 +30,8 @@ from bob.llm_selection_store import (
     REASONING_LEVELS,
     ROLES,
     LLMSelection,
-    LLMSelectionStore,
     RoleSelectionStore,
     get_default_role_store,
-    get_default_store,
 )
 from bob.llm_swap import (
     ClaudeCliUnavailableError,
@@ -64,10 +65,6 @@ def set_switcher(switcher: LLMSwitcher | None) -> None:
     _switcher = switcher
 
 
-# DI seam so the route test can swap the store factory without booting the
-# whole app. Defaults to the process-wide singleton primed by the lifespan.
-_store_provider: Callable[[], LLMSelectionStore] = get_default_store
-
 # DI seam for the LM Studio management client. Defaults to a fresh manager
 # pointing at the local server; tests inject one wired to a fake SDK client.
 _manager_provider: Callable[[], LMStudioManager] = LMStudioManager
@@ -89,20 +86,6 @@ def reset_settings_provider() -> None:
 
     global _settings_provider
     _settings_provider = get_settings
-
-
-def set_store_provider(provider: Callable[[], LLMSelectionStore]) -> None:
-    """Override the selection-store factory used by the endpoints."""
-
-    global _store_provider
-    _store_provider = provider
-
-
-def reset_store_provider() -> None:
-    """Restore the default selection-store factory (the singleton)."""
-
-    global _store_provider
-    _store_provider = get_default_store
 
 
 def set_manager_provider(provider: Callable[[], LMStudioManager]) -> None:
@@ -177,16 +160,17 @@ class LLMSelectionResponse(BaseModel):
 
 @router.get("/selection", response_model=LLMSelectionResponse)
 def get_llm_selection() -> LLMSelectionResponse:
-    """Return the current LLM selection.
+    """Return the current LLM selection (the global surface's flat view).
 
-    Reads through the store. The store is guaranteed seeded by the boot path
-    (:func:`LLMSelectionStore.seed_from_settings`), so ``read`` never returns
-    ``None`` in the running app; the response falls back to the seeded values
-    regardless.
+    Reads the ``jarvis`` role out of the per-role store — the single source of
+    truth for ``llm_selection.json``. The store is guaranteed seeded by the
+    boot path (:func:`RoleSelectionStore.seed_from_settings`), so ``read``
+    never returns ``None`` in the running app; the response falls back to the
+    seeded values regardless.
     """
 
-    store = _store_provider()
-    selection = store.read()
+    role_selection = _role_store_provider().read()
+    selection = role_selection.role("jarvis") if role_selection is not None else None
     provider = selection.provider if selection is not None else "lm_studio"
     lm_model = selection.lm_model if selection is not None else None
     context_length = selection.context_length if selection is not None else {}

@@ -1,25 +1,27 @@
-"""JSON-backed store owning the runtime LLM selection.
+"""JSON-backed store owning the runtime per-role LLM selection.
 
-This is a deep module: callers only see :class:`LLMSelectionStore` and the
-:class:`LLMSelection` value object. All file plumbing — read/parse/seed/write,
-defensive decoding of a hand-edited or legacy file — lives behind those
-boundaries.
+This is a deep module: callers only see :class:`RoleSelectionStore` plus the
+:class:`RoleSelection` / :class:`LLMSelection` value objects. All file
+plumbing — read/parse/seed/write, defensive decoding of a hand-edited or
+legacy file, v1→v2 migration — lives behind those boundaries.
 
-The store owns a single JSON file at ``{BOB_DATA_DIR}/llm_selection.json`` with
-shape::
+The store owns a single JSON file at ``{BOB_DATA_DIR}/llm_selection.json`` in
+the ``schema_version: 2`` per-role shape (a ``{role -> LLMSelection}`` map plus
+``stt`` and ``budget`` blocks; see :class:`RoleSelection`). A legacy flat v1
+file (the single global selection of PRD 0012) is migrated forward on first
+read: the flat selection seeds all four roles identically.
 
-    {
-        "provider": "lm_studio",
-        "lm_model": "qwen2.5-7b-instruct",
-        "context_length": {"qwen2.5-7b-instruct": 32768},
-        "base_url": "http://192.168.1.20:1234/v1"
-    }
+There is deliberately NO flat v1 store any more: two stores writing the same
+file in different shapes is what used to destroy the per-role map (every boot
+cold-start write and every global-picker PUT flattened the four roles back to
+one). The GLOBAL surface (``/api/llm/selection``, SetupScreen) now reads the
+``jarvis`` role as its flat view and writes through the role map.
 
-Precedence / seeding (PRD 0012 / issue 0078):
+Precedence / seeding (PRD 0012 / issue 0078, PRD 0016 / issue 0106):
 
 - First boot with NO JSON file: seed from ``.env`` settings
-  (``LLM_PROVIDER`` / ``LLM_MODEL``) and persist the JSON. From then on the
-  JSON is the source of truth.
+  (``LLM_PROVIDER`` / ``LLM_MODEL`` / ``LLM_BASE_URL``), fan out across all
+  four roles, persist. From then on the JSON is the source of truth.
 - Later boots: the JSON wins; ``.env`` is consulted only when the JSON is
   absent.
 
@@ -89,91 +91,6 @@ class LLMSelection:
         }
 
 
-class LLMSelectionStore:
-    """Persistent JSON store owning the runtime LLM selection.
-
-    The constructor takes the backing file path (its handle), consistent with
-    the deep-module pattern used by :class:`bob.jarvis_store.JarvisStore` and
-    :class:`bob.task_store.TaskStore`. The boot path in :mod:`bob.main` resolves
-    the path under ``BOB_DATA_DIR`` and seeds from settings; tests point it at a
-    ``tmp_path``.
-    """
-
-    def __init__(self, path: Path) -> None:
-        self._path = path
-        self._lock = threading.Lock()
-
-    @property
-    def path(self) -> Path:
-        """The backing JSON file path."""
-
-        return self._path
-
-    def seed_from_settings(self, settings: Settings) -> LLMSelection:
-        """Return the current selection, seeding from ``settings`` on first boot.
-
-        - When the JSON file is absent: build the selection from ``.env``
-          (``LLM_PROVIDER`` / ``LLM_MODEL``), persist it, and return it.
-        - When the JSON file exists: ignore ``.env`` and return the persisted
-          selection (decoded defensively).
-
-        This is the single entry point the boot path calls; it guarantees the
-        file exists afterwards so every later ``read`` is a pure load.
-        """
-
-        with self._lock:
-            existing = self._read_unlocked()
-            if existing is not None:
-                return existing
-            seeded = LLMSelection(
-                provider=settings.LLM_PROVIDER,
-                lm_model=settings.LLM_MODEL,
-                context_length={},
-                base_url=settings.LLM_BASE_URL or None,
-            )
-            self._write_unlocked(seeded)
-            return seeded
-
-    def read(self) -> LLMSelection | None:
-        """Return the persisted selection, or ``None`` when the file is absent.
-
-        Decoding is defensive: a corrupt / partial file is read as far as it
-        parses, with missing keys defaulting to ``lm_studio`` / ``None`` /
-        empty map. Returns ``None`` only when the file does not exist — that is
-        the "first boot, not yet seeded" signal for callers.
-        """
-
-        with self._lock:
-            return self._read_unlocked()
-
-    def write(self, selection: LLMSelection) -> None:
-        """Persist ``selection`` to the JSON file (atomic-ish full rewrite)."""
-
-        with self._lock:
-            self._write_unlocked(selection)
-
-    # --- internals -----------------------------------------------------------
-
-    def _read_unlocked(self) -> LLMSelection | None:
-        if not self._path.exists():
-            return None
-        try:
-            raw = json.loads(self._path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            # A corrupt or unreadable file collapses to defaults rather than
-            # crashing boot — the selection is a runtime preference, never
-            # load-bearing for the LLM call path (the client still has .env).
-            raw = {}
-        return _decode_selection(raw)
-
-    def _write_unlocked(self, selection: LLMSelection) -> None:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._path.write_text(
-            json.dumps(selection.as_dict(), indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
-
-
 def _decode_selection(raw: object) -> LLMSelection:
     """Decode an arbitrary parsed JSON value into an :class:`LLMSelection`.
 
@@ -213,34 +130,6 @@ def _decode_selection(raw: object) -> LLMSelection:
     )
 
 
-# --- Singleton plumbing -------------------------------------------------------
-#
-# Mirrors :mod:`bob.jarvis_store` / :mod:`bob.task_store`. The boot path in
-# :mod:`bob.main` builds the store under ``BOB_DATA_DIR``, seeds it from
-# settings, then primes the singleton via :func:`set_default_store`. The REST
-# router resolves it through :func:`get_default_store`.
-
-_DEFAULT_STORE: LLMSelectionStore | None = None
-
-
-def set_default_store(store: LLMSelectionStore | None) -> None:
-    """Install (or clear) the process-wide singleton :class:`LLMSelectionStore`."""
-
-    global _DEFAULT_STORE
-    _DEFAULT_STORE = store
-
-
-def get_default_store() -> LLMSelectionStore:
-    """Return the process-wide singleton, raising if it hasn't been primed."""
-
-    if _DEFAULT_STORE is None:
-        raise RuntimeError(
-            "LLMSelectionStore default singleton not initialised. "
-            "Did the app lifespan (bob.main) run?"
-        )
-    return _DEFAULT_STORE
-
-
 # =============================================================================
 # Per-role selection — schema_version 2 (PRD 0016 / issue 0106, Annexe D)
 # =============================================================================
@@ -256,12 +145,12 @@ def get_default_store() -> LLMSelectionStore:
 # :class:`RoleSelection` is the v2 value object: a ``{role -> LLMSelection}`` map
 # (reusing the flat :class:`LLMSelection` per role so the per-role provider /
 # base_url / model / context_length contract is shared verbatim) plus an STT
-# selection and a budget block. :class:`RoleSelectionStore` owns the SAME
-# ``{BOB_DATA_DIR}/llm_selection.json`` file as :class:`LLMSelectionStore`, but
-# in the ``schema_version: 2`` shape, and migrates an old flat v1 file forward
-# on first read (the flat selection seeds ALL FOUR roles identically).
+# selection and a budget block. :class:`RoleSelectionStore` owns
+# ``{BOB_DATA_DIR}/llm_selection.json`` in the ``schema_version: 2`` shape, and
+# migrates an old flat v1 file forward on first read (the flat selection seeds
+# ALL FOUR roles identically).
 #
-# Decoding stays as defensive as the v1 store: a corrupt / partial / hand-edited
+# Decoding stays as defensive as the old v1 store: a corrupt / partial / hand-edited
 # file never raises — missing or wrong-typed keys fall back to defaults, and
 # ``budget.ceiling_gib: null`` is preserved as ``None`` ("detect later", S11).
 
@@ -380,11 +269,13 @@ class RoleSelection:
 class RoleSelectionStore:
     """Persistent JSON store owning the per-role LLM selection (``schema_version: 2``).
 
-    Mirrors :class:`LLMSelectionStore` (deep module, path injected, per-store
-    :class:`threading.Lock`) but owns the v2 role-map shape. The store reads and
-    writes the SAME ``{BOB_DATA_DIR}/llm_selection.json`` file; on first read of
-    an old flat v1 file it migrates forward (the flat selection seeds all four
-    roles) and rewrites the file in v2 shape.
+    The SINGLE owner of ``{BOB_DATA_DIR}/llm_selection.json`` (deep module,
+    path injected, per-store :class:`threading.Lock` — the pattern of
+    :class:`bob.jarvis_store.JarvisStore`). On first read of an old flat v1
+    file it migrates forward (the flat selection seeds all four roles) and
+    rewrites the file in v2 shape. The global ``/api/llm/selection`` surface
+    has no store of its own: it reads the ``jarvis`` role as its flat view and
+    persists through this map (see :class:`bob.llm_swap.LLMSwitcher`).
     """
 
     def __init__(self, path: Path) -> None:
@@ -483,6 +374,18 @@ def _seed_role_selection_from_settings(settings: Settings) -> RoleSelection:
     return RoleSelection(roles={role: flat for role in ROLES})
 
 
+def _raw_is_v2(raw: object) -> bool:
+    """True when the parsed JSON is in the per-role v2 shape.
+
+    An explicit ``schema_version >= 2`` or any ``roles`` map present.
+    """
+
+    if not isinstance(raw, dict):
+        return False
+    version = raw.get("schema_version")
+    return (isinstance(version, int) and version >= 2) or isinstance(raw.get("roles"), dict)
+
+
 def _decode_role_selection(raw: object) -> RoleSelection:
     """Decode an arbitrary parsed JSON value into a :class:`RoleSelection`.
 
@@ -497,15 +400,12 @@ def _decode_role_selection(raw: object) -> RoleSelection:
 
     data = raw if isinstance(raw, dict) else {}
 
-    version = data.get("schema_version")
-    roles_raw = data.get("roles")
-    is_v2 = (isinstance(version, int) and version >= 2) or isinstance(roles_raw, dict)
-
-    if not is_v2:
+    if not _raw_is_v2(data):
         # Migration 1 -> 2: the flat selection seeds all four roles identically.
         flat = _decode_selection(data)
         return RoleSelection(roles={role: flat for role in ROLES})
 
+    roles_raw = data.get("roles")
     roles_map: dict[str, object] = roles_raw if isinstance(roles_raw, dict) else {}
     roles: dict[str, LLMSelection] = {}
     for role in ROLES:
