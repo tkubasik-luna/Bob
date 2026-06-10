@@ -674,6 +674,25 @@
   color: #d9a0a0;
 }
 
+/* ── CONFIGURATION section — re-enter the SetupScreen gate ── */
+.set-resetup {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: color-mix(in oklab, var(--bg2) 70%, transparent);
+  color: var(--dim);
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+}
+.set-resetup:hover {
+  color: var(--ink);
+}
+
 /* ── VOIX section — the TTS toggle (moved here from the bottom-right glyph) ── */
 .set-voice {
   display: flex;

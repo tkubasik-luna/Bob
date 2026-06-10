@@ -58,6 +58,7 @@ import {
   putLlmRole,
   putLlmRoleReasoning,
 } from "../../lib/llmApi";
+import { SETUP_COMPLETE_KEY } from "../setup/SetupScreen";
 import "./SettingsControl.css";
 
 // Backend provider ids (mirror of the server enum).
@@ -294,6 +295,26 @@ export function SettingsControl() {
 
             {/* Budget section (issue 0107) — config + over-budget warning. */}
             <BudgetSection budget={budget} />
+
+            <div className="settings-section">
+              <div className="settings-label">CONFIGURATION</div>
+              <button
+                type="button"
+                className="set-resetup"
+                data-testid="set-resetup"
+                onClick={() => {
+                  // Drop the completion flag and reload: `App` re-resolves the
+                  // phase and lands on the SetupScreen gate (per-role wizard).
+                  window.localStorage.removeItem(SETUP_COMPLETE_KEY);
+                  window.location.reload();
+                }}
+              >
+                Relancer le setup des modèles…
+              </button>
+              <div className="set-field-hint">
+                Rouvre l'écran de configuration par rôle (serveur LM Studio + un modèle par rôle).
+              </div>
+            </div>
 
             <div className="settings-section">
               <div className="settings-label">VOIX</div>

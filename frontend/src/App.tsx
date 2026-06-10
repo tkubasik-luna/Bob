@@ -24,6 +24,10 @@ type Phase = "loading" | "setup" | "ready";
  * reachable LM Studio server with a pinned model). A previously-fine server
  * that is now down re-shows setup rather than booting into a dead HUD. */
 async function resolveInitialPhase(): Promise<Phase> {
+  // `?setup=1` forces the gate — handy to rewire roles without digging the
+  // completion flag out of localStorage (also reachable via the Réglages
+  // panel's « Relancer le setup » button).
+  if (new URLSearchParams(window.location.search).get("setup") === "1") return "setup";
   if (window.localStorage.getItem(SETUP_COMPLETE_KEY) !== "1") return "setup";
   try {
     const map = await fetchLlmRoles();
