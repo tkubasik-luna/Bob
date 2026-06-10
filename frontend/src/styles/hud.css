@@ -1255,6 +1255,29 @@ body {
   letter-spacing: 0.32em;
   text-transform: uppercase;
 }
+/* PRD 0016 / issue 0099 — the live STT line: what Bob hears as the user
+ * speaks. Same scale as the assistant transcript but tinted on the accent so
+ * « ce que je dis » reads distinctly from « ce que Bob répond ». The settled
+ * prefix is solid; the still-churning whisper tail is dimmed + italic. The
+ * frozen final (`is-final`) drops the tint to ink — understood, locked. */
+.hud-transcript-user {
+  font-family: var(--font-sans);
+  font-size: 17px;
+  font-weight: 400;
+  letter-spacing: 0.01em;
+  line-height: 1.4;
+  color: color-mix(in oklab, var(--accent) 70%, var(--ink));
+  text-shadow: 0 0 18px color-mix(in oklab, var(--accent) 45%, transparent);
+  animation: transcript-in 320ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+.hud-transcript-user .hud-transcript-user-tail {
+  opacity: 0.55;
+  font-style: italic;
+}
+.hud-transcript-user.is-final {
+  color: var(--ink);
+  text-shadow: 0 0 18px color-mix(in oklab, var(--accent) 30%, transparent);
+}
 .hud-transcript-thinking {
   display: inline-flex;
   align-items: baseline;

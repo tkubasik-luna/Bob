@@ -165,6 +165,42 @@ describe("deriveOrbState — mood ladder (pure)", () => {
   });
 });
 
+describe("deriveOrbState — voice floor (« Yo Bob » → écoute)", () => {
+  it("user_speaking floor → listen (the wake word opened a turn)", () => {
+    expect(deriveOrbState(QUIET, {}, "user_speaking").state).toBe("listen");
+  });
+
+  it("user_speaking beats a still-playing TTS tail (barge-in → écoute)", () => {
+    expect(deriveOrbState({ ...QUIET, speakingMsgId: "msg-9" }, {}, "user_speaking").state).toBe(
+      "listen",
+    );
+  });
+
+  it("user_speaking beats a running task (the mic wins the listen slot)", () => {
+    expect(deriveOrbState(QUIET, tasks("running"), "user_speaking").state).toBe("listen");
+  });
+
+  it("socket down still dominates the voice floor (error > listen)", () => {
+    expect(
+      deriveOrbState({ ...QUIET, connectionStatus: "closed" }, {}, "user_speaking").state,
+    ).toBe("error");
+  });
+
+  it("waiting_input still dominates the voice floor (alert > listen)", () => {
+    expect(deriveOrbState(QUIET, tasks("waiting_input"), "user_speaking").state).toBe("alert");
+  });
+
+  it("idle floor changes nothing (default derivation)", () => {
+    expect(deriveOrbState(QUIET, {}, "idle").state).toBe("idle");
+    expect(deriveOrbState(QUIET, {}).state).toBe("idle");
+  });
+
+  it("bob_speaking / thinking floors do not force a mood (chat path owns them)", () => {
+    expect(deriveOrbState(QUIET, {}, "bob_speaking").state).toBe("idle");
+    expect(deriveOrbState(QUIET, {}, "thinking").state).toBe("idle");
+  });
+});
+
 describe("deriveOrbState — energy", () => {
   // Energy is the active phase's intensity. We don't pin exact magic numbers in
   // the production table here (that would just restate the impl); instead we

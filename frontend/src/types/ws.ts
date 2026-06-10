@@ -317,6 +317,20 @@ export type VoiceTurnErrorMsg = {
   ts: number;
 };
 
+/** Wake word (« Yo Bob », `bob.wake_word`) — the standby detector heard the
+ * wake phrase and the loop is opening the listening turn. `matched_text` is
+ * the small model's raw hypothesis (e.g. « Yobab ») and `score` the fuzzy
+ * matcher's similarity in [0,1]. The HUD surfaces a brief « j'écoute »
+ * confirmation; the orb's écoute mood follows from the `turn_state` event. */
+export type WakeWordMsg = {
+  type: "wake_word";
+  turn_id: string;
+  phrase: string;
+  matched_text: string;
+  score: number;
+  ts: number;
+};
+
 /** Lifecycle state of a sub-task in the sidebar. Mirrors
  * `bob.task_store.TaskState` on the backend. */
 export type TaskState = "pending" | "running" | "waiting_input" | "done" | "failed";
@@ -547,6 +561,7 @@ export type ServerMessage =
   | SttPreparingMsg
   | SttReadyMsg
   | VoiceTurnErrorMsg
+  | WakeWordMsg
   | TaskCreatedMsg
   | TaskUpdatedMsg
   | TaskResultMsg

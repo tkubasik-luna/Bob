@@ -18,14 +18,17 @@
 //   1. `connectionStatus !== "open"`            → error   (socket down)
 //   2. any task in state "failed"               → error   (a delegated hand failed)
 //   3. any task in state "waiting_input"        → alert   (needs attention)
-//   4. response streaming (speaking OR a live   → speak
+//   4. voice floor `user_speaking`              → listen  (the user has the mic —
+//      wake word « Yo Bob » / barge-in: écoute wins over a still-playing tail)
+//   5. response streaming (speaking OR a live   → speak
 //      `streamingAssistant`) and not mid-thought
-//   5. any task in state "running" | "pending"  → listen  (delegation in flight)
-//   6. `isWaitingResponse === true`             → think   (Bob is reasoning)
-//   7. otherwise                                 → idle    (breathing)
+//   6. any task in state "running" | "pending"  → listen  (delegation in flight)
+//   7. `isWaitingResponse === true`             → think   (Bob is reasoning)
+//   8. otherwise                                 → idle    (breathing)
 //
 // PRD: prd/0014-hud-piste-3d-nacre.md — Issue: issues/0084-conscience-orb-orbstate-reducer.md
 
+import type { FloorState } from "../hooks/useTurnState";
 import type { Task, TaskState } from "../types/ws";
 
 /** The orb's mood. Same six-state union the nebula shader understands
@@ -80,33 +83,46 @@ function hasTaskInState(tasks: Record<string, Task>, want: TaskState): boolean {
  * the file header. Extracted from any store / UI so it can be exercised directly
  * in tests, exactly like `deriveSphereState`.
  */
-export function deriveOrbState(chat: OrbChatSnapshot, tasks: Record<string, Task>): OrbDrive {
-  const state = deriveOrbMood(chat, tasks);
+export function deriveOrbState(
+  chat: OrbChatSnapshot,
+  tasks: Record<string, Task>,
+  voiceFloor: FloorState = "idle",
+): OrbDrive {
+  const state = deriveOrbMood(chat, tasks, voiceFloor);
   return { state, energy: STATE_ENERGY[state] };
 }
 
 /** The mood half of the ladder, split out so the energy mapping stays a pure
  * table lookup and the priority order is easy to read in one place. */
-function deriveOrbMood(chat: OrbChatSnapshot, tasks: Record<string, Task>): OrbState {
+function deriveOrbMood(
+  chat: OrbChatSnapshot,
+  tasks: Record<string, Task>,
+  voiceFloor: FloorState,
+): OrbState {
   // 1 — socket down dominates everything (matches `deriveSphereState`).
   if (chat.connectionStatus !== "open") return "error";
   // 2 — a delegated hand failed: surface the failure on the orb.
   if (hasTaskInState(tasks, "failed")) return "error";
   // 3 — a hand is blocked waiting for input: alert, not a hard error.
   if (hasTaskInState(tasks, "waiting_input")) return "alert";
-  // 4 — the answer is streaming (TTS playing, or reply text flowing) and Bob is
+  // 4 — the USER has the voice floor (`turn_state` → user_speaking): the wake
+  //     word « Yo Bob » just opened a turn, or a barge-in cut Bob off. Écoute
+  //     wins over a still-playing audio tail so the orb visibly listens the
+  //     moment the mic turn opens.
+  if (voiceFloor === "user_speaking") return "listen";
+  // 5 — the answer is streaming (TTS playing, or reply text flowing) and Bob is
   //     no longer mid-thought → speak. The `!isWaitingResponse` guard keeps a
   //     fresh "think" (Bob reasoning before the next answer chunk) from being
   //     masked by a still-playing tail of the previous utterance.
   if ((chat.speakingMsgId !== null || chat.isStreamingResponse) && !chat.isWaitingResponse) {
     return "speak";
   }
-  // 5 — work is delegated and running in the background → listen / delegate mood.
+  // 6 — work is delegated and running in the background → listen / delegate mood.
   if (hasTaskInState(tasks, "running") || hasTaskInState(tasks, "pending")) {
     return "listen";
   }
-  // 6 — Bob is reasoning (awaiting its own response) → think.
+  // 7 — Bob is reasoning (awaiting its own response) → think.
   if (chat.isWaitingResponse) return "think";
-  // 7 — nothing happening: breathe at rest.
+  // 8 — nothing happening: breathe at rest.
   return "idle";
 }

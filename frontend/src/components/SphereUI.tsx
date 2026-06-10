@@ -211,7 +211,10 @@ export function SphereUI() {
               <TaskSlot />
             </div>
             <div className="slot-core">
-              <CoreSlot {...orbProps} />
+              {/* `floor` (lifted above) feeds the orb's voice-aware « écoute »
+               * rule: a wake-word (« Yo Bob ») / barge-in `user_speaking` turn
+               * flips the orb to listen. */}
+              <CoreSlot {...orbProps} floor={floor} />
             </div>
             <div className="slot-data">
               <DataSlot onOpenDeliverable={openOverlay} />

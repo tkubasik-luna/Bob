@@ -100,4 +100,59 @@ describe("TranscriptLine", () => {
     expect(container.querySelector(".hud-transcript-hint")).not.toBeNull();
     expect(container.querySelector(".hud-transcript-thinking")).toBeNull();
   });
+
+  // PRD 0016 / issue 0099 — the live STT line: what Bob hears as the user
+  // speaks, stable prefix solid + tentative tail dimmed, final fully solid.
+
+  test("live stt_partial → renders stable prefix + dimmed tentative tail", () => {
+    useChatStore.getState().setLiveTranscript("t1", "quelle heure est", 7, false);
+    const { container } = render(<TranscriptLine state="idle" />);
+    const line = container.querySelector(".hud-transcript-user");
+    expect(line).not.toBeNull();
+    expect(line?.classList.contains("is-final")).toBe(false);
+    expect(container.querySelector(".hud-transcript-user-stable")?.textContent).toBe("quelle ");
+    expect(container.querySelector(".hud-transcript-user-tail")?.textContent).toBe("heure est");
+  });
+
+  test("live stt_final → fully solid (no tentative tail), is-final", () => {
+    useChatStore.getState().setLiveTranscript("t1", "quelle heure est-il", 19, true);
+    const { container } = render(<TranscriptLine state="think" />);
+    const line = container.querySelector(".hud-transcript-user");
+    expect(line?.classList.contains("is-final")).toBe(true);
+    expect(container.querySelector(".hud-transcript-user-stable")?.textContent).toBe(
+      "quelle heure est-il",
+    );
+    expect(container.querySelector(".hud-transcript-user-tail")).toBeNull();
+  });
+
+  test("live transcript outranks the assistant snippet and the thinking dots", () => {
+    setMessages([{ id: "a1", role: "assistant", content: "Bonjour !" }]);
+    useChatStore.getState().setLiveTranscript("t1", "yo bob", 0, false);
+    const { container } = render(<TranscriptLine state="think" />);
+    expect(container.querySelector(".hud-transcript-user")).not.toBeNull();
+    expect(container.querySelector(".hud-transcript-text")).toBeNull();
+    expect(container.querySelector(".hud-transcript-thinking")).toBeNull();
+  });
+
+  test("cleared live transcript → falls back to the normal slots", () => {
+    setMessages([{ id: "a1", role: "assistant", content: "Bonjour !" }]);
+    useChatStore.getState().setLiveTranscript("t1", "yo bob", 0, false);
+    useChatStore.getState().clearLiveTranscript();
+    const { container } = render(<TranscriptLine state="idle" />);
+    expect(container.querySelector(".hud-transcript-user")).toBeNull();
+    expect(container.querySelector(".hud-transcript-text")?.textContent).toBe("Bonjour !");
+  });
+
+  test("empty live transcript text → ignored (no empty flash before the first word)", () => {
+    useChatStore.getState().setLiveTranscript("t1", "", 0, false);
+    const { container } = render(<TranscriptLine state="idle" />);
+    expect(container.querySelector(".hud-transcript-user")).toBeNull();
+    expect(container.querySelector(".hud-transcript-hint")).not.toBeNull();
+  });
+
+  test("hidden=true wins over the live transcript (overlay path)", () => {
+    useChatStore.getState().setLiveTranscript("t1", "yo bob", 0, false);
+    const { container } = render(<TranscriptLine state="idle" hidden />);
+    expect(container.firstChild).toBeNull();
+  });
 });

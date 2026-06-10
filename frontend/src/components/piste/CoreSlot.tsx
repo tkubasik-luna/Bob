@@ -21,6 +21,7 @@
 // intensity) via the reducer's `energy` output. There is no backdrop disc
 // behind the orb — the canvas is transparent and stands alone.
 
+import type { FloorState } from "../../hooks/useTurnState";
 import { type OrbState, deriveOrbState } from "../../lib/orbState";
 import type { SphereCanvasProps } from "../../sphere/SphereCanvas";
 import { useDevTweaksStore } from "../../state/devTweaksStore";
@@ -28,10 +29,12 @@ import { useChatStore } from "../../store/chatStore";
 import "./CoreSlot.css";
 import { ConscienceOrb } from "./orb/ConscienceOrb";
 
-// The orb prop surface for the core slot is exactly SphereCanvas's prop surface
-// — SphereUI derives these once and passes them straight through. Re-exported
-// so the shell binding (and any future slice) keeps the same contract.
-export type CoreSlotProps = SphereCanvasProps;
+// The orb prop surface for the core slot is SphereCanvas's prop surface plus
+// the lifted voice floor — SphereUI derives these once and passes them straight
+// through. `floor` feeds the reducer's voice-aware « écoute » rule (the wake
+// word « Yo Bob » opens a `user_speaking` turn); optional so existing mounts
+// without a floor keep the prior derivation.
+export type CoreSlotProps = SphereCanvasProps & { floor?: FloorState };
 
 /** The dev-forced state union (`devTweaksStore`) is a superset of `OrbState`
  * (same six names), so a forced value maps straight through. */
@@ -62,6 +65,7 @@ export function CoreSlot(props: CoreSlotProps): JSX.Element {
   const derived = deriveOrbState(
     { connectionStatus, isWaitingResponse, speakingMsgId, isStreamingResponse },
     tasks,
+    props.floor ?? "idle",
   );
 
   // A `?dev` forced state (if any) overrides the live derivation, exactly like

@@ -20,6 +20,10 @@ const ASSISTANT_SNIPPET_MAX = 80;
  * `HUDTranscript` adapted to read real messages from `chatStore`.
  *
  * Rendering rules (by sphere state):
+ *   - live STT transcript        → WINS over every slot below: what Bob hears
+ *                                  as the user speaks (stable prefix solid,
+ *                                  tentative tail dimmed; the frozen final is
+ *                                  fully solid until Bob's reply clears it)
  *   - `idle`  + no messages     → hint `"Tapez pour parler à Bob"`
  *   - `idle`  + last assistant  → snippet of last assistant message
  *   - `think`                   → animated `thinking · · ·` dots
@@ -40,6 +44,10 @@ export function TranscriptLine({ state, hidden = false }: TranscriptLineProps) {
   // That's how the sphere shows the spoken phrase appearing word-by-word
   // before the closing `assistant_msg` lands.
   const streamingSpeech = useChatStore((s) => s.streamingAssistant?.speech ?? null);
+  // PRD 0016 / issue 0099 — the live STT hypothesis (`stt_partial` /
+  // `stt_final`): the user's words as Bob hears them, in real time. Written by
+  // `useChatWsBridge`, cleared when Bob's reply lands / the turn aborts.
+  const liveUser = useChatStore((s) => s.liveUserTranscript);
 
   const { lastUser, lastAssistant } = useMemo(() => {
     let user: string | null = null;
@@ -65,6 +73,32 @@ export function TranscriptLine({ state, hidden = false }: TranscriptLineProps) {
     streamingSpeech !== null && streamingSpeech.length > 0 ? streamingSpeech : lastAssistant;
 
   if (hidden) return null;
+
+  // The live voice transcript outranks every other slot: while the user
+  // speaks (and until Bob replies) the line mirrors what the STT engine
+  // hears — the settled prefix solid, the still-churning tail dimmed. The
+  // frozen final (`stt_final`) renders fully solid so the user can see
+  // exactly what Bob understood before the answer arrives.
+  if (liveUser !== null && liveUser.text.length > 0) {
+    const stableLen = liveUser.final
+      ? liveUser.text.length
+      : Math.max(0, Math.min(liveUser.stablePrefixLen, liveUser.text.length));
+    const stable = liveUser.text.slice(0, stableLen);
+    const tail = liveUser.text.slice(stableLen);
+    return (
+      <div className="hud-transcript has-text">
+        <span key={`user_${liveUser.turnId}_${liveUser.final ? "final" : "partial"}`}>
+          <span
+            className={`hud-transcript-user ${liveUser.final ? "is-final" : ""}`}
+            data-testid="live-user-transcript"
+          >
+            <span className="hud-transcript-user-stable">{stable}</span>
+            {tail.length > 0 && <span className="hud-transcript-user-tail">{tail}</span>}
+          </span>
+        </span>
+      </div>
+    );
+  }
 
   // Resolve the slot (`hint` | `thinking` | `text`) + raw text payload up
   // front so we can derive a stable `key` that re-mounts the inner span on

@@ -196,6 +196,15 @@ export function useChatWsBridge(): UseChatWsBridgeResult {
         case "stt_ready":
           dismissToast(sttPrepToastId(msg.turn_id));
           break;
+        case "wake_word":
+          // « Yo Bob » heard by the standby detector — confirm instantly so
+          // the user knows the wake worked while the listening turn opens
+          // (the orb's écoute mood follows from the turn_state event).
+          pushToast(`« ${msg.phrase} » détecté — j'écoute`, {
+            kind: "info",
+            id: `wake_${msg.turn_id}`,
+          });
+          break;
         case "voice_turn_error":
           // STT engine unavailable / failed mid-turn / download failed. The
           // backend aborted the turn cleanly; surface it + return to idle
