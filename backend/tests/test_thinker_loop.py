@@ -566,3 +566,65 @@ def test_parse_snapshot_coerces_wrong_types() -> None:
 def test_parse_snapshot_non_object_returns_none() -> None:
     assert _parse_snapshot_json("[1, 2, 3]") is None
     assert _parse_snapshot_json("") is None
+
+
+# --- lifecycle epoch (stale-pass guard) ---------------------------------------
+
+
+async def test_stale_generation_pass_never_lands_snapshot() -> None:
+    """A pass that outlives a hard_cancel + re-arm (same turn id) drops its result.
+
+    ``hard_cancel`` never awaits the cancelled task, so a pass past its last
+    await point can conclude AFTER a barge-in resume re-armed the SAME turn id
+    (``turn_id`` does not discriminate there). The lifecycle epoch captured at
+    launch must reject the stale landing.
+    """
+
+    state = LiveTranscriptState()
+    client = _FakeThinkerClient()
+    loop = _loop(client, state, _Clock())
+
+    loop.start("t1")
+    # Park a pass IN FLIGHT inside the model call — the dangerous window.
+    client.gate = asyncio.Event()
+    stale_pass = asyncio.create_task(loop._run_pass("salut bob", loop._generation))
+    await client.started.wait()
+
+    # Barge-in: zero-grace cancel (the task is never awaited) + resume re-arms
+    # the SAME turn id.
+    loop.hard_cancel()
+    loop.start("t1")
+
+    # The surviving pass resumes past its await and concludes against the
+    # re-armed turn — the epoch guard must drop its snapshot.
+    client.gate.set()
+    await stale_pass
+    assert state.latest() is None
+
+    # A pass of the CURRENT epoch lands normally.
+    client.gate = None
+    await loop._run_pass("salut bob", loop._generation)
+    snapshot = state.latest()
+    assert snapshot is not None
+    assert snapshot.corrected_text == "salut bob"
+
+
+async def test_stale_generation_pass_never_reschedules_a_rerun() -> None:
+    """A stale pass with a pending rerun must not relaunch into the new epoch."""
+
+    state = LiveTranscriptState()
+    client = _FakeThinkerClient()
+    loop = _loop(client, state, _Clock())
+
+    loop.start("t1")
+    stale_generation = loop._generation
+    loop._rerun = True
+    loop._pending_text = "vieux partiel"
+    loop.hard_cancel()
+    loop.start("t1")
+    loop._rerun = True
+    loop._pending_text = "vieux partiel"
+
+    await loop._maybe_rerun(stale_generation)
+    assert loop.inflight is False
+    assert client.calls == []

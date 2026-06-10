@@ -594,6 +594,53 @@ async def test_user_resumes_during_thinking_does_not_corrupt_state() -> None:
     assert loop.state.value == "idle"
 
 
+async def test_resumed_turn_after_thinking_resume_endpoints_again() -> None:
+    """A turn resumed during ``thinking`` must be able to endpoint again.
+
+    Regression: the endpointer LATCHES once fired (``observe`` returns False
+    until ``reset``). The ``thinking -> user_speaking`` resume path did not
+    reset it, so the resumed utterance could never endpoint — the session
+    wedged in ``user_speaking`` (transcript kept flowing, Bob never replied)
+    until ``voice_stop``.
+    """
+
+    say = _BlockingSayPath()
+    settings = _settings()
+    loop = FullDuplexLoop(
+        voice_turn_factory=lambda: VoiceTurn(
+            engine=FakeSttEngine(transcript="bonjour", samples_per_word=160),
+            session_id="s1",
+            settings=settings,
+        ),
+        say_path=say,
+        settings=settings,
+        session_id="s1",
+    )
+    await loop.start()
+    # Turn 1: voiced + silence → endpoint → say-path launched (blocks in thinking).
+    for _ in range(6):
+        await loop.feed_raw_frame(_LOUD)
+    for _ in range(8):
+        await loop.feed_raw_frame(_QUIET)
+    await say.entered.wait()
+    assert loop.state is TurnState.THINKING
+    say.entered.clear()
+
+    # User resumes during thinking, then goes silent again.
+    for _ in range(6):
+        await loop.feed_raw_frame(_LOUD)
+    assert loop.state.value == "user_speaking"
+    for _ in range(8):
+        await loop.feed_raw_frame(_QUIET)
+
+    # The RESUMED utterance endpoints too: the say-path runs a second time.
+    await asyncio.wait_for(say.entered.wait(), timeout=1.0)
+    assert len(say.transcripts) == 2
+
+    say.release.set()
+    await loop.stop()
+
+
 async def test_silence_only_never_opens_turn() -> None:
     say = _RecordingSayPath()
     loop = _loop(say)
@@ -754,6 +801,37 @@ async def test_bargein_cuts_and_commits_played_text() -> None:
     assert any(t["from"] == "bob_speaking" and t["to"] == "user_speaking" for t in transitions)
 
     say.release.set()
+    await loop.stop()
+
+
+async def test_resumed_turn_after_bargein_endpoints_again() -> None:
+    """The utterance resumed after a barge-in cut must be able to endpoint.
+
+    Regression: same latch as the thinking-resume path — the interrupted
+    turn's endpoint left the endpointer fired, and ``_on_bargein`` did not
+    reset it, so the barged-in utterance never endpointed (wedged in
+    ``user_speaking``).
+    """
+
+    say = _SpeakingSayPath(played="Bonjour le monde")
+    loop = _bargein_loop(say, confirm_ms=90)
+    await _drive_to_bob_speaking(loop, say)
+    say.release.set()  # let the cancelled task unwind as soon as it is cut
+
+    # Confirmed barge-in: Bob is cut, the user holds the floor again.
+    for _ in range(6):
+        await loop.feed_raw_frame(_LOUD)
+    assert loop.state.value == "user_speaking"
+
+    # The resumed utterance: more speech, then trailing silence → endpoint.
+    for _ in range(6):
+        await loop.feed_raw_frame(_LOUD)
+    for _ in range(8):
+        await loop.feed_raw_frame(_QUIET)
+    await loop.join()
+
+    endpoints = [t for t in _turn_states() if t.get("reason") == "endpoint"]
+    assert len(endpoints) == 2, "the resumed utterance never endpointed"
     await loop.stop()
 
 

@@ -29,6 +29,17 @@ PORT="${BACKEND_PORT:-$(env_value BACKEND_PORT)}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8000}"
 
+# Extras STT à installer. ``stt`` (whisper.cpp) est le défaut, toujours posé.
+# Le moteur ``sherpa`` (transducer true-streaming) tire un wheel natif séparé
+# (extra ``stt-sherpa``) — on ne le pose QUE si .env sélectionne STT_ENGINE=sherpa,
+# pour garder l'install légère sur le chemin whisper par défaut.
+STT_ENGINE_VAL="${STT_ENGINE:-$(env_value STT_ENGINE)}"
+STT_EXTRAS=(--extra stt)
+if [[ "$STT_ENGINE_VAL" == "sherpa" ]]; then
+  STT_EXTRAS+=(--extra stt-sherpa)
+  echo "[bob] STT_ENGINE=sherpa → extra stt-sherpa (transducer true-streaming)"
+fi
+
 PIDS=()
 cleanup() {
   echo
@@ -43,7 +54,7 @@ trap cleanup EXIT INT TERM
 echo "[bob] backend → http://$HOST:$PORT"
 (
   cd "$ROOT/backend"
-  uv sync --extra stt --quiet
+  uv sync "${STT_EXTRAS[@]}" --quiet
   exec uv run uvicorn bob.main:app --reload --host "$HOST" --port "$PORT"
 ) &
 PIDS+=($!)

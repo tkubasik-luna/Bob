@@ -9,8 +9,14 @@ skips when ``pywhispercpp`` (or its model) is absent — CI never needs it.
 from __future__ import annotations
 
 import struct
+from typing import TYPE_CHECKING
 
 import pytest
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from bob.stt_engine import _SherpaSession
 
 from bob.stt_engine import (
     MIC_FRAME_TAG,
@@ -151,6 +157,127 @@ def test_whisper_session_whole_buffer_when_window_disabled() -> None:
         session.accept_frame(frame)
     # With the cap disabled, the last partial pass saw the full buffer so far.
     assert max(engine.calls) == 10 * 2
+
+
+# --- sherpa engine (true-streaming) — native-free via a stub recognizer ------
+
+
+class _StubStream:
+    def __init__(self) -> None:
+        self.fed_samples: list[int] = []
+        self.input_finished_called = False
+
+    def accept_waveform(self, rate: int, samples: object) -> None:
+        self.fed_samples.append(len(samples))  # type: ignore[arg-type]
+
+    def input_finished(self) -> None:
+        self.input_finished_called = True
+
+
+class _StubRecognizer:
+    """Returns a scripted hypothesis per ``get_result`` call (one per frame)."""
+
+    def __init__(self, results: list[str]) -> None:
+        self._results = results
+        self._i = 0
+        self.streams: list[_StubStream] = []
+
+    def create_stream(self) -> _StubStream:
+        s = _StubStream()
+        self.streams.append(s)
+        return s
+
+    def is_ready(self, stream: object) -> bool:
+        return False  # no real features; skip the decode-drain loop
+
+    def decode_stream(self, stream: object) -> None:  # pragma: no cover - never called
+        pass
+
+    def get_result(self, stream: object) -> str:
+        text = self._results[min(self._i, len(self._results) - 1)]
+        self._i += 1
+        return text
+
+
+def _sherpa_session_with(results: list[str]) -> _SherpaSession:
+    from bob.stt_engine import SherpaSttEngine, _SherpaSession
+
+    engine = SherpaSttEngine()
+    engine._recognizer = _StubRecognizer(results)
+    return _SherpaSession(engine, sample_rate=16_000)
+
+
+def test_sherpa_session_emits_only_on_change_and_tracks_stable_prefix() -> None:
+    # get_result sequence: frame1 "bonjour", frame2 repeat (no emit), frame3 grows.
+    session = _sherpa_session_with(["bonjour", "bonjour", "bonjour le"])
+    frame = struct.pack("<4h", 0, 0, 0, 0)
+
+    out1 = session.accept_frame(frame)
+    out2 = session.accept_frame(frame)
+    out3 = session.accept_frame(frame)
+
+    assert [p.text for p in out1] == ["bonjour"]
+    assert out2 == []  # unchanged hypothesis → no wire emit
+    assert [p.text for p in out3] == ["bonjour le"]
+    # "bonjour" is the common prefix that survived into "bonjour le".
+    assert out3[0].stable_prefix_len == len("bonjour")
+
+
+def test_sherpa_session_finalize_tail_flushes_and_signals_end() -> None:
+    session = _sherpa_session_with(["salut", "salut toi"])
+    session.accept_frame(struct.pack("<4h", 0, 0, 0, 0))
+    final = session.finalize()
+
+    assert isinstance(final, SttFinal)
+    assert final.text == "salut toi"
+    # finalize must pad the tail AND signal input_finished so the last tokens drain.
+    stream = session._recognizer.streams[0]
+    assert stream.input_finished_called is True
+    assert stream.fed_samples[-1] > 0  # the 0.5 s zero pad
+
+
+def test_sherpa_session_empty_frame_is_noop() -> None:
+    session = _sherpa_session_with(["x"])
+    assert session.accept_frame(b"") == []
+
+
+def test_sherpa_engine_resolves_model_files_and_prefers_int8(tmp_path: Path) -> None:
+    from bob.config import Settings
+    from bob.stt_engine import SherpaSttEngine
+
+    for name in (
+        "encoder-epoch-1.onnx",
+        "encoder-epoch-1.int8.onnx",
+        "decoder-epoch-1.onnx",
+        "decoder-epoch-1.int8.onnx",
+        "joiner-epoch-1.onnx",
+        "joiner-epoch-1.int8.onnx",
+        "tokens.txt",
+    ):
+        (tmp_path / name).write_text("x")
+
+    engine = SherpaSttEngine(
+        Settings(STT_SHERPA_MODEL_DIR=str(tmp_path), STT_SHERPA_INT8=True)
+    )
+    assert engine.is_model_cached() is True
+    files = engine._find_model_files(tmp_path)
+    assert files["encoder"].endswith(".int8.onnx")
+
+    engine_fp32 = SherpaSttEngine(
+        Settings(STT_SHERPA_MODEL_DIR=str(tmp_path), STT_SHERPA_INT8=False)
+    )
+    assert engine_fp32._find_model_files(tmp_path)["encoder"] == str(
+        tmp_path / "encoder-epoch-1.onnx"
+    )
+
+
+def test_sherpa_engine_reports_uncached_when_model_dir_incomplete(tmp_path: Path) -> None:
+    from bob.config import Settings
+    from bob.stt_engine import SherpaSttEngine
+
+    (tmp_path / "tokens.txt").write_text("x")  # missing the .onnx files
+    engine = SherpaSttEngine(Settings(STT_SHERPA_MODEL_DIR=str(tmp_path)))
+    assert engine.is_model_cached() is False
 
 
 # --- Real engine (slow / optional) ------------------------------------------

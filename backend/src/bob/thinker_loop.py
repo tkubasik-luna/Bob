@@ -200,6 +200,13 @@ class ThinkerLoop:
         self._rerun = False
         self._last_trigger: float | None = None
         self._stopped = False
+        # Lifecycle epoch. Bumped on every ``start`` / ``stop`` / ``hard_cancel``
+        # and captured by each pass at launch: a pass whose epoch no longer
+        # matches must not land its snapshot nor reschedule. This is the robust
+        # form of the stale-pass guard — ``turn_id`` alone cannot tell a stale
+        # pass from a live one on a barge-in resume (the SAME turn id is
+        # re-armed), and ``_stopped`` alone is a single flag a re-arm resets.
+        self._generation = 0
 
     # -- public API ----------------------------------------------------------
 
@@ -215,6 +222,7 @@ class ThinkerLoop:
 
         self._turn_id = turn_id
         self._seq = 0
+        self._generation += 1
         self._pending_text = None
         self._rerun = False
         self._last_trigger = None
@@ -274,6 +282,7 @@ class ThinkerLoop:
         """
 
         self._stopped = True
+        self._generation += 1
         self._rerun = False
         task = self._inflight
         self._inflight = None
@@ -305,6 +314,7 @@ class ThinkerLoop:
         """
 
         self._stopped = True
+        self._generation += 1
         self._rerun = False
         self._pending_text = None
         task = self._inflight
@@ -330,9 +340,9 @@ class ThinkerLoop:
     def _launch(self, text: str) -> None:
         """Spawn the single in-flight inference task for ``text``."""
 
-        self._inflight = self._spawn(self._run_pass(text))
+        self._inflight = self._spawn(self._run_pass(text, self._generation))
 
-    async def _run_pass(self, text: str) -> None:
+    async def _run_pass(self, text: str, generation: int) -> None:
         """Run one Thinker inference over ``text`` → snapshot → store + event.
 
         Never raises (cooperative cancel aside): a failed inference is logged and
@@ -340,14 +350,21 @@ class ThinkerLoop:
         prompt, it must never crash the turn. On completion, if a newer partial
         arrived while we ran (``_rerun``), re-evaluate exactly once against it so
         the model always converges on the latest transcript.
+
+        ``generation`` is the lifecycle epoch captured at launch. A
+        ``hard_cancel`` never awaits the task, so a pass past its last await
+        point can outlive the cancel and land a STALE snapshot into a re-armed
+        turn (the barge-in resume re-arms the SAME turn id, so ``turn_id`` does
+        not discriminate). The epoch does: any ``start`` / ``stop`` /
+        ``hard_cancel`` in between bumped it, and the pass drops its result.
         """
 
         turn_id = self._turn_id
         try:
-            if turn_id is None or self._stopped:
+            if turn_id is None or self._stopped or generation != self._generation:
                 return
             snapshot = await self._infer(turn_id, text)
-            if snapshot is None or self._stopped:
+            if snapshot is None or self._stopped or generation != self._generation:
                 return
             accepted = self._live_state.update(snapshot)
             if accepted:
@@ -366,7 +383,7 @@ class ThinkerLoop:
                 "thinker_loop.pass_failed", session_id=self._session_id, turn_id=turn_id
             )
         finally:
-            await self._maybe_rerun()
+            await self._maybe_rerun(generation)
 
     def _push_turn_complete(self, complete: bool) -> None:
         """Push the semantic bit to the ``on_turn_complete`` hook (issue 0120).
@@ -388,10 +405,15 @@ class ThinkerLoop:
                 turn_id=self._turn_id,
             )
 
-    async def _maybe_rerun(self) -> None:
-        """Re-evaluate once if a partial arrived mid-pass (the ≤1 rerun, Annexe H)."""
+    async def _maybe_rerun(self, generation: int) -> None:
+        """Re-evaluate once if a partial arrived mid-pass (the ≤1 rerun, Annexe H).
 
-        if self._stopped or not self._rerun:
+        Epoch-guarded: a stale pass (its ``generation`` no longer current) must
+        not reschedule — the re-armed turn owns the cadence now, and a stale
+        relaunch would overwrite its ``_inflight`` slot.
+        """
+
+        if self._stopped or generation != self._generation or not self._rerun:
             return
         self._rerun = False
         next_text = self._pending_text

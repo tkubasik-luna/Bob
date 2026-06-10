@@ -55,6 +55,16 @@ bob = "bob.attest.cli:main"
 stt = [
     "pywhispercpp>=1.3.0",
 ]
+# Alternative true-streaming transducer STT engine (STT_ENGINE=sherpa). Kept a
+# separate extra so the default whisper.cpp install is unchanged; install with
+# ``uv sync --extra stt-sherpa``.
+# Pinned: the macOS arm64 cp312 wheel for 1.13.x ships a broken rpath (missing
+# bundled libonnxruntime dylib → dlopen fails); 1.11/1.12 have no arm64 wheel.
+# 1.10.46 bundles libonnxruntime correctly and imports clean. Revisit when a
+# newer self-contained arm64 wheel lands upstream.
+stt-sherpa = [
+    "sherpa-onnx==1.10.46",
+]
 
 [dependency-groups]
 dev = [
@@ -106,7 +116,7 @@ ignore_missing_imports = true
 # not be importable depending on the env — an override keeps mypy green in
 # both, where an inline ``type: ignore`` flips to unused when it IS installed.
 [[tool.mypy.overrides]]
-module = ["pywhispercpp.*"]
+module = ["pywhispercpp.*", "sherpa_onnx.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]

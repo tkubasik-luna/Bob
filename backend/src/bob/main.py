@@ -61,12 +61,8 @@ from bob.llm_router import set_switcher as set_llm_switcher
 from bob.llm_selection_store import (
     LLM_SELECTION_FILENAME,
     LLMSelection,
-    LLMSelectionStore,
     RoleSelectionStore,
     set_default_role_store,
-)
-from bob.llm_selection_store import (
-    set_default_store as set_default_llm_selection_store,
 )
 from bob.llm_swap import (
     LLMSwitcher,
@@ -89,8 +85,10 @@ from bob.sub_agent import (
 )
 from bob.task_scheduler import build_default_scheduler
 from bob.task_store import TaskStore
+from bob.tool_intent import build_tool_intent_predicate
 from bob.voice_retention_policy import set_retention_policy as set_voice_retention_policy
 from bob.ws_debug import router as ws_debug_router
+from bob.ws_router import reset_tool_intent_provider, set_tool_intent_provider
 from bob.ws_router import router as ws_router
 
 configure_logging()
@@ -164,45 +162,51 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         )
     )
 
-    # LLM selection store (PRD 0012 / issue 0078). JSON file under BOB_DATA_DIR
-    # owns the runtime selection: seed from .env on first boot, JSON wins after.
-    llm_selection_store = LLMSelectionStore(data_dir / LLM_SELECTION_FILENAME)
-    seeded_selection = llm_selection_store.seed_from_settings(settings)
-    set_default_llm_selection_store(llm_selection_store)
-
-    # LM Studio management manager (PRD 0012 / issue 0079-0080). Single boundary
-    # onto the ``lmstudio`` SDK for cold-start resolution + the live model swap.
-    # Host derives from the PERSISTED base_url (picker URL swap) when set, else
-    # the frozen .env LLM_BASE_URL — so a server chosen in a prior session is
-    # honoured on the next boot.
-    lm_studio_manager = LMStudioManager(
-        host=host_from_base_url(seeded_selection.base_url or settings.LLM_BASE_URL)
-    )
-
-    # Cold-start resolution (issue 0080): provider is LM Studio with no model
-    # pinned anywhere → adopt the model already loaded in LM Studio if any, else
-    # the first chat-capable downloaded model. Best-effort: an unreachable
-    # server leaves the selection unpinned (never crashes boot).
-    if not seeded_selection.lm_model:
-        resolved = resolve_cold_start_model(seeded_selection, lm_studio_manager)
-        if resolved:
-            seeded_selection = LLMSelection(
-                provider=seeded_selection.provider,
-                lm_model=resolved,
-                context_length=seeded_selection.context_length,
-                base_url=seeded_selection.base_url,
-            )
-            llm_selection_store.write(seeded_selection)
-            _logger.info("bob.llm.cold_start_resolved", lm_model=resolved)
-
-    # Per-role LLM selection store (PRD 0016 / issue 0106). Shares the same JSON
-    # file as the legacy flat store; seed migrates a v1 flat file forward to the
-    # four-role v2 shape and guarantees a canonical file. Wiring this default
-    # singleton is what GET /api/llm/roles reads through — without it the route
-    # raises and the HUD picker shows "Sélection par rôle indisponible".
+    # Per-role LLM selection store (PRD 0016 / issue 0106) — the SINGLE owner of
+    # the runtime selection JSON under BOB_DATA_DIR: seed from .env on first
+    # boot, JSON wins after; a legacy flat v1 file migrates forward to the
+    # four-role v2 shape (canonical file guaranteed). Wiring this default
+    # singleton is what GET /api/llm/roles AND the flat GET /api/llm/selection
+    # view read through — without it the routes raise and the HUD picker shows
+    # "Sélection par rôle indisponible".
     role_selection_store = RoleSelectionStore(data_dir / LLM_SELECTION_FILENAME)
     seeded_role_selection = role_selection_store.seed_from_settings(settings)
     set_default_role_store(role_selection_store)
+    jarvis_selection = seeded_role_selection.role("jarvis")
+
+    # LM Studio management manager (PRD 0012 / issue 0079-0080). Single boundary
+    # onto the ``lmstudio`` SDK for cold-start resolution + the live model swap.
+    # Host derives from the PERSISTED jarvis base_url (picker URL swap) when
+    # set, else the frozen .env LLM_BASE_URL — so a server chosen in a prior
+    # session is honoured on the next boot.
+    lm_studio_manager = LMStudioManager(
+        host=host_from_base_url(jarvis_selection.base_url or settings.LLM_BASE_URL)
+    )
+
+    # Cold-start resolution (issue 0080): the jarvis role is LM Studio with no
+    # model pinned → adopt the model already loaded in LM Studio if any, else
+    # the first chat-capable downloaded model. The resolved model pins EVERY
+    # still-unpinned LM Studio role (on a fresh install all four are identical),
+    # while a role the user already pinned keeps its own choice. Best-effort: an
+    # unreachable server leaves the selection unpinned (never crashes boot).
+    if not jarvis_selection.lm_model:
+        resolved = resolve_cold_start_model(jarvis_selection, lm_studio_manager)
+        if resolved:
+            for role, role_sel in seeded_role_selection.roles.items():
+                if role_sel.provider == "lm_studio" and not role_sel.lm_model:
+                    seeded_role_selection = seeded_role_selection.with_role(
+                        role,
+                        LLMSelection(
+                            provider=role_sel.provider,
+                            lm_model=resolved,
+                            context_length=role_sel.context_length,
+                            base_url=role_sel.base_url,
+                            reasoning=role_sel.reasoning,
+                        ),
+                    )
+            role_selection_store.write(seeded_role_selection)
+            jarvis_selection = seeded_role_selection.role("jarvis")
+            _logger.info("bob.llm.cold_start_resolved", lm_model=resolved)
 
     # Sub-agent runner factory used by the scheduler. We build the LLM client
     # once and reuse it across every runner invocation — the underlying
@@ -245,6 +249,16 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         # the failure living only in the boot log.
         _logger.exception("mcp.runtime.startup_failed")
         _app.state.mcp_startup_error = f"{type(exc).__name__}: {exc}"
+
+    # PRD 0016 / issue 0104 — the Draft's tool-intent gate: a voice turn whose
+    # partial lexically hits the sub-agent registry (same scorer + knob as the
+    # ``select_tools`` advertisement gate) stays COLD, so a committed draft can
+    # never replace a tool dispatch. The predicate closes over the registry
+    # object and reads it at call time, so MCP tools registered above are seen.
+    tool_intent_predicate = build_tool_intent_predicate(
+        subagent_registry, min_score=settings.TOOL_RETRIEVAL_MIN_SCORE
+    )
+    set_tool_intent_provider(lambda: tool_intent_predicate)
 
     live_runners: dict[str, SubAgentRunner] = {}
 
@@ -330,7 +344,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     llm_switcher = LLMSwitcher(
         settings=settings,
         manager=lm_studio_manager,
-        selection_store=llm_selection_store,
+        selection_store=role_selection_store,
         orchestrator=orchestrator,
         subagent_holder=subagent_holder,
     )
@@ -384,8 +398,8 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         data_dir=str(data_dir),
         db_path=str(db_path),
         history_len=len(store.history()),
-        llm_provider=seeded_selection.provider,
-        llm_model=seeded_selection.lm_model,
+        llm_provider=jarvis_selection.provider,
+        llm_model=jarvis_selection.lm_model,
     )
 
     # PRD 0018 / issue 0129 — BootWarmup. Every preload (whisper download/load,
@@ -419,6 +433,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         _app.state.boot_warmup = None
         set_llm_switcher(None)
         reset_llm_manager_provider()
+        reset_tool_intent_provider()
         await orchestrator.stop_proactive_loop()
         # Issue 0045 — drain the scheduler's TaskGroup deterministically so
         # in-flight sub-agents don't leak past the lifespan teardown.
@@ -433,7 +448,6 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         jarvis_store_module.set_default_store(None)
         voice_store_module.set_default_store(None)
         turn_metrics_module.set_default_collector(None)
-        set_default_llm_selection_store(None)
         set_default_role_store(None)
         set_role_switcher(None)
         conn.close()

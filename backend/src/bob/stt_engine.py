@@ -20,9 +20,15 @@ Swappable engine
 ----------------
 
 :class:`SttEngine` is a tiny :class:`typing.Protocol` (``open_session`` +
-``is_model_cached`` + ``preload``). Two implementations ship:
+``is_model_cached`` + ``preload``). Three implementations ship:
 
-- :class:`WhisperCppSttEngine` — the real engine: whisper.cpp via
+- :class:`SherpaSttEngine` — true-streaming transducer: a sherpa-onnx streaming
+  zipformer (``OnlineRecognizer.from_transducer``). Emits tokens incrementally
+  as audio arrives (no trailing-buffer re-decode), so partials are low-latency
+  and ``stable_prefix_len`` is a genuine settled length. The French streaming
+  zipformer is auto-downloaded into the user cache on first use when
+  ``STT_SHERPA_MODEL_DIR`` is unset. Select with ``STT_ENGINE=sherpa``.
+- :class:`WhisperCppSttEngine` — the default engine: whisper.cpp via
   ``pywhispercpp`` (Metal/CoreML on Apple Silicon), default model
   ``large-v3-turbo``, downloaded **lazily** the first time a session is
   opened (mirrors :class:`bob.tts_service.KokoroTtsService` —
@@ -43,7 +49,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from threading import Lock
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 import structlog
 
@@ -51,6 +57,7 @@ from bob.config import Settings, get_settings
 
 if TYPE_CHECKING:  # pragma: no cover
     from collections.abc import Iterable
+    from pathlib import Path
 
 _logger = structlog.get_logger(__name__)
 
@@ -390,9 +397,20 @@ class WhisperCppSttEngine:
         self._infer_lock = Lock()
 
     def _model_cache_dir(self) -> object:
-        from pathlib import Path
+        # pywhispercpp stores models in its platform user-data dir (on macOS
+        # ``~/Library/Application Support/pywhispercpp/models``, NOT
+        # ``~/.cache``) — ask the library so the probe never drifts from where
+        # the download actually lands.
+        try:
+            from pathlib import Path
 
-        return Path.home() / ".cache" / "pywhispercpp" / "models"
+            from pywhispercpp.constants import MODELS_DIR
+
+            return Path(MODELS_DIR)
+        except Exception:
+            from pathlib import Path
+
+            return Path.home() / ".cache" / "pywhispercpp" / "models"
 
     def is_model_cached(self) -> bool:
         """True when a whisper.cpp ``ggml-<model>.bin`` is already on disk.
@@ -475,12 +493,227 @@ class WhisperCppSttEngine:
 
 
 class SttEngineUnavailableError(RuntimeError):
-    """The whisper.cpp engine cannot load (missing ``pywhispercpp`` / model).
+    """A real STT engine cannot load (missing native dep / model).
 
-    Surfaced at :meth:`WhisperCppSttEngine.open_session` so the WS layer can
-    abort the turn cleanly (``end_reason:error``) per Annexe G instead of
-    crashing.
+    Surfaced at the engine's ``open_session`` so the WS layer can abort the
+    turn cleanly (``end_reason:error``) per Annexe G instead of crashing.
     """
+
+
+# --- sherpa-onnx engine (real, true-streaming transducer) -------------------
+
+#: French streaming zipformer transducer auto-downloaded when
+#: ``STT_SHERPA_MODEL_DIR`` is unset (the only ready FR streaming transducer in
+#: the sherpa-onnx model zoo). Hosted on the k2-fsa asr-models release.
+_SHERPA_FR_MODEL_URL = (
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/"
+    "sherpa-onnx-streaming-zipformer-fr-2023-04-14.tar.bz2"
+)
+
+
+class _SherpaSession:
+    """True-streaming transducer session: feed frame, decode-drain, read text.
+
+    Unlike :class:`_WhisperCppSession` there is NO trailing-buffer re-decode —
+    the zipformer transducer emits tokens incrementally as audio arrives, so
+    :meth:`accept_frame` simply feeds the waveform, drains the ready decode
+    steps, and reads the current hypothesis. The hypothesis is append-mostly
+    (the transducer rarely rewrites emitted tokens), so ``stable_prefix_len``
+    computed as the common prefix against the previous emission is a tight,
+    honest settled length rather than the looser whisper proxy.
+
+    The STT_PARTIAL_* cadence/window knobs are inert here: the engine is the
+    cadence. A partial is still only emitted when the text actually changed, so
+    silence between words costs nothing on the wire.
+    """
+
+    def __init__(self, engine: SherpaSttEngine, *, sample_rate: int) -> None:
+        recognizer: Any = engine._ensure_loaded()
+        self._recognizer = recognizer
+        self._stream: Any = recognizer.create_stream()
+        self._rate = sample_rate
+        self._last_text = ""
+
+    def accept_frame(self, pcm: bytes) -> list[SttPartial]:
+        import numpy as np
+
+        if not pcm:
+            return []
+        samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
+        self._stream.accept_waveform(self._rate, samples)
+        while self._recognizer.is_ready(self._stream):
+            self._recognizer.decode_stream(self._stream)
+        text = self._recognizer.get_result(self._stream).strip()
+        if not text or text == self._last_text:
+            return []
+        stable = _common_prefix_len(self._last_text, text)
+        self._last_text = text
+        return [SttPartial(text=text, stable_prefix_len=stable)]
+
+    def finalize(self) -> SttFinal:
+        import numpy as np
+
+        # Tail-pad + signal end so the last tokens drain (sherpa convention),
+        # then read the settled hypothesis. No full-buffer re-decode needed —
+        # the stream already holds the whole turn's decoder state.
+        self._stream.accept_waveform(self._rate, np.zeros(int(0.5 * self._rate), np.float32))
+        self._stream.input_finished()
+        while self._recognizer.is_ready(self._stream):
+            self._recognizer.decode_stream(self._stream)
+        text = self._recognizer.get_result(self._stream).strip()
+        return SttFinal(text=text or self._last_text)
+
+    def close(self) -> None:
+        # Drop the per-turn stream; the recognizer (and its model) is shared.
+        self._stream = None
+
+
+class SherpaSttEngine:
+    """sherpa-onnx streaming zipformer transducer engine with lazy model setup.
+
+    Mirrors :class:`WhisperCppSttEngine`'s lazy-load contract: the ``sherpa_onnx``
+    import and the recognizer build are deferred to the first
+    :meth:`open_session` (via :meth:`_ensure_loaded`), so the backend boots green
+    without the native wheel or the weights. When ``STT_SHERPA_MODEL_DIR`` is
+    unset the French streaming zipformer is auto-downloaded into the user cache
+    on first load (mirrors the whisper.cpp / Kokoro lazy-download pattern);
+    :meth:`is_model_cached` lets the WS layer emit a ``stt_preparing`` toast
+    before paying that download.
+
+    Thread-safety: one shared ``OnlineRecognizer`` across turns, each turn gets
+    its own ``stream`` from :meth:`OnlineRecognizer.create_stream`. The recognizer
+    is documented as safe for concurrent streams, but turns are sequential per
+    voice loop anyway; the load is guarded so the build happens exactly once.
+    """
+
+    def __init__(self, settings: Settings | None = None) -> None:
+        self._settings = settings or get_settings()
+        self._recognizer: object | None = None
+        self._load_lock = Lock()
+
+    def _cache_root(self) -> Path:
+        from pathlib import Path
+
+        return Path.home() / ".cache" / "bob" / "sherpa"
+
+    def _resolve_model_dir(self) -> Path:
+        """The model dir to load: explicit setting, else the auto-download cache."""
+
+        from pathlib import Path
+
+        configured = self._settings.STT_SHERPA_MODEL_DIR.strip()
+        if configured:
+            return Path(configured).expanduser()
+        archive_stem = _SHERPA_FR_MODEL_URL.rsplit("/", 1)[-1].removesuffix(".tar.bz2")
+        return self._cache_root() / archive_stem
+
+    def _find_model_files(self, model_dir: Path) -> dict[str, str]:
+        """Glob the 4 required transducer files, honouring ``STT_SHERPA_INT8``."""
+
+
+        def pick(stem: str) -> Path:
+            int8 = sorted(model_dir.glob(f"{stem}*int8*.onnx"))
+            fp32 = sorted(p for p in model_dir.glob(f"{stem}*.onnx") if "int8" not in p.name)
+            order = (int8 + fp32) if self._settings.STT_SHERPA_INT8 else (fp32 + int8)
+            if not order:
+                raise SttEngineUnavailableError(f"no {stem}*.onnx under {model_dir}")
+            return order[0]
+
+        tokens = model_dir / "tokens.txt"
+        if not tokens.exists():
+            raise SttEngineUnavailableError(f"no tokens.txt under {model_dir}")
+        return {
+            "encoder": str(pick("encoder")),
+            "decoder": str(pick("decoder")),
+            "joiner": str(pick("joiner")),
+            "tokens": str(tokens),
+        }
+
+    def is_model_cached(self) -> bool:
+        """True when the transducer files are already on disk (no download).
+
+        Conservative: any probe failure returns True so we never *falsely* claim
+        a download is needed and block on a toast.
+        """
+
+        try:
+            self._find_model_files(self._resolve_model_dir())
+            return True
+        except SttEngineUnavailableError:
+            return False
+        except Exception:
+            return True
+
+    def _download_fr_model(self, model_dir: Path) -> None:
+        """Download+extract the FR zipformer into the cache (auto-download path)."""
+
+        import tarfile
+        import urllib.request
+
+        root = model_dir.parent
+        root.mkdir(parents=True, exist_ok=True)
+        archive = root / _SHERPA_FR_MODEL_URL.rsplit("/", 1)[-1]
+        _logger.info("stt.sherpa.download", url=_SHERPA_FR_MODEL_URL, dest=str(root))
+        urllib.request.urlretrieve(_SHERPA_FR_MODEL_URL, archive)
+        with tarfile.open(archive, "r:bz2") as tar:
+            tar.extractall(root)
+        archive.unlink(missing_ok=True)
+
+    def preload(self) -> None:
+        """Force the recognizer to load (downloading the FR model if absent)."""
+
+        self._ensure_loaded()
+
+    def _ensure_loaded(self) -> object:
+        if self._recognizer is not None:
+            return self._recognizer
+        with self._load_lock:
+            if self._recognizer is not None:
+                return self._recognizer
+            try:
+                # Optional native dep: the pyproject mypy override (like
+                # ``pywhispercpp``) keeps this green whether or not it is
+                # installed — an inline ignore flips to unused either way.
+                import sherpa_onnx
+            except ImportError as exc:  # pragma: no cover - env without native dep
+                raise SttEngineUnavailableError(
+                    "sherpa-onnx is not installed; install it to enable the sherpa STT "
+                    "engine (uv pip install sherpa-onnx), or set STT_ENGINE=whisper_cpp"
+                ) from exc
+
+            model_dir = self._resolve_model_dir()
+            try:
+                files = self._find_model_files(model_dir)
+            except SttEngineUnavailableError:
+                # Auto-download only the default (unconfigured) FR model — an
+                # explicit STT_SHERPA_MODEL_DIR that is incomplete is a config
+                # error and must surface, not silently fetch a different model.
+                if self._settings.STT_SHERPA_MODEL_DIR.strip():
+                    raise
+                self._download_fr_model(model_dir)
+                files = self._find_model_files(model_dir)
+
+            _logger.info("stt.sherpa.load", model_dir=str(model_dir))
+            self._recognizer = sherpa_onnx.OnlineRecognizer.from_transducer(
+                tokens=files["tokens"],
+                encoder=files["encoder"],
+                decoder=files["decoder"],
+                joiner=files["joiner"],
+                num_threads=2,
+                sample_rate=self._settings.STT_SAMPLE_RATE,
+                feature_dim=80,
+                decoding_method="greedy_search",
+                # Endpointing is the voice loop's job (it owns turn freezing);
+                # the engine just transcribes the audio it is fed.
+                enable_endpoint_detection=False,
+            )
+            return self._recognizer
+
+    def open_session(self, turn_id: str) -> SttSession:
+        # Load eagerly so an import/download failure surfaces at session open
+        # (the WS degradation path), not mid-frame.
+        self._ensure_loaded()
+        return _SherpaSession(self, sample_rate=self._settings.STT_SAMPLE_RATE)
 
 
 def _run_whisper(model: object, samples: object) -> Iterable[str]:
@@ -510,6 +743,8 @@ _default_lock = Lock()
 
 
 def _build_engine(settings: Settings) -> SttEngine:
+    if settings.STT_ENGINE == "sherpa":
+        return SherpaSttEngine(settings)
     if settings.STT_ENGINE == "fake":
         # The canned transcript is injected by the attest harness via
         # ``BOB_FAKE_STT_TRANSCRIPT`` (empty in normal dev/test → empty finals).

@@ -409,3 +409,60 @@ async def test_start_clears_previous_turn_draft() -> None:
     assert drafter.draft_text is None
     decision = drafter.commit_gate("bonjour")
     assert decision.reason == "no_draft"
+
+
+# --- lifecycle epoch (stale-pass guard) ---------------------------------------
+
+
+async def test_stale_generation_pass_never_stores_a_draft() -> None:
+    """A pass that outlives a hard_cancel + re-arm (same turn id) drops its reply.
+
+    ``hard_cancel`` never awaits the cancelled task, so a pass past its last
+    await point can conclude AFTER a barge-in resume re-armed the SAME turn id
+    (the ``turn_id`` compare does not discriminate there). The lifecycle epoch
+    captured at launch must reject the stale store — otherwise the resumed turn
+    could adopt a draft written for speech that no longer matches.
+    """
+
+    client = _FakeDraftClient(replies=["stale reply", "fresh reply"])
+    drafter = _drafter(client)
+
+    drafter.start("t1")
+    # Park a pass IN FLIGHT inside the model call — the dangerous window.
+    client.gate = asyncio.Event()
+    stale_pass = asyncio.create_task(drafter._run_pass("salut bob", drafter._generation))
+    await client.started.wait()
+
+    # Barge-in: zero-grace cancel (the task is never awaited) + resume re-arms
+    # the SAME turn id.
+    drafter.hard_cancel()
+    drafter.start("t1")
+
+    # The surviving pass resumes past its await and concludes against the
+    # re-armed turn — the epoch guard must drop its reply.
+    client.gate.set()
+    await stale_pass
+    assert drafter.draft_text is None
+
+    # A pass of the CURRENT epoch stores normally.
+    client.gate = None
+    await drafter._run_pass("salut bob", drafter._generation)
+    assert drafter.draft_text == "fresh reply"
+
+
+async def test_stale_generation_pass_never_reschedules_a_rerun() -> None:
+    """A stale pass with a pending rerun must not relaunch into the new epoch."""
+
+    client = _FakeDraftClient()
+    drafter = _drafter(client)
+
+    drafter.start("t1")
+    stale_generation = drafter._generation
+    drafter.hard_cancel()
+    drafter.start("t1")
+    drafter._rerun = True
+    drafter._pending_text = "vieux partiel"
+
+    await drafter._maybe_rerun(stale_generation)
+    assert drafter.inflight is False
+    assert client.calls == []

@@ -232,6 +232,26 @@ class VoiceTurn:
         self._reset_turn_ctx()
         return final
 
+    def discard(self) -> None:
+        """Quietly drop the turn — no ``stt_final``, no error event.
+
+        Wake-word standby (``bob.wake_word``): re-entering standby after an
+        awake window must shed the ambient audio the open session buffered
+        while idle, or the next wake's final pass would transcribe stale
+        noise. Nothing user-visible happened, so nothing is emitted — unlike
+        :meth:`finalize` (stt_final) and :meth:`abort` (voice_turn_error).
+        Idempotent; a discarded turn accepts no further frames.
+        """
+
+        if self._finished:
+            self._reset_turn_ctx()
+            return
+        self._finished = True
+        with contextlib.suppress(Exception):
+            if self._session is not None:
+                self._session.close()
+        self._reset_turn_ctx()
+
     async def abort(self, *, reason: str) -> None:
         """Abort the turn cleanly (Annexe G): ``end_reason:error`` → idle.
 

@@ -297,9 +297,28 @@ class Settings(BaseSettings):
     # the debug ring buffer (the full text always reaches the client; the ring
     # buffer copy is truncated/masked — Privacy note, Annexe A.2).
     STT_ENABLED: bool = True
-    STT_ENGINE: Literal["whisper_cpp", "fake"] = "whisper_cpp"
+    STT_ENGINE: Literal["whisper_cpp", "sherpa", "fake"] = "whisper_cpp"
     STT_MODEL: str = "large-v3-turbo"
     STT_LANGUAGE: str = "fr"
+
+    # ``sherpa`` engine (true-streaming transducer alternative to whisper.cpp).
+    # whisper.cpp transcribes a BUFFER, so the « Listen » path re-decodes a
+    # trailing window every cadence tick (the STT_PARTIAL_* knobs below). A
+    # sherpa-onnx streaming zipformer transducer instead emits tokens token-by-
+    # token as audio arrives — no re-decode, lower latency, and a GENUINE
+    # settled-prefix (the transducer rarely rewrites emitted tokens) rather than
+    # the common-prefix heuristic whisper needs. The STT_PARTIAL_* cadence/window
+    # knobs are inert for this engine.
+    #
+    # ``STT_SHERPA_MODEL_DIR`` points at an extracted sherpa transducer model
+    # directory (the dir holding ``encoder*.onnx`` / ``decoder*.onnx`` /
+    # ``joiner*.onnx`` / ``tokens.txt``). Empty (default) = lazy auto-download of
+    # the French streaming zipformer into the user cache on first use, mirroring
+    # the whisper.cpp lazy-download pattern (a ``stt_preparing`` toast covers it).
+    # ``STT_SHERPA_INT8`` prefers the int8-quantised weights (smaller/faster, a
+    # touch less accurate) when both variants are present in the dir.
+    STT_SHERPA_MODEL_DIR: str = ""
+    STT_SHERPA_INT8: bool = True
     STT_SAMPLE_RATE: int = 16_000
     STT_PARTIAL_MIN_CHARS: int = 1
     STT_DEBUG_TEXT_MAX_CHARS: int = 16
@@ -360,6 +379,32 @@ class Settings(BaseSettings):
     VAD_SPEECH_RMS: float = 0.02
     VAD_PAUSE_MS: int = 300
     ENDPOINT_SILENCE_MS: int = 600
+
+    # Wake word (« Yo Bob » — :mod:`bob.wake_word`). When enabled, an armed
+    # voice window starts in STANDBY: frames flow but no turn opens and the
+    # main STT stays cold; a small whisper model (``WAKE_WORD_MODEL``)
+    # transcribes a short rolling window (VAD-gated, debounced) and a fuzzy
+    # matcher hunts for ``WAKE_WORD_PHRASE``. On a hit the loop opens a real
+    # turn (the orb flips to « écoute »), seeds the main STT with the rolling
+    # buffer so a same-breath command is captured, and strips the phrase from
+    # the frozen transcript. ``WAKE_WORD_AWAKE_WINDOW_SECONDS`` keeps the
+    # session awake after a wake/turn so follow-ups skip the wake phrase;
+    # past it the loop drops back to standby. ``WAKE_WORD_ACK_REPLY`` is what
+    # Bob says when the user woke him with the bare phrase and nothing else
+    # (empty string = stay silent). ``WAKE_WORD_MATCH_THRESHOLD`` trades false
+    # accepts against false rejects in the fuzzy matcher ([0,1]).
+    #
+    # OFF by default so the 0099/0100 contracts (every speech opens a turn;
+    # silent frames still transcribe) are byte-for-byte unchanged unless the
+    # deployment opts in (see backend/.env).
+    WAKE_WORD_ENABLED: bool = False
+    WAKE_WORD_PHRASE: str = "yo bob"
+    WAKE_WORD_MODEL: str = "tiny"
+    WAKE_WORD_WINDOW_SECONDS: float = 2.5
+    WAKE_WORD_INTERVAL_SECONDS: float = 0.7
+    WAKE_WORD_MATCH_THRESHOLD: float = 0.75
+    WAKE_WORD_AWAKE_WINDOW_SECONDS: float = 12.0
+    WAKE_WORD_ACK_REPLY: str = "Oui ?"
 
     # TTS engine selection (PRD 0016 / issue 0100). ``kokoro`` (default) is the
     # real local engine (:class:`bob.tts_service.KokoroTtsService`). ``fake`` is

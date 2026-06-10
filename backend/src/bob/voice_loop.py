@@ -110,6 +110,7 @@ from bob.turn_fsm import Transition, TurnEvent, TurnFsm, TurnState
 from bob.turn_watchdog import TURN_TIMEOUT_FALLBACK_SPEECH, TurnTimeoutError, TurnWatchdog
 from bob.vad import EnergyVad, VadEvent, rms_normalised
 from bob.voice_turn import VoiceTurn, _scrub_text
+from bob.wake_word import WakeMatch, WakeWordDetector, strip_wake_prefix
 
 _logger = structlog.get_logger(__name__)
 
@@ -311,6 +312,16 @@ class FullDuplexLoop:
     #: owns the DB row + WAV files + Jarvis link + the persistence event. Wired
     #: by ws_router; ``None`` = no persistence (the bare-loop tests / voice OFF).
     persist_turn: Callable[[PersistedTurn], Awaitable[None]] | None = None
+    #: Wake-word detector (:mod:`bob.wake_word`). When wired, the armed window
+    #: starts in STANDBY: no turn opens and the main STT stays cold until the
+    #: detector hears ``WAKE_WORD_PHRASE`` (« Yo Bob ») — then the loop emits a
+    #: ``wake_word`` event, opens the turn (the orb flips to « écoute »), seeds
+    #: the main STT with the detector's rolling buffer (same-breath commands)
+    #: and strips the phrase from the frozen transcript at the endpoint. The
+    #: ``WAKE_WORD_AWAKE_WINDOW_SECONDS`` grace after a wake / finished turn
+    #: lets follow-ups skip the phrase. ``None`` (the default, and every
+    #: existing test) keeps the 0100 behaviour: every VAD speech opens a turn.
+    wake_detector: WakeWordDetector | None = None
 
     _fsm: TurnFsm = field(default_factory=TurnFsm)
     _vad: EnergyVad = field(init=False)
@@ -351,6 +362,14 @@ class FullDuplexLoop:
     _tts_pcm: bytearray = field(default_factory=bytearray)
     _tts_sample_rate: int = 0
     _final_transcript: str = ""
+    #: Wake-word awake horizon (monotonic). While ``now < _awake_until`` the
+    #: loop behaves exactly as without a detector (speech opens a turn); past
+    #: it the loop is back in standby. 0.0 = never woken (standby from arm).
+    _awake_until: float = 0.0
+    #: Whether the OPEN main-STT session has been fed any audio. Standby uses
+    #: it to shed a session that buffered ambient awake-idle audio (discard +
+    #: re-mint) so a later wake's final pass never transcribes stale noise.
+    _stt_fed: bool = False
     #: Turn ids already handed to ``persist_turn`` — the finalize exits race
     #: (``voice_stop`` after an endpoint say-path is still finishing), so we
     #: persist each turn AT MOST ONCE. Bounded implicitly by the session length.
@@ -418,17 +437,26 @@ class FullDuplexLoop:
         if self._latency.t_first_mic_frame is None:
             self._latency.t_first_mic_frame = self._now()
 
+        # One RMS pass; the same per-frame speech/silence decision feeds the VAD
+        # (speech/pause edges), the Endpointer (silence floor) AND the barge-in
+        # controller (confirmation window during bob_speaking).
+        is_speech = rms_normalised(pcm) >= self.settings.VAD_SPEECH_RMS
+
+        # Wake-word standby gate (:mod:`bob.wake_word`): until « Yo Bob » is
+        # heard, frames feed ONLY the small rolling detector — no turn opens,
+        # the main STT stays cold (no continuous large-model passes on ambient
+        # audio) and nothing below (capture/STT/VAD/endpoint) runs. A hit
+        # transitions to the normal flow via ``_on_wake``.
+        if self._in_standby():
+            await self._feed_standby(pcm, is_speech=is_speech)
+            return
+
         # Capture the raw mic PCM for this turn's ``mic_in`` recording (PRD 0016
         # / issue 0109). Only when persistence is wired (the bare-loop tests skip
         # it). ``_begin_capture`` resets the buffer at every turn open so what we
         # persist is the utterance from speech-start onward, not stale silence.
         if self.persist_turn is not None:
             self._mic_pcm.extend(pcm)
-
-        # One RMS pass; the same per-frame speech/silence decision feeds the VAD
-        # (speech/pause edges), the Endpointer (silence floor) AND the barge-in
-        # controller (confirmation window during bob_speaking).
-        is_speech = rms_normalised(pcm) >= self.settings.VAD_SPEECH_RMS
 
         # 1) Feed STT first so the 0099 partial/final path is identical whether
         #    or not the FSM ever leaves idle (silent test frames never trip the
@@ -439,6 +467,7 @@ class FullDuplexLoop:
         advanced = False
         if turn is not None:
             advanced = await self._feed_stt(turn, pcm)
+            self._stt_fed = True
 
         # 1b) Barge-in (issue 0101): while Bob holds the floor, run the
         #     confirmation window. On confirmation we cut Bob and re-open the
@@ -566,6 +595,10 @@ class FullDuplexLoop:
         # A fire-and-forget backchannel synthesis (issue 0120) must not outlive
         # the session — cancel it here (the only place it is ever awaited).
         await self._cancel_backchannel_task()
+        # Drop the wake detector's rolling buffer — nothing heard in a dead
+        # window may leak into the next armed window's first pass.
+        if self.wake_detector is not None:
+            self.wake_detector.reset()
         # Annexe H — ``voice_stop`` tears the loop down: cooperatively cancel any
         # in-flight Thinker pass too (no-op when unwired / already stopped).
         if self.on_thinker_stop is not None:
@@ -620,7 +653,107 @@ class FullDuplexLoop:
             self._turn = None
             return False
         self._turn = turn
+        self._stt_fed = False
         return True
+
+    # -- wake-word standby (« Yo Bob ») ---------------------------------------
+
+    def _in_standby(self) -> bool:
+        """True while the loop is waiting for the wake phrase.
+
+        Standby holds only when a detector is wired, no turn is live (FSM
+        idle) AND the awake grace window has lapsed. Everywhere else the loop
+        behaves exactly as without a detector.
+        """
+
+        return (
+            self.wake_detector is not None
+            and self._fsm.state is TurnState.IDLE
+            and self._now() >= self._awake_until
+        )
+
+    def _touch_awake(self) -> None:
+        """Refresh the awake horizon (wake hit / turn opened / reply done)."""
+
+        if self.wake_detector is not None:
+            self._awake_until = self._now() + max(
+                0.0, self.settings.WAKE_WORD_AWAKE_WINDOW_SECONDS
+            )
+
+    async def _feed_standby(self, pcm: bytes, *, is_speech: bool) -> None:
+        """Standby frame path: rolling detector only; open the turn on a hit."""
+
+        detector = self.wake_detector
+        if detector is None:  # pragma: no cover - guarded by _in_standby
+            return
+        # Shed a main-STT session that buffered ambient audio during the awake
+        # window that just lapsed: discard quietly + re-mint, so a later wake's
+        # FULL-buffer final pass never transcribes stale idle noise.
+        if self._stt_fed and self._turn is not None:
+            self._turn.discard()
+            self._turn = None
+            await self._open_stt_turn()
+        match = await detector.feed(pcm, is_speech=is_speech)
+        if match is not None:
+            await self._on_wake(match)
+
+    async def _on_wake(self, match: WakeMatch) -> None:
+        """A confirmed wake hit: event + open the turn + seed the main STT."""
+
+        detector = self.wake_detector
+        if detector is None:  # pragma: no cover - defensive
+            return
+        seed = detector.recent_audio()
+        detector.reset()
+        self._touch_awake()
+        if self._turn is None and not await self._open_stt_turn():
+            return
+        turn = self._turn
+        await self._emit_wake_word(match, turn.turn_id if turn is not None else "")
+        # Open the FSM turn exactly like a VAD speech-start edge (start_turn,
+        # start_thinker/draft, fresh capture + endpointer + latency).
+        await self._on_speech_start()
+        # The wake utterance itself WAS speech, but the standby gate consumed
+        # those frames before the endpointer existed for this turn: arm its
+        # silence floor so a bare « Yo Bob » followed by silence still
+        # endpoints (otherwise the floor's had-speech invariant never holds).
+        self._endpointer.observe(is_speech=True)
+        # Seed the main STT with the detector's rolling window so a same-breath
+        # command (« Yo Bob, quelle heure est-il ? ») lands in the transcript —
+        # the wake phrase itself is stripped at the endpoint.
+        if turn is not None and seed:
+            if self.persist_turn is not None:
+                self._mic_pcm.extend(seed)
+            await self._feed_stt(turn, seed)
+            self._stt_fed = True
+
+    async def _emit_wake_word(self, match: WakeMatch, turn_id: str) -> None:
+        """Emit the ``wake_word`` voice event (full text to client, scrubbed ring)."""
+
+        detector = self.wake_detector
+        phrase = detector.phrase if detector is not None else ""
+        payload = {
+            "type": "wake_word",
+            "turn_id": turn_id,
+            "phrase": phrase,
+            "matched_text": match.text,
+            "score": match.score,
+            "ts": self._now(),
+        }
+        debug_payload = {
+            **payload,
+            "matched_text": _scrub_text(
+                match.text, max_chars=self.settings.STT_DEBUG_TEXT_MAX_CHARS
+            ),
+        }
+        await emit_event(
+            payload,
+            category="voice",
+            severity="info",
+            source="bob.voice_loop.wake_word",
+            summary=f"wake_word '{phrase}' (score={match.score})",
+            debug_payload=debug_payload,
+        )
 
     async def _on_speech_start(self) -> None:
         """Handle a ``vad_speech_start`` edge (open a turn or resume from thinking)."""
@@ -635,6 +768,8 @@ class FullDuplexLoop:
             transition = self._fsm.on_event(TurnEvent.VAD_SPEECH_START, turn_id=turn.turn_id)
             if transition is None:
                 return
+            # A turn opening keeps the session awake (wake-word grace window).
+            self._touch_awake()
             # Fresh latency accumulator for this turn (keep the first-mic-frame
             # stamp — it measures from when Bob started listening).
             self._latency = TurnLatency(t_first_mic_frame=self._latency.t_first_mic_frame)
@@ -681,6 +816,13 @@ class FullDuplexLoop:
             self._hard_cut_say_path()
             await self._dispatch(TurnEvent.VAD_SPEECH_START, turn_id=self._fsm.turn_id)
             await self._cancel_say_task()
+            # The endpointer LATCHES once fired (``observe`` returns False until
+            # ``reset``): the endpoint that moved the FSM into ``thinking`` left
+            # it spent, so the resumed utterance could never endpoint again —
+            # the turn wedged in ``user_speaking`` until ``voice_stop``. Re-arm
+            # it for the resumed utterance (this frame's speech re-arms the
+            # floor on the same ``feed_raw_frame`` pass, below).
+            self._endpointer.reset()
             # The cancelled say-path's finalize closed the turn's metrics entry
             # (issue 0117); the resumed utterance re-uses the SAME turn id, so
             # re-register it with a fresh time origin.
@@ -770,12 +912,59 @@ class FullDuplexLoop:
         self._bargein.reset()
         self._spoken_text = ""
 
+        # Wake mode: the frozen transcript still carries the wake phrase the
+        # detector's rolling buffer seeded (« Yo Bob, quelle heure est-il ? »).
+        # Strip it so the brain answers the COMMAND. A bare « Yo Bob » (nothing
+        # after the phrase) short-circuits to the configured acknowledgement
+        # (``WAKE_WORD_ACK_REPLY``) — no LLM call on an empty command.
+        prepared_ack: str | None = None
+        wake_bare = False
+        if self.wake_detector is not None and transcript.strip():
+            stripped = strip_wake_prefix(
+                transcript,
+                self.wake_detector.phrase,
+                threshold=self.settings.WAKE_WORD_MATCH_THRESHOLD,
+            )
+            if stripped != transcript:
+                if stripped.strip():
+                    transcript = stripped
+                else:
+                    # Bare wake phrase: nothing to answer. The transcript keeps
+                    # the original text (honest history); the ack — when
+                    # configured — is spoken as a prepared reply (no LLM).
+                    wake_bare = True
+                    ack = self.settings.WAKE_WORD_ACK_REPLY.strip()
+                    prepared_ack = ack or None
+
+        if (
+            self.wake_detector is not None
+            and prepared_ack is None
+            and (wake_bare or not transcript.strip())
+        ):
+            # Nothing to answer (bare wake phrase with no ack configured, or an
+            # empty hypothesis): end the turn cleanly instead of running the
+            # say-path on an empty command. ``voice_stop`` is the legal
+            # thinking→idle edge; STT re-arms for the next utterance (the awake
+            # grace window lets it open a turn without re-waking).
+            await self._dispatch(TurnEvent.VOICE_STOP)
+            self._touch_awake()
+            await self._emit_turn_latency(transition.turn_id)
+            await self._emit_turn_metrics(transition.turn_id)
+            await self._persist_turn(transition.turn_id, "completed")
+            if not self._stopped and self._turn is None:
+                await self._open_stt_turn()
+            return
+
         # The COMMIT GATE (PRD 0016 / issue 0104, Annexe F). On the FINAL frozen
         # transcript, decide whether to adopt the pre-written draft: a committed
         # draft is re-injected into the say-path verbatim (``prepared_reply``) so
         # Bob answers near-instantly; a discarded one (divergence / no draft / tool
         # turn) leaves ``prepared_reply`` None and the say-path regenerates COLD.
-        prepared_reply = await self._run_commit_gate(transcript, transition.turn_id)
+        # A wake acknowledgement (above) takes precedence — it is already text.
+        if prepared_ack is not None:
+            prepared_reply: str | None = prepared_ack
+        else:
+            prepared_reply = await self._run_commit_gate(transcript, transition.turn_id)
         # ``gate_decided`` — the speculative-draft verdict is in; the say-path
         # can launch (committed draft or cold regeneration).
         metrics.mark(transition.turn_id, "gate_decided")
@@ -1106,6 +1295,10 @@ class FullDuplexLoop:
         # a double-call harmless regardless.
         if completed_normally:
             await self._persist_turn(turn_id, "completed")
+        # A finished reply re-opens the wake grace window so a follow-up
+        # utterance can start without the wake phrase.
+        if completed_normally:
+            self._touch_awake()
         # Re-arm STT for the next utterance unless we have been stopped or a
         # resumed turn already opened one.
         if not self._stopped and self._turn is None:
@@ -1224,6 +1417,11 @@ class FullDuplexLoop:
         # above; this awaits its unwind so the interrupted turn's summaries are
         # emitted before the resumed turn re-registers below.
         await self._cancel_say_task()
+        # The endpointer latched when the interrupted turn endpointed; without
+        # a reset the RESUMED utterance can never endpoint (the turn wedges in
+        # ``user_speaking`` until ``voice_stop``). Re-arm it — the user's
+        # ongoing speech re-arms the floor on the next frames.
+        self._endpointer.reset()
         # The cancelled say-path's finalize emitted the interrupted turn's
         # metrics summary (issue 0117). The barge-in re-uses the SAME id for
         # the resumed utterance (0101 FSM contract), so re-register it with a

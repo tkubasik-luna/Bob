@@ -232,3 +232,23 @@ def test_semantic_signal_pre_speech_inert() -> None:
     assert ep.armed is False
     for _ in range(10):
         assert ep.observe(is_speech=False) is False  # never fires without speech
+
+
+def test_semantic_endpoint_never_fires_with_zero_stable_transcript() -> None:
+    """The formal zero-transcript guard: no semantic fire before any settled text.
+
+    Even if a ``user_turn_complete`` raced in and a confirmation somehow latched
+    while the stable watermark is still 0 (no STT partial settled this turn),
+    the semantic source must not end the turn — only the silence floor may.
+    """
+
+    ep = Endpointer(silence_floor_frames=50)
+    ep.observe(is_speech=True)  # arm the floor (speech seen)
+    ep.note_user_turn_complete(True)
+    # Force the latched-confirmed state with a zero watermark (defensive: the
+    # public confirmation path requires a stable ADVANCE, which implies > 0 —
+    # the guard keeps the invariant local instead of relying on that ordering).
+    ep._semantic_confirmed = True
+    assert ep.observe(is_speech=False) is False  # semantic blocked
+    ep.note_stable_prefix(3)  # transcript settled → semantic may now fire
+    assert ep.observe(is_speech=False) is True

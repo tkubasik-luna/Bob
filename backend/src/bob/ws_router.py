@@ -93,10 +93,10 @@ from bob.debug_log import emit_debug
 from bob.event_bus_v2 import emit_event, get_snapshot_for_task, subscribe_for_task
 from bob.live_transcript_state import LiveTranscriptState
 from bob.orchestrator import Orchestrator, OrchestratorResponse, get_default_orchestrator
-from bob.speculative_draft import SpeculativeDraft
+from bob.speculative_draft import SpeculativeDraft, ToolIntentPredicate
 from bob.speech_pipeline import ChunkBatchSummary, SpeechStreamPipeline
 from bob.spoken_text_cleaner import clean_for_speech
-from bob.stt_engine import SttEngine, get_default_stt_engine
+from bob.stt_engine import SttEngine, WhisperCppSttEngine, get_default_stt_engine
 from bob.task_store import TaskStoreError
 from bob.task_supervisor import create_supervised_task
 from bob.thinker_loop import ThinkerLoop
@@ -104,6 +104,7 @@ from bob.tts_service import KokoroTtsService, SynthesisChunk, get_default_tts_se
 from bob.turn_watchdog import TURN_TIMEOUT_FALLBACK_SPEECH, TurnTimeoutError, TurnWatchdog
 from bob.voice_loop import FullDuplexLoop, PersistedTurn, SayPathDriver
 from bob.voice_turn import VoiceTurn
+from bob.wake_word import WakeWordDetector
 
 router = APIRouter()
 _logger = structlog.get_logger(__name__)
@@ -154,6 +155,32 @@ def set_stt_engine_provider(provider: Callable[[], SttEngine]) -> None:
 def reset_stt_engine_provider() -> None:
     global _stt_engine_provider
     _stt_engine_provider = get_default_stt_engine
+
+
+def _default_tool_intent_provider() -> ToolIntentPredicate | None:
+    """No predicate by default — the bare loop always speculates (issue 0104)."""
+
+    return None
+
+
+# PRD 0016 / issue 0104 — the tool-intent gate. The lifespan wires a predicate
+# built over the LIVE sub-agent registry (gmail + web + MCP fleet) via
+# :func:`bob.tool_intent.build_tool_intent_predicate`, so a turn that would
+# dispatch a tool produces NO draft and stays COLD. ``None`` (tests / bare
+# boot) keeps the pre-wiring behaviour: every turn speculates.
+_tool_intent_provider: Callable[[], ToolIntentPredicate | None] = _default_tool_intent_provider
+
+
+def set_tool_intent_provider(provider: Callable[[], ToolIntentPredicate | None]) -> None:
+    """Override the Draft's tool-intent predicate factory (lifespan / tests)."""
+
+    global _tool_intent_provider
+    _tool_intent_provider = provider
+
+
+def reset_tool_intent_provider() -> None:
+    global _tool_intent_provider
+    _tool_intent_provider = _default_tool_intent_provider
 
 
 @router.websocket("/ws/chat")
@@ -578,6 +605,35 @@ async def _handle_voice_mode(
         session["voice_mode"] = enabled
 
 
+def _make_wake_detector(settings: Settings) -> WakeWordDetector | None:
+    """Build the « Yo Bob » wake-word detector when the deployment opted in.
+
+    Only on the real whisper.cpp path: the fake STT engine (tests / ``bob
+    attest``) keeps the 0099/0100 contract — every speech opens a turn — so
+    the deterministic scenarios are untouched by the wake gate. The detector
+    gets its OWN small-model engine (``WAKE_WORD_MODEL``, default ``tiny``)
+    so standby passes stay cheap; it lazy-loads on the first pass.
+    """
+
+    if not settings.WAKE_WORD_ENABLED or settings.STT_ENGINE != "whisper_cpp":
+        return None
+    if not isinstance(_stt_engine_provider(), WhisperCppSttEngine):
+        # A seam-injected engine (tests / attest harness) means the deployment
+        # is NOT on the real whisper path even if the setting says so — keep
+        # the 0099 contract (every frame transcribes, no wake gate).
+        return None
+    wake_settings = settings.model_copy(update={"STT_MODEL": settings.WAKE_WORD_MODEL})
+    engine = WhisperCppSttEngine(wake_settings)
+    return WakeWordDetector(
+        transcriber=engine.transcribe_pcm,
+        phrase=settings.WAKE_WORD_PHRASE,
+        sample_rate=settings.STT_SAMPLE_RATE,
+        window_seconds=settings.WAKE_WORD_WINDOW_SECONDS,
+        interval_seconds=settings.WAKE_WORD_INTERVAL_SECONDS,
+        threshold=settings.WAKE_WORD_MATCH_THRESHOLD,
+    )
+
+
 async def _handle_voice_start(
     websocket: WebSocket,
     payload: dict[str, Any],
@@ -704,6 +760,10 @@ async def _handle_voice_start(
         on_draft_cancel=(drafter.hard_cancel if drafter is not None else None),
         draft_commit_gate=(drafter.commit_gate if drafter is not None else None),
         draft_emit_decision=(drafter.emit_decision if drafter is not None else None),
+        # Wake word (« Yo Bob »): when enabled the armed window starts in
+        # standby — no turn opens until the small-model detector hears the
+        # phrase; the orb flips to « écoute » on the wake-opened turn.
+        wake_detector=_make_wake_detector(settings),
     )
     # PRD 0018 / issue 0120 — semantic-endpoint fast path: each concluding
     # Thinker pass PUSHES its ``user_turn_complete`` bit straight into the
@@ -1262,11 +1322,22 @@ def _make_speculative_draft(session_id: str, settings: Settings) -> SpeculativeD
         _logger.warning("ws_router.draft_client_build_failed", session_id=session_id)
         return None
 
+    # Tool-intent gate (issue 0104): a turn that would dispatch a tool must
+    # stay COLD — a committed draft would bypass the dispatch and speak a
+    # hallucinated answer. A failing provider degrades to no gate (the draft
+    # still speculates) rather than taking voice_start down.
+    try:
+        is_tool_intent = _tool_intent_provider()
+    except Exception:
+        _logger.exception("ws_router.tool_intent_provider_failed", session_id=session_id)
+        is_tool_intent = None
+
     return SpeculativeDraft(
         client=client,
         settings=settings,
         session_id=session_id,
         spawn=_thinker_spawn,
+        is_tool_intent=is_tool_intent,
     )
 
 

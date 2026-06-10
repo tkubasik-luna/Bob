@@ -246,6 +246,12 @@ class SpeculativeDraft:
         self._rerun = False
         self._last_trigger: float | None = None
         self._stopped = False
+        # Lifecycle epoch (mirrors ThinkerLoop). Bumped on every ``start`` /
+        # ``stop`` / ``hard_cancel`` and captured by each pass at launch: a pass
+        # whose epoch no longer matches must not store its draft nor reschedule.
+        # ``turn_id`` cannot discriminate on a barge-in resume (the SAME id is
+        # re-armed) and ``_stopped`` alone is reset by the re-arm.
+        self._generation = 0
         # The latest landed draft + the partial it was built on. ``None`` until a
         # pass produces one; survives :meth:`stop` so the endpoint gate reads it.
         self._draft_text: str | None = None
@@ -266,6 +272,7 @@ class SpeculativeDraft:
         """
 
         self._turn_id = turn_id
+        self._generation += 1
         self._pending_text = None
         self._rerun = False
         self._last_trigger = None
@@ -327,6 +334,7 @@ class SpeculativeDraft:
         """
 
         self._stopped = True
+        self._generation += 1
         self._rerun = False
         task = self._inflight
         self._inflight = None
@@ -357,6 +365,7 @@ class SpeculativeDraft:
         """
 
         self._stopped = True
+        self._generation += 1
         self._rerun = False
         self._pending_text = None
         task = self._inflight
@@ -432,9 +441,9 @@ class SpeculativeDraft:
     # -- internals -----------------------------------------------------------
 
     def _launch(self, text: str) -> None:
-        self._inflight = self._spawn(self._run_pass(text))
+        self._inflight = self._spawn(self._run_pass(text, self._generation))
 
-    async def _run_pass(self, text: str) -> None:
+    async def _run_pass(self, text: str, generation: int) -> None:
         """Run one Draft inference over ``text`` → a raw reply → hold it + event.
 
         Never raises (cooperative cancel aside): a failed inference is logged +
@@ -442,15 +451,22 @@ class SpeculativeDraft:
         when the pass starts and ``ready`` when a non-empty reply lands. On
         completion re-evaluates exactly once if a newer partial arrived mid-pass
         (the ≤1 rerun).
+
+        ``generation`` is the lifecycle epoch captured at launch. A
+        ``hard_cancel`` never awaits the task, so a pass past its last await
+        point can outlive the cancel and store a STALE draft into a re-armed
+        turn (the barge-in resume re-arms the SAME turn id, so the ``turn_id``
+        compare does not discriminate). The epoch does: any ``start`` / ``stop``
+        / ``hard_cancel`` in between bumped it, and the pass drops its result.
         """
 
         turn_id = self._turn_id
         try:
-            if turn_id is None or self._stopped:
+            if turn_id is None or self._stopped or generation != self._generation:
                 return
             await self._emit_status(turn_id, "drafting")
             reply = await self._infer(text)
-            if self._stopped or turn_id != self._turn_id:
+            if self._stopped or generation != self._generation or turn_id != self._turn_id:
                 return
             if reply and reply.strip():
                 self._draft_text = reply.strip()
@@ -463,12 +479,16 @@ class SpeculativeDraft:
                 "speculative_draft.pass_failed", session_id=self._session_id, turn_id=turn_id
             )
         finally:
-            await self._maybe_rerun()
+            await self._maybe_rerun(generation)
 
-    async def _maybe_rerun(self) -> None:
-        """Re-evaluate once if a partial arrived mid-pass (the ≤1 rerun, Annexe H)."""
+    async def _maybe_rerun(self, generation: int) -> None:
+        """Re-evaluate once if a partial arrived mid-pass (the ≤1 rerun, Annexe H).
 
-        if self._stopped or not self._rerun:
+        Epoch-guarded (mirrors ThinkerLoop): a stale pass must not reschedule —
+        the re-armed turn owns the cadence + ``_inflight`` slot now.
+        """
+
+        if self._stopped or generation != self._generation or not self._rerun:
             return
         self._rerun = False
         next_text = self._pending_text

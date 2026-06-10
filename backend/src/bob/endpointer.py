@@ -214,8 +214,14 @@ class Endpointer:
         # Semantic source: a confirmed complete clause ends the turn EARLIER than
         # the silence floor (it does not require the floor's silence run, only
         # that the user is not currently speaking — checked above — and that
-        # speech was observed this turn — checked just above).
-        if self._semantic_confirmed:
+        # speech was observed this turn — checked just above). The
+        # ``_latest_stable > 0`` term makes the zero-transcript invariant FORMAL
+        # rather than emergent: a semantic endpoint can only fire once the STT
+        # has settled at least one transcript character this turn, so a
+        # ``user_turn_complete`` that raced in before any partial can never end
+        # an empty turn (the confirmation rule already implies this — the guard
+        # keeps the invariant local instead of relying on caller ordering).
+        if self._semantic_confirmed and self._latest_stable > 0:
             self._fired = True
             return True
 
