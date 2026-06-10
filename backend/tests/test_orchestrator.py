@@ -877,6 +877,85 @@ async def test_do_generate_done_synthesis_probable_appends_uncertainty() -> None
     assert "creuser" in user_msg["content"]
 
 
+@pytest.mark.asyncio
+async def test_done_synthesis_timeout_falls_back_to_raw_result() -> None:
+    """2026-06-10 regression: a hung synthesis LLM no longer loses the
+    announcement — the raw ``task.result`` ships instead (with the
+    uncertainty suffix when ``probable``)."""
+
+    received: list[dict[str, Any]] = []
+
+    async def _emitter(event: dict[str, Any]) -> None:
+        received.append(event)
+
+    ws_events.set_emitter(_emitter)
+    try:
+        orchestrator, _jc, _sub, _js, task_store, _scheduler = _make_orchestrator()
+        task_id = _seed_done_task(
+            task_store,
+            title="Patrick Bruel en prison",
+            result="Pas en prison : contrôle judiciaire.",
+            scope="fact",
+            confidence="probable",
+        )
+
+        async def _timed_out(task_id_: str, prompt: str) -> str | None:
+            return None
+
+        orchestrator._render_proactive_text = _timed_out  # type: ignore[method-assign]
+        await orchestrator._do_generate_done_synthesis(task_id)
+    finally:
+        ws_events.set_emitter(None)
+
+    assistant_msgs = [e for e in received if e["type"] == "assistant_msg"]
+    assert len(assistant_msgs) == 1
+    speech = assistant_msgs[0]["speech"]
+    assert speech.startswith("Pas en prison : contrôle judiciaire.")
+    assert "Pas encore confirmé" in speech
+    assert "creuser" in speech
+
+
+def test_fallback_done_announcement_shapes() -> None:
+    """Pure helper: verbatim short result, generic line for document-class
+    results, None for empty, ``probable`` suffix appended."""
+
+    from bob.orchestrator import _fallback_done_announcement
+    from bob.task_store import Task
+
+    def _task(result: str | None, confidence: str | None = None) -> Task:
+        return Task(
+            id="t1",
+            title="Cours bitcoin",
+            goal="g",
+            state="done",
+            needs_attention=False,
+            result=result,
+            parent_task_id=None,
+            created_at="",
+            updated_at="",
+            dismissed=False,
+            confidence=confidence,  # type: ignore[arg-type]
+        )
+
+    assert _fallback_done_announcement(_task(None)) is None
+    assert _fallback_done_announcement(_task("   ")) is None
+    assert _fallback_done_announcement(_task("BTC -3% sur 24h.")) == "BTC -3% sur 24h."
+    # Probable → uncertainty + offer to dig deeper, spoken as its own sentence.
+    probable = _fallback_done_announcement(_task("BTC -3% sur 24h.", confidence="probable"))
+    assert probable is not None
+    assert probable.startswith("BTC -3% sur 24h.")
+    assert "Pas encore confirmé" in probable
+    # Document-class result (long / multi-line markdown) is never read aloud.
+    long_result = "x" * 400
+    generic = _fallback_done_announcement(_task(long_result))
+    assert generic is not None
+    assert long_result not in generic
+    assert "Cours bitcoin" in generic
+    multiline = _fallback_done_announcement(_task("# Rapport\n\nplein de sections"))
+    assert multiline is not None
+    assert "Cours bitcoin" in multiline
+
+
 # ---------------------------------------------------------------------------
 # Proactive queue + buffer race conditions (slice #0025)
 # ---------------------------------------------------------------------------

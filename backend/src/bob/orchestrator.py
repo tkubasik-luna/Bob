@@ -133,7 +133,7 @@ from bob.task_completion_debouncer import (
     DEFAULT_DEBOUNCE_SECONDS,
     TaskCompletionDebouncer,
 )
-from bob.task_store import TaskStore, TaskStoreError
+from bob.task_store import Task, TaskStore, TaskStoreError
 from bob.task_supervisor import create_supervised_task
 from bob.tools import (
     DispatchResult,
@@ -213,6 +213,35 @@ _USER_TYPING_GRACE_S = 2.0
 # ``_user_typing`` to clear. Small enough to feel instant; the loop only ever
 # spins after pulling an event from the queue.
 _FLUSH_POLL_INTERVAL_S = 0.05
+
+
+# Above this length (or any multi-line text) ``task.result`` is a
+# document-class deliverable (full markdown exposé) — unreadable aloud, so the
+# fallback announces availability instead of dumping it into TTS.
+_FALLBACK_RESULT_MAX_CHARS = 300
+
+
+def _fallback_done_announcement(task: Task) -> str | None:
+    """Deterministic spoken text when the done-synthesis LLM is unavailable.
+
+    ``task.result`` holds the sub-agent's ``result_summary`` — user-facing
+    French by contract — so short results ship verbatim; document-class
+    results collapse to a "résultat prêt" line. A ``probable`` answer
+    (migration 0013) keeps its uncertainty + the offer to dig deeper, which
+    the skipped synthesis would otherwise have voiced. ``None`` (empty
+    result) keeps the legacy skip — nothing useful to say.
+    """
+
+    raw = (task.result or "").strip()
+    if not raw:
+        return None
+    if len(raw) > _FALLBACK_RESULT_MAX_CHARS or "\n" in raw:
+        text = f"Ta tâche « {task.title} » est terminée — le résultat est prêt à l'écran."
+    else:
+        text = raw
+    if task.confidence == "probable":
+        text += " Pas encore confirmé — je peux creuser pour vérifier si tu veux."
+    return text
 
 
 # Event kinds accepted by the proactive queue. The literal is exposed so
@@ -1423,7 +1452,21 @@ class Orchestrator:
             prompt += "\n" + DONE_SYNTHESIS_PROBABLE_ADDENDUM.template
         text = await self._render_proactive_text(task_id, prompt)
         if text is None:
-            return
+            # The synthesis LLM hung / failed (2026-06-10: gemma wedged for
+            # > 60 s and the answer was silently lost). ``result_summary`` is
+            # user-facing French by contract — ship it raw rather than
+            # nothing. Deterministic: no second LLM call on a path that just
+            # proved the LLM unreliable.
+            text = _fallback_done_announcement(task)
+            if text is None:
+                return
+            emit_debug(
+                category="system",
+                severity="warn",
+                source="orchestrator._do_generate_done_synthesis",
+                summary="Synthèse proactive indisponible — annonce du résultat brut (fallback)",
+                payload={"task_id": task_id, "confidence": task.confidence},
+            )
         # PRD 0011 / issue 0072 — a proactive done-synthesis is a Jarvis
         # orchestration act: surface a "synthèse" chip in the Jarvis lane, then
         # duplicate the synthesised answer text into the lane (same channels +

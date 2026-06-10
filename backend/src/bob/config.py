@@ -579,8 +579,16 @@ class Settings(BaseSettings):
     # Each guard degrades independently — continue the turn with the existing
     # (incomplete) summary, skip the proactive announcement, surface
     # ``audio_error`` + ``audio_end`` to the client. ``<= 0`` disables.
+    #
+    # PROACTIVE_SYNTHESIS_TIMEOUT_SECONDS was 60 s when a timeout meant "the
+    # announcement is lost" (so the guard was sized to never fire). Since the
+    # done-synthesis now FALLS BACK to speaking the raw ``task.result`` on
+    # timeout, the dial means "how long the pretty rephrasing gets before the
+    # raw text ships" — 15 s covers a healthy local call; a wedged / loading
+    # LM Studio (2026-06-10: gemma hung > 60 s, answer never delivered) ships
+    # the raw answer instead of silence.
     SUMMARY_REGEN_TIMEOUT_SECONDS: float = 60.0
-    PROACTIVE_SYNTHESIS_TIMEOUT_SECONDS: float = 60.0
+    PROACTIVE_SYNTHESIS_TIMEOUT_SECONDS: float = 15.0
     TTS_PRELOAD_TIMEOUT_SECONDS: float = 600.0
     TTS_STREAM_TIMEOUT_SECONDS: float = 120.0
 
