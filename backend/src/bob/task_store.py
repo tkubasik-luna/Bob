@@ -60,6 +60,15 @@ DEFAULT_TASK_SCOPE: TaskScope = "brief"
 
 _VALID_SCOPES: frozenset[str] = frozenset({"fact", "brief", "deep"})
 
+#: How sure the sub-agent is of its terminal answer (migration 0013).
+#: ``confirmed`` — cross-checked / directly stated by a reliable source.
+#: ``probable`` — best available answer, NOT verified (fast fact-scope
+#: answer, iteration-cap exit). ``None`` (legacy rows / model omitted the
+#: field) reads as ``confirmed`` so pre-0013 behaviour is unchanged.
+TaskConfidence = Literal["confirmed", "probable"]
+
+_VALID_CONFIDENCES: frozenset[str] = frozenset({"confirmed", "probable"})
+
 
 @dataclass(frozen=True)
 class Task:
@@ -103,6 +112,9 @@ class Task:
     #: defensive: any legacy single-object / corrupt / ``null`` column value is
     #: read back as the empty list and never raises (issue 0066).
     result_payload: list[dict[str, object]] = field(default_factory=list)
+    #: Confidence of the terminal answer (migration 0013) — see
+    #: :data:`TaskConfidence`. ``None`` reads as ``confirmed`` (legacy).
+    confidence: TaskConfidence | None = None
     lineage: list[str] = field(default_factory=list)
     #: Turn index at which Jarvis delivered this task's result to the user.
     #:
@@ -208,7 +220,7 @@ class TaskStore:
             cursor = self._conn.execute(
                 "SELECT id, title, goal, state, needs_attention, result, result_payload,"
                 " parent_task_id, created_at, updated_at, dismissed, lineage,"
-                " delivered_at_turn, scope"
+                " delivered_at_turn, scope, confidence"
                 " FROM tasks WHERE id = ?",
                 (task_id,),
             )
@@ -235,7 +247,7 @@ class TaskStore:
         query = (
             "SELECT id, title, goal, state, needs_attention, result, result_payload,"
             " parent_task_id, created_at, updated_at, dismissed, lineage, delivered_at_turn,"
-            " scope"
+            " scope, confidence"
             " FROM tasks"
         )
         where: list[str] = []
@@ -310,7 +322,7 @@ class TaskStore:
         sql = (
             "SELECT id, title, goal, state, needs_attention, result, result_payload,"
             " parent_task_id, created_at, updated_at, dismissed, lineage, delivered_at_turn,"
-            " scope"
+            " scope, confidence"
             " FROM tasks"
             f" WHERE {' AND '.join(where_clauses)}"
             f" ORDER BY {', '.join(order_parts)}"
@@ -367,8 +379,14 @@ class TaskStore:
         result: str,
         *,
         result_payload: list[dict[str, object]] | None = None,
+        confidence: TaskConfidence | None = None,
     ) -> None:
         """Store a task's final result text + optional list of section descriptors.
+
+        ``confidence`` (migration 0013) records how sure the sub-agent is of
+        the answer — ``None`` (default) leaves the column NULL, read back as
+        ``confirmed``. The done-synthesis uses ``probable`` to voice the
+        uncertainty and offer a deeper follow-up run.
 
         ``result`` is the spoken / markdown text (the source of truth for the
         ``task_result`` WS string and ``show_task_result`` recall). PRD 0008 /
@@ -389,9 +407,9 @@ class TaskStore:
         payload_json = json.dumps(result_payload) if result_payload else None
         with self._lock, self._conn:
             cursor = self._conn.execute(
-                "UPDATE tasks SET result = ?, result_payload = ?,"
+                "UPDATE tasks SET result = ?, result_payload = ?, confidence = ?,"
                 " updated_at = datetime('now') WHERE id = ?",
-                (result, payload_json, task_id),
+                (result, payload_json, confidence, task_id),
             )
             if cursor.rowcount == 0:
                 raise TaskStoreError(f"task not found: {task_id}")
@@ -532,6 +550,7 @@ def _row_to_task(row: tuple[object, ...]) -> Task:
         lineage_raw,
         delivered_at_turn,
         scope_raw,
+        confidence_raw,
     ) = row
     assert isinstance(id_, str)
     assert isinstance(title, str)
@@ -554,6 +573,11 @@ def _row_to_task(row: tuple[object, ...]) -> Task:
     scope: TaskScope = (
         scope_raw if scope_raw in _VALID_SCOPES else DEFAULT_TASK_SCOPE  # type: ignore[assignment]
     )
+    # Defensive read: any unknown / legacy value collapses to None (read as
+    # ``confirmed``) — confidence shapes the announcement, never execution.
+    confidence: TaskConfidence | None = (
+        confidence_raw if confidence_raw in _VALID_CONFIDENCES else None  # type: ignore[assignment]
+    )
     # ``state`` is constrained by the SQL CHECK to the TaskState set — the
     # cast to the Literal alias is safe.
     return Task(
@@ -569,6 +593,7 @@ def _row_to_task(row: tuple[object, ...]) -> Task:
         updated_at=updated_at,
         dismissed=bool(dismissed),
         scope=scope,
+        confidence=confidence,
         lineage=lineage,
         delivered_at_turn=delivered_at_turn,
     )

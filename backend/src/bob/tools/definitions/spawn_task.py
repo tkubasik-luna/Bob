@@ -89,7 +89,11 @@ _SPAWN_TASK_PARAMETERS = {
                 "que le bitcoin a baissé aujourd'hui ? ». 'brief' (défaut) : "
                 "réponse courte sans détail exhaustif. 'deep' : l'utilisateur "
                 "demande explicitement des infos complètes, un rapport ou un "
-                "briefing — ex. « donne-moi des infos sur le bitcoin »."
+                "briefing — ex. « donne-moi des infos sur le bitcoin » — OU "
+                "demande de vérifier/confirmer/approfondir une réponse "
+                "précédente donnée comme incertaine (dans ce cas, reprends "
+                "dans le goal ce qui a déjà été trouvé et ce qui reste à "
+                "confirmer)."
             ),
         },
     },

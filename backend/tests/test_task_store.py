@@ -332,6 +332,21 @@ def test_set_result_unknown_task_raises(fresh_task_store: TaskStore) -> None:
         fresh_task_store.set_result("missing-id", "X")
 
 
+def test_set_result_round_trips_confidence(fresh_task_store: TaskStore) -> None:
+    """Migration 0013 — ``confidence`` survives a set/get round-trip; the
+    default (omitted) leaves it ``None`` (read as ``confirmed``)."""
+
+    task_id = fresh_task_store.create_task(title="T", goal="g")
+    fresh_task_store.set_result(task_id, "X")
+    assert fresh_task_store.get_task(task_id).confidence is None
+
+    fresh_task_store.set_result(task_id, "X", confidence="probable")
+    assert fresh_task_store.get_task(task_id).confidence == "probable"
+
+    fresh_task_store.set_result(task_id, "X", confidence="confirmed")
+    assert fresh_task_store.get_task(task_id).confidence == "confirmed"
+
+
 def test_set_result_defaults_result_payload_to_empty_list(
     fresh_task_store: TaskStore,
 ) -> None:

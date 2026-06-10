@@ -101,6 +101,7 @@ from pydantic import ValidationError
 from bob import ws_events
 from bob.config import get_settings
 from bob.context.prompt_fragments import (
+    SUB_AGENT_FORCED_FINAL_DIRECTIVE,
     SUB_AGENT_V2_ADDENDUM_TEMPLATE,
     SUB_AGENT_V2_SYSTEM_PROMPT,
     scope_directive_fragment,
@@ -151,7 +152,7 @@ from bob.sub_agent.tool_retrieval import (
     score_tools,
     select_tools,
 )
-from bob.task_store import Task, TaskStore, TaskStoreError
+from bob.task_store import Task, TaskConfidence, TaskStore, TaskStoreError
 from bob.ui_registry import (
     ComponentDescriptor,
     validate_component_descriptor,
@@ -972,6 +973,12 @@ class SubAgentRunner:
             )
             return
 
+        # Migration 0013 — resolve the scope budget once per run (the runner
+        # is single-shot and ``task.scope`` is immutable). ``fact`` / ``brief``
+        # get a tight iteration cap so the soft scope directive is backed by a
+        # structural guarantee; ``deep`` keeps the global caps.
+        self._policy = self._policy.for_scope(task.scope)
+
         # PRD 0011 / issue 0071 — a ``started`` activity chip opens the agent's
         # timeline in the feed, interleaved with the reasoning stream.
         await self._emit_activity(TaskStarted(agent_ref=task_id, title=task.title))
@@ -1032,6 +1039,27 @@ class SubAgentRunner:
 
             if iteration >= self._policy.max_iterations:
                 await self._emit_activity(CapReached(agent_ref=task_id, cap="iteration"))
+                # Migration 0013 — before the salvage exit, give the model ONE
+                # forced final call ("budget exhausted — emit done NOW with the
+                # best gathered info, flag confidence"). A model-authored
+                # answer-with-uncertainty beats a raw salvaged tool dump; the
+                # legacy salvage path below stays as the fallback when the
+                # forced call fails or returns anything but a valid ``done``.
+                forced = await self._attempt_forced_final_answer(task_id, pending_addenda)
+                if forced is not None:
+                    forced = forced.model_copy(
+                        update={
+                            "status": "degraded",
+                            "reason_code": REASON_ITERATION_CAP,
+                            "cost": self._build_cost(
+                                started_at=started_at,
+                                iterations=iteration,
+                                tokens_used=tokens_used,
+                            ),
+                        }
+                    )
+                    await self._handle_done(task_id, forced, result_store)
+                    return
                 await self._emit_terminal_done(
                     task_id,
                     status="degraded",
@@ -1039,6 +1067,8 @@ class SubAgentRunner:
                     # RC2 — surface whatever the agent already retrieved rather
                     # than an empty done (which read as "aucun résultat").
                     result_summary=_salvage_tool_result_text(last_tool_name, last_tool_result),
+                    # A salvaged partial result is by definition unverified.
+                    confidence="probable",
                     cost=self._build_cost(
                         started_at=started_at,
                         iterations=iteration,
@@ -1926,6 +1956,73 @@ class SubAgentRunner:
 
     # --- Action handlers -----------------------------------------------------
 
+    async def _attempt_forced_final_answer(
+        self,
+        task_id: str,
+        pending_addenda: list[AddendumEntry],
+    ) -> DoneAction | None:
+        """One last LLM call forcing a best-effort ``done`` at the iteration cap.
+
+        Migration 0013 — appends :data:`SUB_AGENT_FORCED_FINAL_DIRECTIVE` as a
+        trailing system message over the normal message build (full task
+        history included), so the model answers from everything it already
+        gathered and flags ``confidence="probable"`` when unverified.
+
+        Best-effort by design: any failure (LLM error, unparseable output, a
+        non-``done`` action, an invalid deliverable) returns ``None`` and the
+        caller falls back to the legacy salvage exit. No retry loop — the
+        budget is already blown. ``CancelledError`` propagates so the
+        scheduler's hard-kill semantics are untouched.
+        """
+
+        try:
+            task = self._task_store.get_task(task_id)
+        except TaskStoreError:
+            _logger.exception("sub_agent_runner.forced_final_reload_failed", task_id=task_id)
+            return None
+        messages = [
+            *self._build_messages(task, pending_addenda),
+            {"role": "system", "content": SUB_AGENT_FORCED_FINAL_DIRECTIVE.template},
+        ]
+        try:
+            raw, _degraded = await self._stream_iteration(task_id, messages)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _logger.exception("sub_agent_runner.forced_final_llm_failed", task_id=task_id)
+            return None
+        try:
+            normalised = _normalise_payload(raw)
+        except SubAgentActionParseError as exc:
+            _logger.warning(
+                "sub_agent_runner.forced_final_parse_failed",
+                task_id=task_id,
+                reason=str(exc),
+            )
+            return None
+        action = normalised.action
+        if not isinstance(action, DoneAction):
+            _logger.warning(
+                "sub_agent_runner.forced_final_not_done",
+                task_id=task_id,
+                action=type(action).__name__ if action is not None else "ask_user",
+            )
+            return None
+        if _validate_deliverable(action.ui_payload) is not None:
+            return None
+        emit_debug(
+            category="task",
+            severity="info",
+            source="bob.sub_agent_runner._attempt_forced_final_answer",
+            summary="Cap d'itérations atteint — réponse finale forcée obtenue",
+            payload={
+                "task_id": task_id,
+                "confidence": action.confidence,
+                "kind": "forced_final_answer",
+            },
+        )
+        return action
+
     async def _handle_done(
         self, task_id: str, action: DoneAction, result_store: ToolResultStore
     ) -> None:
@@ -1964,6 +2061,7 @@ class SubAgentRunner:
             result_summary=result_summary,
             sections=sections,
             cost=action.cost,
+            confidence=action.confidence,
         )
 
     @staticmethod
@@ -2418,6 +2516,7 @@ class SubAgentRunner:
         result_summary: str,
         sections: list[dict[str, Any]] | None,
         cost: dict[str, Any],
+        confidence: TaskConfidence | None = None,
         redact_result_in_debug: bool = False,
         persist_result_on_failure: bool = False,
     ) -> None:
@@ -2510,7 +2609,10 @@ class SubAgentRunner:
         try:
             if store_state == "done":
                 self._task_store.set_result(
-                    task_id, persisted_result, result_payload=structured_payload
+                    task_id,
+                    persisted_result,
+                    result_payload=structured_payload,
+                    confidence=confidence,
                 )
                 message_id = self._task_store.append_message(
                     task_id,
@@ -2809,6 +2911,7 @@ class SubAgentRunner:
         reason_code: str,
         result_summary: str,
         cost: dict[str, Any],
+        confidence: TaskConfidence | None = None,
         result_store: ToolResultStore | None = None,
         redact_result_in_debug: bool = False,
         persist_result_on_failure: bool = False,
@@ -2841,6 +2944,7 @@ class SubAgentRunner:
             result_summary=result_summary,
             sections=sections,
             cost=cost,
+            confidence=confidence,
             redact_result_in_debug=redact_result_in_debug,
             persist_result_on_failure=persist_result_on_failure,
         )

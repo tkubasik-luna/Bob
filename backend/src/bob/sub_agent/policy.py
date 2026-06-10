@@ -84,6 +84,15 @@ class SubAgentPolicy:
     #: diagnostic progress); only the same dead end repeating burns it down.
     stall_force_threshold: int = 3
     per_task_type: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
+    #: Migration 0013 (fact-scope fast answer) — partial overrides keyed by
+    #: ``Task.scope``. Same merge semantics as :attr:`per_task_type`. The
+    #: 2026-06-10 « Patrick Bruel » run showed the soft fact directive
+    #: (« fewest tool calls, usually one ») loses against the model's
+    #: thoroughness instinct (9 tool calls); the scope cap is the structural
+    #: guarantee. The runner resolves :meth:`for_scope` once per run and, at
+    #: the iteration cap, forces a final best-effort answer (confidence
+    #: ``probable``) instead of a bare degraded exit.
+    per_scope: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
 
     def for_task_type(self, task_type: str | None) -> SubAgentPolicy:
         """Resolve the effective policy for ``task_type``.
@@ -111,6 +120,31 @@ class SubAgentPolicy:
             **{key: value for key, value in override.items() if key in allowed},
         )
 
+    def for_scope(self, scope: str | None) -> SubAgentPolicy:
+        """Resolve the effective policy for a task ``scope`` (migration 0013).
+
+        Returns ``self`` when ``scope`` is None or no override is registered.
+        Same shallow-merge semantics as :meth:`for_task_type`.
+        """
+
+        if scope is None:
+            return self
+        override = self.per_scope.get(scope)
+        if not override:
+            return self
+        allowed = {
+            "max_iterations",
+            "wall_clock_seconds",
+            "token_cap",
+            "cancel_grace_seconds",
+            "converge_on_terminal_result",
+            "stall_force_threshold",
+        }
+        return replace(
+            self,
+            **{key: value for key, value in override.items() if key in allowed},
+        )
+
 
 def default_policy() -> SubAgentPolicy:
     """Return the process-wide default :class:`SubAgentPolicy`.
@@ -118,9 +152,19 @@ def default_policy() -> SubAgentPolicy:
     Centralised so the orchestrator boot and the test harness both
     construct the runner with the same baseline; tweaking the dials in
     one place exercises every call site.
+
+    Scope budgets (migration 0013): an iteration is one parsed ``progress``
+    or ``tool_call`` action, so ``fact`` (one precise fact) gets up to 4
+    actions — typically 2-3 tool calls — before the runner forces a final
+    best-effort answer; ``brief`` gets 10; ``deep`` keeps the global 50.
     """
 
-    return SubAgentPolicy()
+    return SubAgentPolicy(
+        per_scope={
+            "fact": {"max_iterations": 4},
+            "brief": {"max_iterations": 10},
+        }
+    )
 
 
 __all__ = ["SubAgentPolicy", "default_policy"]

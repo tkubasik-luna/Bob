@@ -152,7 +152,7 @@ CANCEL_CONFIRMATION = PromptFragment(
 
 TOOLS_SYSTEM_ADDENDUM = PromptFragment(
     id="tools_system_addendum",
-    version=5,
+    version=6,
     template=(
         "\n\nTu disposes des outils suivants :\n"
         "- ``say`` : pour répondre directement à l'utilisateur. C'est ton "
@@ -168,7 +168,13 @@ TOOLS_SYSTEM_ADDENDUM = PromptFragment(
         "l'utilisateur veut UN fait précis (oui/non, un chiffre — ex. "
         "« est-ce que le bitcoin a baissé aujourd'hui ? ») ; ``deep`` s'il "
         "demande explicitement des infos complètes ou un rapport (ex. "
-        "« donne-moi des infos sur le bitcoin ») ; ``brief`` sinon.\n"
+        "« donne-moi des infos sur le bitcoin ») ; ``brief`` sinon. "
+        "Cas particulier : si l'utilisateur demande de VÉRIFIER, confirmer "
+        "ou approfondir une réponse qu'une tâche précédente a donnée comme "
+        "incertaine (« vérifie », « creuse », « t'es sûr ? »), appelle "
+        "``spawn_task`` avec ``scope='deep'`` et mets dans ``goal`` ce qui "
+        "a déjà été trouvé + ce qui reste à confirmer, pour ne pas refaire "
+        "les recherches initiales.\n"
         "- ``addendum_task`` : pour ajouter une info à une sous-tâche "
         "déjà en cours sans la redémarrer. Le bloc STATE en tête de "
         "prompt liste l'``id`` exact de chaque tâche active.\n"
@@ -284,6 +290,25 @@ DONE_SYNTHESIS_FACT_TEMPLATE = PromptFragment(
         "Variant of DONE_SYNTHESIS_TEMPLATE for ``scope='fact'`` tasks "
         "(migration 0012): the user asked for a single fact, so Jarvis "
         "answers it directly — no framing, no follow-up question."
+    ),
+)
+
+
+DONE_SYNTHESIS_PROBABLE_ADDENDUM = PromptFragment(
+    id="done_synthesis_probable",
+    version=1,
+    template=(
+        "ATTENTION : ce résultat n'est PAS vérifié à 100 % (la tâche a "
+        "répondu vite, sans recouper). Par exception aux consignes "
+        "ci-dessus : signale l'incertitude en 2-3 mots naturels (« a priori "
+        "», « sous réserve », « pas encore confirmé ») et termine par UNE "
+        "courte proposition de vérifier — ex. « …je peux creuser pour "
+        "confirmer si tu veux. »"
+    ),
+    description=(
+        "Appended to the done-synthesis prompt (fact or default template) "
+        "when ``task.confidence == 'probable'`` (migration 0013): Jarvis "
+        "voices the uncertainty and offers a deeper follow-up run."
     ),
 )
 
@@ -456,19 +481,47 @@ SUB_AGENT_V2_SYSTEM_PROMPT = PromptFragment(
 
 SUB_AGENT_SCOPE_FACT_DIRECTIVE = PromptFragment(
     id="sub_agent_scope_fact",
-    version=1,
+    version=2,
     template=(
         "ANSWER SCOPE: the user wants ONE precise fact (yes/no, a number, a "
-        "date) — not a report. Make the FEWEST tool calls needed to "
-        "establish that fact (usually one), then finish. ``result_summary`` "
-        "is the fact itself in 1 short French sentence. Set ``ui_payload`` "
-        "to null and do NOT author a Markdown deliverable — a short factual "
-        "answer needs no document. Prefer ``result_ref`` only if a tool "
-        "result directly IS the answer."
+        "date) — not a report, and they want it FAST. You have a HARD budget "
+        "of ~3 actions; exceeding it forces a degraded exit. As soon as you "
+        "have a PLAUSIBLE answer, emit ``done`` — do NOT keep searching to "
+        "cross-check it. Set ``confidence``: \"confirmed\" if a reliable "
+        "source states the fact directly, \"probable\" if it is your best "
+        "reading but not verified (the user is told and can ask for a deeper "
+        "check). A fast \"probable\" beats a slow \"confirmed\". "
+        "``result_summary`` is the fact itself in 1 short French sentence. "
+        "Set ``ui_payload`` to null and do NOT author a Markdown deliverable "
+        "— a short factual answer needs no document. Prefer ``result_ref`` "
+        "only if a tool result directly IS the answer."
     ),
     description=(
         "Appended to the sub-agent system prompt when ``Task.scope`` is "
-        "``fact``: minimal tool use, one-sentence result, no deliverable."
+        "``fact``: minimal tool use, one-sentence result, no deliverable. "
+        "v2 (migration 0013): answer as soon as plausible + ``confidence`` "
+        "field — the hard budget lives in SubAgentPolicy.per_scope."
+    ),
+)
+
+
+SUB_AGENT_FORCED_FINAL_DIRECTIVE = PromptFragment(
+    id="sub_agent_forced_final",
+    version=1,
+    template=(
+        "BUDGET EXHAUSTED — this is your LAST call. You MUST emit ``done`` "
+        "NOW. No ``tool_call``, no ``progress`` — they will be rejected. "
+        "Answer the goal with the best information already gathered above. "
+        "If the gathered information does not fully settle the question, "
+        "still give your best reading and set ``confidence`` to "
+        "\"probable\"; set it to \"confirmed\" only if a source above states "
+        "the answer directly. ``result_summary`` stays 1-2 short French "
+        "sentences."
+    ),
+    description=(
+        "Injected as a final system message when the runner hits the "
+        "iteration cap (migration 0013): one last LLM call forcing a "
+        "best-effort ``done`` instead of a bare degraded exit."
     ),
 )
 

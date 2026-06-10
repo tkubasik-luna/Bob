@@ -148,6 +148,16 @@ class DoneAction(BaseModel):
     #: rather than re-emitting the whole Mail descriptor (the step it failed at,
     #: 2026-05-30 RC1). ``None`` keeps the legacy ``ui_payload``-driven path.
     result_ref: str | None = Field(default=None)
+    #: Migration 0013 (fact-scope fast answer) — how sure the agent is of the
+    #: answer. ``confirmed``: cross-checked / directly stated by a reliable
+    #: source. ``probable``: best available answer, NOT verified — the
+    #: orchestrator's done-synthesis voices the uncertainty and offers a
+    #: deeper follow-up run. Defaults to ``confirmed`` (NOT ``None``) for two
+    #: reasons: legacy behaviour is preserved when the model omits it, and a
+    #: non-optional Literal keeps the field out of the ``anyOf`` drop rule in
+    #: :func:`sub_agent_action_response_schema` so guided decoding constrains
+    #: it to the two literals.
+    confidence: Literal["confirmed", "probable"] = Field(default="confirmed")
     status: SubAgentDoneStatus
     reason_code: str = Field(..., min_length=1)
     cost: dict[str, Any] = Field(default_factory=dict)

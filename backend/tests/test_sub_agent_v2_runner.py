@@ -58,6 +58,7 @@ from bob.sub_agent.actions import (
     SUB_AGENT_ACTION_SCHEMA_NAME,
     sub_agent_action_response_schema,
 )
+from bob.sub_agent.policy import default_policy
 from bob.sub_agent.runner import (
     _model_payload_to_sections,
     _normalise_payload,
@@ -164,17 +165,19 @@ def _done_v2_payload(
     reason_code: str = "ok",
     cost: dict[str, Any] | None = None,
     ui_payload: dict[str, Any] | str | None = None,
+    confidence: str | None = None,
 ) -> str:
-    return json.dumps(
-        {
-            "action": "done",
-            "result_summary": result_summary,
-            "ui_payload": ui_payload,
-            "status": status,
-            "reason_code": reason_code,
-            "cost": cost or {},
-        }
-    )
+    payload: dict[str, Any] = {
+        "action": "done",
+        "result_summary": result_summary,
+        "ui_payload": ui_payload,
+        "status": status,
+        "reason_code": reason_code,
+        "cost": cost or {},
+    }
+    if confidence is not None:
+        payload["confidence"] = confidence
+    return json.dumps(payload)
 
 
 def _valid_mail_props() -> dict[str, Any]:
@@ -309,7 +312,14 @@ async def test_iteration_cap_emits_done_degraded() -> None:
 
     progress_msgs = [m for m in store.get_task_messages(task_id) if m.action == "progress"]
     assert len(progress_msgs) == 3
-    assert len(client.calls) == 3  # the 4th iteration boundary tripped the cap
+    # 3 loop calls until the 4th iteration boundary tripped the cap, plus the
+    # forced-final-answer call (migration 0013) — here it returns yet another
+    # ``progress`` (not a ``done``) so the runner falls back to the salvage
+    # exit, exercised by the assertions below.
+    assert len(client.calls) == 4
+    forced_final_call = client.calls[-1]
+    assert forced_final_call["messages"][-1]["role"] == "system"
+    assert "BUDGET EXHAUSTED" in forced_final_call["messages"][-1]["content"]
 
     # The bus carries the structured reason on the terminal state change.
     assert state_changes
@@ -317,6 +327,116 @@ async def test_iteration_cap_emits_done_degraded() -> None:
     assert terminal["new_state"] == "done"
     assert terminal["status"] == "degraded"
     assert terminal["reason_code"] == REASON_ITERATION_CAP
+
+
+@pytest.mark.asyncio
+async def test_iteration_cap_forced_final_answer_persists_done() -> None:
+    """Migration 0013: at the iteration cap, the forced final call's ``done``
+    is persisted (status degraded, reason iteration_cap) with its
+    ``confidence`` instead of the bare salvage exit."""
+
+    store = _make_store()
+    task_id = _make_running_task(store)
+    bus = EventBus()
+    state_changes = await _collect_state_changes(bus)
+    client = _ScriptedClient(
+        chat_values=[
+            *(_progress_payload(f"step {i}") for i in range(1, 4)),
+            # The forced final call answers with a best-effort done.
+            _done_v2_payload(
+                result_summary="Réponse plausible, non recoupée.",
+                status="complete",
+                confidence="probable",
+            ),
+        ]
+    )
+    policy = SubAgentPolicy(
+        max_iterations=3,
+        wall_clock_seconds=999.0,
+        token_cap=10_000,
+        stall_force_threshold=4,
+    )
+    runner = SubAgentRunner(
+        subagent_client=client,
+        task_store=store,
+        event_bus=bus,
+        policy=policy,
+        clock=_ControllableClock(),
+    )
+
+    await runner.run(task_id)
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    task = store.get_task(task_id)
+    assert task.state == "done"
+    assert task.result == "Réponse plausible, non recoupée."
+    assert task.confidence == "probable"
+    assert len(client.calls) == 4  # 3 loop calls + the forced final call
+
+    assert state_changes
+    terminal = state_changes[-1]
+    assert terminal["new_state"] == "done"
+    # The model said ``complete`` but a cap exit stays honest: degraded.
+    assert terminal["status"] == "degraded"
+    assert terminal["reason_code"] == REASON_ITERATION_CAP
+
+
+@pytest.mark.asyncio
+async def test_fact_scope_resolves_tight_policy_cap() -> None:
+    """Migration 0013: a ``scope='fact'`` task resolves the per-scope budget
+    (default 4 iterations) from ``default_policy()`` at run start."""
+
+    store = _make_store()
+    task_id = store.create_task(title="t", goal="un fait", scope="fact")
+    store.update_state(task_id, "running")
+    client = _ScriptedClient(
+        chat_values=[
+            _done_v2_payload(result_summary="42.", confidence="confirmed"),
+        ]
+    )
+    runner = SubAgentRunner(
+        subagent_client=client,
+        task_store=store,
+        event_bus=EventBus(),
+        policy=default_policy(),
+        clock=_ControllableClock(),
+    )
+
+    await runner.run(task_id)
+
+    assert runner.policy.max_iterations == 4
+    task = store.get_task(task_id)
+    assert task.state == "done"
+    assert task.confidence == "confirmed"
+
+
+def test_policy_for_scope_merges_overrides() -> None:
+    """``for_scope`` mirrors ``for_task_type``: shallow merge, None/unknown → self."""
+
+    policy = default_policy()
+    assert policy.for_scope(None) is policy
+    assert policy.for_scope("deep") is policy
+    fact = policy.for_scope("fact")
+    assert fact.max_iterations == 4
+    assert fact.wall_clock_seconds == policy.wall_clock_seconds
+    brief = policy.for_scope("brief")
+    assert brief.max_iterations == 10
+
+
+def test_parse_done_confidence_defaults_confirmed() -> None:
+    """Migration 0013: ``confidence`` parses when present, defaults to
+    ``confirmed`` when omitted (legacy payloads unchanged)."""
+
+    legacy = parse_action(json.loads(_done_v2_payload(result_summary="x")))
+    assert isinstance(legacy, DoneAction)
+    assert legacy.confidence == "confirmed"
+
+    probable = parse_action(
+        json.loads(_done_v2_payload(result_summary="x", confidence="probable"))
+    )
+    assert isinstance(probable, DoneAction)
+    assert probable.confidence == "probable"
 
 
 @pytest.mark.asyncio

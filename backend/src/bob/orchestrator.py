@@ -94,6 +94,7 @@ from bob.context.prompt_fragments import (
     ASK_USER_PARAPHRASE_TEMPLATE,
     CANCEL_CONFIRMATION,
     DONE_SYNTHESIS_FACT_TEMPLATE,
+    DONE_SYNTHESIS_PROBABLE_ADDENDUM,
     DONE_SYNTHESIS_TEMPLATE,
     FAILED_SYNTHESIS_TEMPLATE,
     FORWARD_CONFIRMATION,
@@ -1415,6 +1416,11 @@ class Orchestrator:
             task_title=task.title,
             result=result_text,
         )
+        # Migration 0013 — an unverified answer (fast fact-scope run or
+        # iteration-cap exit) is announced WITH its uncertainty + an offer to
+        # dig deeper, instead of being voiced as a certainty.
+        if task.confidence == "probable":
+            prompt += "\n" + DONE_SYNTHESIS_PROBABLE_ADDENDUM.template
         text = await self._render_proactive_text(task_id, prompt)
         if text is None:
             return

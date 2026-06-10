@@ -684,12 +684,13 @@ def _seed_done_task(
     title: str,
     result: str,
     scope: str = "brief",
+    confidence: str | None = None,
 ) -> str:
     """Helper: create a task in ``done`` state with ``result`` set."""
 
     task_id = task_store.create_task(title=title, goal="g", scope=scope)  # type: ignore[arg-type]
     task_store.update_state(task_id, "running")
-    task_store.set_result(task_id, result)
+    task_store.set_result(task_id, result, confidence=confidence)  # type: ignore[arg-type]
     task_store.update_state(task_id, "done")
     return task_id
 
@@ -831,6 +832,49 @@ async def test_do_generate_done_synthesis_fact_scope_uses_direct_template() -> N
     assert "UNE phrase courte" in user_msg["content"]
     # The brief/deep framing line must NOT leak into the fact prompt.
     assert "2 phrases" not in user_msg["content"]
+    # Confirmed (default) answer: no uncertainty addendum.
+    assert "PAS vérifié" not in user_msg["content"]
+
+
+@pytest.mark.asyncio
+async def test_do_generate_done_synthesis_probable_appends_uncertainty() -> None:
+    """Migration 0013: ``confidence='probable'`` appends the uncertainty
+    addendum so Jarvis voices the doubt + offers a deeper check."""
+
+    received: list[dict[str, Any]] = []
+
+    async def _emitter(event: dict[str, Any]) -> None:
+        received.append(event)
+
+    ws_events.set_emitter(_emitter)
+    try:
+        orchestrator, jarvis_client, _sub, _js, task_store, _scheduler = _make_orchestrator(
+            chat_responses=[
+                "A priori non, il est sous contrôle judiciaire — je peux creuser si tu veux."
+            ],
+        )
+        task_id = _seed_done_task(
+            task_store,
+            title="Patrick Bruel en prison",
+            result="Pas en prison : contrôle judiciaire.",
+            scope="fact",
+            confidence="probable",
+        )
+
+        await orchestrator._do_generate_done_synthesis(task_id)
+    finally:
+        ws_events.set_emitter(None)
+
+    assistant_msgs = [e for e in received if e["type"] == "assistant_msg"]
+    assert len(assistant_msgs) == 1
+
+    user_msg = jarvis_client.chat_calls[0]["messages"][-1]
+    assert user_msg["role"] == "user"
+    # The fact template still leads…
+    assert "UN fait précis" in user_msg["content"]
+    # …and the uncertainty addendum trails it.
+    assert "PAS vérifié" in user_msg["content"]
+    assert "creuser" in user_msg["content"]
 
 
 # ---------------------------------------------------------------------------
