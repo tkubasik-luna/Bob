@@ -102,6 +102,13 @@ ignore_missing_imports = true
 module = ["partial_json_parser.*"]
 ignore_missing_imports = true
 
+# Optional native STT extra (``uv sync --extra stt``): the module may or may
+# not be importable depending on the env — an override keeps mypy green in
+# both, where an inline ``type: ignore`` flips to unused when it IS installed.
+[[tool.mypy.overrides]]
+module = ["pywhispercpp.*"]
+ignore_missing_imports = true
+
 [[tool.mypy.overrides]]
 module = [
     "google.auth.*",

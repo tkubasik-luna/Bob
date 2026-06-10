@@ -29,6 +29,7 @@ from bob.llm_swap import (
     RoleManagerRegistry,
     UnknownProviderError,
 )
+from bob.lm_studio_manager import LMStudioManager
 
 from ._harness.fake_llm import FakeLLMClient
 
@@ -302,7 +303,8 @@ async def test_set_reasoning_never_touches_load_policy(tmp_path: Path) -> None:
         def release_role(self, *_args: object, **_kwargs: object) -> None:
             raise AssertionError("release_role must not run for a reasoning update")
 
-    manager_registry = RoleManagerRegistry(factory=lambda _host: _ExplodingManager())  # type: ignore[arg-type]
+    exploding_factory = cast(Callable[[str], LMStudioManager], lambda _host: _ExplodingManager())
+    manager_registry = RoleManagerRegistry(factory=exploding_factory)
     switcher = RoleLLMSwitcher(
         settings=_settings(),
         selection_store=store,

@@ -26,6 +26,13 @@ os.environ.setdefault("LLM_BASE_URL", "http://localhost:1234/v1")
 os.environ.setdefault("LLM_MODEL", "test-model")
 os.environ.setdefault("LLM_API_KEY", "test-key")
 
+# Issue 0129 — keep the suite hermetic: the BootWarmup background task would
+# otherwise touch the real engines (Kokoro/torch load, whisper download probe,
+# LM Studio reconcile against localhost) at EVERY TestClient lifespan boot.
+# The skip setting makes the warmup a no-op; the warmup tests opt back in with
+# ``monkeypatch.setenv("BOB_SKIP_TTS_PRELOAD", "false")`` + injected fakes.
+os.environ.setdefault("BOB_SKIP_TTS_PRELOAD", "true")
+
 # Tests manage their own DB lifecycle via the ``clear_jarvis_history`` fixture
 # and expect bob.db to persist across lifespan reuse inside a single test
 # (e.g. seeding state outside the TestClient, then starting it). Disable the

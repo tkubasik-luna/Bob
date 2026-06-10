@@ -423,7 +423,7 @@ class WhisperCppSttEngine:
             if self._model is not None:
                 return self._model
             try:
-                from pywhispercpp.model import Model  # type: ignore[import-not-found]
+                from pywhispercpp.model import Model
             except ImportError as exc:  # pragma: no cover - env without native dep
                 raise SttEngineUnavailableError(
                     "pywhispercpp is not installed; install it to enable the whisper.cpp "

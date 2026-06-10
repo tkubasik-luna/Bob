@@ -9,14 +9,17 @@ Lifespan wiring (boot, in order):
 3. Build the :class:`TaskScheduler`, install it as the singleton and run
    ``recover_after_restart`` so any task left in ``running`` by a previous
    process is coerced back to ``pending`` then re-promoted under the cap.
-4. Preload + warm the Kokoro TTS pipeline so the first user message is fast.
+4. Start the :class:`bob.boot_warmup.BootWarmup` background task (PRD 0018 /
+   issue 0129): STT whisper download/load, Kokoro preload + warmup and the
+   voice roles' LM Studio model loads all run AFTER the lifespan yields, so
+   WS clients connect immediately while the engines warm. Honours
+   ``BOB_SKIP_TTS_PRELOAD`` (warmup no-op); failures surface on ``/health``.
 
 Shutdown: release the SQLite connection.
 """
 
 from __future__ import annotations
 
-import asyncio
 import sqlite3
 from collections.abc import AsyncIterator, Callable, Coroutine
 from contextlib import asynccontextmanager
@@ -32,6 +35,7 @@ from bob import task_scheduler as task_scheduler_module
 from bob import task_store as task_store_module
 from bob import turn_metrics as turn_metrics_module
 from bob import voice_store as voice_store_module
+from bob.boot_warmup import BootWarmup, default_warmup_steps
 from bob.config import get_settings
 from bob.connectors.mcp import MCPRuntime
 from bob.db.migrations_runner import apply_migrations, default_migrations_dir
@@ -85,7 +89,6 @@ from bob.sub_agent import (
 )
 from bob.task_scheduler import build_default_scheduler
 from bob.task_store import TaskStore
-from bob.tts_service import get_default_tts_service
 from bob.voice_retention_policy import set_retention_policy as set_voice_retention_policy
 from bob.ws_debug import router as ws_debug_router
 from bob.ws_router import router as ws_router
@@ -385,25 +388,35 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         llm_model=seeded_selection.lm_model,
     )
 
+    # PRD 0018 / issue 0129 — BootWarmup. Every preload (whisper download/load,
+    # Kokoro preload + warmup, the voice roles' LM Studio model residency) now
+    # runs in supervised background tasks (issue 0124) that only start once the
+    # lifespan yields below — boot no longer blocks 30 s+ and a WS client can
+    # connect while the engines warm. A user who beats the warmup falls back on
+    # the per-turn lazy paths (existing ``stt_preparing`` / ``tts_preparing``
+    # toasts), serialized against the warmup by the engines' load locks. Step
+    # failures land in ``warmup.errors`` → surfaced by ``/health``.
+    #
     # Issue 0098 — the attestation harness boots a headless, text-only backend
     # and sets ``BOB_SKIP_TTS_PRELOAD`` so the Kokoro download + espeak-ng G2P
-    # warmup (which can be absent / native-abort in CI) never runs. Voice still
-    # lazy-loads on first synthesis if it is ever requested.
+    # warmup (which can be absent / native-abort in CI) never runs: the warmup
+    # is a no-op and every model keeps lazy-loading on first use.
+    warmup = BootWarmup(
+        default_warmup_steps(settings, seeded_role_selection, role_manager_registry)
+    )
+    _app.state.boot_warmup = warmup
     if settings.BOB_SKIP_TTS_PRELOAD:
         _logger.info("startup.preload.kokoro.skipped")
     else:
-        tts = get_default_tts_service()
-        _logger.info("startup.preload.kokoro.begin")
-        try:
-            await asyncio.to_thread(tts.preload)
-            _logger.info("startup.preload.kokoro.done")
-            await asyncio.to_thread(tts.warmup)
-        except Exception:
-            _logger.exception("startup.preload.kokoro.failed")
+        warmup.start()
 
     try:
         yield
     finally:
+        # Issue 0129 — cancel any still-running warmup step before the wiring
+        # below is torn out from under it (worker threads finish on their own).
+        await warmup.stop()
+        _app.state.boot_warmup = None
         set_llm_switcher(None)
         reset_llm_manager_provider()
         await orchestrator.stop_proactive_loop()
@@ -452,15 +465,24 @@ app.include_router(llm_router)
 
 
 @app.get("/health")
-async def health(request: Request) -> dict[str, str]:
-    """Liveness probe — also surfaces a degraded MCP boot (issue 0124).
+async def health(request: Request) -> dict[str, Any]:
+    """Liveness probe — also surfaces a degraded boot (issues 0124 / 0129).
 
     ``mcp_startup_error`` is recorded by the lifespan when the MCP runtime
-    startup raised unexpectedly; the process still serves traffic (the MCP
-    tools simply never registered), so the status is ``degraded``, not down.
+    startup raised unexpectedly; ``warmup_errors`` maps each failed BootWarmup
+    step (``stt`` / ``tts`` / ``llm_roles``) to its error. In both cases the
+    process still serves traffic (the affected capability lazy-loads or stays
+    unregistered), so the status is ``degraded``, not down. A clean boot keeps
+    the historical exact shape ``{"status": "ok"}``.
     """
 
+    out: dict[str, Any] = {"status": "ok"}
     error = getattr(request.app.state, "mcp_startup_error", None)
     if error:
-        return {"status": "degraded", "mcp_startup_error": str(error)}
-    return {"status": "ok"}
+        out["status"] = "degraded"
+        out["mcp_startup_error"] = str(error)
+    warmup = getattr(request.app.state, "boot_warmup", None)
+    if isinstance(warmup, BootWarmup) and warmup.errors:
+        out["status"] = "degraded"
+        out["warmup_errors"] = dict(warmup.errors)
+    return out

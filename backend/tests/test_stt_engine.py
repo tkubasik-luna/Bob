@@ -158,7 +158,7 @@ def test_whisper_session_whole_buffer_when_window_disabled() -> None:
 
 def _whisper_available() -> bool:
     try:
-        import pywhispercpp.model  # type: ignore[import-not-found]  # noqa: F401
+        import pywhispercpp.model  # noqa: F401
     except Exception:
         return False
     engine = WhisperCppSttEngine()
