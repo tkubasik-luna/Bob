@@ -187,6 +187,21 @@ describe("SetupScreen", () => {
     );
   });
 
+  test("the STT toggle flips + persists the listening flag (independent from TTS)", async () => {
+    render(<SetupScreen onReady={vi.fn()} />);
+
+    const toggle = await screen.findByRole("switch", { name: "Écoute micro (STT)" });
+    expect(toggle).toHaveAttribute("aria-checked", "true");
+
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-checked", "false");
+    expect(window.localStorage.getItem("bob.sttEnabled")).toBe("0");
+
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-checked", "true");
+    expect(window.localStorage.getItem("bob.sttEnabled")).toBe("1");
+  });
+
   test("stops on the failing role + offers a way back, without entering the HUD", async () => {
     const onReady = vi.fn();
     apiMock.putLlmRole.mockImplementation(async (role: string) => {

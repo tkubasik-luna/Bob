@@ -29,6 +29,7 @@ import {
   pingLm,
   putLlmRole,
 } from "../../lib/llmApi";
+import { useSttMode } from "../../hooks/useSttMode";
 import "./SetupScreen.css";
 
 /** localStorage key — set once the user completes setup. `App` no longer skips
@@ -108,6 +109,10 @@ export function SetupScreen({ onReady }: Props) {
   });
   // Re-render tick while a role is loading so its elapsed counter advances.
   const [, setClock] = useState(0);
+  // STT (mic listening) toggle — persisted flag read by SphereUI's mic gate.
+  // Independent from the TTS voice toggle (Réglages · VOIX): this decides
+  // whether Bob LISTENS, not whether he speaks.
+  const { sttEnabled, toggle: toggleStt } = useSttMode();
   // The seed (fetchLlmRoles) is async; if the user starts interacting before it
   // resolves, the seed must NOT clobber what they typed/picked (the race that
   // made an edited URL "revert" and the ping keep probing the stale server).
@@ -406,6 +411,26 @@ export function SetupScreen({ onReady }: Props) {
               </div>
             );
           })}
+        </div>
+
+        <div className="setup-stt-row" data-testid="setup-stt">
+          <div className="setup-role-id">
+            <span className="setup-role-label">Écoute micro · STT</span>
+            <span className="setup-role-hint">Wake word « Yo Bob » + transcription locale</span>
+          </div>
+          <button
+            type="button"
+            className={`setup-toggle ${sttEnabled ? "is-on" : ""}`}
+            role="switch"
+            aria-checked={sttEnabled}
+            aria-label="Écoute micro (STT)"
+            onClick={toggleStt}
+          >
+            <span className="setup-toggle-track" aria-hidden="true">
+              <span className="setup-toggle-knob" />
+            </span>
+            <span className="setup-toggle-text">{sttEnabled ? "Activée" : "Coupée"}</span>
+          </button>
         </div>
 
         {error ? <p className="setup-error">{error}</p> : null}

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { useMicCapture } from "../audio/useMicCapture";
 import { useChatWsBridge } from "../hooks/useChatWsBridge";
 import { useTurnState } from "../hooks/useTurnState";
-import { useVoiceMode } from "../hooks/useVoiceMode";
+import { useSttMode } from "../hooks/useSttMode";
 import { useAudioLevel } from "../sphere/useAudioLevel";
 import { type SphereDerivedState, useSphereState } from "../sphere/useSphereState";
 import { useDevTweaksStore } from "../state/devTweaksStore";
@@ -86,11 +86,14 @@ export function SphereUI() {
   const audioLevelRef = useAudioLevel();
 
   // PRD 0016 / issue 0099 — the « Listen » mic path. The HUD `new` window owns
-  // the mic; it is armed only while the voice toggle is ON *and* the socket is
+  // the mic; it is armed only while the STT toggle is ON *and* the socket is
   // open (so `voice_start` + binary frames never fire on a dead connection).
   // `useMicCapture` handles getUserMedia + the AudioWorklet + the
   // voice_start/voice_stop framing; mounting it here is the whole wiring.
-  const { voiceEnabled } = useVoiceMode();
+  // STT (listening, SetupScreen toggle) is decoupled from TTS (speaking,
+  // `useVoiceMode` / Réglages · VOIX): muting Bob's voice no longer disarms
+  // the mic — listening is ambient for the « Yo Bob » wake word.
+  const { sttEnabled } = useSttMode();
   // PRD 0016 Annexe G / issue 0101 — the half-duplex mute gate. The live voice
   // floor is lifted HERE (one `/ws/debug` socket) and shared with the
   // FloorIndicator pill below. Browser AEC is enabled in getUserMedia but is
@@ -101,7 +104,7 @@ export function SphereUI() {
   // instant the floor leaves `bob_speaking`.
   const floor = useTurnState();
   useMicCapture({
-    enabled: voiceEnabled && wsStatus === "open",
+    enabled: sttEnabled && wsStatus === "open",
     send,
     sendBinary,
     windowName: "new",
