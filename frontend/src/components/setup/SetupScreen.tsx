@@ -31,9 +31,9 @@ import {
 } from "../../lib/llmApi";
 import "./SetupScreen.css";
 
-/** localStorage key — set once the user completes setup so later launches skip
- * straight to the HUD (unless a configured server is unreachable, in which
- * case `App` re-shows this screen). */
+/** localStorage key — set once the user completes setup. `App` no longer skips
+ * the gate on it (the SetupScreen shows on EVERY launch, seeded from the
+ * committed map); it stays as a marker of a past completed setup. */
 export const SETUP_COMPLETE_KEY = "bob.setupComplete";
 
 /** Select-value encoding: a Claude pick is the literal `"claude"`; an LM Studio
