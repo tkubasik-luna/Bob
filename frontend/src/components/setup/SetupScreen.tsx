@@ -42,6 +42,31 @@ export const SETUP_COMPLETE_KEY = "bob.setupComplete";
 const CLAUDE_CHOICE = "claude";
 const LM_PREFIX = "lm:";
 
+/** Canonicalise a typed LM Studio URL before it is pinged or committed.
+ *
+ * The INFERENCE client uses this URL raw, while the backend's ping / models /
+ * load management plane canonicalises it (`host_from_base_url`) — so a
+ * "127.0.0.0:1234"-style entry pinged green and listed models, yet broke at
+ * inference time. Mirror the backend's canonicalisation here: ensure a scheme
+ * and a `/v1` path, and collapse every loopback alias (`127.x.x.x` /
+ * `0.0.0.0` / `::1`) to `localhost`. Remote hosts are preserved verbatim. */
+export function normaliseBaseUrl(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed) return "";
+  const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed) ? trimmed : `http://${trimmed}`;
+  try {
+    const url = new URL(withScheme);
+    const host = url.hostname.replace(/^\[|\]$/g, "");
+    if (host === "0.0.0.0" || host === "::1" || /^127\./.test(host)) {
+      url.hostname = "localhost";
+    }
+    if (url.pathname === "" || url.pathname === "/") url.pathname = "/v1";
+    return url.toString().replace(/\/$/, "");
+  } catch {
+    return trimmed;
+  }
+}
+
 const ROLE_META: { key: LlmRole; label: string; hint: string }[] = [
   { key: "jarvis", label: "Jarvis · voix", hint: "Tour parlé, face utilisateur" },
   { key: "thinker", label: "Penseur", hint: "Raisonnement toujours chaud" },
@@ -126,7 +151,7 @@ export function SetupScreen({ onReady }: Props) {
   // Ping the candidate URL (debounced) so the user sees live reachability
   // before committing — same probe the in-HUD panel uses.
   useEffect(() => {
-    const url = baseUrl.trim();
+    const url = normaliseBaseUrl(baseUrl);
     if (!url) {
       setReachable(null);
       setModels([]);
@@ -146,7 +171,7 @@ export function SetupScreen({ onReady }: Props) {
   }, [baseUrl]);
 
   const refreshModels = useCallback(async () => {
-    const url = baseUrl.trim();
+    const url = normaliseBaseUrl(baseUrl);
     if (!url) return;
     setLoadingModels(true);
     setModelsError(null);
@@ -197,7 +222,7 @@ export function SetupScreen({ onReady }: Props) {
       draft: { state: "pending" },
       subagent: { state: "pending" },
     });
-    const url = baseUrl.trim();
+    const url = normaliseBaseUrl(baseUrl);
     for (const { key } of ROLE_META) {
       const choice = choices[key];
       const startedAt = performance.now();

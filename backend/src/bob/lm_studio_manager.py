@@ -554,10 +554,14 @@ class LMStudioManager:
         1. If ``role`` already points at a DIFFERENT model, release that old
            reference first (which may evict the old model iff no other role
            still holds it — selective, ref-counted offload).
-        2. If the target is already resident, just bump its ref-count for this
-           role (NO eviction of peers, NO reload) — the "re-selecting a loaded
-           model doesn't offload the others" invariant — unless ``reload`` forces
-           a fresh load at a new context window.
+        2. Reconcile against the server's LIVE loaded set: a model resident on
+           the server is adopted / ref-bumped (NO eviction of peers, NO reload)
+           — the "re-selecting a loaded model doesn't offload the others"
+           invariant — unless ``reload`` forces a fresh load at a new context
+           window. The in-process ref map alone is never trusted for this: it
+           can claim residency for a model that was since ejected from the LM
+           Studio UI (or lost to a server restart), and skipping the load on
+           that stale claim left the role pointing at an unloaded model.
         3. Otherwise budget-check the NEW resident set (resident + candidate ≤
            ceiling). Over budget → raise :class:`ModelBudgetExceededError`
            BEFORE touching the SDK (nothing loaded / evicted).
@@ -573,34 +577,37 @@ class LMStudioManager:
             # Re-pointing the role: drop the old ref (may evict the old model).
             self.release_role(role)
 
-        already_resident = model_id in self._refs
-        if already_resident and not reload:
-            # Pure ref-count bump — the target stays loaded, peers untouched.
-            self._refs.setdefault(model_id, set()).add(role)
-            self._role_model[role] = model_id
-            self._budget_add(model_id, context_length)
-            return
-
         if not reload:
-            # The in-process ref map starts EMPTY at boot, but LM Studio may have
-            # already JIT-loaded this exact model on the first inference (or it
-            # was loaded out-of-band). Reloading it would be a wasteful duplicate
-            # load with a visible reload blip — the "model loaded twice" bug.
-            # Reconcile against the server's live loaded set and adopt an
-            # already-resident model into the ref map instead of reloading it.
-            # Best-effort: if the server can't be listed, fall through to the
-            # normal load path (which surfaces its own error).
+            # Reconcile against the server's live loaded set — in BOTH
+            # directions. The ref map starts EMPTY at boot while LM Studio may
+            # have already JIT-loaded the model (reloading it would be the
+            # "model loaded twice" bug), and it can be STALE the other way: the
+            # refs book a model the server no longer holds (ejected from the LM
+            # Studio UI / server restart), and adopting that claim without a
+            # load left the role pointing at an unloaded model. Best-effort: if
+            # the server can't be listed, fall through to the normal load path
+            # (which surfaces its own error).
             try:
                 server_loaded = model_id in self.loaded_model_ids()
             except LMStudioUnavailableError:
                 server_loaded = False
             if server_loaded:
+                already_booked = model_id in self._refs
                 self._refs.setdefault(model_id, set()).add(role)
                 self._role_model[role] = model_id
-                # The model physically fits (it is already loaded) — book its
-                # footprint to reflect reality without a redundant budget gate.
-                self._budget_set(model_id, self._footprint_for(model_id, context_length))
+                if already_booked:
+                    # Pure ref-count bump — footprint already booked.
+                    self._budget_add(model_id, context_length)
+                else:
+                    # The model physically fits (it is already loaded) — book
+                    # its footprint to reflect reality without a redundant
+                    # budget gate.
+                    self._budget_set(model_id, self._footprint_for(model_id, context_length))
                 return
+            if model_id in self._refs:
+                # Stale residency claim — drop the phantom footprint so the
+                # budget check below gates against reality, then load for real.
+                self._budget_remove(model_id)
 
         # A NEW load (or a forced reload): budget-check FIRST. On a forced
         # reload of an already-resident model its own footprint is already

@@ -15,7 +15,23 @@ vi.mock("../../lib/llmApi", async () => {
   return { ...actual, ...apiMock };
 });
 
-import { SETUP_COMPLETE_KEY, SetupScreen } from "./SetupScreen";
+import { SETUP_COMPLETE_KEY, SetupScreen, normaliseBaseUrl } from "./SetupScreen";
+
+describe("normaliseBaseUrl", () => {
+  test("adds the scheme + /v1 path and collapses loopback aliases to localhost", () => {
+    // The raw URL feeds the INFERENCE client while ping/models canonicalise
+    // server-side — "127.0.0.0:1234" pinged green yet broke inference.
+    expect(normaliseBaseUrl("127.0.0.0:1234")).toBe("http://localhost:1234/v1");
+    expect(normaliseBaseUrl("127.0.0.1:1234")).toBe("http://localhost:1234/v1");
+    expect(normaliseBaseUrl("0.0.0.0:1234")).toBe("http://localhost:1234/v1");
+    expect(normaliseBaseUrl("localhost:1234")).toBe("http://localhost:1234/v1");
+    expect(normaliseBaseUrl("  http://localhost:1234/v1  ")).toBe("http://localhost:1234/v1");
+    // Remote hosts + explicit paths are preserved.
+    expect(normaliseBaseUrl("http://192.168.1.20:1234/v1")).toBe("http://192.168.1.20:1234/v1");
+    expect(normaliseBaseUrl("192.168.1.20:1234")).toBe("http://192.168.1.20:1234/v1");
+    expect(normaliseBaseUrl("")).toBe("");
+  });
+});
 
 const MODELS = [
   {

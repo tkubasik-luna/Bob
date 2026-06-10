@@ -96,6 +96,12 @@ class _FakeLlmNamespace:
     ``load_new_instance``; ``fail_models`` (issue 0107) raises an OOM for ONLY
     the named model ids so a multi-load test can fail one role's load while the
     rest succeed.
+
+    STATEFUL like the real server: once attached to a client (see
+    :class:`_FakeClient`), a successful ``load_new_instance`` makes the model
+    appear in ``list_loaded_models`` and ``unload`` removes it — the manager
+    reconciles its ref map against that live view, so the fake must keep it
+    truthful.
     """
 
     def __init__(
@@ -107,6 +113,12 @@ class _FakeLlmNamespace:
         self.fail_models = fail_models or set()
         self.loaded: list[tuple[str, object]] = []
         self.unloaded: list[str] = []
+        self._resident: list[_SDKLoadedModel] | None = None
+
+    def attach_resident(self, resident: list[_SDKLoadedModel]) -> None:
+        """Bind the client's live loaded-model list so loads/unloads mutate it."""
+
+        self._resident = resident
 
     def load_new_instance(
         self,
@@ -119,10 +131,18 @@ class _FakeLlmNamespace:
         if model_key in self.fail_models:
             raise lmstudio.LMStudioServerError(f"out of memory loading {model_key}")
         self.loaded.append((model_key, config))
+        if self._resident is not None:
+            self._resident.append(_FakeLoaded(model_key))
         return object()
 
     def unload(self, model_identifier: str) -> None:
         self.unloaded.append(model_identifier)
+        if self._resident is not None:
+            self._resident[:] = [
+                handle
+                for handle in self._resident
+                if getattr(handle, "identifier", None) != model_identifier
+            ]
 
 
 class _FakeClient:
@@ -138,6 +158,7 @@ class _FakeClient:
         self._loaded = loaded
         self.closed = False
         self.llm = llm or _FakeLlmNamespace()
+        self.llm.attach_resident(self._loaded)
 
     def list_downloaded_models(self) -> list[_SDKDownloadedModel]:
         return list(self._downloaded)
@@ -498,6 +519,28 @@ def test_assign_role_adopts_server_loaded_model_without_reloading() -> None:
     assert llm.unloaded == []
     assert manager.ref_count("qwen2.5-7b-instruct") == 1
     assert manager.model_for_role("jarvis") == "qwen2.5-7b-instruct"
+
+
+def test_assign_role_reloads_when_refs_are_stale_vs_server() -> None:
+    # The ref map can claim residency for a model the server NO LONGER holds
+    # (ejected from the LM Studio UI / server restart between swaps). Trusting
+    # that stale claim skipped the load and left the role on an unloaded model
+    # (the "setup loaded only one of my models" bug) — assign_role must
+    # reconcile against the live server and load for real.
+    manager, llm = _multiload_manager(ceiling_gib=100.0)
+    manager.assign_role("jarvis", "modelA")
+    assert manager.ref_count("modelA") == 1
+
+    # The model vanishes server-side behind the manager's back.
+    llm.unload("modelA")
+    llm.unloaded.clear()
+    loaded_before = list(llm.loaded)
+
+    manager.assign_role("thinker", "modelA")  # refs say resident — server says no
+
+    assert [m for m, _ in llm.loaded] == [m for m, _ in loaded_before] + ["modelA"]
+    assert manager.ref_count("modelA") == 2
+    assert manager.roles_for("modelA") == frozenset({"jarvis", "thinker"})
 
 
 def test_assign_role_loads_when_not_resident_anywhere() -> None:
